@@ -21,7 +21,7 @@ ENCODING_SIZE = 70 #for reference, not used
 #need to encode a board state into a tensor of some sort
 #we have 6 unique pieces, so 12 per side. 
 #we also need to encode castling and en passant somehow along with whose turn it is
-def encode_board(board: chess.Board) -> torch.Tensor:
+def encode_board(board: chess.Board) -> list[int]:
     encoding = [0 for _ in range(NUM_SQUARES)]
 
     for square in chess.SQUARES: #integers 0-63
@@ -43,7 +43,7 @@ def encode_board(board: chess.Board) -> torch.Tensor:
     encoding.append(1 if board.has_kingside_castling_rights(chess.BLACK) else 0) #67
     encoding.append(1 if board.has_queenside_castling_rights(chess.BLACK) else 0) #68
 
-    encoding.append(board.ep_square if board.ep_square is not None else 0) #69
+    encoding.append(board.ep_square if board.ep_square is not None and board.has_legal_en_passant() else 0) #69
 
     return encoding
 

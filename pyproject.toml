@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# main.py lives at the repository root rather than in an installed package.
+pythonpath = ["."]
+testpaths = ["tests"]
