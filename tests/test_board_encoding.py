@@ -10,11 +10,14 @@ from main import (
     BLACK_QUEENSIDE_INDEX,
     EN_PASSANT_INDEX,
     ENCODING_SIZE,
+    NUM_MOVE_IDS,
     TURN_INDEX,
     WHITE_KINGSIDE_INDEX,
     WHITE_QUEENSIDE_INDEX,
     decode_board,
+    decode_id_to_move,
     encode_board,
+    encode_move_to_id,
 )
 
 CARLSEN_PGN = Path(__file__).parent.parent / "Carlsen" / "Carlsen.pgn"
@@ -36,6 +39,8 @@ PIECE_CODES = {
     "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
     "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
 }
+
+PROMOTION_CHOICES = [None, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
 
 
 def board_after(*san_moves: str) -> chess.Board:
@@ -244,3 +249,45 @@ def test_round_trip_every_position_of_real_games():
         for move in game.mainline_moves():
             board.push(move)
             assert_round_trip(board)
+
+
+#ids worked out by hand as ((from * 64) + to) * 5 + promotion, so the layout is checked against
+#something other than encode_move_to_id itself. Changing the layout invalidates any saved ids or trained model.
+@pytest.mark.parametrize(
+    "uci, expected_id",
+    [
+        pytest.param("a1b1", 5, id="lowest-real-move"),
+        pytest.param("h8g8", 20470, id="highest-real-move"),
+        pytest.param("e2e4", 3980, id="pawn-push"),              #(12 * 64 + 28) * 5
+        pytest.param("e1g1", 1310, id="castling-is-a-king-move"),  #(4 * 64 + 6) * 5
+        pytest.param("a2a1n", 2561, id="knight-promotion"),      #(8 * 64 + 0) * 5 + 1
+        pytest.param("e7d8b", 16937, id="bishop-promotion"),     #(52 * 64 + 59) * 5 + 2
+        pytest.param("g7h8r", 17598, id="rook-promotion"),       #(54 * 64 + 63) * 5 + 3
+        pytest.param("e7e8q", 16944, id="queen-promotion"),      #(52 * 64 + 60) * 5 + 4
+    ],
+)
+def test_move_id_layout(uci, expected_id):
+    move = chess.Move.from_uci(uci)
+
+    assert encode_move_to_id(move) == expected_id
+    assert decode_id_to_move(expected_id) == move
+
+
+def test_every_move_has_its_own_id():
+    all_moves = [
+        chess.Move(from_square, to_square, promotion=promotion)
+        for from_square in chess.SQUARES
+        for to_square in chess.SQUARES
+        for promotion in PROMOTION_CHOICES
+    ]
+
+    ids = [encode_move_to_id(move) for move in all_moves]
+
+    #64 from squares * 64 to squares * (no promotion + 4 promotion pieces)
+    assert NUM_MOVE_IDS == 20480
+
+    #every id in 0..NUM_MOVE_IDS-1 is used exactly once, so no two moves collide
+    #and every index of the model's output layer decodes to a move
+    assert sorted(ids) == list(range(NUM_MOVE_IDS))
+    for move, move_id in zip(all_moves, ids):
+        assert decode_id_to_move(move_id) == move, move.uci()

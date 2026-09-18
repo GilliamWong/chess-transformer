@@ -15,6 +15,9 @@ EN_PASSANT_INDEX = 69
 
 ENCODING_SIZE = 70 #for reference, not used
 
+NUM_PROMOTION_CHOICES = 5 #no promotion, knight, bishop, rook, queen
+NUM_MOVE_IDS = NUM_SQUARES * NUM_SQUARES * NUM_PROMOTION_CHOICES #20480, the size of the move vocabulary
+
 
 
 
@@ -70,14 +73,14 @@ def decode_board(encoding: list[int]) -> chess.Board:
 
 def encode_move_to_id(move: chess.Move) -> int:
     promotion = move.promotion - 1 if move.promotion is not None else 0
-    id = ((move.from_square * 64) + move.to_square) * 5 + promotion
+    id = ((move.from_square * NUM_SQUARES) + move.to_square) * NUM_PROMOTION_CHOICES + promotion
     return id
 
 
 def decode_id_to_move(move: int) -> chess.Move:
-    promotion = move % 5
-    destination = ((move - promotion) // 5) % 64
-    source = (((move - promotion) // 5) // 64)
+    promotion = move % NUM_PROMOTION_CHOICES
+    destination = ((move - promotion) // NUM_PROMOTION_CHOICES) % NUM_SQUARES
+    source = (((move - promotion) // NUM_PROMOTION_CHOICES) // NUM_SQUARES)
 
     promotion = None if promotion == 0 else promotion + 1
 
