@@ -68,6 +68,21 @@ def decode_board(encoding: list[int]) -> chess.Board:
 
     return board
 
+def encode_move_to_id(move: chess.Move) -> int:
+    promotion = move.promotion - 1 if move.promotion is not None else 0
+    id = ((move.from_square * 64) + move.to_square) * 5 + promotion
+    return id
+
+
+def decode_id_to_move(move: int) -> chess.Move:
+    promotion = move % 5
+    destination = ((move - promotion) // 5) % 64
+    source = (((move - promotion) // 5) // 64)
+
+    promotion = None if promotion == 0 else promotion + 1
+
+    return chess.Move(source, destination, promotion=promotion)
+
 # 1  # pawn white
 # 2  # knight white
 # 3  # bishop white
@@ -80,6 +95,16 @@ def integer_to_piece(piece: int) -> chess.Piece | None:
         return chess.Piece(piece, chess.WHITE)
     else:
         return chess.Piece(piece - NUM_PIECE_TYPES, chess.BLACK)
+
+def piece_to_integer(piece: chess.Piece | None) -> int:
+    if piece is None: return 0
+    output_piece = 0
+    if piece.color == chess.WHITE:
+        output_piece += piece.piece_type
+    else:
+        output_piece += piece.piece_type + NUM_PIECE_TYPES
+
+    return output_piece
 
 def main():
     with open("Carlsen/Carlsen.pgn") as f:
