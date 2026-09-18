@@ -22,6 +22,16 @@ def game_to_examples(game: chess.pgn.Game) -> list[TrainingExample]:
 
     return complete_game
 
+def pgn_to_examples(pgn_path: Path) -> list[list[TrainingExample]]:
+    output = []
+    with open(pgn_path) as pgn:
+        game = chess.pgn.read_game(pgn)
+        while game is not None:
+            output.append(game_to_examples(game))
+            game = chess.pgn.read_game(pgn)
+
+    return output
+
 def read_games(pgn_path: Path) -> Iterator[chess.pgn.Game]:
     with open(pgn_path) as pgn:
         #read_game returns None once the file is exhausted
