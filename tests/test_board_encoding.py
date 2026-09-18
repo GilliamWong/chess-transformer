@@ -1,11 +1,10 @@
 from itertools import islice
-from pathlib import Path
 
 import chess
-import chess.pgn
 import pytest
 
-from main import (
+from data import CARLSEN_PGN, read_games
+from encoding import (
     BLACK_KINGSIDE_INDEX,
     BLACK_QUEENSIDE_INDEX,
     EN_PASSANT_INDEX,
@@ -20,7 +19,6 @@ from main import (
     encode_move_to_id,
 )
 
-CARLSEN_PGN = Path(__file__).parent.parent / "Carlsen" / "Carlsen.pgn"
 NUM_PGN_GAMES_TO_REPLAY = 5
 
 #written out by hand so the layout is checked against something other than encode_board itself
@@ -239,8 +237,7 @@ def test_round_trip_position(fen):
 
 
 def test_round_trip_every_position_of_real_games():
-    with open(CARLSEN_PGN) as pgn:
-        games = list(islice(iter(lambda: chess.pgn.read_game(pgn), None), NUM_PGN_GAMES_TO_REPLAY))
+    games = list(islice(read_games(CARLSEN_PGN), NUM_PGN_GAMES_TO_REPLAY))
     assert len(games) == NUM_PGN_GAMES_TO_REPLAY
 
     for game in games:
