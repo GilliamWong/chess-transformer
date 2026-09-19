@@ -4,6 +4,7 @@ from encoding import encode_board, encode_move_to_id
 from torch.utils.data import Dataset
 import torch
 import chess.pgn
+import random
 
 CARLSEN_PGN = Path(__file__).parent / "Carlsen" / "Carlsen.pgn"
 
@@ -11,6 +12,8 @@ CARLSEN_PGN = Path(__file__).parent / "Carlsen" / "Carlsen.pgn"
 class TrainingExample:
     board: list[int]
     move: int
+
+Game = list[TrainingExample] #one example per position, in the order the game was played
 
 def game_to_examples(game: chess.pgn.Game) -> list[TrainingExample]:
     board = game.board()
@@ -22,8 +25,9 @@ def game_to_examples(game: chess.pgn.Game) -> list[TrainingExample]:
 
     return complete_game
 
-#takes a chess pgn and converts it to a set of training examples
-def pgn_to_examples(pgn_path: Path) -> list[list[TrainingExample]]:
+#takes a chess pgn and converts it to training examples. Examples stay grouped by game
+#so that split_data can keep every position of a game on the same side of the split.
+def pgn_to_examples(pgn_path: Path) -> list[Game]:
     output = []
     with open(pgn_path) as pgn:
         game = chess.pgn.read_game(pgn)
@@ -33,10 +37,28 @@ def pgn_to_examples(pgn_path: Path) -> list[list[TrainingExample]]:
 
     return output
 
+#splits by game rather than by position: consecutive positions of one game are nearly identical,
+#so a game on both sides of the split would inflate validation accuracy.
+def split_data(games: list[Game], train_fraction: float = 0.8, seed: int = 42) -> tuple[list[Game], list[Game]]:
+    if not 0 <= train_fraction <= 1:
+        #a percentage like 80 would otherwise silently put every game in train
+        raise ValueError(f"train_fraction must be between 0 and 1, got {train_fraction}")
+
+    shuffled_games = games.copy() #copy so we don't modify the input games list
+    random.Random(seed).shuffle(shuffled_games) #shuffles in place and returns None
+
+    cut = int(len(shuffled_games) * train_fraction)
+
+    train = shuffled_games[:cut]
+    val = shuffled_games[cut:]
+
+    return train, val
+
+
 class ChessGamesDataset(Dataset):
     """set of examples of chess games that we can use as a dataset"""
 
-    def __init__(self, games: list[list[TrainingExample]]):
+    def __init__(self, games: list[Game]):
         #two tensors, one for the board positions and the other for the moves
         boards = []
         moves = []
