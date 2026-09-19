@@ -7,6 +7,7 @@ from encoding import (
     BLACK_QUEENSIDE_INDEX,
     EN_PASSANT_INDEX,
     ENCODING_SIZE,
+    NUM_BOARD_TOKENS,
     NUM_MOVE_IDS,
     TURN_INDEX,
     WHITE_KINGSIDE_INDEX,
@@ -24,10 +25,15 @@ START_POSITION_ENCODING = (
     + [0] * 32                      #ranks 3-6
     + [7] * 8                       #rank 7
     + [10, 8, 9, 11, 12, 9, 8, 10]  #rank 8, a8..h8
-    + [1]                           #white to move
-    + [1, 1, 1, 1]                  #castling: white K, white Q, black k, black q
-    + [0]                           #no en passant square
+    + [14]                          #white to move
+    + [16, 16, 16, 16]              #castling: white K, white Q, black k, black q
+    + [17]                          #no en passant square
 )
+
+#token ids written out by hand, like the start position above
+BLACK_TO_MOVE, WHITE_TO_MOVE = 13, 14
+NO_CASTLING_RIGHT, CASTLING_RIGHT = 15, 16
+NO_EN_PASSANT = 17  #en passant square s is token 17 + s
 
 PIECE_CODES = {
     "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
@@ -43,11 +49,12 @@ def board_after(*san_moves: str) -> chess.Board:
 
 
 def castling_flags(encoding) -> tuple[int, int, int, int]:
+    """1 for a castling right and 0 for none. Any other token comes out as neither"""
     return (
-        encoding[WHITE_KINGSIDE_INDEX],
-        encoding[WHITE_QUEENSIDE_INDEX],
-        encoding[BLACK_KINGSIDE_INDEX],
-        encoding[BLACK_QUEENSIDE_INDEX],
+        encoding[WHITE_KINGSIDE_INDEX] - NO_CASTLING_RIGHT,
+        encoding[WHITE_QUEENSIDE_INDEX] - NO_CASTLING_RIGHT,
+        encoding[BLACK_KINGSIDE_INDEX] - NO_CASTLING_RIGHT,
+        encoding[BLACK_QUEENSIDE_INDEX] - NO_CASTLING_RIGHT,
     )
 
 
@@ -82,7 +89,7 @@ def test_every_piece_has_its_own_code():
 def test_black_to_move():
     board = board_after("e4")
 
-    assert encode_board(board)[TURN_INDEX] == 0
+    assert encode_board(board)[TURN_INDEX] == BLACK_TO_MOVE
     assert decode_board(encode_board(board)).turn == chess.BLACK
 
 
@@ -170,7 +177,7 @@ def test_decoded_board_can_still_castle():
 def test_en_passant_square(san_moves, expected_ep_square):
     board = board_after(*san_moves)
 
-    assert encode_board(board)[EN_PASSANT_INDEX] == expected_ep_square
+    assert encode_board(board)[EN_PASSANT_INDEX] == NO_EN_PASSANT + expected_ep_square
     assert_round_trip(board)
 
 
@@ -195,7 +202,7 @@ def test_en_passant_square_expires_after_one_move():
 
     encoding = encode_board(board)
 
-    assert encoding[EN_PASSANT_INDEX] == 0
+    assert encoding[EN_PASSANT_INDEX] == NO_EN_PASSANT
     assert decode_board(encoding).ep_square is None
 
 
@@ -299,3 +306,20 @@ def test_every_legal_move_of_real_games_has_an_id(carlsen_games):
             for move in board.legal_moves:
                 assert decode_id_to_move(encode_move_to_id(move)) == move, move.uci()
             board.push(played_move)
+
+
+
+#the reason the offsets exist: a token never means two things. Blocks written out by hand
+def test_every_slot_stays_inside_its_token_block(carlsen_games):
+    assert NUM_BOARD_TOKENS == 81
+
+    for game in carlsen_games:
+        board = game.board()
+        for move in game.mainline_moves():
+            board.push(move)
+            encoding = encode_board(board)
+
+            assert all(0 <= token <= 12 for token in encoding[:TURN_INDEX])
+            assert encoding[TURN_INDEX] in (BLACK_TO_MOVE, WHITE_TO_MOVE)
+            assert all(flag in (0, 1) for flag in castling_flags(encoding))
+            assert NO_EN_PASSANT <= encoding[EN_PASSANT_INDEX] < NUM_BOARD_TOKENS

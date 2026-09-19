@@ -61,11 +61,11 @@ def test_items_have_the_dtype_and_shape_the_model_needs():
 
 
 def test_largest_values_survive_compact_storage():
-    #63 is the largest board value (an en passant square), 1967 the largest move id
-    dataset = ChessGamesDataset([[TrainingExample(make_board(63), 1967)]])
+    #80 is the largest board token (en passant on h8), 1967 the largest move id
+    dataset = ChessGamesDataset([[TrainingExample(make_board(80), 1967)]])
 
     board, move = dataset[0]
-    assert board.tolist() == make_board(63)
+    assert board.tolist() == make_board(80)
     assert move.item() == 1967
 
 

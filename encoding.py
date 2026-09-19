@@ -11,7 +11,22 @@ BLACK_KINGSIDE_INDEX = 67
 BLACK_QUEENSIDE_INDEX = 68
 EN_PASSANT_INDEX = 69
 
-ENCODING_SIZE = 70 #for reference, not used
+ENCODING_SIZE = 70 #length of an encoded board
+
+#the same raw value means different things in different slots (1 is a white pawn on a square,
+#white to move in the turn slot, a castling right, or square b1 in the en passant slot).
+#each kind of value gets its own block of token ids so they never share an embedding row.
+#encode_board adds the offsets, so an encoded board is already a list of token ids
+NUM_PIECE_CODES = 1 + 2 * NUM_PIECE_TYPES #13, empty + 6 white + 6 black
+NUM_FLAG_VALUES = 2 #0 or 1
+NUM_EN_PASSANT_VALUES = NUM_SQUARES #0 for no en passant square, otherwise the square itself
+
+PIECE_TOKEN_OFFSET = 0
+TURN_TOKEN_OFFSET = PIECE_TOKEN_OFFSET + NUM_PIECE_CODES #13
+CASTLING_TOKEN_OFFSET = TURN_TOKEN_OFFSET + NUM_FLAG_VALUES #15, shared by all four castling slots
+EN_PASSANT_TOKEN_OFFSET = CASTLING_TOKEN_OFFSET + NUM_FLAG_VALUES #17
+
+NUM_BOARD_TOKENS = EN_PASSANT_TOKEN_OFFSET + NUM_EN_PASSANT_VALUES #81, the size of the board vocabulary
 
 def _build_all_possible_moves() -> tuple[chess.Move, ...]:
     board = chess.Board.empty()
@@ -76,28 +91,30 @@ def encode_board(board: chess.Board) -> list[int]:
 
         encoding[square] = piece_encoding
 
-    encoding.append(1 if board.turn == chess.WHITE else 0) #64
-    encoding.append(1 if board.has_kingside_castling_rights(chess.WHITE) else 0) #65
-    encoding.append(1 if board.has_queenside_castling_rights(chess.WHITE) else 0) #66
+    encoding.append(TURN_TOKEN_OFFSET + (1 if board.turn == chess.WHITE else 0)) #64
+    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_kingside_castling_rights(chess.WHITE) else 0)) #65
+    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_queenside_castling_rights(chess.WHITE) else 0)) #66
 
-    encoding.append(1 if board.has_kingside_castling_rights(chess.BLACK) else 0) #67
-    encoding.append(1 if board.has_queenside_castling_rights(chess.BLACK) else 0) #68
+    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_kingside_castling_rights(chess.BLACK) else 0)) #67
+    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_queenside_castling_rights(chess.BLACK) else 0)) #68
 
-    encoding.append(board.ep_square if board.ep_square is not None and board.has_legal_en_passant() else 0) #69
+    encoding.append(EN_PASSANT_TOKEN_OFFSET + (board.ep_square if board.ep_square is not None and board.has_legal_en_passant() else 0)) #69
 
     return encoding
 
 def decode_board(encoding: list[int]) -> chess.Board:
     board = chess.Board.empty()
 
-    board.turn = (chess.WHITE if encoding[TURN_INDEX] == 1 else chess.BLACK)
-    board.ep_square = (None if encoding[EN_PASSANT_INDEX] == 0 else encoding[EN_PASSANT_INDEX])
+    board.turn = (chess.WHITE if encoding[TURN_INDEX] == TURN_TOKEN_OFFSET + 1 else chess.BLACK)
+
+    ep_square = encoding[EN_PASSANT_INDEX] - EN_PASSANT_TOKEN_OFFSET
+    board.ep_square = (None if ep_square == 0 else ep_square)
 
     castling = ""
-    if encoding[WHITE_KINGSIDE_INDEX] == 1: castling += "K"
-    if encoding[WHITE_QUEENSIDE_INDEX] == 1: castling += "Q"
-    if encoding[BLACK_KINGSIDE_INDEX] == 1: castling += "k"
-    if encoding[BLACK_QUEENSIDE_INDEX] == 1: castling += "q"
+    if encoding[WHITE_KINGSIDE_INDEX] == CASTLING_TOKEN_OFFSET + 1: castling += "K"
+    if encoding[WHITE_QUEENSIDE_INDEX] == CASTLING_TOKEN_OFFSET + 1: castling += "Q"
+    if encoding[BLACK_KINGSIDE_INDEX] == CASTLING_TOKEN_OFFSET + 1: castling += "k"
+    if encoding[BLACK_QUEENSIDE_INDEX] == CASTLING_TOKEN_OFFSET + 1: castling += "q"
     if castling == "": castling = "-"
 
     board.set_castling_fen(castling)
