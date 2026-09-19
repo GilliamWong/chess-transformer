@@ -1,9 +1,17 @@
 import chess
+import chess.pgn
 import pytest
 import torch
 from torch.utils.data import DataLoader
 
-from data import ChessGamesDataset, TrainingExample, game_to_examples, split_data
+from data import (
+    ChessGamesDataset,
+    TrainingExample,
+    create_dataloaders,
+    game_to_examples,
+    pgns_to_examples,
+    split_data,
+)
 from encoding import ENCODING_SIZE, decode_board, decode_id_to_move, encode_board, encode_move_to_id
 
 
@@ -87,9 +95,12 @@ def test_every_label_is_legal_in_its_position(carlsen_games):
         assert decode_id_to_move(move.item()) in decode_board(board.tolist()).legal_moves, index
 
 
-def make_games(count: int) -> list[list[TrainingExample]]:
-    """one-position games whose move id says which game it is"""
-    return [[TrainingExample(make_board(0), game_number)] for game_number in range(count)]
+def make_games(count: int, positions_per_game: int = 1) -> list[list[TrainingExample]]:
+    """games whose move ids say which game they are"""
+    return [
+        [TrainingExample(make_board(0), game_number) for _ in range(positions_per_game)]
+        for game_number in range(count)
+    ]
 
 
 def game_numbers(games: list[list[TrainingExample]]) -> list[int]:
@@ -131,3 +142,67 @@ def test_split_is_the_same_for_the_same_seed():
 def test_split_rejects_a_percentage():
     with pytest.raises(ValueError):
         split_data(make_games(10), train_fraction=80)
+
+
+def loader_moves(loader: DataLoader) -> list[int]:
+    """every move id the loader yields in one epoch, in the order it yields them"""
+    return [move for _, moves in loader for move in moves.tolist()]
+
+
+def write_pgn(pgn_path, games) -> None:
+    with open(pgn_path, "w") as pgn:
+        for game in games:
+            print(game, file=pgn, end="\n\n")
+
+
+def test_pgns_to_examples_joins_the_games_of_every_pgn_in_order(carlsen_games, tmp_path):
+    first_pgn, second_pgn = tmp_path / "first.pgn", tmp_path / "second.pgn"
+    write_pgn(first_pgn, carlsen_games[:3])
+    write_pgn(second_pgn, carlsen_games[3:])
+
+    games = pgns_to_examples([first_pgn, second_pgn])
+
+    assert games == [game_to_examples(game) for game in carlsen_games]
+
+
+def test_dataloaders_keep_each_game_on_one_side_of_the_split():
+    #3 positions per game, so a split by position rather than by game would cut through a game
+    train_loader, val_loader = create_dataloaders(make_games(10, positions_per_game=3), train_fraction=0.8)
+
+    train_games, val_games = set(loader_moves(train_loader)), set(loader_moves(val_loader))
+
+    assert len(train_loader.dataset) == 24 and len(val_loader.dataset) == 6
+    assert train_games.isdisjoint(val_games)
+    assert train_games | val_games == set(range(10))
+
+
+def test_dataloaders_use_their_own_batch_sizes():
+    train_loader, val_loader = create_dataloaders(make_games(100), train_batch_size=16, val_batch_size=5)
+
+    train_boards, train_moves = next(iter(train_loader))
+    val_boards, val_moves = next(iter(val_loader))
+
+    assert train_boards.shape == (16, ENCODING_SIZE) and train_moves.shape == (16,)
+    assert val_boards.shape == (5, ENCODING_SIZE) and val_moves.shape == (5,)
+
+
+def test_train_loader_reshuffles_and_val_loader_does_not():
+    torch.manual_seed(0)
+    train_loader, val_loader = create_dataloaders(make_games(100), train_batch_size=16, val_batch_size=16)
+
+    first_epoch, second_epoch = loader_moves(train_loader), loader_moves(train_loader)
+
+    #every example exactly once per epoch, the short last batch included, in a new order each time
+    assert sorted(first_epoch) == sorted(second_epoch) == sorted(train_loader.dataset.moves.tolist())
+    assert first_epoch != second_epoch
+    assert loader_moves(val_loader) == val_loader.dataset.moves.tolist()
+
+
+def test_dataloaders_pass_the_split_settings_through():
+    games = make_games(50)
+
+    default_split, _ = create_dataloaders(games)
+    other_split, _ = create_dataloaders(games, train_fraction=0.5, seed=7)
+
+    assert len(default_split.dataset) == 40 and len(other_split.dataset) == 25
+    assert set(other_split.dataset.moves.tolist()) == set(game_numbers(split_data(games, 0.5, 7)[0]))

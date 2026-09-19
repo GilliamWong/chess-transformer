@@ -1,7 +1,7 @@
 from pathlib import Path
 from dataclasses import dataclass
 from encoding import encode_board, encode_move_to_id
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 import torch
 import chess.pgn
 import random
@@ -36,6 +36,14 @@ def pgn_to_examples(pgn_path: Path) -> list[Game]:
             game = chess.pgn.read_game(pgn)
 
     return output
+
+#a list of games from possibly more than one PGN, good for extensibility
+def pgns_to_examples(pgn_paths: list[Path]) -> list[Game]:
+    games = []
+    for path in pgn_paths:
+        games.extend(pgn_to_examples(path))
+
+    return games
 
 #splits by game rather than by position: consecutive positions of one game are nearly identical,
 #so a game on both sides of the split would inflate validation accuracy.
@@ -76,3 +84,26 @@ class ChessGamesDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         return self.boards[index].long(), self.moves[index].long()
+
+
+#takes games that are already parsed rather than pgn paths, so the loaders can be built
+#(and tested) without reading a whole pgn. Use pgns_to_examples to get the games.
+def create_dataloaders(
+    games: list[Game],
+    train_batch_size: int = 256,
+    val_batch_size: int = 512,
+    train_fraction: float = 0.8,
+    seed: int = 42
+) -> tuple[DataLoader, DataLoader]:
+
+    train_data, val_data = split_data(games, train_fraction=train_fraction, seed=seed)
+
+    train_dataset = ChessGamesDataset(train_data)
+    val_dataset = ChessGamesDataset(val_data)
+
+    #train is reshuffled every epoch so a batch is not 256 positions of the same few games.
+    #val is only measured, so its order does not matter
+    train_loader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False)
+
+    return train_loader, val_loader
