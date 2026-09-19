@@ -12,12 +12,12 @@ from data import (
     pgns_to_examples,
     split_data,
 )
-from encoding import ENCODING_SIZE, decode_board, decode_id_to_move, encode_board, encode_move_to_id
+from encoding import TOKENS_PER_BOARD, decode_board, decode_id_to_move, encode_board, encode_move_to_id
 
 
 def make_board(fill: int) -> list[int]:
     """a recognisable stand-in board, so a test can tell which example it got back"""
-    return [fill] * ENCODING_SIZE
+    return [fill] * TOKENS_PER_BOARD
 
 
 #two games of different lengths, so flattening has a game boundary to get wrong
@@ -56,7 +56,7 @@ def test_items_have_the_dtype_and_shape_the_model_needs():
     board, move = ChessGamesDataset(TWO_GAMES)[0]
 
     #embedding lookups and CrossEntropyLoss targets both require int64
-    assert board.dtype == torch.long and board.shape == (ENCODING_SIZE,)
+    assert board.dtype == torch.long and board.shape == (TOKENS_PER_BOARD,)
     assert move.dtype == torch.long and move.shape == ()
 
 
@@ -80,7 +80,7 @@ def test_dataloader_batches_boards_and_moves():
 
     boards, moves = next(iter(loader))
 
-    assert boards.shape == (2, ENCODING_SIZE)
+    assert boards.shape == (2, TOKENS_PER_BOARD)
     assert moves.tolist() == [10, 20]
 
 
@@ -182,8 +182,8 @@ def test_dataloaders_use_their_own_batch_sizes():
     train_boards, train_moves = next(iter(train_loader))
     val_boards, val_moves = next(iter(val_loader))
 
-    assert train_boards.shape == (16, ENCODING_SIZE) and train_moves.shape == (16,)
-    assert val_boards.shape == (5, ENCODING_SIZE) and val_moves.shape == (5,)
+    assert train_boards.shape == (16, TOKENS_PER_BOARD) and train_moves.shape == (16,)
+    assert val_boards.shape == (5, TOKENS_PER_BOARD) and val_moves.shape == (5,)
 
 
 def test_train_loader_reshuffles_and_val_loader_does_not():

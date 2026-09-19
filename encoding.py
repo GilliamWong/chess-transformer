@@ -11,7 +11,7 @@ BLACK_KINGSIDE_INDEX = 67
 BLACK_QUEENSIDE_INDEX = 68
 EN_PASSANT_INDEX = 69
 
-ENCODING_SIZE = 70 #length of an encoded board
+TOKENS_PER_BOARD = 70 #length of an encoded board, each token is one of BOARD_VOCAB_SIZE values
 
 #the same raw value means different things in different slots (1 is a white pawn on a square,
 #white to move in the turn slot, a castling right, or square b1 in the en passant slot).
@@ -26,7 +26,7 @@ TURN_TOKEN_OFFSET = PIECE_TOKEN_OFFSET + NUM_PIECE_CODES #13
 CASTLING_TOKEN_OFFSET = TURN_TOKEN_OFFSET + NUM_FLAG_VALUES #15, shared by all four castling slots
 EN_PASSANT_TOKEN_OFFSET = CASTLING_TOKEN_OFFSET + NUM_FLAG_VALUES #17
 
-NUM_BOARD_TOKENS = EN_PASSANT_TOKEN_OFFSET + NUM_EN_PASSANT_VALUES #81, the size of the board vocabulary
+BOARD_VOCAB_SIZE = EN_PASSANT_TOKEN_OFFSET + NUM_EN_PASSANT_VALUES #81, the size of the board vocabulary
 
 def _build_all_possible_moves() -> tuple[chess.Move, ...]:
     board = chess.Board.empty()

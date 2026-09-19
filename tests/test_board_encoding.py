@@ -6,8 +6,8 @@ from encoding import (
     BLACK_KINGSIDE_INDEX,
     BLACK_QUEENSIDE_INDEX,
     EN_PASSANT_INDEX,
-    ENCODING_SIZE,
-    NUM_BOARD_TOKENS,
+    TOKENS_PER_BOARD,
+    BOARD_VOCAB_SIZE,
     NUM_MOVE_IDS,
     TURN_INDEX,
     WHITE_KINGSIDE_INDEX,
@@ -69,7 +69,7 @@ def assert_round_trip(board: chess.Board) -> None:
 def test_start_position_layout():
     encoding = encode_board(chess.Board())
 
-    assert len(encoding) == ENCODING_SIZE
+    assert len(encoding) == TOKENS_PER_BOARD
     assert encoding == START_POSITION_ENCODING
 
 
@@ -311,7 +311,7 @@ def test_every_legal_move_of_real_games_has_an_id(carlsen_games):
 
 #the reason the offsets exist: a token never means two things. Blocks written out by hand
 def test_every_slot_stays_inside_its_token_block(carlsen_games):
-    assert NUM_BOARD_TOKENS == 81
+    assert BOARD_VOCAB_SIZE == 81
 
     for game in carlsen_games:
         board = game.board()
@@ -322,4 +322,4 @@ def test_every_slot_stays_inside_its_token_block(carlsen_games):
             assert all(0 <= token <= 12 for token in encoding[:TURN_INDEX])
             assert encoding[TURN_INDEX] in (BLACK_TO_MOVE, WHITE_TO_MOVE)
             assert all(flag in (0, 1) for flag in castling_flags(encoding))
-            assert NO_EN_PASSANT <= encoding[EN_PASSANT_INDEX] < NUM_BOARD_TOKENS
+            assert NO_EN_PASSANT <= encoding[EN_PASSANT_INDEX] < BOARD_VOCAB_SIZE
