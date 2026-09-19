@@ -13,10 +13,7 @@ EN_PASSANT_INDEX = 69
 
 ENCODING_SIZE = 70 #for reference, not used
 
-NUM_PROMOTION_CHOICES = 5 #no promotion, knight, bishop, rook, queen
-NUM_MOVE_IDS = NUM_SQUARES * NUM_SQUARES * NUM_PROMOTION_CHOICES #20480, the size of the move vocabulary
-
-def _build_moves_list() -> list[chess.Move]:
+def _build_all_possible_moves() -> tuple[chess.Move, ...]:
     board = chess.Board.empty()
     moves = []
     queen = chess.Piece(chess.QUEEN, chess.WHITE)
@@ -48,7 +45,18 @@ def _build_moves_list() -> list[chess.Move]:
 
     return tuple(moves)
             
-ALL_POSSIBLE_MOVES = _build_moves_list()
+ALL_POSSIBLE_MOVES = _build_all_possible_moves()
+NUM_MOVE_IDS = len(ALL_POSSIBLE_MOVES) #1968, the size of the move vocabulary
+
+def _build_move_dict() -> dict[chess.Move, int]:
+    output = {}
+    for move_id, move in enumerate(ALL_POSSIBLE_MOVES):
+        output[move] = move_id
+
+    return output
+
+MOVE_TO_ID = _build_move_dict()
+
 
 #need to encode a board state into a tensor of some sort
 #we have 6 unique pieces, so 12 per side. 
@@ -101,19 +109,11 @@ def decode_board(encoding: list[int]) -> chess.Board:
     return board
 
 def encode_move_to_id(move: chess.Move) -> int:
-    promotion = move.promotion - 1 if move.promotion is not None else 0
-    id = ((move.from_square * NUM_SQUARES) + move.to_square) * NUM_PROMOTION_CHOICES + promotion
-    return id
+    return MOVE_TO_ID[move]
 
 
-def decode_id_to_move(move: int) -> chess.Move:
-    promotion = move % NUM_PROMOTION_CHOICES
-    destination = ((move - promotion) // NUM_PROMOTION_CHOICES) % NUM_SQUARES
-    source = (((move - promotion) // NUM_PROMOTION_CHOICES) // NUM_SQUARES)
-
-    promotion = None if promotion == 0 else promotion + 1
-
-    return chess.Move(source, destination, promotion=promotion)
+def decode_id_to_move(move_id: int) -> chess.Move:
+    return ALL_POSSIBLE_MOVES[move_id]
 
 # 1  # pawn white
 # 2  # knight white

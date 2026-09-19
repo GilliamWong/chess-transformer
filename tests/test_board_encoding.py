@@ -1,10 +1,14 @@
+from collections.abc import Iterator
 from itertools import islice
+from pathlib import Path
 
 import chess
+import chess.pgn
 import pytest
 
-from data import CARLSEN_PGN, read_games
+from data import CARLSEN_PGN
 from encoding import (
+    ALL_POSSIBLE_MOVES,
     BLACK_KINGSIDE_INDEX,
     BLACK_QUEENSIDE_INDEX,
     EN_PASSANT_INDEX,
@@ -38,7 +42,12 @@ PIECE_CODES = {
     "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
 }
 
-PROMOTION_CHOICES = [None, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
+
+def read_games(pgn_path: Path) -> Iterator[chess.pgn.Game]:
+    with open(pgn_path) as pgn:
+        #read_game returns None once the file is exhausted
+        while (game := chess.pgn.read_game(pgn)) is not None:
+            yield game
 
 
 def board_after(*san_moves: str) -> chess.Board:
@@ -248,19 +257,21 @@ def test_round_trip_every_position_of_real_games():
             assert_round_trip(board)
 
 
-#ids worked out by hand as ((from * 64) + to) * 5 + promotion, so the layout is checked against
-#something other than encode_move_to_id itself. Changing the layout invalidates any saved ids or trained model.
+#counted on paper rather than taken from the table: 1456 queen-line pairs + 336 knight jumps,
+#plus 44 promoting (from, to) pairs * 4 promotion pieces
+def test_move_vocabulary_size():
+    assert NUM_MOVE_IDS == 1792 + 176
+    assert len(ALL_POSSIBLE_MOVES) == NUM_MOVE_IDS
+    assert len(set(ALL_POSSIBLE_MOVES)) == NUM_MOVE_IDS  #a duplicate would make two ids decode to one move
+
+
+#the order of the table is the vocabulary. Changing it invalidates any saved ids or trained model.
 @pytest.mark.parametrize(
     "uci, expected_id",
     [
-        pytest.param("a1b1", 5, id="lowest-real-move"),
-        pytest.param("h8g8", 20470, id="highest-real-move"),
-        pytest.param("e2e4", 3980, id="pawn-push"),              #(12 * 64 + 28) * 5
-        pytest.param("e1g1", 1310, id="castling-is-a-king-move"),  #(4 * 64 + 6) * 5
-        pytest.param("a2a1n", 2561, id="knight-promotion"),      #(8 * 64 + 0) * 5 + 1
-        pytest.param("e7d8b", 16937, id="bishop-promotion"),     #(52 * 64 + 59) * 5 + 2
-        pytest.param("g7h8r", 17598, id="rook-promotion"),       #(54 * 64 + 63) * 5 + 3
-        pytest.param("e7e8q", 16944, id="queen-promotion"),      #(52 * 64 + 60) * 5 + 4
+        pytest.param("a1b1", 0, id="first-move"),
+        pytest.param("a7a8n", 1792, id="first-promotion"),
+        pytest.param("h2h1q", 1967, id="last-promotion"),
     ],
 )
 def test_move_id_layout(uci, expected_id):
@@ -270,21 +281,39 @@ def test_move_id_layout(uci, expected_id):
     assert decode_id_to_move(expected_id) == move
 
 
-def test_every_move_has_its_own_id():
-    all_moves = [
-        chess.Move(from_square, to_square, promotion=promotion)
-        for from_square in chess.SQUARES
-        for to_square in chess.SQUARES
-        for promotion in PROMOTION_CHOICES
-    ]
+def test_every_id_round_trips():
+    for move_id in range(NUM_MOVE_IDS):
+        assert encode_move_to_id(decode_id_to_move(move_id)) == move_id
 
-    ids = [encode_move_to_id(move) for move in all_moves]
 
-    #64 from squares * 64 to squares * (no promotion + 4 promotion pieces)
-    assert NUM_MOVE_IDS == 20480
+def test_impossible_move_is_rejected():
+    #must fail loudly rather than become a wrong training label
+    with pytest.raises(KeyError):
+        encode_move_to_id(chess.Move(chess.A1, chess.B4))
 
-    #every id in 0..NUM_MOVE_IDS-1 is used exactly once, so no two moves collide
-    #and every index of the model's output layer decodes to a move
-    assert sorted(ids) == list(range(NUM_MOVE_IDS))
-    for move, move_id in zip(all_moves, ids):
-        assert decode_id_to_move(move_id) == move, move.uci()
+
+@pytest.mark.parametrize(
+    "fen",
+    [
+        pytest.param("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1", id="white-castling"),
+        pytest.param("r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1", id="black-castling"),
+        pytest.param("4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1", id="en-passant"),
+        pytest.param("1n2k3/P7/8/8/8/8/8/4K3 w - - 0 1", id="white-edge-file-promotions"),
+        pytest.param("4k3/8/8/8/8/8/7p/4K1N1 b - - 0 1", id="black-edge-file-promotions"),
+    ],
+)
+def test_special_legal_moves_have_ids(fen):
+    board = chess.Board(fen)
+
+    for move in board.legal_moves:
+        assert decode_id_to_move(encode_move_to_id(move)) == move, move.uci()
+
+
+#catches a wrong enumeration (a missing direction or piece), which the round trip over the table cannot see
+def test_every_legal_move_of_real_games_has_an_id():
+    for game in islice(read_games(CARLSEN_PGN), NUM_PGN_GAMES_TO_REPLAY):
+        board = game.board()
+        for played_move in game.mainline_moves():
+            for move in board.legal_moves:
+                assert decode_id_to_move(encode_move_to_id(move)) == move, move.uci()
+            board.push(played_move)

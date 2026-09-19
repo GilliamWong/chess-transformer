@@ -37,5 +37,5 @@ def pgn_to_examples(pgn_path: Path) -> list[list[TrainingExample]]:
 class chess_games_dataset(Dataset):
     """set of examples of chess games that we can use as a dataset"""
 
-    def __init__(self, chess.pgn):
-        self.data = 
+    def __init__(self, pgn_path: Path):
+        raise NotImplementedError #TODO: unfinished
