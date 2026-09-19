@@ -1,12 +1,6 @@
-from collections.abc import Iterator
-from itertools import islice
-from pathlib import Path
-
 import chess
-import chess.pgn
 import pytest
 
-from data import CARLSEN_PGN
 from encoding import (
     ALL_POSSIBLE_MOVES,
     BLACK_KINGSIDE_INDEX,
@@ -22,8 +16,6 @@ from encoding import (
     encode_board,
     encode_move_to_id,
 )
-
-NUM_PGN_GAMES_TO_REPLAY = 5
 
 #written out by hand so the layout is checked against something other than encode_board itself
 START_POSITION_ENCODING = (
@@ -41,13 +33,6 @@ PIECE_CODES = {
     "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
     "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
 }
-
-
-def read_games(pgn_path: Path) -> Iterator[chess.pgn.Game]:
-    with open(pgn_path) as pgn:
-        #read_game returns None once the file is exhausted
-        while (game := chess.pgn.read_game(pgn)) is not None:
-            yield game
 
 
 def board_after(*san_moves: str) -> chess.Board:
@@ -245,11 +230,8 @@ def test_round_trip_position(fen):
     assert_round_trip(chess.Board(fen))
 
 
-def test_round_trip_every_position_of_real_games():
-    games = list(islice(read_games(CARLSEN_PGN), NUM_PGN_GAMES_TO_REPLAY))
-    assert len(games) == NUM_PGN_GAMES_TO_REPLAY
-
-    for game in games:
+def test_round_trip_every_position_of_real_games(carlsen_games):
+    for game in carlsen_games:
         board = game.board()
         assert_round_trip(board)
         for move in game.mainline_moves():
@@ -310,8 +292,8 @@ def test_special_legal_moves_have_ids(fen):
 
 
 #catches a wrong enumeration (a missing direction or piece), which the round trip over the table cannot see
-def test_every_legal_move_of_real_games_has_an_id():
-    for game in islice(read_games(CARLSEN_PGN), NUM_PGN_GAMES_TO_REPLAY):
+def test_every_legal_move_of_real_games_has_an_id(carlsen_games):
+    for game in carlsen_games:
         board = game.board()
         for played_move in game.mainline_moves():
             for move in board.legal_moves:

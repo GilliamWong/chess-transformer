@@ -1,10 +1,8 @@
-from collections.abc import Iterator
 from pathlib import Path
 from dataclasses import dataclass
-from encoding import decode_board, encode_board, encode_move_to_id
+from encoding import encode_board, encode_move_to_id
 from torch.utils.data import Dataset
 import torch
-import chess
 import chess.pgn
 
 CARLSEN_PGN = Path(__file__).parent / "Carlsen" / "Carlsen.pgn"
@@ -24,6 +22,7 @@ def game_to_examples(game: chess.pgn.Game) -> list[TrainingExample]:
 
     return complete_game
 
+#takes a chess pgn and converts it to a set of training examples
 def pgn_to_examples(pgn_path: Path) -> list[list[TrainingExample]]:
     output = []
     with open(pgn_path) as pgn:
@@ -34,8 +33,24 @@ def pgn_to_examples(pgn_path: Path) -> list[list[TrainingExample]]:
 
     return output
 
-class chess_games_dataset(Dataset):
+class ChessGamesDataset(Dataset):
     """set of examples of chess games that we can use as a dataset"""
 
-    def __init__(self, pgn_path: Path):
-        raise NotImplementedError #TODO: unfinished
+    def __init__(self, games: list[list[TrainingExample]]):
+        #two tensors, one for the board positions and the other for the moves
+        boards = []
+        moves = []
+
+        for game in games:
+            for example in game:
+                boards.append(example.board)
+                moves.append(example.move)
+
+        self.boards = torch.tensor(boards, dtype=torch.uint8)
+        self.moves = torch.tensor(moves, dtype=torch.int16)
+
+    def __len__(self):
+        return len(self.moves)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.boards[index].long(), self.moves[index].long()
