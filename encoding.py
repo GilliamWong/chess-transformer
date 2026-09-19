@@ -16,6 +16,40 @@ ENCODING_SIZE = 70 #for reference, not used
 NUM_PROMOTION_CHOICES = 5 #no promotion, knight, bishop, rook, queen
 NUM_MOVE_IDS = NUM_SQUARES * NUM_SQUARES * NUM_PROMOTION_CHOICES #20480, the size of the move vocabulary
 
+def _build_moves_list() -> list[chess.Move]:
+    board = chess.Board.empty()
+    moves = []
+    queen = chess.Piece(chess.QUEEN, chess.WHITE)
+    knight = chess.Piece(chess.KNIGHT, chess.WHITE)
+
+    for square in range(NUM_SQUARES):
+        board.set_piece_at(square, queen)
+        move_set = board.attacks(square)
+        board.set_piece_at(square, knight)
+        move_set = move_set.union(board.attacks(square))
+
+        board.remove_piece_at(square)
+
+        moves.extend(chess.Move(square, destination) for destination in move_set)
+
+    #promotions
+    for from_rank, to_rank in [(6, 7), (1, 0)]:
+        for from_file in range(8):
+            for shift in (-1, 0, 1):
+                to_file = from_file + shift
+                if to_file not in range(8):
+                    continue
+                from_square = chess.square(from_file, from_rank)
+                to_square = chess.square(to_file, to_rank)
+
+                for piece in (chess.KNIGHT, chess.ROOK, chess.BISHOP, chess.QUEEN):
+                    moves.append(chess.Move(from_square, to_square, promotion=piece))
+
+
+    return tuple(moves)
+            
+ALL_POSSIBLE_MOVES = _build_moves_list()
+
 #need to encode a board state into a tensor of some sort
 #we have 6 unique pieces, so 12 per side. 
 #we also need to encode castling and en passant somehow along with whose turn it is

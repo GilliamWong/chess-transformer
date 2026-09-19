@@ -2,7 +2,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from dataclasses import dataclass
 from encoding import decode_board, encode_board, encode_move_to_id
-
+from torch.utils.data import Dataset
+import torch
+import chess
 import chess.pgn
 
 CARLSEN_PGN = Path(__file__).parent / "Carlsen" / "Carlsen.pgn"
@@ -32,8 +34,8 @@ def pgn_to_examples(pgn_path: Path) -> list[list[TrainingExample]]:
 
     return output
 
-def read_games(pgn_path: Path) -> Iterator[chess.pgn.Game]:
-    with open(pgn_path) as pgn:
-        #read_game returns None once the file is exhausted
-        while (game := chess.pgn.read_game(pgn)) is not None:
-            yield game
+class chess_games_dataset(Dataset):
+    """set of examples of chess games that we can use as a dataset"""
+
+    def __init__(self, chess.pgn):
+        self.data = 
