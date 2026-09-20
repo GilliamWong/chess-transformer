@@ -26,3 +26,6 @@ pgn_data/lichess_elite/
 
 # Output of preprocess.py, about 180 GB of arrays
 processed_data/
+
+# TensorBoard logs, one folder per training run
+runs/

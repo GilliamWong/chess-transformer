@@ -21,6 +21,8 @@ NVIDIA GPU with a recent driver.
 ```
 uv run main.py                          10,000,000 positions: 9,765 steps, about 3 minutes on an RTX 5070 Ti
 uv run main.py --positions 12_300_000   any other amount
+uv run main.py --name d256_lr3e-3       a name for the run's plots, default the date and time
+uv run tensorboard --logdir runs        live plots of loss, accuracy and learning rate, at localhost:6006
 ```
 
 Training runs for a fixed number of positions rather than epochs. A step is one batch of `BATCH_SIZE`

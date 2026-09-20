@@ -3,6 +3,7 @@
 #   the same training time:       12,000 steps  (TRAIN_POSITIONS_BUDGET = 12_300_000), at about 58 steps a second
 import argparse
 from collections.abc import Iterator
+from datetime import datetime
 from itertools import islice
 from pathlib import Path
 from data import CARLSEN_PGN, pgns_to_examples, create_dataloaders, datasets_to_dataloaders, load_training_set
@@ -10,6 +11,7 @@ import torch
 import math
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from model import ChessTransformer
 
@@ -18,9 +20,9 @@ WARMUP_STEPS = 500
 BATCH_SIZE = 1024
 
 #positions to train on, unless --positions is given. A step is one batch, so steps = positions // BATCH_SIZE
-TRAIN_POSITIONS_BUDGET = 10_000_000
+TRAIN_POSITIONS_BUDGET = 5_800_000
 
-EVAL_EVERY = 1000  #steps between two looks at the val set
+EVAL_EVERY = 100  #steps between two looks at the val set
 EVAL_BATCHES = 100 #only this many val batches for those looks, the whole val set is kept for the end
 SEED = 42
 DROPOUT = 0.0
@@ -30,6 +32,7 @@ DROPOUT = 0.0
 TRAINING_SET = "baseline"
 
 CHECKPOINT_PATH = Path(__file__).parent / "model.pt" #weights from the evaluation with the best val loss
+RUNS_DIR = Path(__file__).parent / "runs" #one folder of tensorboard logs per run: tensorboard --logdir runs
 
 def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     while True:
@@ -47,7 +50,8 @@ def train(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
     best_val_loss: float,
-    max_steps: int) -> None:
+    max_steps: int,
+    writer: SummaryWriter) -> None:
 
     loss_total = 0.0
     total_examples = 0
@@ -86,6 +90,12 @@ def train(
 
             #tqdm.write rather than print, which would cut through the progress bar
             tqdm.write(f"step {step}/{max_steps} ({step * BATCH_SIZE:,} positions): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
+
+            #the part of the name before the slash groups the plots: both losses end up next to each other
+            writer.add_scalar("loss/train", train_loss, step)
+            writer.add_scalar("loss/val", val_loss, step)
+            writer.add_scalar("accuracy/val", val_accuracy, step)
+            writer.add_scalar("learning_rate", scheduler.get_last_lr()[0], step)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -173,8 +183,10 @@ def lr_multiplier(step: int, max_steps: int) -> float:
     return multiplier
 
 
-def main(positions_budget: int = TRAIN_POSITIONS_BUDGET):
+def main(positions_budget: int = TRAIN_POSITIONS_BUDGET, run_name: str | None = None):
     max_steps = positions_budget // BATCH_SIZE
+    if run_name is None:
+        run_name = datetime.now().strftime("%m-%d_%H-%M-%S")
 
     #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
     if max_steps <= WARMUP_STEPS:
@@ -202,17 +214,24 @@ def main(positions_budget: int = TRAIN_POSITIONS_BUDGET):
     print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
     print(f"{max_steps:,} steps of {BATCH_SIZE} positions, evaluating every {EVAL_EVERY}")
-    train(compiled_model, model, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, max_steps=max_steps)
+    print(f"logging to runs/{run_name}, watch with: tensorboard --logdir runs")
+    writer = SummaryWriter(log_dir=str(RUNS_DIR / run_name))
+    train(compiled_model, model, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, max_steps=max_steps, writer=writer)
 
     #the number to quote for this run: the final weights on the whole val set
     val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
     print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
+
+    writer.add_scalar("final/val_loss", val_loss, max_steps)
+    writer.add_scalar("final/val_accuracy", val_accuracy, max_steps)
+    writer.close()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="train the chess transformer")
     #int() accepts underscores, so --positions 12_300_000 works
     parser.add_argument("--positions", type=int, default=TRAIN_POSITIONS_BUDGET, help="positions to train on, default %(default)s")
+    parser.add_argument("--name", help="name of this run in tensorboard, default the date and time")
     arguments = parser.parse_args()
 
-    main(arguments.positions)
+    main(arguments.positions, arguments.name)
