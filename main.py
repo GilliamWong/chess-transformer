@@ -10,6 +10,10 @@ NUM_EPOCHS = 10
 LEARN_RATE = 1e-3
 BATCH_SIZE = 1024
 SEED = 42
+#dropout guards against memorising a small dataset. With tens of millions of positions the model sees
+#each one about once, so there is nothing to memorise and dropout only slows the learning down.
+#worth turning back on (0.1) when training on "carlsen" alone
+DROPOUT = 0.0
 
 #"carlsen" parses pgn_data/Carlsen.pgn, which is in the repository and takes 20 seconds.
 #anything else is the name of a training set in processed_data/ (see load_training_set in data.py)
@@ -142,21 +146,23 @@ def main():
     train_data_loader, val_data_loader = load_dataloaders()
     print(f"{TRAINING_SET}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
 
-    model = ChessTransformer().to(device)
+    model = ChessTransformer(dropout=DROPOUT).to(device)
     loss_function = nn.CrossEntropyLoss()
+
+    compiled_model = torch.compile(model)
     #fused does the whole update in one gpu kernel, it only exists for parameters that are on the gpu
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARN_RATE, fused=(device.type == "cuda"))
 
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
     #anything else means the data or the metrics are wrong
-    val_loss, val_accuracy = evaluate_model(model, val_data_loader, loss_function, device)
+    val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
     print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
     best_val_loss = val_loss
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_data_loader, loss_function, optimizer, device)
-        val_loss, val_accuracy = evaluate_model(model, val_data_loader, loss_function, device)
+        train_loss = train_one_epoch(compiled_model, train_data_loader, loss_function, optimizer, device)
+        val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
 
         print(f"epoch {epoch}/{NUM_EPOCHS}: train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
@@ -164,6 +170,8 @@ def main():
         #so the last epoch is not necessarily the best one
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            #saved from model, not compiled_model: the compiled wrapper prefixes every name with
+            #"_orig_mod." and play/player.py could not load that
             torch.save(model.state_dict(), CHECKPOINT_PATH)
             print(f"  saved to {CHECKPOINT_PATH.name}")
 
