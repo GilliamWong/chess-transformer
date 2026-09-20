@@ -17,3 +17,6 @@ Thumbs.db
 
 # Chess engines (downloaded binaries, official Stockfish release unzipped into engines/)
 engines/
+
+# Games of the last evaluate_elo.py match
+match.pgn
