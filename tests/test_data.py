@@ -1,5 +1,6 @@
 import chess
 import chess.pgn
+import numpy as np
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -206,3 +207,29 @@ def test_dataloaders_pass_the_split_settings_through():
 
     assert len(default_split.dataset) == 40 and len(other_split.dataset) == 25
     assert set(other_split.dataset.moves.tolist()) == set(game_numbers(split_data(games, 0.5, 7)[0]))
+
+
+def test_dataset_from_arrays_matches_dataset_from_games():
+    from_games = ChessGamesDataset(TWO_GAMES)
+    boards = np.array([example.board for game in TWO_GAMES for example in game], dtype=np.uint8)
+    moves = np.array([example.move for game in TWO_GAMES for example in game], dtype=np.int16)
+
+    from_arrays = ChessGamesDataset.from_arrays(boards, moves)
+
+    assert len(from_arrays) == len(from_games)
+    for index in range(len(from_games)):
+        assert torch.equal(from_arrays[index][0], from_games[index][0])
+        assert torch.equal(from_arrays[index][1], from_games[index][1])
+    assert from_arrays[0][0].dtype == torch.long and from_arrays[0][1].dtype == torch.long
+
+
+def test_dataset_from_arrays_rejects_mismatched_lengths():
+    with pytest.raises(ValueError):
+        ChessGamesDataset.from_arrays(np.zeros((3, TOKENS_PER_BOARD), dtype=np.uint8), np.zeros(2, dtype=np.int16))
+
+
+def test_a_list_of_indices_comes_back_as_one_batch():
+    boards, moves = ChessGamesDataset(TWO_GAMES)[[2, 0]]
+
+    assert boards.shape == (2, TOKENS_PER_BOARD)
+    assert moves.tolist() == [30, 10]

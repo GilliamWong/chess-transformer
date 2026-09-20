@@ -1,5 +1,5 @@
 from pathlib import Path
-from data import CARLSEN_PGN, pgns_to_examples, create_dataloaders
+from data import CARLSEN_PGN, ChessGamesDataset, pgns_to_examples, create_dataloaders, datasets_to_dataloaders
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -10,6 +10,10 @@ NUM_EPOCHS = 10
 LEARN_RATE = 1e-3
 BATCH_SIZE = 1024
 SEED = 42
+
+#"carlsen" parses pgn_data/Carlsen.pgn, which is in the repository and takes 20 seconds.
+#anything else is the name of a training set written by select_games.py (see the readme)
+TRAINING_SET = "baseline"
 
 CHECKPOINT_PATH = Path(__file__).parent / "model.pt" #weights of the epoch with the best val loss
 
@@ -106,6 +110,28 @@ def evaluate_model(
     return (epoch_loss_total / total_examples), (total_correct_preds / total_examples)
 
 
+def load_dataloaders() -> tuple[DataLoader, DataLoader]:
+    if TRAINING_SET == "carlsen":
+        print("parsing games, this takes a while")
+        games = pgns_to_examples([CARLSEN_PGN])
+        return create_dataloaders(
+            games,
+            train_batch_size=BATCH_SIZE,
+            val_batch_size=BATCH_SIZE,
+            seed=SEED
+        )
+
+    #imported here so that training on carlsen alone does not need the lichess files
+    from select_games import load_training_set
+    train_boards, train_moves, val_boards, val_moves = load_training_set(TRAINING_SET)
+    return datasets_to_dataloaders(
+        ChessGamesDataset.from_arrays(train_boards, train_moves),
+        ChessGamesDataset.from_arrays(val_boards, val_moves),
+        train_batch_size=BATCH_SIZE,
+        val_batch_size=BATCH_SIZE
+    )
+
+
 def main():
     #sets up the model, creates the dataset and dataloader, creates loss and optimizers
     #and also runs the training loop for some number of epochs
@@ -115,15 +141,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}")
 
-    print("parsing games, this takes a while")
-    games = pgns_to_examples([CARLSEN_PGN])
-    train_data_loader, val_data_loader = create_dataloaders(
-        games,
-        train_batch_size=BATCH_SIZE,
-        val_batch_size=BATCH_SIZE,
-        seed=SEED
-    )
-    print(f"{len(games)} games, {len(train_data_loader.dataset)} train positions, {len(val_data_loader.dataset)} val positions")
+    train_data_loader, val_data_loader = load_dataloaders()
+    print(f"{TRAINING_SET}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
 
     model = ChessTransformer().to(device)
     loss_function = nn.CrossEntropyLoss()
