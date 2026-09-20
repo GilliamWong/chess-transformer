@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+from itertools import islice
 from pathlib import Path
 from data import CARLSEN_PGN, pgns_to_examples, create_dataloaders, datasets_to_dataloaders, load_training_set
 import torch
@@ -6,9 +8,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from model import ChessTransformer
 
-NUM_EPOCHS = 10
 LEARN_RATE = 1e-3
 BATCH_SIZE = 1024
+
+TRAIN_POSITIONS_BUDGET = 10_000_000
+MAX_STEPS = TRAIN_POSITIONS_BUDGET // BATCH_SIZE #a step is one batch, one update of the weights
+
+EVAL_EVERY = 1000  #steps between two looks at the val set
+EVAL_BATCHES = 100 #only this many val batches for those looks, the whole val set is kept for the end
 SEED = 42
 #dropout guards against memorising a small dataset. With tens of millions of positions the model sees
 #each one about once, so there is nothing to memorise and dropout only slows the learning down.
@@ -19,35 +26,42 @@ DROPOUT = 0.0
 #anything else is the name of a training set in processed_data/ (see load_training_set in data.py)
 TRAINING_SET = "baseline"
 
-CHECKPOINT_PATH = Path(__file__).parent / "model.pt" #weights of the epoch with the best val loss
+CHECKPOINT_PATH = Path(__file__).parent / "model.pt" #weights from the evaluation with the best val loss
 
-#trains the model for one epoch and returns averasge loss over that epoch
-def train_one_epoch(
-    model: nn.Module, 
-    train_data_loader: DataLoader, 
-    loss_function: nn.Module, 
-    optimizer: torch.optim.Optimizer, 
-    device: torch.device) -> float:
+def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    while True:
+        for batch, labels in data_loader:
+            yield batch, labels
+
+#trains the model for MAX_STEPS steps. Every EVAL_EVERY steps it looks at the val set, reports,
+#and saves checkpoint_model if the val loss is the best so far
+def train(
+    model: nn.Module,
+    checkpoint_model: nn.Module,
+    train_data_loader: DataLoader,
+    val_data_loader: DataLoader,
+    loss_function: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    best_val_loss: float) -> None:
 
     #set model.train()
-    #loop through the dataloader
+    #take batches from the dataloader until we have done MAX_STEPS steps
     #for every batch from the dataloader and move to the gpu, then:
     #zero out gradients, put the data through the model
     #put model outputs through the loss function
     #call loss.backwards
     #then take a step with the optimizer
-    #log the loss and repeat the loop until the epoch is finished
-    #then return the average loss
+    #every EVAL_EVERY steps log the loss, evaluate, and save if it is the best so far
 
-    epoch_loss_total = 0.0
+    loss_total = 0.0
     total_examples = 0
 
     model.train()
 
-    #leave=False clears the bar when the epoch ends, so only main's summary lines stay on screen
-    progress = tqdm(train_data_loader, desc="train", leave=False)
+    progress = tqdm(range(1, MAX_STEPS + 1), desc="train")
 
-    for batch, labels in progress:
+    for step, (batch, labels) in zip(progress, endless_batches(train_data_loader)):
         labels = labels.to(device)
         batch = batch.to(device)
 
@@ -64,21 +78,41 @@ def train_one_epoch(
 
         optimizer.step()
 
-        epoch_loss_total += loss.item() * len(labels)
+        loss_total += loss.item() * len(labels)
         total_examples += len(labels)
 
         #the running average, a single batch's loss jumps around too much to read
-        progress.set_postfix(loss=f"{epoch_loss_total / total_examples:.3f}")
+        progress.set_postfix(loss=f"{loss_total / total_examples:.3f}")
 
-    return epoch_loss_total / total_examples
-    
+        #the last step is always evaluated, so the final weights get their chance to be the checkpoint
+        if step % EVAL_EVERY == 0 or step == MAX_STEPS:
+            train_loss = loss_total / total_examples
+            val_loss, val_accuracy = evaluate_model(model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
+            #evaluate_model leaves the model in eval mode, and nothing else would switch it back
+            model.train()
 
-#returns average loss and accuracy for the model on the test set
+            #tqdm.write rather than print, which would cut through the progress bar
+            tqdm.write(f"step {step}/{MAX_STEPS} ({step * BATCH_SIZE:,} positions): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                #saved from checkpoint_model, not the compiled model: the compiled wrapper prefixes every
+                #name with "_orig_mod." and play/player.py could not load that
+                torch.save(checkpoint_model.state_dict(), CHECKPOINT_PATH)
+                tqdm.write(f"  saved to {CHECKPOINT_PATH.name}")
+
+            loss_total = 0.0
+            total_examples = 0
+
+
+#returns average loss and accuracy for the model on the test set, or on its first max_batches batches.
+#the val loader is not shuffled, so those are the same positions every time and the numbers can be compared
 def evaluate_model(
     model: nn.Module, 
     test_data_loader: DataLoader, 
     loss_function: nn.Module, 
-    device: torch.device) -> tuple[float, float]:
+    device: torch.device,
+    max_batches: int | None = None) -> tuple[float, float]:
 
     epoch_loss_total = 0.0
     total_correct_preds = 0
@@ -88,7 +122,9 @@ def evaluate_model(
 
     with torch.no_grad():
 
-        progress = tqdm(test_data_loader, desc="val", leave=False)
+        num_batches = len(test_data_loader) if max_batches is None else min(max_batches, len(test_data_loader))
+        #islice stops after num_batches, leave=False clears the bar afterwards
+        progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False)
 
         for batch, labels in progress:
             labels = labels.to(device)
@@ -136,7 +172,7 @@ def load_dataloaders() -> tuple[DataLoader, DataLoader]:
 
 def main():
     #sets up the model, creates the dataset and dataloader, creates loss and optimizers
-    #and also runs the training loop for some number of epochs
+    #and also runs the training loop for MAX_STEPS steps
 
     torch.manual_seed(SEED)
 
@@ -155,25 +191,16 @@ def main():
 
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
     #anything else means the data or the metrics are wrong
-    val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
+    #on the same val batches as the evaluations during training, so it is the loss they have to beat
+    val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
     print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
-    best_val_loss = val_loss
+    print(f"{MAX_STEPS:,} steps of {BATCH_SIZE} positions, evaluating every {EVAL_EVERY}")
+    train(compiled_model, model, train_data_loader, val_data_loader, loss_function, optimizer, device, best_val_loss=val_loss)
 
-    for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = train_one_epoch(compiled_model, train_data_loader, loss_function, optimizer, device)
-        val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
-
-        print(f"epoch {epoch}/{NUM_EPOCHS}: train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
-
-        #once the model overfits, val loss rises while train loss keeps falling,
-        #so the last epoch is not necessarily the best one
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            #saved from model, not compiled_model: the compiled wrapper prefixes every name with
-            #"_orig_mod." and play/player.py could not load that
-            torch.save(model.state_dict(), CHECKPOINT_PATH)
-            print(f"  saved to {CHECKPOINT_PATH.name}")
+    #the number to quote for this run: the final weights on the whole val set
+    val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
+    print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
 
 if __name__ == "__main__":
