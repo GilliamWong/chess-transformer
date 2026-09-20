@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import math
 from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS
 
 class TransformerBlock(nn.Module):
@@ -11,8 +12,85 @@ class TransformerBlock(nn.Module):
         #this is encoder attention so no causal masking needed, unless we want to predict more than one output position?
         #but I believe that's a future project. 
 
+        #so the flow is: take input, create Q K and V
+        #then split Q K V into separate heads in torch 
+        #perform attention operation per head, then apply softmax
+        #matmul with V, then recombine heads
+        #matmul with head mixer weights and then output
+
+        #this also contains the mlp and norms
+        #so the entire flow is, with prenorm
+        #x = x + attention(layernorm1(x))
+        #project up with a linear layer into the mlp dim
+        #then project back down into input dim with another linear layer
+        #so x = x + mlp(layernorm2(x))
+
+        #since this is prenorm we need to add a final norm in the chess transformer model right before
+        #the output head. 
+
+        #so in this init we need Q, K, V, Layernorm1, layernorm2, mlp up, mlp down, head combine 
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_head = d_model // n_heads #these mmust be divisible 
+        self.dropout = dropout
+
+        self.Q = nn.Linear(self.d_model, self.d_model)
+        self.K = nn.Linear(self.d_model, self.d_model)
+        self.V = nn.Linear(self.d_model, self.d_model)
+
+        self.ln1 = nn.LayerNorm(self.d_model)
+        self.ln2 = nn.LayerNorm(self.d_model)
+
+        self.combine_heads = nn.Linear(self.d_model, self.d_model)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(self.d_model, 4 * self.d_model),
+            nn.GELU(),
+            nn.Linear(4 * self.d_model, self.d_model)
+        )
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.head_mix_dropout = nn.Dropout(dropout)
+        self.mlp_dropout = nn.Dropout(dropout)
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+        #reminder that x is of shape B T d_model
+        #dims:
+        B, T, d_model = x.shape
+        residual = x
+        x_norm = self.ln1(residual)
+        
+        #first create Q K V
+        Q = self.Q(x_norm) #shape B T d_model
+        K = self.K(x_norm) #shape B T d_model
+        V = self.V(x_norm) #shape B T d_model
+
+        #reshape last dim into heads for q and k, we need to reshape first and then transpose to satisfy 
+        #the ever fickle nature of torch memory storage yay
+        Q_heads = Q.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2) #shape of all is is B n_heads T d_head
+        K_heads = K.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        V_heads = V.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        #perform attention then softmax
+        attention = (Q_heads @ K_heads.transpose(-2, -1)) / math.sqrt(self.d_head) #should be B n_heads T T
+        softmax_attention = self.attn_dropout(torch.softmax(attention, dim=-1))
+
+        attention_weights = softmax_attention @ V_heads #B n_heads T T @ B n_heads T d_head, output is B n_heads T d_head
+
+        #reshape and transpose the heads back together
+        attention_weights = attention_weights.transpose(1, 2).reshape(B, T, self.d_model)
+
+        combined_head_weights = self.head_mix_dropout(self.combine_heads(attention_weights)) #B T d_model @ d_head d_model = B T d_model
+
+        residual = residual + combined_head_weights
+
+        #now for the mlp
+        x_norm2 = self.ln2(residual)
+        residual = residual + self.mlp_dropout(self.mlp(x_norm2))
+
+        return residual
 
 
 class ChessTransformer(nn.Module):
