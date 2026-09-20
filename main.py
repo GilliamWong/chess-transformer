@@ -2,6 +2,12 @@
 #   the same number of positions: 5,673 steps   (TRAIN_POSITIONS_BUDGET = 5_800_000)
 #   the same training time:       12,000 steps  (TRAIN_POSITIONS_BUDGET = 12_300_000), at about 58 steps a second
 import argparse
+import socket
+import subprocess
+import sys
+import threading
+import time
+import webbrowser
 from collections.abc import Iterator
 from datetime import datetime
 from itertools import islice
@@ -15,15 +21,15 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from model import ChessTransformer
 
-PEAK_LEARN_RATE = 6e-3
+PEAK_LEARN_RATE = 1e-2
 WARMUP_STEPS = 500
 BATCH_SIZE = 1024
 
 #positions to train on, unless --positions is given. A step is one batch, so steps = positions // BATCH_SIZE
-TRAIN_POSITIONS_BUDGET = 5_800_000
+TRAIN_POSITIONS_BUDGET = 15_000_000
 
 EVAL_EVERY = 100  #steps between two looks at the val set
-EVAL_BATCHES = 100 #only this many val batches for those looks, the whole val set is kept for the end
+EVAL_BATCHES = 20 #only this many val batches for those looks, the whole val set is kept for the end
 SEED = 42
 DROPOUT = 0.0
 
@@ -33,6 +39,7 @@ TRAINING_SET = "baseline"
 
 CHECKPOINT_PATH = Path(__file__).parent / "model.pt" #weights from the evaluation with the best val loss
 RUNS_DIR = Path(__file__).parent / "runs" #one folder of tensorboard logs per run: tensorboard --logdir runs
+TENSORBOARD_PORT = 6006
 
 def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     while True:
@@ -58,7 +65,8 @@ def train(
 
     model.train()
 
-    progress = tqdm(range(1, max_steps + 1), desc="train")
+    #dynamic_ncols: a bar wider than a resized terminal wraps, and every update becomes a new line
+    progress = tqdm(range(1, max_steps + 1), desc="train", dynamic_ncols=True)
 
     for step, (batch, labels) in zip(progress, endless_batches(train_data_loader)):
         labels = labels.to(device)
@@ -127,7 +135,7 @@ def evaluate_model(
 
         num_batches = len(test_data_loader) if max_batches is None else min(max_batches, len(test_data_loader))
         #islice stops after num_batches, leave=False clears the bar afterwards
-        progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False)
+        progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False, dynamic_ncols=True)
 
         for batch, labels in progress:
             labels = labels.to(device)
@@ -183,6 +191,32 @@ def lr_multiplier(step: int, max_steps: int) -> float:
     return multiplier
 
 
+def tensorboard_is_running() -> bool:
+    with socket.socket() as connection:
+        return connection.connect_ex(("localhost", TENSORBOARD_PORT)) == 0
+
+#starts tensorboard unless one is already serving, and opens it in the browser once it answers.
+#it is a separate process, so it keeps serving the plots after training has finished
+def start_tensorboard() -> None:
+    if not tensorboard_is_running():
+        RUNS_DIR.mkdir(exist_ok=True)
+        subprocess.Popen(
+            [sys.executable, "-m", "tensorboard.main", "--logdir", str(RUNS_DIR), "--port", str(TENSORBOARD_PORT)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+    def open_when_ready() -> None:
+        for _ in range(60):
+            if tensorboard_is_running():
+                webbrowser.open(f"http://localhost:{TENSORBOARD_PORT}")
+                return
+            time.sleep(0.5)
+
+    #in the background, tensorboard takes a few seconds to come up and training should not wait for it
+    threading.Thread(target=open_when_ready, daemon=True).start()
+
+
 def main(positions_budget: int = TRAIN_POSITIONS_BUDGET, run_name: str | None = None):
     max_steps = positions_budget // BATCH_SIZE
     if run_name is None:
@@ -232,6 +266,10 @@ if __name__ == "__main__":
     #int() accepts underscores, so --positions 12_300_000 works
     parser.add_argument("--positions", type=int, default=TRAIN_POSITIONS_BUDGET, help="positions to train on, default %(default)s")
     parser.add_argument("--name", help="name of this run in tensorboard, default the date and time")
+    parser.add_argument("--no-tensorboard", action="store_true", help="do not start tensorboard or open the browser")
     arguments = parser.parse_args()
+
+    if not arguments.no_tensorboard:
+        start_tensorboard()
 
     main(arguments.positions, arguments.name)

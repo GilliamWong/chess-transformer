@@ -19,11 +19,14 @@ NVIDIA GPU with a recent driver.
 ## Train
 
 ```
-uv run main.py                          10,000,000 positions: 9,765 steps, about 3 minutes on an RTX 5070 Ti
+uv run main.py                          TRAIN_POSITIONS_BUDGET positions, about 3 minutes per 10 million on an RTX 5070 Ti
 uv run main.py --positions 12_300_000   any other amount
 uv run main.py --name d256_lr3e-3       a name for the run's plots, default the date and time
-uv run tensorboard --logdir runs        live plots of loss, accuracy and learning rate, at localhost:6006
 ```
+
+Training starts TensorBoard and opens it in the browser (live plots of loss, accuracy and learning rate
+at localhost:6006, every run in `runs/` overlaid). `--no-tensorboard` skips that, and
+`uv run tensorboard --logdir runs` shows the plots without training.
 
 Training runs for a fixed number of positions rather than epochs. A step is one batch of `BATCH_SIZE`
 positions, so steps = positions / 1024. The other settings are constants at the top of `main.py`:
