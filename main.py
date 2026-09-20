@@ -3,6 +3,7 @@ from data import CARLSEN_PGN, pgns_to_examples, create_dataloaders
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from model import ChessTransformer
 
 NUM_EPOCHS = 10
@@ -35,13 +36,19 @@ def train_one_epoch(
 
     model.train()
 
-    for batch, labels in train_data_loader:
+    #leave=False clears the bar when the epoch ends, so only main's summary lines stay on screen
+    progress = tqdm(train_data_loader, desc="train", leave=False)
+
+    for batch, labels in progress:
         labels = labels.to(device)
         batch = batch.to(device)
 
-        logits = model(batch)
+        #the matrix multiplies run in bfloat16, which is about twice as fast on the gpu. The weights stay
+        #in float32. bfloat16 has the same range as float32, so unlike float16 it needs no GradScaler
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            logits = model(batch)
 
-        loss = loss_function(logits, labels)
+            loss = loss_function(logits, labels)
 
         optimizer.zero_grad()
 
@@ -51,6 +58,9 @@ def train_one_epoch(
 
         epoch_loss_total += loss.item() * len(labels)
         total_examples += len(labels)
+
+        #the running average, a single batch's loss jumps around too much to read
+        progress.set_postfix(loss=f"{epoch_loss_total / total_examples:.3f}")
 
     return epoch_loss_total / total_examples
     
@@ -70,20 +80,28 @@ def evaluate_model(
 
     with torch.no_grad():
 
-        for batch, labels in test_data_loader:
+        progress = tqdm(test_data_loader, desc="val", leave=False)
+
+        for batch, labels in progress:
             labels = labels.to(device)
             batch = batch.to(device)
 
-            #should be of dim B 1 output_dim
-            logits = model(batch)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                #should be of dim B 1 output_dim
+                logits = model(batch)
 
-            model_preds = torch.softmax(logits, dim=-1).argmax(dim=-1)
+                model_preds = torch.softmax(logits, dim=-1).argmax(dim=-1)
 
-            loss = loss_function(logits, labels)
+                loss = loss_function(logits, labels)
 
             epoch_loss_total += loss.item() * len(labels)
             total_correct_preds += (model_preds == labels).sum().item()
             total_examples += len(labels)
+
+            progress.set_postfix(
+                loss=f"{epoch_loss_total / total_examples:.3f}",
+                accuracy=f"{total_correct_preds / total_examples:.1%}"
+            )
 
     return (epoch_loss_total / total_examples), (total_correct_preds / total_examples)
 
@@ -109,7 +127,8 @@ def main():
 
     model = ChessTransformer().to(device)
     loss_function = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARN_RATE)
+    #fused does the whole update in one gpu kernel, it only exists for parameters that are on the gpu
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARN_RATE, fused=(device.type == "cuda"))
 
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
     #anything else means the data or the metrics are wrong
