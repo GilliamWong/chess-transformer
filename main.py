@@ -1,6 +1,7 @@
 #for reference: the first model (carlsen pgn only) trained for 10 epochs of 580,949 positions, about 4 minutes.
 #   the same number of positions: 5,673 steps   (TRAIN_POSITIONS_BUDGET = 5_800_000)
 #   the same training time:       12,000 steps  (TRAIN_POSITIONS_BUDGET = 12_300_000), at about 58 steps a second
+import argparse
 from collections.abc import Iterator
 from itertools import islice
 from pathlib import Path
@@ -16,8 +17,8 @@ PEAK_LEARN_RATE = 6e-3
 WARMUP_STEPS = 500
 BATCH_SIZE = 1024
 
+#positions to train on, unless --positions is given. A step is one batch, so steps = positions // BATCH_SIZE
 TRAIN_POSITIONS_BUDGET = 10_000_000
-MAX_STEPS = TRAIN_POSITIONS_BUDGET // BATCH_SIZE #a step is one batch, one update of the weights
 
 EVAL_EVERY = 1000  #steps between two looks at the val set
 EVAL_BATCHES = 100 #only this many val batches for those looks, the whole val set is kept for the end
@@ -45,14 +46,15 @@ def train(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
-    best_val_loss: float) -> None:
+    best_val_loss: float,
+    max_steps: int) -> None:
 
     loss_total = 0.0
     total_examples = 0
 
     model.train()
 
-    progress = tqdm(range(1, MAX_STEPS + 1), desc="train")
+    progress = tqdm(range(1, max_steps + 1), desc="train")
 
     for step, (batch, labels) in zip(progress, endless_batches(train_data_loader)):
         labels = labels.to(device)
@@ -77,13 +79,13 @@ def train(
         progress.set_postfix(loss=f"{loss_total / total_examples:.3f}")
 
         #the last step is always evaluated, so the final weights get their chance to be the checkpoint
-        if step % EVAL_EVERY == 0 or step == MAX_STEPS:
+        if step % EVAL_EVERY == 0 or step == max_steps:
             train_loss = loss_total / total_examples
             val_loss, val_accuracy = evaluate_model(model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
             model.train()
 
             #tqdm.write rather than print, which would cut through the progress bar
-            tqdm.write(f"step {step}/{MAX_STEPS} ({step * BATCH_SIZE:,} positions): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
+            tqdm.write(f"step {step}/{max_steps} ({step * BATCH_SIZE:,} positions): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -160,21 +162,23 @@ def load_dataloaders() -> tuple[DataLoader, DataLoader]:
         val_batch_size=BATCH_SIZE
     )
 
-def lr_multiplier(step: int) -> float:
+def lr_multiplier(step: int, max_steps: int) -> float:
     if step <= WARMUP_STEPS:
         return (step + 1) / WARMUP_STEPS
 
-    progress = (step - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
+    progress = (step - WARMUP_STEPS) / (max_steps - WARMUP_STEPS)
 
     multiplier = 0.5 * (1 + math.cos(math.pi * progress))
 
     return multiplier
 
 
-def main():
+def main(positions_budget: int = TRAIN_POSITIONS_BUDGET):
+    max_steps = positions_budget // BATCH_SIZE
+
     #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
-    if MAX_STEPS <= WARMUP_STEPS:
-        raise ValueError(f"TRAIN_POSITIONS_BUDGET gives {MAX_STEPS} steps, it has to be more than the {WARMUP_STEPS} warmup steps")
+    if max_steps <= WARMUP_STEPS:
+        raise ValueError(f"{positions_budget:,} positions is {max_steps} steps, it has to be more than the {WARMUP_STEPS} warmup steps")
 
     torch.manual_seed(SEED)
 
@@ -190,15 +194,15 @@ def main():
     compiled_model = torch.compile(model)
     #fused does the whole update in one gpu kernel, it only exists for parameters that are on the gpu
     optimizer = torch.optim.AdamW(model.parameters(), lr=PEAK_LEARN_RATE, fused=(device.type == "cuda"))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_multiplier(step, max_steps))
 
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
     #anything else means the data or the metrics are wrong
     val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
     print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
-    print(f"{MAX_STEPS:,} steps of {BATCH_SIZE} positions, evaluating every {EVAL_EVERY}")
-    train(compiled_model, model, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss)
+    print(f"{max_steps:,} steps of {BATCH_SIZE} positions, evaluating every {EVAL_EVERY}")
+    train(compiled_model, model, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, max_steps=max_steps)
 
     #the number to quote for this run: the final weights on the whole val set
     val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
@@ -206,4 +210,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="train the chess transformer")
+    #int() accepts underscores, so --positions 12_300_000 works
+    parser.add_argument("--positions", type=int, default=TRAIN_POSITIONS_BUDGET, help="positions to train on, default %(default)s")
+    arguments = parser.parse_args()
+
+    main(arguments.positions)
