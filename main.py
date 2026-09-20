@@ -1,5 +1,5 @@
 from pathlib import Path
-from data import CARLSEN_PGN, ChessGamesDataset, pgns_to_examples, create_dataloaders, datasets_to_dataloaders
+from data import CARLSEN_PGN, pgns_to_examples, create_dataloaders, datasets_to_dataloaders, load_training_set
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -12,7 +12,7 @@ BATCH_SIZE = 1024
 SEED = 42
 
 #"carlsen" parses pgn_data/Carlsen.pgn, which is in the repository and takes 20 seconds.
-#anything else is the name of a training set written by select_games.py (see the readme)
+#anything else is the name of a training set in processed_data/ (see load_training_set in data.py)
 TRAINING_SET = "baseline"
 
 CHECKPOINT_PATH = Path(__file__).parent / "model.pt" #weights of the epoch with the best val loss
@@ -121,12 +121,10 @@ def load_dataloaders() -> tuple[DataLoader, DataLoader]:
             seed=SEED
         )
 
-    #imported here so that training on carlsen alone does not need the lichess files
-    from select_games import load_training_set
-    train_boards, train_moves, val_boards, val_moves = load_training_set(TRAINING_SET)
+    train_dataset, val_dataset = load_training_set(TRAINING_SET)
     return datasets_to_dataloaders(
-        ChessGamesDataset.from_arrays(train_boards, train_moves),
-        ChessGamesDataset.from_arrays(val_boards, val_moves),
+        train_dataset,
+        val_dataset,
         train_batch_size=BATCH_SIZE,
         val_batch_size=BATCH_SIZE
     )

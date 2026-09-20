@@ -2,10 +2,10 @@ import chess
 import pytest
 import torch
 
-from evaluate_elo import elo_difference, parse_score
+from play.evaluate_elo import elo_difference, parse_score
 from model import ChessTransformer
-from player import choose_move
-from uci import parse_position
+from play.player import choose_move
+from play.uci import parse_position
 
 CPU = torch.device("cpu")
 

@@ -5,11 +5,13 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+import data
 from data import (
     ChessGamesDataset,
     TrainingExample,
     create_dataloaders,
     game_to_examples,
+    load_training_set,
     pgns_to_examples,
     split_data,
 )
@@ -233,3 +235,41 @@ def test_a_list_of_indices_comes_back_as_one_batch():
 
     assert boards.shape == (2, TOKENS_PER_BOARD)
     assert moves.tolist() == [30, 10]
+
+
+def write_training_set(folder, name, positions_per_split) -> None:
+    """raw arrays the way processed_data/ holds them: uint8 boards and int16 moves, no header"""
+    for split, num_positions in positions_per_split.items():
+        boards = np.full((num_positions, TOKENS_PER_BOARD), 5, dtype=np.uint8)
+        moves = np.arange(num_positions, dtype=np.int16)
+        (folder / f"{name}_{split}_boards.bin").write_bytes(boards.tobytes())
+        (folder / f"{name}_{split}_moves.bin").write_bytes(moves.tobytes())
+
+
+def test_training_set_is_loaded_from_raw_arrays(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    write_training_set(tmp_path, "tiny", {"train": 300, "val": 20})
+
+    train_dataset, val_dataset = load_training_set("tiny")
+
+    assert len(train_dataset) == 300 and len(val_dataset) == 20
+    boards, moves = train_dataset[[299, 0]]
+    assert boards.tolist() == [[5] * TOKENS_PER_BOARD] * 2
+    assert moves.tolist() == [299, 0]  #large enough that reading the int16 moves as bytes would give something else
+
+
+def test_missing_training_set_is_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        load_training_set("does_not_exist")
+
+
+def test_training_set_with_mismatched_files_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    write_training_set(tmp_path, "broken", {"train": 300, "val": 20})
+    moves_path = tmp_path / "broken_train_moves.bin"
+    moves_path.write_bytes(moves_path.read_bytes()[:-2])  #one move short, as after an interrupted copy
+
+    with pytest.raises(ValueError):
+        load_training_set("broken")

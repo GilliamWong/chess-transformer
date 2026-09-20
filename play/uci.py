@@ -14,7 +14,7 @@ import sys
 import chess
 import torch
 from main import CHECKPOINT_PATH
-from player import choose_move, load_model
+from play.player import choose_move, load_model
 
 ENGINE_NAME = "ChessTransformer"
 
@@ -97,8 +97,8 @@ def main(checkpoint_path: Path = CHECKPOINT_PATH, random_mover: bool = False):
 
 
 if __name__ == "__main__":
-    #"python uci.py" plays model.pt, "python uci.py other.pt" plays another checkpoint
-    #(so two checkpoints can play each other), "python uci.py random" plays random moves
+    #"python -m play.uci" plays model.pt, "python -m play.uci other.pt" plays another checkpoint
+    #(so two checkpoints can play each other), "python -m play.uci random" plays random moves
     if len(sys.argv) > 1 and sys.argv[1] == "random":
         main(random_mover=True)
     else:

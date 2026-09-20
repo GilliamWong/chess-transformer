@@ -1,9 +1,9 @@
-#downloads the two programs evaluate_elo.py needs into engines/, which is too big for git and gitignored:
+#downloads the two programs play/evaluate_elo.py needs into engines/, which is too big for git and gitignored:
 #   stockfish   the opponent the model is measured against
 #   cute chess  cutechess-cli runs the matches, cutechess is the gui for playing the model yourself
 #it also tells the cute chess gui where the model and stockfish are, so they show up in its engine list.
 #
-#training does not need any of this, only evaluate_elo.py does. Run it once: python download_engines.py
+#training does not need any of this, only evaluate_elo.py does. Run it once from the repository root: python -m play.download_engines
 import json
 import os
 import platform
@@ -12,7 +12,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).parent
+PROJECT_DIR = Path(__file__).parent.parent #this file is in play/, the engines and the model are one level up
 ENGINES_DIR = PROJECT_DIR / "engines"
 
 #official release pages: github.com/official-stockfish/Stockfish and github.com/cutechess/cutechess
@@ -51,7 +51,7 @@ def register_with_gui() -> None:
     our_engines = [
         {
             "name": "ChessTransformer",
-            "command": f'"{sys.executable}" uci.py',
+            "command": f'"{sys.executable}" -m play.uci',
             "workingDirectory": str(PROJECT_DIR),
             "protocol": "uci"
         },
@@ -83,7 +83,7 @@ def main():
     download(CUTECHESS_URL, ENGINES_DIR / "cutechess", CUTECHESS_CLI)
     register_with_gui()
 
-    print("done, evaluate_elo.py is ready once main.py has trained a model")
+    print("done, python -m play.evaluate_elo is ready once main.py has trained a model")
 
 
 if __name__ == "__main__":

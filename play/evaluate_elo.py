@@ -1,14 +1,15 @@
 #plays the trained model against an opponent and reports the result.
 #
-#   python evaluate_elo.py                    a match against stockfish limited to 1320 elo
-#   python evaluate_elo.py --elo 1500         the same against a stronger setting
-#   python evaluate_elo.py --opponent random  against random moves, a trained model should win nearly all of these
-#   python evaluate_elo.py --opponent human   opens the cute chess gui so you can play it yourself
+#run from the repository root:
+#   python -m play.evaluate_elo                    a match against stockfish limited to 1320 elo
+#   python -m play.evaluate_elo --elo 1500         the same against a stronger setting
+#   python -m play.evaluate_elo --opponent random  against random moves, a trained model should win nearly all of these
+#   python -m play.evaluate_elo --opponent human   opens the cute chess gui so you can play it yourself
 #
 #the games are run by cutechess-cli rather than by our own loop. It already handles the things
 #a match needs: alternating colours, a different opening for every pair of games, the draw rules,
 #running several games at once, saving the pgns, and the elo difference with its error margin.
-#The model talks to it through uci.py.
+#The model talks to it through play/uci.py.
 import argparse
 import math
 import re
@@ -16,10 +17,9 @@ import subprocess
 import sys
 from pathlib import Path
 from data import CARLSEN_PGN
-from download_engines import CUTECHESS_CLI, CUTECHESS_DIR, CUTECHESS_GUI, STOCKFISH
+from play.download_engines import CUTECHESS_CLI, CUTECHESS_DIR, CUTECHESS_GUI, STOCKFISH, PROJECT_DIR
 from main import CHECKPOINT_PATH
 
-PROJECT_DIR = Path(__file__).parent
 
 MATCH_PGN = PROJECT_DIR / "match.pgn" #every game of the last match, worth reading to see how it loses
 
@@ -35,7 +35,7 @@ SEED = 42
 
 def model_engine(checkpoint_path: Path) -> list[str]:
     return [
-        "-engine", "name=ChessTransformer", f"cmd={sys.executable}", "arg=uci.py", f"arg={checkpoint_path}",
+        "-engine", "name=ChessTransformer", f"cmd={sys.executable}", "arg=-m", "arg=play.uci", f"arg={checkpoint_path}",
         f"dir={PROJECT_DIR}", "proto=uci"
     ]
 
@@ -46,7 +46,7 @@ def stockfish_engine(elo: int) -> list[str]:
     ]
 
 def random_engine() -> list[str]:
-    return ["-engine", "name=RandomMover", f"cmd={sys.executable}", "arg=uci.py", "arg=random", f"dir={PROJECT_DIR}", "proto=uci"]
+    return ["-engine", "name=RandomMover", f"cmd={sys.executable}", "arg=-m", "arg=play.uci", "arg=random", f"dir={PROJECT_DIR}", "proto=uci"]
 
 #runs the match and returns cutechess-cli's output
 def play_match(checkpoint_path: Path, opponent: list[str], num_games: int) -> str:
@@ -128,7 +128,7 @@ def main():
         raise FileNotFoundError(f"{arguments.checkpoint} does not exist, train a model with main.py first")
     for program in (STOCKFISH, CUTECHESS_CLI, CUTECHESS_GUI):
         if not program.exists():
-            raise FileNotFoundError(f"{program} does not exist, run download_engines.py first")
+            raise FileNotFoundError(f"{program} does not exist, run python -m play.download_engines first")
     if not MIN_STOCKFISH_ELO <= arguments.elo <= MAX_STOCKFISH_ELO:
         raise ValueError(f"--elo must be between {MIN_STOCKFISH_ELO} and {MAX_STOCKFISH_ELO}, got {arguments.elo}")
 
