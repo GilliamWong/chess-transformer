@@ -20,3 +20,6 @@ engines/
 
 # Games of the last evaluate_elo.py match
 match.pgn
+
+# Lichess elite database, 27 GB of pgns (database.nikonoel.fr). Only Carlsen.pgn is small enough for git
+pgn_data/lichess_elite/

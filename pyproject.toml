@@ -1,3 +1,32 @@
+[project]
+name = "chess-transformer"
+version = "0.1.0"
+description = "A transformer that learns to play chess by imitating Magnus Carlsen's games"
+requires-python = ">=3.10"
+dependencies = [
+    "chess>=1.11",
+    "numpy>=1.26", # torch warns on every start without it
+    "torch>=2.9",
+    "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+# The project is a set of scripts run from the repository root, not an installable package.
+[tool.uv]
+package = false
+
+# PyPI's Windows wheel of torch is CPU only, so torch comes from PyTorch's own CUDA 13.0 index on
+# Windows and Linux. RTX 50 series cards need CUDA 12.8 or newer. macOS has no CUDA and uses PyPI.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [tool.pytest.ini_options]
 # main.py lives at the repository root rather than in an installed package.
 pythonpath = ["."]

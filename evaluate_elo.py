@@ -16,13 +16,10 @@ import subprocess
 import sys
 from pathlib import Path
 from data import CARLSEN_PGN
+from download_engines import CUTECHESS_CLI, CUTECHESS_DIR, CUTECHESS_GUI, STOCKFISH
 from main import CHECKPOINT_PATH
 
 PROJECT_DIR = Path(__file__).parent
-CUTECHESS_DIR = PROJECT_DIR / "engines" / "cutechess" / "cutechess-1.5.1-win64"
-CUTECHESS_CLI = CUTECHESS_DIR / "cutechess-cli.exe"
-CUTECHESS_GUI = CUTECHESS_DIR / "cutechess.exe"
-STOCKFISH = PROJECT_DIR / "engines" / "stockfish" / "stockfish-windows-x86-64-universal.exe"
 
 MATCH_PGN = PROJECT_DIR / "match.pgn" #every game of the last match, worth reading to see how it loses
 
@@ -129,6 +126,9 @@ def main():
 
     if not arguments.checkpoint.exists():
         raise FileNotFoundError(f"{arguments.checkpoint} does not exist, train a model with main.py first")
+    for program in (STOCKFISH, CUTECHESS_CLI, CUTECHESS_GUI):
+        if not program.exists():
+            raise FileNotFoundError(f"{program} does not exist, run download_engines.py first")
     if not MIN_STOCKFISH_ELO <= arguments.elo <= MAX_STOCKFISH_ELO:
         raise ValueError(f"--elo must be between {MIN_STOCKFISH_ELO} and {MAX_STOCKFISH_ELO}, got {arguments.elo}")
 

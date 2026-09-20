@@ -6,7 +6,10 @@ import torch
 import chess.pgn
 import random
 
-CARLSEN_PGN = Path(__file__).parent / "Carlsen" / "Carlsen.pgn"
+PGN_DATA_DIR = Path(__file__).parent / "pgn_data"
+CARLSEN_PGN = PGN_DATA_DIR / "Carlsen.pgn"
+#one pgn per month, 2013-01 to 2025-11. 27 GB, so not in git: see the readme for where to get them
+LICHESS_ELITE_PGNS = sorted((PGN_DATA_DIR / "lichess_elite").glob("*.pgn"))
 
 @dataclass
 class TrainingExample:
