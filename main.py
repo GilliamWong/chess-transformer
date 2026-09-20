@@ -1,14 +1,19 @@
+#for reference: the first model (carlsen pgn only) trained for 10 epochs of 580,949 positions, about 4 minutes.
+#   the same number of positions: 5,673 steps   (TRAIN_POSITIONS_BUDGET = 5_800_000)
+#   the same training time:       12,000 steps  (TRAIN_POSITIONS_BUDGET = 12_300_000), at about 58 steps a second
 from collections.abc import Iterator
 from itertools import islice
 from pathlib import Path
 from data import CARLSEN_PGN, pgns_to_examples, create_dataloaders, datasets_to_dataloaders, load_training_set
 import torch
+import math
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from model import ChessTransformer
 
-LEARN_RATE = 1e-3
+PEAK_LEARN_RATE = 6e-3
+WARMUP_STEPS = 500
 BATCH_SIZE = 1024
 
 TRAIN_POSITIONS_BUDGET = 10_000_000
@@ -17,9 +22,6 @@ MAX_STEPS = TRAIN_POSITIONS_BUDGET // BATCH_SIZE #a step is one batch, one updat
 EVAL_EVERY = 1000  #steps between two looks at the val set
 EVAL_BATCHES = 100 #only this many val batches for those looks, the whole val set is kept for the end
 SEED = 42
-#dropout guards against memorising a small dataset. With tens of millions of positions the model sees
-#each one about once, so there is nothing to memorise and dropout only slows the learning down.
-#worth turning back on (0.1) when training on "carlsen" alone
 DROPOUT = 0.0
 
 #"carlsen" parses pgn_data/Carlsen.pgn, which is in the repository and takes 20 seconds.
@@ -33,8 +35,7 @@ def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, tor
         for batch, labels in data_loader:
             yield batch, labels
 
-#trains the model for MAX_STEPS steps. Every EVAL_EVERY steps it looks at the val set, reports,
-#and saves checkpoint_model if the val loss is the best so far
+
 def train(
     model: nn.Module,
     checkpoint_model: nn.Module,
@@ -42,17 +43,9 @@ def train(
     val_data_loader: DataLoader,
     loss_function: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
     best_val_loss: float) -> None:
-
-    #set model.train()
-    #take batches from the dataloader until we have done MAX_STEPS steps
-    #for every batch from the dataloader and move to the gpu, then:
-    #zero out gradients, put the data through the model
-    #put model outputs through the loss function
-    #call loss.backwards
-    #then take a step with the optimizer
-    #every EVAL_EVERY steps log the loss, evaluate, and save if it is the best so far
 
     loss_total = 0.0
     total_examples = 0
@@ -65,8 +58,6 @@ def train(
         labels = labels.to(device)
         batch = batch.to(device)
 
-        #the matrix multiplies run in bfloat16, which is about twice as fast on the gpu. The weights stay
-        #in float32. bfloat16 has the same range as float32, so unlike float16 it needs no GradScaler
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             logits = model(batch)
 
@@ -77,6 +68,7 @@ def train(
         loss.backward()
 
         optimizer.step()
+        scheduler.step()
 
         loss_total += loss.item() * len(labels)
         total_examples += len(labels)
@@ -88,7 +80,6 @@ def train(
         if step % EVAL_EVERY == 0 or step == MAX_STEPS:
             train_loss = loss_total / total_examples
             val_loss, val_accuracy = evaluate_model(model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
-            #evaluate_model leaves the model in eval mode, and nothing else would switch it back
             model.train()
 
             #tqdm.write rather than print, which would cut through the progress bar
@@ -169,10 +160,21 @@ def load_dataloaders() -> tuple[DataLoader, DataLoader]:
         val_batch_size=BATCH_SIZE
     )
 
+def lr_multiplier(step: int) -> float:
+    if step <= WARMUP_STEPS:
+        return (step + 1) / WARMUP_STEPS
+
+    progress = (step - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)
+
+    multiplier = 0.5 * (1 + math.cos(math.pi * progress))
+
+    return multiplier
+
 
 def main():
-    #sets up the model, creates the dataset and dataloader, creates loss and optimizers
-    #and also runs the training loop for MAX_STEPS steps
+    #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
+    if MAX_STEPS <= WARMUP_STEPS:
+        raise ValueError(f"TRAIN_POSITIONS_BUDGET gives {MAX_STEPS} steps, it has to be more than the {WARMUP_STEPS} warmup steps")
 
     torch.manual_seed(SEED)
 
@@ -187,16 +189,16 @@ def main():
 
     compiled_model = torch.compile(model)
     #fused does the whole update in one gpu kernel, it only exists for parameters that are on the gpu
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARN_RATE, fused=(device.type == "cuda"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=PEAK_LEARN_RATE, fused=(device.type == "cuda"))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_multiplier)
 
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
     #anything else means the data or the metrics are wrong
-    #on the same val batches as the evaluations during training, so it is the loss they have to beat
     val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
     print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
     print(f"{MAX_STEPS:,} steps of {BATCH_SIZE} positions, evaluating every {EVAL_EVERY}")
-    train(compiled_model, model, train_data_loader, val_data_loader, loss_function, optimizer, device, best_val_loss=val_loss)
+    train(compiled_model, model, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss)
 
     #the number to quote for this run: the final weights on the whole val set
     val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
