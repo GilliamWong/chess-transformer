@@ -38,7 +38,29 @@ class ChessTransformer(nn.Module):
 
         self.output_projection = nn.Linear(d_model, NUM_MOVE_IDS)
 
+    def forward(self, board_state: torch.Tensor) -> torch.Tensor:
+        #input is B x TOKENS_PER_BOARD
 
+        #take the input, embed it
+        #take the embedded input and add the position embed as well
+        #take that and pass it through our encoder layers
+        #then take that, put it through the output dim, and return
+
+        #embed state is B tokens_per_board d_model now
+        embed_state = self.embed(board_state)
+
+        #add the position embed which is already the right dim
+        embed_state = embed_state + self.position_embed
+
+        #pass through the model layers
+        #this is of dim B tokens_per_board d_model, so we mean to get one token per board
+        model_output = self.encoder(embed_state).mean(dim=1)
+
+        #take the model output and project into output dim
+        output_logits = self.output_projection(model_output)
+
+        #return
+        return output_logits
 
         
 
