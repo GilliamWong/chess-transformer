@@ -116,6 +116,8 @@ class ChessTransformer(nn.Module):
 
         self.output_projection = nn.Linear(d_model, NUM_MOVE_IDS)
 
+        self.ln = nn.LayerNorm(d_model)
+
     def forward(self, board_state: torch.Tensor) -> torch.Tensor:
         #input is B x TOKENS_PER_BOARD
 
@@ -132,7 +134,8 @@ class ChessTransformer(nn.Module):
 
         #pass through the model layers
         #this is of dim B tokens_per_board d_model, so we mean to get one token per board
-        model_output = self.encoder(embed_state).mean(dim=1)
+        #we also apply layernorm as is standard with prenorm
+        model_output = self.ln(self.encoder(embed_state)).mean(dim=1)
 
         #take the model output and project into output dim
         output_logits = self.output_projection(model_output)
