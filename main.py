@@ -2,26 +2,28 @@
 #   the same number of positions: 5,673 steps   (TRAIN_POSITIONS_BUDGET = 5_800_000)
 #   the same training time:       12,000 steps  (TRAIN_POSITIONS_BUDGET = 12_300_000), at about 58 steps a second
 import argparse
-import socket
-import subprocess
-import sys
-import threading
+import json
 import time
-import webbrowser
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from data import CARLSEN_PGN, pgns_to_examples, create_dataloaders, datasets_to_dataloaders, load_training_set
+from data import ARTIFACTS_DIR, CARLSEN_PGN, pgns_to_examples, create_dataloaders, datasets_to_dataloaders, load_training_set
 import torch
 import math
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from tools.checkpoint import save_checkpoint
 from model import ChessTransformer
 
-PEAK_LEARN_RATE = 1e-2
+#the model, each of these has a command line flag (python main.py --help)
+D_MODEL = 128
+NUM_LAYERS = 4
+N_HEADS = 4
+
+PEAK_LEARN_RATE = 6e-3
 WARMUP_STEPS = 500
 BATCH_SIZE = 1024
 
@@ -37,9 +39,9 @@ DROPOUT = 0.0
 #anything else is the name of a training set in processed_data/ (see load_training_set in data.py)
 TRAINING_SET = "baseline"
 
-CHECKPOINT_PATH = Path(__file__).parent / "model.pt" #weights from the evaluation with the best val loss
-RUNS_DIR = Path(__file__).parent / "runs" #one folder of tensorboard logs per run: tensorboard --logdir runs
-TENSORBOARD_PORT = 6006
+#the best checkpoint of the latest run. Every run also keeps its own in runs/<name>/model.pt
+CHECKPOINT_PATH = ARTIFACTS_DIR / "model.pt"
+RUNS_DIR = ARTIFACTS_DIR / "runs" #one folder of tensorboard logs per run
 
 def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     while True:
@@ -49,7 +51,7 @@ def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, tor
 
 def train(
     model: nn.Module,
-    checkpoint_model: nn.Module,
+    save_best_checkpoint: Callable[[], None],
     train_data_loader: DataLoader,
     val_data_loader: DataLoader,
     loss_function: nn.Module,
@@ -107,10 +109,7 @@ def train(
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                #saved from checkpoint_model, not the compiled model: the compiled wrapper prefixes every
-                #name with "_orig_mod." and play/player.py could not load that
-                torch.save(checkpoint_model.state_dict(), CHECKPOINT_PATH)
-                tqdm.write(f"  saved to {CHECKPOINT_PATH.name}")
+                save_best_checkpoint()
 
             loss_total = 0.0
             total_examples = 0
@@ -191,36 +190,21 @@ def lr_multiplier(step: int, max_steps: int) -> float:
     return multiplier
 
 
-def tensorboard_is_running() -> bool:
-    with socket.socket() as connection:
-        return connection.connect_ex(("localhost", TENSORBOARD_PORT)) == 0
+def main(
+    positions_budget: int = TRAIN_POSITIONS_BUDGET,
+    run_name: str | None = None,
+    d_model: int = D_MODEL,
+    num_layers: int = NUM_LAYERS,
+    n_heads: int = N_HEADS,
+    peak_learn_rate: float = PEAK_LEARN_RATE):
 
-#starts tensorboard unless one is already serving, and opens it in the browser once it answers.
-#it is a separate process, so it keeps serving the plots after training has finished
-def start_tensorboard() -> None:
-    if not tensorboard_is_running():
-        RUNS_DIR.mkdir(exist_ok=True)
-        subprocess.Popen(
-            [sys.executable, "-m", "tensorboard.main", "--logdir", str(RUNS_DIR), "--port", str(TENSORBOARD_PORT)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-
-    def open_when_ready() -> None:
-        for _ in range(60):
-            if tensorboard_is_running():
-                webbrowser.open(f"http://localhost:{TENSORBOARD_PORT}")
-                return
-            time.sleep(0.5)
-
-    #in the background, tensorboard takes a few seconds to come up and training should not wait for it
-    threading.Thread(target=open_when_ready, daemon=True).start()
-
-
-def main(positions_budget: int = TRAIN_POSITIONS_BUDGET, run_name: str | None = None):
     max_steps = positions_budget // BATCH_SIZE
     if run_name is None:
-        run_name = datetime.now().strftime("%m-%d_%H-%M-%S")
+        #the settings that differ between experiments, so the plots in tensorboard label themselves
+        run_name = f"d{d_model}_L{num_layers}_h{n_heads}_lr{peak_learn_rate:g}_{positions_budget / 1e6:g}M_{datetime.now():%H-%M-%S}"
+
+    #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
+    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "dropout": DROPOUT}
 
     #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
     if max_steps <= WARMUP_STEPS:
@@ -234,12 +218,14 @@ def main(positions_budget: int = TRAIN_POSITIONS_BUDGET, run_name: str | None = 
     train_data_loader, val_data_loader = load_dataloaders()
     print(f"{TRAINING_SET}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
 
-    model = ChessTransformer(dropout=DROPOUT).to(device)
+    model = ChessTransformer(**model_settings).to(device)
+    num_parameters = sum(parameter.numel() for parameter in model.parameters())
+    print(f"model: {model_settings}, {num_parameters:,} parameters")
     loss_function = nn.CrossEntropyLoss()
 
     compiled_model = torch.compile(model)
     #fused does the whole update in one gpu kernel, it only exists for parameters that are on the gpu
-    optimizer = torch.optim.AdamW(model.parameters(), lr=PEAK_LEARN_RATE, fused=(device.type == "cuda"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=peak_learn_rate, fused=(device.type == "cuda"))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: lr_multiplier(step, max_steps))
 
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
@@ -248,9 +234,28 @@ def main(positions_budget: int = TRAIN_POSITIONS_BUDGET, run_name: str | None = 
     print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
 
     print(f"{max_steps:,} steps of {BATCH_SIZE} positions, evaluating every {EVAL_EVERY}")
-    print(f"logging to runs/{run_name}, watch with: tensorboard --logdir runs")
-    writer = SummaryWriter(log_dir=str(RUNS_DIR / run_name))
-    train(compiled_model, model, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, max_steps=max_steps, writer=writer)
+    run_dir = RUNS_DIR / run_name
+    print(f"logging to {run_dir.relative_to(ARTIFACTS_DIR.parent)}")
+    writer = SummaryWriter(log_dir=str(run_dir))
+
+    #compare_runs.py reads this. The results are added once the run has finished
+    run_settings = {
+        "model_settings": model_settings,
+        "parameters": num_parameters,
+        "peak_learn_rate": peak_learn_rate,
+        "positions_budget": positions_budget,
+        "batch_size": BATCH_SIZE,
+        "training_set": TRAINING_SET
+    }
+    (run_dir / "settings.json").write_text(json.dumps(run_settings, indent=4))
+
+    #saved from model, not compiled_model: the compiled wrapper prefixes every name with "_orig_mod."
+    def save_best_checkpoint() -> None:
+        save_checkpoint(model, model_settings, CHECKPOINT_PATH)
+        save_checkpoint(model, model_settings, run_dir / "model.pt")
+
+    start_time = time.time()
+    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, max_steps=max_steps, writer=writer)
 
     #the number to quote for this run: the final weights on the whole val set
     val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
@@ -260,6 +265,9 @@ def main(positions_budget: int = TRAIN_POSITIONS_BUDGET, run_name: str | None = 
     writer.add_scalar("final/val_accuracy", val_accuracy, max_steps)
     writer.close()
 
+    run_settings.update(final_val_loss=val_loss, final_val_accuracy=val_accuracy, train_seconds=time.time() - start_time)
+    (run_dir / "settings.json").write_text(json.dumps(run_settings, indent=4))
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="train the chess transformer")
@@ -267,9 +275,15 @@ if __name__ == "__main__":
     parser.add_argument("--positions", type=int, default=TRAIN_POSITIONS_BUDGET, help="positions to train on, default %(default)s")
     parser.add_argument("--name", help="name of this run in tensorboard, default the date and time")
     parser.add_argument("--no-tensorboard", action="store_true", help="do not start tensorboard or open the browser")
+    parser.add_argument("--d-model", type=int, default=D_MODEL, help="width of the model, default %(default)s")
+    parser.add_argument("--layers", type=int, default=NUM_LAYERS, help="number of transformer blocks, default %(default)s")
+    parser.add_argument("--heads", type=int, default=N_HEADS, help="attention heads, d-model has to divide by it, default %(default)s")
+    parser.add_argument("--lr", type=float, default=PEAK_LEARN_RATE, help="peak learning rate, default %(default)s")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
+        #imported here because tools/tensorboard_server.py imports RUNS_DIR from this file
+        from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.name)
+    main(arguments.positions, arguments.name, arguments.d_model, arguments.layers, arguments.heads, arguments.lr)

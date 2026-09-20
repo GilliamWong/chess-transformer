@@ -7,7 +7,10 @@ import torch
 import chess.pgn
 import random
 
-PGN_DATA_DIR = Path(__file__).parent / "pgn_data"
+#pgns, preprocessed training sets, checkpoints, tensorboard runs and the chess engines: no code lives here
+ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
+
+PGN_DATA_DIR = ARTIFACTS_DIR / "pgn_data"
 CARLSEN_PGN = PGN_DATA_DIR / "Carlsen.pgn"
 
 @dataclass
@@ -49,7 +52,7 @@ def pgns_to_examples(pgn_paths: list[Path]) -> list[Game]:
 
 #training sets too big to parse from pgn on every run, already encoded into arrays on disk.
 #see processed_data/scripts_used/ for how they were made
-PROCESSED_DATA_DIR = Path(__file__).parent / "processed_data"
+PROCESSED_DATA_DIR = ARTIFACTS_DIR / "processed_data"
 
 #splits by game rather than by position: consecutive positions of one game are nearly identical,
 #so a game on both sides of the split would inflate validation accuracy.

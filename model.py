@@ -2,6 +2,19 @@ import torch
 from torch import nn
 from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS
 
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float):
+        super().__init__()
+        #this is all from memory so bear with me
+        #the input is B TOKENS_PER_BOARD d_model
+
+        #this is encoder attention so no causal masking needed, unless we want to predict more than one output position?
+        #but I believe that's a future project. 
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+
 class ChessTransformer(nn.Module):
     def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -20,21 +33,8 @@ class ChessTransformer(nn.Module):
 
         #we'll have one positional encoding per token position on the board
         self.position_embed = nn.Parameter(torch.randn(TOKENS_PER_BOARD, d_model))
-
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dropout=dropout,
-            dim_feedforward=4 * d_model,
-            batch_first=True,
-            norm_first=True
-        )
-
-        #all layers initialized to the same weights, but should be fine in this instance
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer=layer, 
-            num_layers=num_layers
-        )
+        
+        self.encoder = nn.Sequential(*[TransformerBlock(d_model, n_heads, dropout) for _ in range(num_layers)])
 
         self.output_projection = nn.Linear(d_model, NUM_MOVE_IDS)
 

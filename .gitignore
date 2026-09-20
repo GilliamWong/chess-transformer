@@ -22,7 +22,7 @@ engines/
 match.pgn
 
 # Lichess elite database, 27 GB of pgns (database.nikonoel.fr). Only Carlsen.pgn is small enough for git
-pgn_data/lichess_elite/
+artifacts/pgn_data/lichess_elite/
 
 # Output of preprocess.py, about 180 GB of arrays
 processed_data/
