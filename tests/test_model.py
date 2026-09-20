@@ -77,12 +77,12 @@ def test_can_overfit_one_batch(batch):
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
 
     first_loss = loss_function(model(boards), moves).item()
-    for _ in range(200):
+    for _ in range(400):
         loss = loss_function(model(boards), moves)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
     assert first_loss > 5  #an untrained guess over 1968 moves is about ln(1968) = 7.6
-    assert loss.item() < 0.1
+    assert loss.item() < 0.3  #the final layer norm bounds the pooled vector, so the loss no longer races to zero
     assert (model(boards).argmax(dim=1) == moves).all()

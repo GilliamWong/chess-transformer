@@ -19,22 +19,28 @@ NVIDIA GPU with a recent driver.
 ## Train
 
 ```
-uv run main.py                          TRAIN_POSITIONS_BUDGET positions, about 3 minutes per 10 million on an RTX 5070 Ti
-uv run main.py --positions 12_300_000   any other amount
+uv run main.py                          4 minutes of training (TRAIN_MINUTES_BUDGET), the standard budget for comparing models
+uv run main.py --note "final layer norm"    the same, with a note for the results page
+uv run main.py --minutes 30             a longer run
+uv run main.py --positions 10_000_000   a budget in positions instead, about 3 minutes per 10 million on an RTX 5070 Ti
 uv run main.py --d-model 256 --layers 8 --heads 8 --lr 3e-3    a different model, see --help for every flag
-uv run python -m tools.compare_runs     a table of every finished run, best first
+uv run python -m tools.compare_runs     a table of every finished run, grouped by budget, best first
 ```
 
 Training starts TensorBoard and opens it in the browser (live plots of loss, accuracy and learning rate
 at localhost:6006, every run overlaid). `--no-tensorboard` skips that, and
 `uv run tensorboard --logdir artifacts/runs` shows the plots without training.
 
-Training runs for a fixed number of positions rather than epochs. A step is one batch of `BATCH_SIZE`
-positions, so steps = positions / 1024. The other settings are constants at the top of `main.py`:
+Runs with the same budget are comparable: the same `--positions` for equal data, the same `--minutes` for
+equal GPU time (compiling and evaluating are not counted, and a slower model simply gets fewer steps). Every
+finished run is added to `artifacts/progress.html`, a table and a chart of validation accuracy run after
+run. The page reloads itself, so it can stay open.
+
+A step is one batch of `BATCH_SIZE` (1024) positions. The other settings are constants at the top of `main.py`:
 
 | Constant | Meaning |
 |---|---|
-| `TRAIN_POSITIONS_BUDGET` | Positions to train on when `--positions` is not given |
+| `TRAIN_MINUTES_BUDGET` | Minutes to train for when neither `--minutes` nor `--positions` is given |
 | `TRAINING_SET` | `"carlsen"` for the 7,818 Carlsen games in the repository (also set `DROPOUT = 0.1`), or the name of a set in `artifacts/processed_data/` |
 | `PEAK_LEARN_RATE`, `WARMUP_STEPS` | The learning rate warms up to the peak, then decays to zero at the last step |
 | `EVAL_EVERY`, `EVAL_BATCHES` | How often, and on how much of the validation set, progress is reported |
@@ -83,6 +89,6 @@ Everything else is kept out of the way:
 
 | Folder | What is in it |
 |---|---|
-| `tools/` | Checkpoint saving and loading, the run table, the TensorBoard launcher, and `play/` (choosing the model's move, the UCI protocol, matches against Stockfish). Run as modules from the root: `python -m tools.<name>` |
+| `tools/` | Checkpoint saving and loading, the training budget, the run table and results page, the TensorBoard launcher, and `play/` (choosing the model's move, the UCI protocol, matches against Stockfish). Run as modules from the root: `python -m tools.<name>` |
 | `artifacts/` | No code: the PGNs, preprocessed training sets, checkpoints, TensorBoard runs and chess engines. Only `pgn_data/Carlsen.pgn` is in git |
 | `tests/` | `uv run pytest` |
