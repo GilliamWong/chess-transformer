@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import math
-from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS
+from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, MOVE_PROMOTIONS, NUM_SQUARES
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float):
@@ -96,35 +96,29 @@ class TransformerBlock(nn.Module):
 class ChessTransformer(nn.Module):
     def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
-
-        #we take our inputs, which would just be current board state, and embed it
-        #we take that embedding and feed it through the model
-        #we then downproject that embedding back into whatever our output dim is
-        #so the model needs layers for the embedding projection, adding positional encodings
-        #the transformer itself, assuming we'll need encoders for now since no causal masking for chess
-        #then an output head which downprojects the output of the encoder into 1968 output dimensions
-
         #the dim of the board input is 70, with a torch.long dtype
+        self.d_model = d_model
 
         #one mebedding per possible board token, each of d_model size
-        self.embed = nn.Embedding(BOARD_VOCAB_SIZE, d_model)
+        self.embed = nn.Embedding(BOARD_VOCAB_SIZE, self.d_model)
 
         #we'll have one positional encoding per token position on the board
-        self.position_embed = nn.Parameter(torch.randn(TOKENS_PER_BOARD, d_model))
+        self.position_embed = nn.Parameter(torch.randn(TOKENS_PER_BOARD, self.d_model))
         
-        self.encoder = nn.Sequential(*[TransformerBlock(d_model, n_heads, dropout) for _ in range(num_layers)])
+        self.encoder = nn.Sequential(*[TransformerBlock(self.d_model, n_heads, dropout) for _ in range(num_layers)])
 
-        self.output_projection = nn.Linear(d_model, NUM_MOVE_IDS)
+        self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
+        self.register_buffer("to_squares", torch.tensor(MOVE_TO_SQUARES, dtype=torch.long))
+        self.register_buffer("promotions", torch.tensor(MOVE_PROMOTIONS, dtype=torch.long))
 
-        self.ln = nn.LayerNorm(d_model)
+        self.from_projection = nn.Linear(self.d_model, self.d_model)
+        self.to_projection = nn.Linear(self.d_model, self.d_model)
+        self.promotion_projection = nn.Linear(self.d_model, 5)
+
+        self.ln = nn.LayerNorm(self.d_model)
 
     def forward(self, board_state: torch.Tensor) -> torch.Tensor:
         #input is B x TOKENS_PER_BOARD
-
-        #take the input, embed it
-        #take the embedded input and add the position embed as well
-        #take that and pass it through our encoder layers
-        #then take that, put it through the output dim, and return
 
         #embed state is B tokens_per_board d_model now
         embed_state = self.embed(board_state)
@@ -133,15 +127,29 @@ class ChessTransformer(nn.Module):
         embed_state = embed_state + self.position_embed
 
         #pass through the model layers
-        #this is of dim B tokens_per_board d_model, so we mean to get one token per board
+        #this is of dim B tokens_per_board d_model
         #we also apply layernorm as is standard with prenorm
-        model_output = self.ln(self.encoder(embed_state)).mean(dim=1)
+        model_output = self.ln(self.encoder(embed_state))
 
-        #take the model output and project into output dim
-        output_logits = self.output_projection(model_output)
+        #take model output and make the from and to vectors for each board square
+        #we take off the last six tokens since those are metadata
+        from_vector = self.from_projection(model_output[:, :NUM_SQUARES, :]) #B T d_model
+        to_vector = self.to_projection(model_output[:, :NUM_SQUARES, :]) #B T d_model
+        promotion_logits = self.promotion_projection(model_output[:, :NUM_SQUARES, :]) #B T 5
 
-        #return
-        return output_logits
+        #take the from and to pairs and matmul them together
+        #intuition is that for each square, the from vector stores smth like "what's on this square? Where do I want to go?"
+        #and the to vector stores "what does this square want to receive"?
+        #sorta like attention, when dot producted together, make a T T matrix that represents how much the piece on each square
+        #wants to go to another square
+
+        #B T T 
+        logits = (from_vector @ to_vector.transpose(1, 2)) / math.sqrt(self.d_model)
+
+        #B d_vocab
+        combined_logits = logits[:, self.from_squares, self.to_squares] + promotion_logits[:, self.to_squares, self.promotions]
+
+        return combined_logits
 
         
 

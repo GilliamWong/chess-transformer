@@ -72,6 +72,11 @@ def _build_move_dict() -> dict[chess.Move, int]:
 
 MOVE_TO_ID = _build_move_dict()
 
+#move from and to are both length 1968, store the starting and ending squares of every possible move
+MOVE_FROM_SQUARES = tuple(move.from_square for move in ALL_POSSIBLE_MOVES)
+MOVE_TO_SQUARES = tuple(move.to_square for move in ALL_POSSIBLE_MOVES)
+MOVE_PROMOTIONS = tuple(0 if move.promotion is None else move.promotion - 1 for move in ALL_POSSIBLE_MOVES)
+
 
 #need to encode a board state into a tensor of some sort
 #we have 6 unique pieces, so 12 per side. 
