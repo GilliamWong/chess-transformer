@@ -7,8 +7,28 @@ from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM
 VALUE_TOKEN_DIM = 16
 NUM_RESULTS = 3
 
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, d_hidden: int):
+        super().__init__()
+
+        self.up_projection = nn.Linear(d_model, d_hidden, bias=False)
+        self.gate_projection = nn.Linear(d_model, d_hidden, bias=False)
+        self.down_projection = nn.Linear(d_hidden, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        #this would take something like B T d_model
+        #and then return the same thing
+        up_projection = self.up_projection(x)
+        gate = self.gate_projection(x)
+
+        intermediate = F.silu(gate) * up_projection
+
+        output = self.down_projection(intermediate)
+
+        return output
+
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, position_templates: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, position_templates: int, dropout: float, swiglu: bool = False):
         super().__init__()
         #this is all from memory so bear with me
         #the input is B TOKENS_PER_BOARD d_model
@@ -49,11 +69,17 @@ class TransformerBlock(nn.Module):
 
         self.combine_heads = nn.Linear(self.d_model, self.d_model)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(self.d_model, 4 * self.d_model),
-            nn.GELU(),
-            nn.Linear(4 * self.d_model, self.d_model)
-        )
+        #which of the two is a setting of the model and stored in its checkpoint, so that models trained with the
+        #other one keep loading. 8/3 makes swiglu's three matrices as many weights as the two of the gelu mlp,
+        #rounded up to a multiple of 8
+        if swiglu:
+            self.mlp = SwiGLU(self.d_model, 8 * math.ceil(self.d_model / 3))
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(self.d_model, 4 * self.d_model),
+                nn.GELU(),
+                nn.Linear(4 * self.d_model, self.d_model)
+            )
 
         self.template_mix = nn.Linear(self.d_model, position_templates * self.n_heads)
 
@@ -111,7 +137,7 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, dropout: float = 0.1):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, swiglu: bool = False, dropout: float = 0.1):
         super().__init__()
         #the dim of the board input is 70, with a torch.long dtype
         self.d_model = d_model
@@ -128,7 +154,7 @@ class ChessTransformer(nn.Module):
         self.templates = nn.Parameter(torch.zeros(position_templates, NUM_SQUARES, NUM_SQUARES))
 
         #a ModuleList since Sequential can only hand a block one input, and they need the templates too
-        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, dropout) for _ in range(num_layers)])
+        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, dropout, swiglu) for _ in range(num_layers)])
 
         self.board_down_project = nn.Sequential(
             nn.Linear(self.d_model, VALUE_TOKEN_DIM),

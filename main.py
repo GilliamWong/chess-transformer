@@ -277,7 +277,8 @@ def main(
     training_set: str = TRAINING_SET,
     value_loss_weight: float = VALUE_LOSS_WEIGHT,
     history: int = HISTORY,
-    schedule: str = SCHEDULE):
+    schedule: str = SCHEDULE,
+    swiglu: bool = False):
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -289,7 +290,7 @@ def main(
         run_name = f"d{d_model}_L{num_layers}_h{n_heads}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
 
     #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
-    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "history": history, "dropout": DROPOUT}
+    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "history": history, "swiglu": swiglu, "dropout": DROPOUT}
 
     #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
     if not budget.timed and budget.max_steps <= WARMUP_STEPS:
@@ -401,6 +402,7 @@ if __name__ == "__main__":
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT, help="weight of the value head's loss next to the move loss, default %(default)s")
     parser.add_argument("--history", type=int, default=HISTORY, help="past plies the model is shown, default %(default)s")
     parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="what the learning rate does after the warmup, see SCHEDULE in main.py. Default %(default)s")
+    parser.add_argument("--swiglu", action="store_true", help="a swiglu mlp in every block instead of the gelu one")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -408,4 +410,4 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history, arguments.schedule)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history, arguments.schedule, arguments.swiglu)

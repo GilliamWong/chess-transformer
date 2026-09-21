@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, Sampler, SequentialSampler
 import numpy as np
 import torch
+import warnings
 import chess.pgn
 import random
 
@@ -118,11 +119,15 @@ class ChessGamesDataset(Dataset):
             raise ValueError("history needs the ply of every position, to know which rows are the same game")
 
         dataset = cls([], history)
-        dataset.boards = torch.from_numpy(boards)
-        dataset.moves = torch.from_numpy(moves)
-        dataset.results = torch.from_numpy(results)
-        if plies is not None:
-            dataset.plies = torch.from_numpy(plies)
+        #the arrays may be read-only memory maps. torch warns that writing through the tensor would be undefined,
+        #and nothing here ever writes to them
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+            dataset.boards = torch.from_numpy(boards)
+            dataset.moves = torch.from_numpy(moves)
+            dataset.results = torch.from_numpy(results)
+            if plies is not None:
+                dataset.plies = torch.from_numpy(plies)
 
         return dataset
 
@@ -257,8 +262,10 @@ def datasets_to_dataloaders(
 #with history the items also describe that many past plies, which needs <name>_{train,val}_plies.bin
 def load_training_set(name: str, history: int = 0) -> tuple[ChessGamesDataset | MixedDataset, ChessGamesDataset]:
     if "+" in name:
-        train_datasets, val_datasets = zip(*(load_training_set(one_name, history) for one_name in name.split("+")))
-        return MixedDataset(list(train_datasets)), val_datasets[0]
+        #a set that is named several times is opened once and gets that many shares of every batch
+        names = name.split("+")
+        loaded = {one_name: load_training_set(one_name, history) for one_name in dict.fromkeys(names)}
+        return MixedDataset([loaded[one_name][0] for one_name in names]), loaded[names[0]][1]
 
     datasets = []
     for split in ("train", "val"):
@@ -271,17 +278,18 @@ def load_training_set(name: str, history: int = 0) -> tuple[ChessGamesDataset | 
             raise FileNotFoundError(f"{results_path.name} is missing, scripts_used/add_results.py writes it")
 
         #the files are raw arrays without a header, in the dtypes ChessGamesDataset stores: uint8 boards, int16 moves, int8 results.
-        #mode "c" is copy on write: nothing can change the files, but torch.from_numpy gets the writable array it asks for
-        boards = np.memmap(boards_path, dtype=np.uint8, mode="c").reshape(-1, TOKENS_PER_BOARD)
-        moves = np.memmap(moves_path, dtype=np.int16, mode="c")
-        results = np.memmap(results_path, dtype=np.int8, mode="c")
+        #mode "r", read-only. Copy on write ("c") looks harmless but makes windows reserve memory for the whole file:
+        #with a set named three times an overnight run held 35 GB of reservations for 12 GB of data
+        boards = np.memmap(boards_path, dtype=np.uint8, mode="r").reshape(-1, TOKENS_PER_BOARD)
+        moves = np.memmap(moves_path, dtype=np.int16, mode="r")
+        results = np.memmap(results_path, dtype=np.int8, mode="r")
 
         plies = None
         if history > 0:
             plies_path = PROCESSED_DATA_DIR / f"{name}_{split}_plies.bin"
             if not plies_path.exists():
                 raise FileNotFoundError(f"{plies_path.name} is missing, scripts_used/add_plies.py writes it")
-            plies = np.memmap(plies_path, dtype=np.int16, mode="c")
+            plies = np.memmap(plies_path, dtype=np.int16, mode="r")
         datasets.append(ChessGamesDataset.from_arrays(boards, moves, results, plies, history))
 
     return datasets[0], datasets[1]
