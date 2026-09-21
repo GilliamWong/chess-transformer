@@ -25,7 +25,7 @@ def game_to_examples(game: chess.pgn.Game) -> list[TrainingExample]:
     complete_game = []
 
     for move in game.mainline_moves():
-        complete_game.append(TrainingExample(board=encode_board(board), move=encode_move_to_id(move)))
+        complete_game.append(TrainingExample(board=encode_board(board), move=encode_move_to_id(move, board.turn)))
         board.push(move)
 
     return complete_game

@@ -33,6 +33,20 @@ START_POSITION_ENCODING = (
     + [17]                          #no en passant square
 )
 
+#after 1. e4, as black sees it: black's own pieces at the bottom and coded as white, the e4 pawn on e5
+AFTER_E4_ENCODING = (
+    [4, 2, 3, 5, 6, 3, 2, 4]
+    + [1] * 8
+    + [0] * 16
+    + [0, 0, 0, 0, 7, 0, 0, 0]      #rank 5
+    + [0] * 8
+    + [7, 7, 7, 7, 0, 7, 7, 7]      #rank 7
+    + [10, 8, 9, 11, 12, 9, 8, 10]
+    + [13]                          #black to move
+    + [16, 16, 16, 16]
+    + [17]
+)
+
 #token ids written out by hand, like the start position above
 BLACK_TO_MOVE, WHITE_TO_MOVE = 13, 14
 NO_CASTLING_RIGHT, CASTLING_RIGHT = 15, 16
@@ -92,21 +106,22 @@ def test_every_piece_has_its_own_code():
 def test_black_to_move():
     board = board_after("e4")
 
-    assert encode_board(board)[TURN_INDEX] == BLACK_TO_MOVE
+    assert encode_board(board) == AFTER_E4_ENCODING
     assert decode_board(encode_board(board)).turn == chess.BLACK
 
 
+#the flags are the side to move's kingside and queenside, then the opponent's
 @pytest.mark.parametrize(
     "san_moves, expected_flags",
     [
-        pytest.param(["e4", "e5", "Ke2"], (0, 0, 1, 1), id="white-king-moved"),
+        pytest.param(["e4", "e5", "Ke2"], (1, 1, 0, 0), id="white-king-moved-black-to-move"),
         pytest.param(["e4", "e5", "Ke2", "Ke7"], (0, 0, 0, 0), id="both-kings-moved"),
-        pytest.param(["h4", "h5", "Rh3"], (0, 1, 1, 1), id="white-h-rook-moved"),
+        pytest.param(["h4", "h5", "Rh3"], (1, 1, 0, 1), id="white-h-rook-moved-black-to-move"),
         pytest.param(["a4", "a5", "Ra3", "Ra6"], (1, 0, 1, 0), id="both-a-rooks-moved"),
         pytest.param(
             ["b3", "b6", "Bb2", "Bb7", "Bxg7", "Bxg2", "Bxh8"],
-            (1, 1, 0, 1),
-            id="black-h-rook-captured-at-home",
+            (0, 1, 1, 1),
+            id="black-h-rook-captured-at-home-black-to-move",
         ),
         pytest.param(
             ["b3", "b6", "Bb2", "Bb7", "Bxg7", "Bxg2", "Bxh8", "Bxh1"],
@@ -115,8 +130,8 @@ def test_black_to_move():
         ),
         pytest.param(
             ["e4", "e5", "Nf3", "Nf6", "Bc4", "Bc5", "O-O"],
-            (0, 0, 1, 1),
-            id="white-castled-kingside",
+            (1, 1, 0, 0),
+            id="white-castled-kingside-black-to-move",
         ),
         pytest.param(
             ["e4", "e5", "Nf3", "Nf6", "Bc4", "Bc5", "O-O", "O-O"],
@@ -125,8 +140,8 @@ def test_black_to_move():
         ),
         pytest.param(
             ["d4", "d5", "Nc3", "Nc6", "Bf4", "Bf5", "Qd2", "Qd7", "O-O-O"],
-            (0, 0, 1, 1),
-            id="white-castled-queenside",
+            (1, 1, 0, 0),
+            id="white-castled-queenside-black-to-move",
         ),
     ],
 )
@@ -166,15 +181,15 @@ def test_decoded_board_can_still_castle():
 @pytest.mark.parametrize(
     "san_moves, expected_ep_square",
     [
-        #a3 and h6 are the smallest and largest en passant squares, so 0 (a1) is a safe "none" value
-        pytest.param(["h3", "b5", "h4", "b4", "a4"], chess.A3, id="a3-lowest-square"),
+        #the side to move captures up the board, so the square is always on rank 6 and 0 (a1) is a safe "none" value
+        pytest.param(["h3", "b5", "h4", "b4", "a4"], chess.A6, id="a3-mirrored-for-black"),
         pytest.param(["g4", "a6", "g5", "h5"], chess.H6, id="h6-highest-square"),
         #a double push that no enemy pawn can capture leaves the position playing the same, so it encodes as none
         pytest.param(["e4"], 0, id="no-capture-available"),
         #the capturing pawn is pinned to its king, so the capture is not legal
         pytest.param(["e4", "e5", "d4", "exd4", "e5", "Qe7", "a3", "d5"], 0, id="capturing-pawn-pinned"),
         pytest.param(["e4", "a6", "e5", "d5"], chess.D6, id="d6-white-can-capture"),
-        pytest.param(["a3", "e5", "a4", "e4", "d4"], chess.D3, id="d3-black-can-capture"),
+        pytest.param(["a3", "e5", "a4", "e4", "d4"], chess.D6, id="d3-mirrored-black-can-capture"),
     ],
 )
 def test_en_passant_square(san_moves, expected_ep_square):
@@ -210,7 +225,7 @@ def test_en_passant_square_expires_after_one_move():
 
 
 def test_en_passant_capture_removes_the_captured_pawn():
-    board = board_after("e4", "a6", "e5", "d5", "exd6")
+    board = board_after("e4", "a6", "e5", "d5", "exd6", "a5")
 
     encoding = encode_board(board)
 
@@ -259,29 +274,38 @@ def test_move_vocabulary_size():
 
 #the order of the table is the vocabulary. Changing it invalidates any saved ids or trained model.
 @pytest.mark.parametrize(
-    "uci, expected_id",
+    "uci, turn, expected_id",
     [
-        pytest.param("a1b1", 0, id="first-move"),
-        pytest.param("a7a8n", 1792, id="first-promotion"),
-        pytest.param("h2h1q", 1967, id="last-promotion"),
+        pytest.param("a1b1", chess.WHITE, 0, id="first-move"),
+        pytest.param("a7a8n", chess.WHITE, 1792, id="first-promotion"),
+        pytest.param("h2h1q", chess.WHITE, 1967, id="last-promotion"),
+        #black's moves get the id of the same move seen from black's side
+        pytest.param("a8b8", chess.BLACK, 0, id="black-first-move"),
+        pytest.param("a2a1n", chess.BLACK, 1792, id="black-first-promotion"),
     ],
 )
-def test_move_id_layout(uci, expected_id):
+def test_move_id_layout(uci, turn, expected_id):
     move = chess.Move.from_uci(uci)
 
-    assert encode_move_to_id(move) == expected_id
-    assert decode_id_to_move(expected_id) == move
+    assert encode_move_to_id(move, turn) == expected_id
+    assert decode_id_to_move(expected_id, turn) == move
+
+
+def test_black_and_white_share_ids_for_the_same_move():
+    assert encode_move_to_id(chess.Move.from_uci("e7e5"), chess.BLACK) == encode_move_to_id(chess.Move.from_uci("e2e4"), chess.WHITE)
+    assert encode_move_to_id(chess.Move.from_uci("g8f6"), chess.BLACK) == encode_move_to_id(chess.Move.from_uci("g1f3"), chess.WHITE)
 
 
 def test_every_id_round_trips():
-    for move_id in range(NUM_MOVE_IDS):
-        assert encode_move_to_id(decode_id_to_move(move_id)) == move_id
+    for turn in (chess.WHITE, chess.BLACK):
+        for move_id in range(NUM_MOVE_IDS):
+            assert encode_move_to_id(decode_id_to_move(move_id, turn), turn) == move_id
 
 
 def test_impossible_move_is_rejected():
     #must fail loudly rather than become a wrong training label
     with pytest.raises(KeyError):
-        encode_move_to_id(chess.Move(chess.A1, chess.B4))
+        encode_move_to_id(chess.Move(chess.A1, chess.B4), chess.WHITE)
 
 
 @pytest.mark.parametrize(
@@ -298,7 +322,7 @@ def test_special_legal_moves_have_ids(fen):
     board = chess.Board(fen)
 
     for move in board.legal_moves:
-        assert decode_id_to_move(encode_move_to_id(move)) == move, move.uci()
+        assert decode_id_to_move(encode_move_to_id(move, board.turn), board.turn) == move, move.uci()
 
 
 #catches a wrong enumeration (a missing direction or piece), which the round trip over the table cannot see
@@ -307,7 +331,7 @@ def test_every_legal_move_of_real_games_has_an_id(carlsen_games):
         board = game.board()
         for played_move in game.mainline_moves():
             for move in board.legal_moves:
-                assert decode_id_to_move(encode_move_to_id(move)) == move, move.uci()
+                assert decode_id_to_move(encode_move_to_id(move, board.turn), board.turn) == move, move.uci()
             board.push(played_move)
 
 
@@ -336,7 +360,7 @@ def test_move_parts_describe_the_move_with_that_id():
     promotion_pieces = [None, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
     for move_id in range(NUM_MOVE_IDS):
         move = chess.Move(MOVE_FROM_SQUARES[move_id], MOVE_TO_SQUARES[move_id], promotion=promotion_pieces[MOVE_PROMOTIONS[move_id]])
-        assert move == decode_id_to_move(move_id)
+        assert move == decode_id_to_move(move_id, chess.WHITE)
 
 
 def test_every_promotion_shares_its_squares_with_a_plain_move():

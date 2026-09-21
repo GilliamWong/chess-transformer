@@ -41,7 +41,7 @@ def test_game_to_examples_pairs_each_position_with_the_move_played_from_it():
     for example, uci in zip(examples, ("e2e4", "e7e5", "g1f3")):
         move = chess.Move.from_uci(uci)
         assert example.board == encode_board(board)  #the position before the move, not after
-        assert example.move == encode_move_to_id(move)
+        assert example.move == encode_move_to_id(move, board.turn)
         board.push(move)
 
 
@@ -95,7 +95,8 @@ def test_every_label_is_legal_in_its_position(carlsen_games):
     assert len(dataset) == sum(len(game) for game in games)
     for index in range(len(dataset)):
         board, move = dataset[index]
-        assert decode_id_to_move(move.item()) in decode_board(board.tolist()).legal_moves, index
+        position = decode_board(board.tolist())
+        assert decode_id_to_move(move.item(), position.turn) in position.legal_moves, index
 
 
 def make_games(count: int, positions_per_game: int = 1) -> list[list[TrainingExample]]:
