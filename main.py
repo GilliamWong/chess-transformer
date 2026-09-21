@@ -47,7 +47,7 @@ TRAIN_MINUTES_BUDGET = 4
 EVAL_EVERY = 100  #steps between two looks at the val set
 POSTFIX_EVERY = 20 #steps between two updates of the loss next to the progress bar, reading it makes the cpu wait for the gpu
 EVAL_BATCHES = 20 #only this many val batches for those looks, the whole val set is kept for the end
-SEED = 42
+SEED = 42 #of the model's first weights and of the order of the training positions. The carlsen train/val split always uses this one
 DROPOUT = 0.0
 
 VALUE_LOSS_WEIGHT = 1.0
@@ -278,7 +278,9 @@ def main(
     value_loss_weight: float = VALUE_LOSS_WEIGHT,
     history: int = HISTORY,
     schedule: str = SCHEDULE,
-    swiglu: bool = False):
+    swiglu: bool = False,
+    seed: int = SEED,
+    mlp_ratio: float | None = None):
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -290,7 +292,7 @@ def main(
         run_name = f"d{d_model}_L{num_layers}_h{n_heads}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
 
     #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
-    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "history": history, "swiglu": swiglu, "dropout": DROPOUT}
+    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "history": history, "swiglu": swiglu, "mlp_ratio": mlp_ratio, "dropout": DROPOUT}
 
     #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
     if not budget.timed and budget.max_steps <= WARMUP_STEPS:
@@ -298,7 +300,7 @@ def main(
     if budget.timed and budget.max_seconds < 60:
         raise ValueError(f"{minutes_budget} minutes is too short, the warmup alone takes a good part of a minute")
 
-    torch.manual_seed(SEED)
+    torch.manual_seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}")
@@ -343,6 +345,7 @@ def main(
         "parameters": num_parameters,
         "peak_learn_rate": peak_learn_rate,
         "schedule": schedule,
+        "seed": seed,
         "value_loss_weight": value_loss_weight,
         "budget": budget.describe(),
         "batch_size": BATCH_SIZE,
@@ -403,6 +406,8 @@ if __name__ == "__main__":
     parser.add_argument("--history", type=int, default=HISTORY, help="past plies the model is shown, default %(default)s")
     parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="what the learning rate does after the warmup, see SCHEDULE in main.py. Default %(default)s")
     parser.add_argument("--swiglu", action="store_true", help="a swiglu mlp in every block instead of the gelu one")
+    parser.add_argument("--seed", type=int, default=SEED, help="runs that differ only in this show how much of a difference between two runs is chance. Default %(default)s")
+    parser.add_argument("--mlp-ratio", type=float, help="hidden size of the mlp in every block as a multiple of d-model, default 4 (8/3 with --swiglu)")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -410,4 +415,4 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history, arguments.schedule, arguments.swiglu)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history, arguments.schedule, arguments.swiglu, arguments.seed, arguments.mlp_ratio)

@@ -28,7 +28,7 @@ class SwiGLU(nn.Module):
         return output
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, position_templates: int, dropout: float, swiglu: bool = False):
+    def __init__(self, d_model: int, n_heads: int, position_templates: int, dropout: float, swiglu: bool = False, mlp_ratio: float | None = None):
         super().__init__()
         #this is all from memory so bear with me
         #the input is B TOKENS_PER_BOARD d_model
@@ -69,14 +69,18 @@ class TransformerBlock(nn.Module):
 
         self.combine_heads = nn.Linear(self.d_model, self.d_model)
 
-        #setting that models trained with the other one keep loading. 
+        if mlp_ratio is None:
+            d_hidden = 8 * math.ceil(self.d_model / 3) if swiglu else 4 * self.d_model
+        else:
+            d_hidden = max(8, 8 * round(mlp_ratio * self.d_model / 8))
+
         if swiglu:
-            self.mlp = SwiGLU(self.d_model, 8 * math.ceil(self.d_model / 3))
+            self.mlp = SwiGLU(self.d_model, d_hidden)
         else:
             self.mlp = nn.Sequential(
-                nn.Linear(self.d_model, 4 * self.d_model),
+                nn.Linear(self.d_model, d_hidden),
                 nn.GELU(),
-                nn.Linear(4 * self.d_model, self.d_model)
+                nn.Linear(d_hidden, self.d_model)
             )
 
         self.template_mix = nn.Linear(self.d_model, position_templates * self.n_heads)
@@ -135,7 +139,7 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, swiglu: bool = False, dropout: float = 0.1):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, swiglu: bool = False, mlp_ratio: float | None = None, dropout: float = 0.1):
         super().__init__()
         #the dim of the board input is 70, with a torch.long dtype
         self.d_model = d_model
@@ -152,7 +156,7 @@ class ChessTransformer(nn.Module):
         self.templates = nn.Parameter(torch.zeros(position_templates, NUM_SQUARES, NUM_SQUARES))
 
         #a ModuleList since Sequential can only hand a block one input, and they need the templates too
-        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, dropout, swiglu) for _ in range(num_layers)])
+        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, dropout, swiglu, mlp_ratio) for _ in range(num_layers)])
 
         self.board_down_project = nn.Sequential(
             nn.Linear(self.d_model, VALUE_TOKEN_DIM),
