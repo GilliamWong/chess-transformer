@@ -88,6 +88,8 @@ def train(
 
         loss.backward()
 
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
         optimizer.step()
         progress.update(budget.step_done())
         scheduler.step()
