@@ -9,8 +9,10 @@ from encoding import (
     TOKENS_PER_BOARD,
     BOARD_VOCAB_SIZE,
     MOVE_FROM_SQUARES,
-    MOVE_PROMOTIONS,
     MOVE_TO_SQUARES,
+    PROMOTION_MOVE_IDS,
+    PROMOTION_PIECES,
+    PROMOTION_TO_SQUARES,
     NUM_MOVE_IDS,
     TURN_INDEX,
     WHITE_KINGSIDE_INDEX,
@@ -355,19 +357,30 @@ def test_every_slot_stays_inside_its_token_block(carlsen_games):
 
 #a policy head looks moves up by these instead of by id, so they have to describe the same move
 def test_move_parts_describe_the_move_with_that_id():
-    assert len(MOVE_FROM_SQUARES) == len(MOVE_TO_SQUARES) == len(MOVE_PROMOTIONS) == NUM_MOVE_IDS
+    assert len(MOVE_FROM_SQUARES) == len(MOVE_TO_SQUARES) == NUM_MOVE_IDS
 
-    promotion_pieces = [None, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
     for move_id in range(NUM_MOVE_IDS):
-        move = chess.Move(MOVE_FROM_SQUARES[move_id], MOVE_TO_SQUARES[move_id], promotion=promotion_pieces[MOVE_PROMOTIONS[move_id]])
-        assert move == decode_id_to_move(move_id, chess.WHITE)
+        move = decode_id_to_move(move_id, chess.WHITE)
+        assert (move.from_square, move.to_square) == (MOVE_FROM_SQUARES[move_id], MOVE_TO_SQUARES[move_id])
 
 
 def test_every_promotion_shares_its_squares_with_a_plain_move():
     #the head scores a promotion as its (from, to) pair plus something for the piece, so the pair has to exist
-    plain_pairs = {(f, t) for f, t, promotion in zip(MOVE_FROM_SQUARES, MOVE_TO_SQUARES, MOVE_PROMOTIONS) if promotion == 0}
-    promotion_pairs = [(f, t) for f, t, promotion in zip(MOVE_FROM_SQUARES, MOVE_TO_SQUARES, MOVE_PROMOTIONS) if promotion != 0]
+    plain_pairs = {(move.from_square, move.to_square) for move in ALL_POSSIBLE_MOVES if move.promotion is None}
+    promotion_pairs = [(MOVE_FROM_SQUARES[move_id], MOVE_TO_SQUARES[move_id]) for move_id in PROMOTION_MOVE_IDS]
 
     assert len(promotion_pairs) == 176 and len(set(promotion_pairs)) == 44
     assert set(promotion_pairs) <= plain_pairs
-    assert sorted(set(MOVE_PROMOTIONS)) == [0, 1, 2, 3, 4]
+
+
+#a policy head adds something to exactly these ids, picked by landing square and piece
+def test_promotion_tables_describe_every_promotion_and_nothing_else():
+    assert len(PROMOTION_MOVE_IDS) == len(PROMOTION_TO_SQUARES) == len(PROMOTION_PIECES) == 176
+    assert set(PROMOTION_MOVE_IDS) == {move_id for move_id, move in enumerate(ALL_POSSIBLE_MOVES) if move.promotion is not None}
+
+    pieces = [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]
+    for move_id, to_square, piece in zip(PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES):
+        move = ALL_POSSIBLE_MOVES[move_id]
+        assert move.to_square == to_square
+        assert move.promotion == pieces[piece]
+

@@ -75,7 +75,12 @@ MOVE_TO_ID = _build_move_dict()
 #move from and to are both length 1968, store the starting and ending squares of every possible move
 MOVE_FROM_SQUARES = tuple(move.from_square for move in ALL_POSSIBLE_MOVES)
 MOVE_TO_SQUARES = tuple(move.to_square for move in ALL_POSSIBLE_MOVES)
-MOVE_PROMOTIONS = tuple(0 if move.promotion is None else move.promotion - 1 for move in ALL_POSSIBLE_MOVES)
+
+#the 176 promotions on their own, all three the same length: the move id, the square the pawn lands on,
+#and the piece as 0 knight, 1 bishop, 2 rook, 3 queen
+PROMOTION_MOVE_IDS = tuple(move_id for move_id, move in enumerate(ALL_POSSIBLE_MOVES) if move.promotion is not None)
+PROMOTION_TO_SQUARES = tuple(ALL_POSSIBLE_MOVES[move_id].to_square for move_id in PROMOTION_MOVE_IDS)
+PROMOTION_PIECES = tuple(ALL_POSSIBLE_MOVES[move_id].promotion - chess.KNIGHT for move_id in PROMOTION_MOVE_IDS)
 
 
 #need to encode a board state into a tensor of some sort

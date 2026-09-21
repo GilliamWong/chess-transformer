@@ -3,7 +3,7 @@ import torch
 from torch import nn
 
 from data import ChessGamesDataset, game_to_examples
-from encoding import NUM_MOVE_IDS, TOKENS_PER_BOARD
+from encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD
 from model import ChessTransformer
 
 BATCH_SIZE = 16
@@ -56,6 +56,23 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
     in_a_batch = model(boards)[:1]
 
     assert torch.allclose(alone, in_a_batch, atol=1e-5)
+
+
+#something added to every move changes no probability but can grow without limit, and did: training in bf16
+#collapsed once that constant passed 256. The promotion term may only reach the promotions
+def test_promotion_term_only_changes_promotion_logits(batch):
+    model = small_model().eval()
+    boards, _ = batch
+    before = model(boards)
+
+    with torch.no_grad():
+        model.promotion_projection.bias += 5.0
+    change = model(boards) - before
+
+    is_promotion = torch.zeros(NUM_MOVE_IDS, dtype=torch.bool)
+    is_promotion[list(PROMOTION_MOVE_IDS)] = True
+    assert torch.allclose(change[:, is_promotion], torch.full_like(change[:, is_promotion], 5.0), atol=1e-4)
+    assert (change[:, ~is_promotion] == 0).all()
 
 
 #a layer that forward never uses gets no gradient and would silently never train

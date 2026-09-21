@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import math
-from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, MOVE_PROMOTIONS, NUM_SQUARES
+from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
 
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float):
@@ -109,11 +109,15 @@ class ChessTransformer(nn.Module):
 
         self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
         self.register_buffer("to_squares", torch.tensor(MOVE_TO_SQUARES, dtype=torch.long))
-        self.register_buffer("promotions", torch.tensor(MOVE_PROMOTIONS, dtype=torch.long))
+
+        #the 176 promotions: their move id, the square the pawn lands on and the piece (0-3)
+        self.register_buffer("promotion_move_ids", torch.tensor(PROMOTION_MOVE_IDS, dtype=torch.long))
+        self.register_buffer("promotion_to_squares", torch.tensor(PROMOTION_TO_SQUARES, dtype=torch.long))
+        self.register_buffer("promotion_pieces", torch.tensor(PROMOTION_PIECES, dtype=torch.long))
 
         self.from_projection = nn.Linear(self.d_model, self.d_model)
         self.to_projection = nn.Linear(self.d_model, self.d_model)
-        self.promotion_projection = nn.Linear(self.d_model, 5)
+        self.promotion_projection = nn.Linear(self.d_model, 4) #one per piece a pawn can become
 
         self.ln = nn.LayerNorm(self.d_model)
 
@@ -131,23 +135,29 @@ class ChessTransformer(nn.Module):
         #we also apply layernorm as is standard with prenorm
         model_output = self.ln(self.encoder(embed_state))
 
-        #take model output and make the from and to vectors for each board square
-        #we take off the last six tokens since those are metadata
-        from_vector = self.from_projection(model_output[:, :NUM_SQUARES, :]) #B T d_model
-        to_vector = self.to_projection(model_output[:, :NUM_SQUARES, :]) #B T d_model
-        promotion_logits = self.promotion_projection(model_output[:, :NUM_SQUARES, :]) #B T 5
+        with torch.autocast(device_type=board_state.device.type, enabled=False):
 
-        #take the from and to pairs and matmul them together
-        #intuition is that for each square, the from vector stores smth like "what's on this square? Where do I want to go?"
-        #and the to vector stores "what does this square want to receive"?
-        #sorta like attention, when dot producted together, make a T T matrix that represents how much the piece on each square
-        #wants to go to another square
+            #take model output and make the from and to vectors for each board square
+            #we take off the last six tokens since those are metadata
+            from_vector = self.from_projection(model_output[:, :NUM_SQUARES, :].float()) #B T d_model
+            to_vector = self.to_projection(model_output[:, :NUM_SQUARES, :].float()) #B T d_model
+            promotion_logits = self.promotion_projection(model_output[:, :NUM_SQUARES, :].float()) #B T 4
 
-        #B T T 
-        logits = (from_vector @ to_vector.transpose(1, 2)) / math.sqrt(self.d_model)
+            #take the from and to pairs and matmul them together
+            #intuition is that for each square, the from vector stores smth like "what's on this square? Where do I want to go?"
+            #and the to vector stores "what does this square want to receive"?
+            #sorta like attention, when dot producted together, make a T T matrix that represents how much the piece on each square
+            #wants to go to another square
 
-        #B d_vocab
-        combined_logits = logits[:, self.from_squares, self.to_squares] + promotion_logits[:, self.to_squares, self.promotions]
+            #B T T 
+            logits = (from_vector @ to_vector.transpose(1, 2)) / math.sqrt(self.d_model)
+
+            #B d_vocab
+            combined_logits = logits[:, self.from_squares, self.to_squares]
+
+            #the promotions of a pawn share their (from, to) pair with each other and with the plain move, so only they
+            #get something added. Adding to every move let a constant drift up until bf16 could not tell logits apart
+            combined_logits[:, self.promotion_move_ids] += promotion_logits[:, self.promotion_to_squares, self.promotion_pieces]
 
         return combined_logits
 
