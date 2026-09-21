@@ -17,15 +17,21 @@ CARLSEN_PGN = PGN_DATA_DIR / "Carlsen.pgn"
 class TrainingExample:
     board: list[int]
     move: int
+    result: int #how the game ended for the side to move: 1 won, 0 draw, -1 lost
+
+#the pgn's Result header, which is from white's side
+WHITE_RESULTS = {"1-0": 1, "1/2-1/2": 0, "0-1": -1}
 
 Game = list[TrainingExample] #one example per position, in the order the game was played
 
 def game_to_examples(game: chess.pgn.Game) -> list[TrainingExample]:
     board = game.board()
     complete_game = []
+    white_result = WHITE_RESULTS[game.headers["Result"]]
 
     for move in game.mainline_moves():
-        complete_game.append(TrainingExample(board=encode_board(board), move=encode_move_to_id(move, board.turn)))
+        result = white_result if board.turn == chess.WHITE else -white_result
+        complete_game.append(TrainingExample(board=encode_board(board), move=encode_move_to_id(move, board.turn), result=result))
         board.push(move)
 
     return complete_game
@@ -76,28 +82,32 @@ class ChessGamesDataset(Dataset):
     """set of examples of chess games that we can use as a dataset"""
 
     def __init__(self, games: list[Game]):
-        #two tensors, one for the board positions and the other for the moves
+        #three tensors: the board positions, the moves and how the games ended
         boards = []
         moves = []
+        results = []
 
         for game in games:
             for example in game:
                 boards.append(example.board)
                 moves.append(example.move)
+                results.append(example.result)
 
         self.boards = torch.tensor(boards, dtype=torch.uint8)
         self.moves = torch.tensor(moves, dtype=torch.int16)
+        self.results = torch.tensor(results, dtype=torch.int8)
 
     #for positions that are already arrays (load_training_set). They can be memory mapped and far too
     #many for a python list of games: the tensors share the arrays' memory, nothing is copied
     @classmethod
-    def from_arrays(cls, boards: np.ndarray, moves: np.ndarray) -> "ChessGamesDataset":
-        if len(boards) != len(moves):
-            raise ValueError(f"{len(boards)} boards but {len(moves)} moves")
+    def from_arrays(cls, boards: np.ndarray, moves: np.ndarray, results: np.ndarray) -> "ChessGamesDataset":
+        if not len(boards) == len(moves) == len(results):
+            raise ValueError(f"{len(boards)} boards but {len(moves)} moves and {len(results)} results")
 
         dataset = cls([])
         dataset.boards = torch.from_numpy(boards)
         dataset.moves = torch.from_numpy(moves)
+        dataset.results = torch.from_numpy(results)
 
         return dataset
 
@@ -105,8 +115,9 @@ class ChessGamesDataset(Dataset):
         return len(self.moves)
 
     #index is one position, or a list of positions that come back as one batch (see datasets_to_dataloaders)
-    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.boards[index].long(), self.moves[index].long()
+    #the result comes back as the class the value head predicts: 0 lost, 1 draw, 2 won
+    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.boards[index].long(), self.moves[index].long(), self.results[index].long() + 1
 
 
 #takes games that are already parsed rather than pgn paths, so the loaders can be built
@@ -146,7 +157,7 @@ def datasets_to_dataloaders(
 
     return train_loader, val_loader
 
-#opens <name>_{train,val}_{boards,moves}.bin from processed_data/ as datasets. The arrays are memory mapped,
+#opens <name>_{train,val}_{boards,moves,results}.bin from processed_data/ as datasets. The arrays are memory mapped,
 #so 71 million positions cost no memory up front: pages are read from disk as batches touch them, and the
 #first epoch is a little slower than the rest while the operating system caches the file
 def load_training_set(name: str) -> tuple[ChessGamesDataset, ChessGamesDataset]:
@@ -154,13 +165,17 @@ def load_training_set(name: str) -> tuple[ChessGamesDataset, ChessGamesDataset]:
     for split in ("train", "val"):
         boards_path = PROCESSED_DATA_DIR / f"{name}_{split}_boards.bin"
         moves_path = PROCESSED_DATA_DIR / f"{name}_{split}_moves.bin"
+        results_path = PROCESSED_DATA_DIR / f"{name}_{split}_results.bin"
         if not boards_path.exists() or not moves_path.exists():
             raise FileNotFoundError(f"{boards_path.name} or {moves_path.name} is missing from {PROCESSED_DATA_DIR}")
+        if not results_path.exists():
+            raise FileNotFoundError(f"{results_path.name} is missing, scripts_used/add_results.py writes it")
 
-        #the files are raw arrays without a header, in the dtypes ChessGamesDataset stores: uint8 boards, int16 moves.
+        #the files are raw arrays without a header, in the dtypes ChessGamesDataset stores: uint8 boards, int16 moves, int8 results.
         #mode "c" is copy on write: nothing can change the files, but torch.from_numpy gets the writable array it asks for
         boards = np.memmap(boards_path, dtype=np.uint8, mode="c").reshape(-1, TOKENS_PER_BOARD)
         moves = np.memmap(moves_path, dtype=np.int16, mode="c")
-        datasets.append(ChessGamesDataset.from_arrays(boards, moves))
+        results = np.memmap(results_path, dtype=np.int8, mode="c")
+        datasets.append(ChessGamesDataset.from_arrays(boards, moves, results))
 
     return datasets[0], datasets[1]

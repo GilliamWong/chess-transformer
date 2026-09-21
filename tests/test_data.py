@@ -25,14 +25,15 @@ def make_board(fill: int) -> list[int]:
 
 #two games of different lengths, so flattening has a game boundary to get wrong
 TWO_GAMES = [
-    [TrainingExample(make_board(1), 10), TrainingExample(make_board(2), 20)],
-    [TrainingExample(make_board(3), 30)],
+    [TrainingExample(make_board(1), 10, 1), TrainingExample(make_board(2), 20, -1)],
+    [TrainingExample(make_board(3), 30, 0)],
 ]
 
 
 def test_game_to_examples_pairs_each_position_with_the_move_played_from_it():
     game = chess.pgn.Game()
     game.add_line([chess.Move.from_uci(uci) for uci in ("e2e4", "e7e5", "g1f3")])
+    game.headers["Result"] = "1-0"
 
     examples = game_to_examples(game)
 
@@ -44,30 +45,40 @@ def test_game_to_examples_pairs_each_position_with_the_move_played_from_it():
         assert example.move == encode_move_to_id(move, board.turn)
         board.push(move)
 
+    #white won: a win for the side to move when white is to move, a loss when black is
+    assert [example.result for example in examples] == [1, -1, 1]
+
 
 def test_dataset_flattens_games_in_order():
     dataset = ChessGamesDataset(TWO_GAMES)
 
     assert len(dataset) == 3
     for index, (fill, move_id) in enumerate([(1, 10), (2, 20), (3, 30)]):
-        board, move = dataset[index]
+        board, move, _ = dataset[index]
         assert board.tolist() == make_board(fill)
         assert move.item() == move_id
 
 
 def test_items_have_the_dtype_and_shape_the_model_needs():
-    board, move = ChessGamesDataset(TWO_GAMES)[0]
+    board, move, result = ChessGamesDataset(TWO_GAMES)[0]
 
     #embedding lookups and CrossEntropyLoss targets both require int64
     assert board.dtype == torch.long and board.shape == (TOKENS_PER_BOARD,)
     assert move.dtype == torch.long and move.shape == ()
+    assert result.dtype == torch.long and result.shape == ()
+
+
+def test_results_come_back_as_the_classes_of_the_value_head():
+    _, _, results = ChessGamesDataset(TWO_GAMES)[[0, 1, 2]]
+
+    assert results.tolist() == [2, 0, 1]  #won, lost, draw
 
 
 def test_largest_values_survive_compact_storage():
     #80 is the largest board token (en passant on h8), 1967 the largest move id
-    dataset = ChessGamesDataset([[TrainingExample(make_board(80), 1967)]])
+    dataset = ChessGamesDataset([[TrainingExample(make_board(80), 1967, 0)]])
 
-    board, move = dataset[0]
+    board, move, _ = dataset[0]
     assert board.tolist() == make_board(80)
     assert move.item() == 1967
 
@@ -75,13 +86,13 @@ def test_largest_values_survive_compact_storage():
 def test_value_too_large_for_storage_is_rejected():
     #must fail rather than wrap around into a different, valid-looking id
     with pytest.raises(RuntimeError):
-        ChessGamesDataset([[TrainingExample(make_board(0), 40000)]])
+        ChessGamesDataset([[TrainingExample(make_board(0), 40000, 0)]])
 
 
 def test_dataloader_batches_boards_and_moves():
     loader = DataLoader(ChessGamesDataset(TWO_GAMES), batch_size=2, shuffle=False)
 
-    boards, moves = next(iter(loader))
+    boards, moves, _ = next(iter(loader))
 
     assert boards.shape == (2, TOKENS_PER_BOARD)
     assert moves.tolist() == [10, 20]
@@ -94,7 +105,7 @@ def test_every_label_is_legal_in_its_position(carlsen_games):
 
     assert len(dataset) == sum(len(game) for game in games)
     for index in range(len(dataset)):
-        board, move = dataset[index]
+        board, move, _ = dataset[index]
         position = decode_board(board.tolist())
         assert decode_id_to_move(move.item(), position.turn) in position.legal_moves, index
 
@@ -102,7 +113,7 @@ def test_every_label_is_legal_in_its_position(carlsen_games):
 def make_games(count: int, positions_per_game: int = 1) -> list[list[TrainingExample]]:
     """games whose move ids say which game they are"""
     return [
-        [TrainingExample(make_board(0), game_number) for _ in range(positions_per_game)]
+        [TrainingExample(make_board(0), game_number, 0) for _ in range(positions_per_game)]
         for game_number in range(count)
     ]
 
@@ -150,7 +161,7 @@ def test_split_rejects_a_percentage():
 
 def loader_moves(loader: DataLoader) -> list[int]:
     """every move id the loader yields in one epoch, in the order it yields them"""
-    return [move for _, moves in loader for move in moves.tolist()]
+    return [move for _, moves, _ in loader for move in moves.tolist()]
 
 
 def write_pgn(pgn_path, games) -> None:
@@ -183,8 +194,8 @@ def test_dataloaders_keep_each_game_on_one_side_of_the_split():
 def test_dataloaders_use_their_own_batch_sizes():
     train_loader, val_loader = create_dataloaders(make_games(100), train_batch_size=16, val_batch_size=5)
 
-    train_boards, train_moves = next(iter(train_loader))
-    val_boards, val_moves = next(iter(val_loader))
+    train_boards, train_moves, _ = next(iter(train_loader))
+    val_boards, val_moves, _ = next(iter(val_loader))
 
     assert train_boards.shape == (16, TOKENS_PER_BOARD) and train_moves.shape == (16,)
     assert val_boards.shape == (5, TOKENS_PER_BOARD) and val_moves.shape == (5,)
@@ -216,35 +227,37 @@ def test_dataset_from_arrays_matches_dataset_from_games():
     from_games = ChessGamesDataset(TWO_GAMES)
     boards = np.array([example.board for game in TWO_GAMES for example in game], dtype=np.uint8)
     moves = np.array([example.move for game in TWO_GAMES for example in game], dtype=np.int16)
+    results = np.array([example.result for game in TWO_GAMES for example in game], dtype=np.int8)
 
-    from_arrays = ChessGamesDataset.from_arrays(boards, moves)
+    from_arrays = ChessGamesDataset.from_arrays(boards, moves, results)
 
     assert len(from_arrays) == len(from_games)
     for index in range(len(from_games)):
-        assert torch.equal(from_arrays[index][0], from_games[index][0])
-        assert torch.equal(from_arrays[index][1], from_games[index][1])
+        for from_array, from_game in zip(from_arrays[index], from_games[index]):
+            assert torch.equal(from_array, from_game)
     assert from_arrays[0][0].dtype == torch.long and from_arrays[0][1].dtype == torch.long
 
 
 def test_dataset_from_arrays_rejects_mismatched_lengths():
     with pytest.raises(ValueError):
-        ChessGamesDataset.from_arrays(np.zeros((3, TOKENS_PER_BOARD), dtype=np.uint8), np.zeros(2, dtype=np.int16))
+        ChessGamesDataset.from_arrays(np.zeros((3, TOKENS_PER_BOARD), dtype=np.uint8), np.zeros(2, dtype=np.int16), np.zeros(3, dtype=np.int8))
 
 
 def test_a_list_of_indices_comes_back_as_one_batch():
-    boards, moves = ChessGamesDataset(TWO_GAMES)[[2, 0]]
+    boards, moves, _ = ChessGamesDataset(TWO_GAMES)[[2, 0]]
 
     assert boards.shape == (2, TOKENS_PER_BOARD)
     assert moves.tolist() == [30, 10]
 
 
 def write_training_set(folder, name, positions_per_split) -> None:
-    """raw arrays the way processed_data/ holds them: uint8 boards and int16 moves, no header"""
+    """raw arrays the way processed_data/ holds them: uint8 boards, int16 moves and int8 results, no header"""
     for split, num_positions in positions_per_split.items():
         boards = np.full((num_positions, TOKENS_PER_BOARD), 5, dtype=np.uint8)
         moves = np.arange(num_positions, dtype=np.int16)
         (folder / f"{name}_{split}_boards.bin").write_bytes(boards.tobytes())
         (folder / f"{name}_{split}_moves.bin").write_bytes(moves.tobytes())
+        (folder / f"{name}_{split}_results.bin").write_bytes(np.full(num_positions, -1, dtype=np.int8).tobytes())
 
 
 def test_training_set_is_loaded_from_raw_arrays(tmp_path, monkeypatch):
@@ -254,9 +267,10 @@ def test_training_set_is_loaded_from_raw_arrays(tmp_path, monkeypatch):
     train_dataset, val_dataset = load_training_set("tiny")
 
     assert len(train_dataset) == 300 and len(val_dataset) == 20
-    boards, moves = train_dataset[[299, 0]]
+    boards, moves, results = train_dataset[[299, 0]]
     assert boards.tolist() == [[5] * TOKENS_PER_BOARD] * 2
     assert moves.tolist() == [299, 0]  #large enough that reading the int16 moves as bytes would give something else
+    assert results.tolist() == [0, 0]  #-1 in the file, a lost game
 
 
 def test_missing_training_set_is_reported(tmp_path, monkeypatch):

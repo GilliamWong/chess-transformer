@@ -39,6 +39,8 @@ EVAL_BATCHES = 20 #only this many val batches for those looks, the whole val set
 SEED = 42
 DROPOUT = 0.0
 
+VALUE_LOSS_WEIGHT = 1.0
+
 #"carlsen" parses pgn_data/Carlsen.pgn, which is in the repository and takes 20 seconds.
 #anything else is the name of a training set in processed_data/ (see load_training_set in data.py)
 TRAINING_SET = "baseline"
@@ -47,10 +49,10 @@ TRAINING_SET = "baseline"
 CHECKPOINT_PATH = ARTIFACTS_DIR / "model.pt"
 RUNS_DIR = ARTIFACTS_DIR / "runs" #one folder of tensorboard logs per run
 
-def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     while True:
-        for batch, labels in data_loader:
-            yield batch, labels
+        for batch, labels, results in data_loader:
+            yield batch, labels, results
 
 
 def train(
@@ -76,14 +78,16 @@ def train(
     progress = tqdm(total=budget.total, desc="train", dynamic_ncols=True, unit="s" if budget.timed else "it",
                     bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}{postfix}]")
 
-    for batch, labels in endless_batches(train_data_loader):
+    #results is how each position's game ended for the side to move: 0 lost, 1 draw, 2 won
+    for batch, labels, results in endless_batches(train_data_loader):
         labels = labels.to(device)
+        results = results.to(device)
         batch = batch.to(device)
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits = model(batch)
+            logits, value_logits = model(batch)
 
-            loss = loss_function(logits, labels)
+            loss = loss_function(logits, labels) + VALUE_LOSS_WEIGHT * loss_function(value_logits, results)
 
         optimizer.zero_grad()
 
@@ -106,16 +110,18 @@ def train(
         if step % EVAL_EVERY == 0 or budget.finished():
             train_loss = loss_total / total_examples
             budget.pause() #evaluating does not count towards a budget in minutes
-            val_loss, val_accuracy = evaluate_model(model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
+            val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
             model.train()
 
             #tqdm.write rather than print, which would cut through the progress bar
-            tqdm.write(f"step {step} ({budget.positions:,} positions, {budget.seconds / 60:.1f} min): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
+            tqdm.write(f"step {step} ({budget.positions:,} positions, {budget.seconds / 60:.1f} min): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
 
             #the part of the name before the slash groups the plots: both losses end up next to each other
             writer.add_scalar("loss/train", train_loss, step)
             writer.add_scalar("loss/val", val_loss, step)
             writer.add_scalar("accuracy/val", val_accuracy, step)
+            writer.add_scalar("loss/val_value", val_value_loss, step)
+            writer.add_scalar("accuracy/val_value", val_value_accuracy, step)
             writer.add_scalar("learning_rate", scheduler.get_last_lr()[0], step)
 
             if val_loss < best_val_loss:
@@ -132,17 +138,20 @@ def train(
     progress.close()
 
 
-#returns average loss and accuracy for the model on the test set, or on its first max_batches batches.
+#returns average loss and accuracy for the model on the test set, or on its first max_batches batches: first of the
+#moves, then of the value head. The move loss stays on its own so it can be compared with runs from before the value head.
 #the val loader is not shuffled, so those are the same positions every time and the numbers can be compared
 def evaluate_model(
     model: nn.Module, 
     test_data_loader: DataLoader, 
     loss_function: nn.Module, 
     device: torch.device,
-    max_batches: int | None = None) -> tuple[float, float]:
+    max_batches: int | None = None) -> tuple[float, float, float, float]:
 
     epoch_loss_total = 0.0
     total_correct_preds = 0
+    value_loss_total = 0.0
+    value_correct_preds = 0
     total_examples = 0
 
     model.eval()
@@ -153,20 +162,24 @@ def evaluate_model(
         #islice stops after num_batches, leave=False clears the bar afterwards
         progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False, dynamic_ncols=True)
 
-        for batch, labels in progress:
+        for batch, labels, results in progress:
             labels = labels.to(device)
+            results = results.to(device)
             batch = batch.to(device)
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 #should be of dim B 1 output_dim
-                logits = model(batch)
+                logits, value_logits = model(batch)
 
                 model_preds = torch.softmax(logits, dim=-1).argmax(dim=-1)
 
                 loss = loss_function(logits, labels)
+                value_loss = loss_function(value_logits, results)
 
             epoch_loss_total += loss.item() * len(labels)
             total_correct_preds += (model_preds == labels).sum().item()
+            value_loss_total += value_loss.item() * len(labels)
+            value_correct_preds += (value_logits.argmax(dim=-1) == results).sum().item()
             total_examples += len(labels)
 
             progress.set_postfix(
@@ -174,7 +187,7 @@ def evaluate_model(
                 accuracy=f"{total_correct_preds / total_examples:.1%}"
             )
 
-    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples)
+    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples)
 
 
 def load_dataloaders() -> tuple[DataLoader, DataLoader]:
@@ -275,8 +288,9 @@ def main(
 
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
     #anything else means the data or the metrics are wrong
-    val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
-    print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
+    #the value head starts at about ln(3) = 1.1 and a third right
+    val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
+    print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
 
     print(f"budget: {budget.describe()}, batches of {BATCH_SIZE} positions, evaluating every {EVAL_EVERY} steps")
     run_dir = RUNS_DIR / run_name
@@ -288,6 +302,7 @@ def main(
         "model_settings": model_settings,
         "parameters": num_parameters,
         "peak_learn_rate": peak_learn_rate,
+        "value_loss_weight": VALUE_LOSS_WEIGHT,
         "budget": budget.describe(),
         "batch_size": BATCH_SIZE,
         "training_set": TRAINING_SET,
@@ -304,16 +319,20 @@ def main(
     train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, budget=budget, writer=writer)
 
     #the number to quote for this run: the final weights on the whole val set
-    val_loss, val_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
-    print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}")
+    val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
+    print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
 
     writer.add_scalar("final/val_loss", val_loss, budget.steps)
     writer.add_scalar("final/val_accuracy", val_accuracy, budget.steps)
+    writer.add_scalar("final/val_value_loss", val_value_loss, budget.steps)
+    writer.add_scalar("final/val_value_accuracy", val_value_accuracy, budget.steps)
     writer.close()
 
     run_settings.update(
         final_val_loss=val_loss,
         final_val_accuracy=val_accuracy,
+        final_val_value_loss=val_value_loss,
+        final_val_value_accuracy=val_value_accuracy,
         train_seconds=budget.seconds,
         positions_seen=budget.positions,
         finished_at=datetime.now().isoformat(timespec="seconds")

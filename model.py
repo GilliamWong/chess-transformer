@@ -4,6 +4,9 @@ import torch.nn.functional as F
 import math
 from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
 
+VALUE_TOKEN_DIM = 16
+NUM_RESULTS = 3
+
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, position_templates: int, dropout: float):
         super().__init__()
@@ -125,6 +128,18 @@ class ChessTransformer(nn.Module):
         #a ModuleList since Sequential can only hand a block one input, and they need the templates too
         self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, dropout) for _ in range(num_layers)])
 
+        self.board_down_project = nn.Sequential(
+            nn.Linear(self.d_model, VALUE_TOKEN_DIM),
+            nn.GELU()
+        ) 
+
+        #value head which predicts win loss or draw. Forces the model to learn some sense of long term planning from games. 
+        self.value_head = nn.Sequential(
+            nn.Linear(TOKENS_PER_BOARD * VALUE_TOKEN_DIM, self.d_model),
+            nn.GELU(),
+            nn.Linear(self.d_model, NUM_RESULTS)
+        )
+
         self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
         self.register_buffer("to_squares", torch.tensor(MOVE_TO_SQUARES, dtype=torch.long))
 
@@ -139,8 +154,9 @@ class ChessTransformer(nn.Module):
 
         self.ln = nn.LayerNorm(self.d_model)
 
-    def forward(self, board_state: torch.Tensor) -> torch.Tensor:
+    def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         #input is B x TOKENS_PER_BOARD
+        B = board_state.shape[0]
 
         #embed state is B tokens_per_board d_model now
         embed_state = self.embed(board_state)
@@ -179,7 +195,12 @@ class ChessTransformer(nn.Module):
             #get something added. Adding to every move let a constant drift up until bf16 could not tell logits apart
             combined_logits[:, self.promotion_move_ids] += promotion_logits[:, self.promotion_to_squares, self.promotion_pieces]
 
-        return combined_logits
+            #B T d_model turned to B T VALUE_TOKEN_DIM, then reshaped to B T * VALUE_TOKEN_DIM
+            compressed_board = self.board_down_project(model_output.float()).reshape(B, -1)
+
+            #shape B 3, stored as loss, draw, win
+            board_value_logits = self.value_head(compressed_board)            
+        return combined_logits, board_value_logits
 
         
 

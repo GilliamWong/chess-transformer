@@ -21,7 +21,8 @@ def test_model_of_any_size_comes_back_with_the_same_weights(tmp_path):
     loaded, loaded_settings = load_checkpoint(tmp_path / "model.pt", CPU)
 
     assert loaded_settings == SETTINGS
-    assert torch.equal(loaded.eval()(boards), model(boards))
+    for loaded_output, output in zip(loaded.eval()(boards), model(boards)):
+        assert torch.equal(loaded_output, output)
 
 
 def test_player_loads_a_model_that_is_not_the_default_size(tmp_path):

@@ -19,18 +19,19 @@ def small_model() -> ChessTransformer:
 def batch(carlsen_games) -> tuple[torch.Tensor, torch.Tensor]:
     """the first positions of a real game, with the moves played from them"""
     dataset = ChessGamesDataset([game_to_examples(carlsen_games[0])])
-    boards, moves = zip(*(dataset[index] for index in range(BATCH_SIZE)))
+    boards, moves, _ = zip(*(dataset[index] for index in range(BATCH_SIZE)))
     return torch.stack(boards), torch.stack(moves)
 
 
 def test_one_set_of_move_logits_per_board(batch):
     boards, _ = batch
 
-    logits = small_model()(boards)
+    logits, value_logits = small_model()(boards)
 
     #not (batch, TOKENS_PER_BOARD, NUM_MOVE_IDS): the tokens have to be pooled into one answer per board
     assert boards.shape == (BATCH_SIZE, TOKENS_PER_BOARD)
     assert logits.shape == (BATCH_SIZE, NUM_MOVE_IDS)
+    assert value_logits.shape == (BATCH_SIZE, 3)  #lost, draw, won
 
 
 #without the positional embedding the model sees which pieces exist but not where they are
@@ -43,7 +44,7 @@ def test_moving_a_piece_changes_the_output(batch):
     swapped[0, 1], swapped[0, 12] = start_position[0, 12], start_position[0, 1]  #knight b1 <-> pawn e2
 
     #with no position information the two outputs differ only by float rounding, around 1e-7
-    difference = (model(start_position) - model(swapped)).abs().max().item()
+    difference = (model(start_position)[0] - model(swapped)[0]).abs().max().item()
     assert difference > 1e-4
 
 
@@ -52,10 +53,8 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
     model = small_model().eval()
     boards, _ = batch
 
-    alone = model(boards[:1])
-    in_a_batch = model(boards)[:1]
-
-    assert torch.allclose(alone, in_a_batch, atol=1e-5)
+    for alone, in_a_batch in zip(model(boards[:1]), model(boards)):
+        assert torch.allclose(alone, in_a_batch[:1], atol=1e-5)
 
 
 #something added to every move changes no probability but can grow without limit, and did: training in bf16
@@ -63,11 +62,11 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
 def test_promotion_term_only_changes_promotion_logits(batch):
     model = small_model().eval()
     boards, _ = batch
-    before = model(boards)
+    before, _ = model(boards)
 
     with torch.no_grad():
         model.promotion_projection.bias += 5.0
-    change = model(boards) - before
+    change = model(boards)[0] - before
 
     is_promotion = torch.zeros(NUM_MOVE_IDS, dtype=torch.bool)
     is_promotion[list(PROMOTION_MOVE_IDS)] = True
@@ -79,13 +78,13 @@ def test_promotion_term_only_changes_promotion_logits(batch):
 def test_attention_bias_starts_at_zero(batch):
     model = small_model().eval()
     boards, _ = batch
-    before = model(boards)
+    before, _ = model(boards)
 
     with torch.no_grad():
         for block in model.encoder:
             block.template_mix.weight += 1.0
 
-    assert torch.equal(model(boards), before)
+    assert torch.equal(model(boards)[0], before)
 
 
 #a layer that forward never uses gets no gradient and would silently never train
@@ -98,7 +97,10 @@ def test_every_parameter_gets_a_gradient(batch):
     with torch.no_grad():
         model.templates.normal_(std=0.1)
 
-    nn.CrossEntropyLoss()(model(boards), moves).backward()
+    #both heads have to be in the loss, or the one left out gets no gradient
+    logits, value_logits = model(boards)
+    results = torch.ones(len(boards), dtype=torch.long)
+    (nn.CrossEntropyLoss()(logits, moves) + nn.CrossEntropyLoss()(value_logits, results)).backward()
 
     for name, parameter in model.named_parameters():
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
@@ -111,13 +113,13 @@ def test_can_overfit_one_batch(batch):
     loss_function = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
 
-    first_loss = loss_function(model(boards), moves).item()
+    first_loss = loss_function(model(boards)[0], moves).item()
     for _ in range(400):
-        loss = loss_function(model(boards), moves)
+        loss = loss_function(model(boards)[0], moves)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
     assert first_loss > 5  #an untrained guess over 1968 moves is about ln(1968) = 7.6
     assert loss.item() < 0.3  #the final layer norm bounds the pooled vector, so the loss no longer races to zero
-    assert (model(boards).argmax(dim=1) == moves).all()
+    assert (model(boards)[0].argmax(dim=1) == moves).all()
