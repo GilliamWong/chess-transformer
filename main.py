@@ -190,8 +190,8 @@ def evaluate_model(
     return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples)
 
 
-def load_dataloaders() -> tuple[DataLoader, DataLoader]:
-    if TRAINING_SET == "carlsen":
+def load_dataloaders(training_set: str = TRAINING_SET) -> tuple[DataLoader, DataLoader]:
+    if training_set == "carlsen":
         print("parsing games, this takes a while")
         games = pgns_to_examples([CARLSEN_PGN])
         return create_dataloaders(
@@ -201,7 +201,7 @@ def load_dataloaders() -> tuple[DataLoader, DataLoader]:
             seed=SEED
         )
 
-    train_dataset, val_dataset = load_training_set(TRAINING_SET)
+    train_dataset, val_dataset = load_training_set(training_set)
     return datasets_to_dataloaders(
         train_dataset,
         val_dataset,
@@ -238,7 +238,8 @@ def main(
     num_layers: int = NUM_LAYERS,
     n_heads: int = N_HEADS,
     peak_learn_rate: float = PEAK_LEARN_RATE,
-    position_templates: int = POSITION_TEMPLATES):
+    position_templates: int = POSITION_TEMPLATES,
+    training_set: str = TRAINING_SET):
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -263,8 +264,8 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}")
 
-    train_data_loader, val_data_loader = load_dataloaders()
-    print(f"{TRAINING_SET}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
+    train_data_loader, val_data_loader = load_dataloaders(training_set)
+    print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
 
     model = ChessTransformer(**model_settings).to(device)
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -305,7 +306,7 @@ def main(
         "value_loss_weight": VALUE_LOSS_WEIGHT,
         "budget": budget.describe(),
         "batch_size": BATCH_SIZE,
-        "training_set": TRAINING_SET,
+        "training_set": training_set,
         "note": note,
         "commit": current_commit()
     }
@@ -358,6 +359,7 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=N_HEADS, help="attention heads, d-model has to divide by it, default %(default)s")
     parser.add_argument("--lr", type=float, default=PEAK_LEARN_RATE, help="peak learning rate, default %(default)s")
     parser.add_argument("--templates", type=int, default=POSITION_TEMPLATES, help="attention bias templates the blocks mix, default %(default)s")
+    parser.add_argument("--training-set", default=TRAINING_SET, help="name of a training set in processed_data/, several joined with + to mix them in equal shares (val is the first one's), or carlsen. Default %(default)s")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -365,4 +367,4 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set)

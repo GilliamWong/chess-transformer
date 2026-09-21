@@ -1,7 +1,8 @@
 from pathlib import Path
 from dataclasses import dataclass
 from encoding import TOKENS_PER_BOARD, encode_board, encode_move_to_id
-from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, SequentialSampler
+from collections.abc import Iterator
+from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, Sampler, SequentialSampler
 import numpy as np
 import torch
 import chess.pgn
@@ -120,6 +121,50 @@ class ChessGamesDataset(Dataset):
         return self.boards[index].long(), self.moves[index].long(), self.results[index].long() + 1
 
 
+#several training sets behind one index: the positions of the first, then of the second and so on. The sets stay
+#separate memory mapped files, joining them into one tensor would read all of them into memory
+class MixedDataset(Dataset):
+    def __init__(self, datasets: list[ChessGamesDataset]):
+        self.datasets = datasets
+        self.first_indices = [sum(len(dataset) for dataset in datasets[:number]) for number in range(len(datasets))]
+
+    def __len__(self):
+        return sum(len(dataset) for dataset in self.datasets)
+
+    #a batch comes back grouped by set rather than in the order of index, which training does not care about
+    def __getitem__(self, index: list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        indices = torch.as_tensor(index)
+        parts = []
+        for dataset, first_index in zip(self.datasets, self.first_indices):
+            in_dataset = indices[(indices >= first_index) & (indices < first_index + len(dataset))] - first_index
+            parts.append(dataset[in_dataset.tolist()])
+
+        boards, moves, results = zip(*parts)
+        return torch.cat(boards), torch.cat(moves), torch.cat(results)
+
+
+#batches for a MixedDataset with the same number of positions from every set, however different their sizes.
+#Positions are drawn at random with replacement: over a run that sees a fraction of tens of millions of positions
+#that is the same as shuffling, and no set runs out before the others
+class EqualSharesBatchSampler(Sampler):
+    def __init__(self, dataset: MixedDataset, batch_size: int):
+        if batch_size % len(dataset.datasets) != 0:
+            raise ValueError(f"a batch of {batch_size} cannot be shared equally between {len(dataset.datasets)} sets")
+        self.dataset = dataset
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return len(self.dataset) // self.batch_size
+
+    def __iter__(self) -> Iterator[list[int]]:
+        share = self.batch_size // len(self.dataset.datasets)
+        for _ in range(len(self)):
+            batch = []
+            for dataset, first_index in zip(self.dataset.datasets, self.dataset.first_indices):
+                batch += (torch.randint(len(dataset), (share,)) + first_index).tolist()
+            yield batch
+
+
 #takes games that are already parsed rather than pgn paths, so the loaders can be built
 #(and tested) without reading a whole pgn. Use pgns_to_examples to get the games.
 def create_dataloaders(
@@ -141,7 +186,7 @@ def create_dataloaders(
 #batching off), so a batch is one tensor lookup instead of one __getitem__ call per position plus a collate.
 #measured on 580k positions: 0.2s per epoch instead of 3.0s, which starts to matter at 70 million
 def datasets_to_dataloaders(
-    train_dataset: ChessGamesDataset,
+    train_dataset: ChessGamesDataset | MixedDataset,
     val_dataset: ChessGamesDataset,
     train_batch_size: int = 256,
     val_batch_size: int = 512
@@ -149,7 +194,10 @@ def datasets_to_dataloaders(
 
     #train is reshuffled every epoch so a batch is not 256 positions of the same few games.
     #val is only measured, so its order does not matter
-    train_sampler = BatchSampler(RandomSampler(train_dataset), batch_size=train_batch_size, drop_last=False)
+    if isinstance(train_dataset, MixedDataset):
+        train_sampler = EqualSharesBatchSampler(train_dataset, train_batch_size)
+    else:
+        train_sampler = BatchSampler(RandomSampler(train_dataset), batch_size=train_batch_size, drop_last=False)
     val_sampler = BatchSampler(SequentialSampler(val_dataset), batch_size=val_batch_size, drop_last=False)
 
     train_loader = DataLoader(train_dataset, sampler=train_sampler, batch_size=None)
@@ -160,7 +208,14 @@ def datasets_to_dataloaders(
 #opens <name>_{train,val}_{boards,moves,results}.bin from processed_data/ as datasets. The arrays are memory mapped,
 #so 71 million positions cost no memory up front: pages are read from disk as batches touch them, and the
 #first epoch is a little slower than the rest while the operating system caches the file
-def load_training_set(name: str) -> tuple[ChessGamesDataset, ChessGamesDataset]:
+#
+#"baseline+fishtest" mixes sets: every train batch takes the same number of positions from each. The val positions
+#are those of the first set alone, so the val numbers of a mix can be compared with runs on that set
+def load_training_set(name: str) -> tuple[ChessGamesDataset | MixedDataset, ChessGamesDataset]:
+    if "+" in name:
+        train_datasets, val_datasets = zip(*(load_training_set(one_name) for one_name in name.split("+")))
+        return MixedDataset(list(train_datasets)), val_datasets[0]
+
     datasets = []
     for split in ("train", "val"):
         boards_path = PROCESSED_DATA_DIR / f"{name}_{split}_boards.bin"

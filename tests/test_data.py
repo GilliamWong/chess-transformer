@@ -10,6 +10,7 @@ from data import (
     ChessGamesDataset,
     TrainingExample,
     create_dataloaders,
+    datasets_to_dataloaders,
     game_to_examples,
     load_training_set,
     pgns_to_examples,
@@ -271,6 +272,23 @@ def test_training_set_is_loaded_from_raw_arrays(tmp_path, monkeypatch):
     assert boards.tolist() == [[5] * TOKENS_PER_BOARD] * 2
     assert moves.tolist() == [299, 0]  #large enough that reading the int16 moves as bytes would give something else
     assert results.tolist() == [0, 0]  #-1 in the file, a lost game
+
+
+def test_mixed_training_sets_share_every_batch_equally(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    write_training_set(tmp_path, "large", {"train": 3000, "val": 20})
+    write_training_set(tmp_path, "small", {"train": 100, "val": 30})
+    #move ids say which set a position is from: large has 0 to 2999, small is moved up to 10000 and above
+    small_moves = tmp_path / "small_train_moves.bin"
+    small_moves.write_bytes((np.arange(100, dtype=np.int16) + 10000).tobytes())
+
+    train_dataset, val_dataset = load_training_set("large+small")
+    train_loader, _ = datasets_to_dataloaders(train_dataset, val_dataset, train_batch_size=16, val_batch_size=16)
+
+    assert len(train_dataset) == 3100 and len(val_dataset) == 20  #val is the first set's
+    for _, (boards, moves, results) in zip(range(20), train_loader):
+        assert boards.shape == (16, TOKENS_PER_BOARD) and results.shape == (16,)
+        assert (moves >= 10000).sum() == 8  #half of every batch although small is 3% of the positions
 
 
 def test_missing_training_set_is_reported(tmp_path, monkeypatch):

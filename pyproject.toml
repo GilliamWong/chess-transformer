@@ -5,6 +5,7 @@ description = "A transformer that learns to play chess by imitating Magnus Carls
 requires-python = ">=3.10"
 dependencies = [
     "chess>=1.11",
+    "matplotlib>=3.8", # tools/plot_templates.py
     "numpy>=1.26", # torch warns on every start without it
     "tensorboard>=2.15",
     "torch>=2.9",
