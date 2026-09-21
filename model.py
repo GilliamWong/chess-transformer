@@ -69,9 +69,7 @@ class TransformerBlock(nn.Module):
 
         self.combine_heads = nn.Linear(self.d_model, self.d_model)
 
-        #which of the two is a setting of the model and stored in its checkpoint, so that models trained with the
-        #other one keep loading. 8/3 makes swiglu's three matrices as many weights as the two of the gelu mlp,
-        #rounded up to a multiple of 8
+        #setting that models trained with the other one keep loading. 
         if swiglu:
             self.mlp = SwiGLU(self.d_model, 8 * math.ceil(self.d_model / 3))
         else:
