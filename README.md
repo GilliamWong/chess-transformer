@@ -45,8 +45,8 @@ A step is one batch of `BATCH_SIZE` (1024) positions. The other settings are con
 | `PEAK_LEARN_RATE`, `WARMUP_STEPS` | The learning rate warms up to the peak, then decays to zero at the last step |
 | `EVAL_EVERY`, `EVAL_BATCHES` | How often, and on how much of the validation set, progress is reported |
 
-The checkpoint with the best validation loss is saved to `artifacts/model.pt` and to
-`artifacts/runs/<name>/model.pt`. It holds the model's settings as well as its weights, so a model of any
+The checkpoint with the best validation loss is saved to `artifacts/runs/<name>/model.pt`, so every run keeps
+its own and none is overwritten. The tools play and measure the run that finished last unless told otherwise. It holds the model's settings as well as its weights, so a model of any
 size can be played (`--checkpoint artifacts/runs/<name>/model.pt` plays an older run).
 
 `TRAINING_SET` defaults to `"baseline"`: 71 million positions from rapid and classical games of the

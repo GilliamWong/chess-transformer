@@ -3,7 +3,9 @@
 #   the same training time:       12,000 steps  (--positions 12_300_000, or simply --minutes 4), at about 58 steps a second
 import argparse
 import json
+import queue
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterator
 from datetime import datetime
@@ -17,7 +19,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from tools.budget import Budget
-from tools.checkpoint import save_checkpoint
+from tools.checkpoint import RUNS_DIR, save_checkpoint
 from model import ChessTransformer
 
 #the model, each of these has a command line flag (python main.py --help)
@@ -35,6 +37,7 @@ BATCH_SIZE = 1024
 TRAIN_MINUTES_BUDGET = 4
 
 EVAL_EVERY = 100  #steps between two looks at the val set
+POSTFIX_EVERY = 20 #steps between two updates of the loss next to the progress bar, reading it makes the cpu wait for the gpu
 EVAL_BATCHES = 20 #only this many val batches for those looks, the whole val set is kept for the end
 SEED = 42
 DROPOUT = 0.0
@@ -45,14 +48,30 @@ VALUE_LOSS_WEIGHT = 1.0
 #anything else is the name of a training set in processed_data/ (see load_training_set in data.py)
 TRAINING_SET = "baseline"
 
-#the best checkpoint of the latest run. Every run also keeps its own in runs/<name>/model.pt
-CHECKPOINT_PATH = ARTIFACTS_DIR / "model.pt"
-RUNS_DIR = ARTIFACTS_DIR / "runs" #one folder of tensorboard logs per run
 
 def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     while True:
         for batch, labels, results in data_loader:
             yield batch, labels, results
+
+#the same batches, already on the device. A background thread reads the next few and copies them over while the gpu
+#works on the current one; reading them only when the step asks for them left the gpu waiting 4-5 ms of every 25.
+#measured: 39,500 -> 44,200 positions a second
+def batches_on_device(batches: Iterator[tuple[torch.Tensor, ...]], device: torch.device, ahead: int = 4) -> Iterator[tuple[torch.Tensor, ...]]:
+    ready = queue.Queue(maxsize=ahead)
+
+    def to_device(tensor: torch.Tensor) -> torch.Tensor:
+        #pinned memory is what lets the copy run while the gpu computes
+        return tensor.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else tensor.to(device)
+
+    def fill() -> None:
+        for batch in batches:
+            ready.put(tuple(to_device(tensor) for tensor in batch))
+
+    #a daemon, so it does not keep the program alive once training stops asking for batches
+    threading.Thread(target=fill, daemon=True).start()
+    while True:
+        yield ready.get()
 
 
 def train(
@@ -66,9 +85,11 @@ def train(
     device: torch.device,
     best_val_loss: float,
     budget: Budget,
-    writer: SummaryWriter) -> None:
+    writer: SummaryWriter,
+    value_loss_weight: float = VALUE_LOSS_WEIGHT) -> None:
 
-    loss_total = 0.0
+    #kept on the device: adding to it does not make the cpu wait for the gpu the way loss.item() does
+    loss_total = torch.zeros((), device=device)
     total_examples = 0
 
     model.train()
@@ -79,15 +100,11 @@ def train(
                     bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}{postfix}]")
 
     #results is how each position's game ended for the side to move: 0 lost, 1 draw, 2 won
-    for batch, labels, results in endless_batches(train_data_loader):
-        labels = labels.to(device)
-        results = results.to(device)
-        batch = batch.to(device)
-
+    for batch, labels, results in batches_on_device(endless_batches(train_data_loader), device):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             logits, value_logits = model(batch)
 
-            loss = loss_function(logits, labels) + VALUE_LOSS_WEIGHT * loss_function(value_logits, results)
+            loss = loss_function(logits, labels) + value_loss_weight * loss_function(value_logits, results)
 
         optimizer.zero_grad()
 
@@ -100,15 +117,16 @@ def train(
         scheduler.step()
         step = budget.steps
 
-        loss_total += loss.item() * len(labels)
+        loss_total += loss.detach() * len(labels)
         total_examples += len(labels)
 
         #the running average, a single batch's loss jumps around too much to read
-        progress.set_postfix(loss=f"{loss_total / total_examples:.3f}")
+        if step % POSTFIX_EVERY == 0:
+            progress.set_postfix(loss=f"{loss_total.item() / total_examples:.3f}")
 
         #the last step is always evaluated, so the final weights get their chance to be the checkpoint
         if step % EVAL_EVERY == 0 or budget.finished():
-            train_loss = loss_total / total_examples
+            train_loss = loss_total.item() / total_examples #also waits for the gpu, so the pause starts when the steps are really done
             budget.pause() #evaluating does not count towards a budget in minutes
             val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
             model.train()
@@ -128,7 +146,7 @@ def train(
                 best_val_loss = val_loss
                 save_best_checkpoint()
 
-            loss_total = 0.0
+            loss_total.zero_()
             total_examples = 0
             budget.resume()
 
@@ -239,7 +257,8 @@ def main(
     n_heads: int = N_HEADS,
     peak_learn_rate: float = PEAK_LEARN_RATE,
     position_templates: int = POSITION_TEMPLATES,
-    training_set: str = TRAINING_SET):
+    training_set: str = TRAINING_SET,
+    value_loss_weight: float = VALUE_LOSS_WEIGHT):
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -303,7 +322,7 @@ def main(
         "model_settings": model_settings,
         "parameters": num_parameters,
         "peak_learn_rate": peak_learn_rate,
-        "value_loss_weight": VALUE_LOSS_WEIGHT,
+        "value_loss_weight": value_loss_weight,
         "budget": budget.describe(),
         "batch_size": BATCH_SIZE,
         "training_set": training_set,
@@ -314,10 +333,9 @@ def main(
 
     #saved from model, not compiled_model: the compiled wrapper prefixes every name with "_orig_mod."
     def save_best_checkpoint() -> None:
-        save_checkpoint(model, model_settings, CHECKPOINT_PATH)
         save_checkpoint(model, model_settings, run_dir / "model.pt")
 
-    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, budget=budget, writer=writer)
+    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight)
 
     #the number to quote for this run: the final weights on the whole val set
     val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
@@ -360,6 +378,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=PEAK_LEARN_RATE, help="peak learning rate, default %(default)s")
     parser.add_argument("--templates", type=int, default=POSITION_TEMPLATES, help="attention bias templates the blocks mix, default %(default)s")
     parser.add_argument("--training-set", default=TRAINING_SET, help="name of a training set in processed_data/, several joined with + to mix them in equal shares (val is the first one's), or carlsen. Default %(default)s")
+    parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT, help="weight of the value head's loss next to the move loss, default %(default)s")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -367,4 +386,4 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight)
