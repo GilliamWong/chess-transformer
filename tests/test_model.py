@@ -75,10 +75,28 @@ def test_promotion_term_only_changes_promotion_logits(batch):
     assert (change[:, ~is_promotion] == 0).all()
 
 
+#the templates start at zero so that a new model is exactly the model without them, whatever template_mix holds
+def test_attention_bias_starts_at_zero(batch):
+    model = small_model().eval()
+    boards, _ = batch
+    before = model(boards)
+
+    with torch.no_grad():
+        for block in model.encoder:
+            block.template_mix.weight += 1.0
+
+    assert torch.equal(model(boards), before)
+
+
 #a layer that forward never uses gets no gradient and would silently never train
 def test_every_parameter_gets_a_gradient(batch):
     model = small_model()
     boards, moves = batch
+
+    #the bias is template_mix times templates, so while the templates are zero template_mix cannot get a gradient.
+    #In training they leave zero on the first step
+    with torch.no_grad():
+        model.templates.normal_(std=0.1)
 
     nn.CrossEntropyLoss()(model(boards), moves).backward()
 

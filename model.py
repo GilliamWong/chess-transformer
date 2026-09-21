@@ -1,10 +1,11 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import math
 from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, position_templates: int, dropout: float):
         super().__init__()
         #this is all from memory so bear with me
         #the input is B TOKENS_PER_BOARD d_model
@@ -33,6 +34,7 @@ class TransformerBlock(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads #these mmust be divisible 
+        self.position_templates = position_templates
         self.dropout = dropout
 
         self.Q = nn.Linear(self.d_model, self.d_model)
@@ -50,13 +52,15 @@ class TransformerBlock(nn.Module):
             nn.Linear(4 * self.d_model, self.d_model)
         )
 
+        self.template_mix = nn.Linear(self.d_model, position_templates * self.n_heads)
+
         self.attn_dropout = nn.Dropout(dropout)
         self.head_mix_dropout = nn.Dropout(dropout)
         self.mlp_dropout = nn.Dropout(dropout)
 
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #reminder that x is of shape B T d_model
+    def forward(self, x: torch.Tensor, templates: torch.Tensor) -> torch.Tensor:
+        #reminder that x is of shape B T d_model, templates is position_templates 64 64 and shared by every block
         #dims:
         B, T, d_model = x.shape
         residual = x
@@ -75,6 +79,16 @@ class TransformerBlock(nn.Module):
 
         #perform attention then softmax
         attention = (Q_heads @ K_heads.transpose(-2, -1)) / math.sqrt(self.d_head) #should be B n_heads T T
+
+        #B 64 n_heads * position_templates, reshaped to B 64 n_heads position_templates
+        position_template_coeffs = self.template_mix(x_norm[:, :NUM_SQUARES, :]).reshape(B, NUM_SQUARES, self.n_heads, self.position_templates)
+        bias = torch.einsum("biht,tij->bhij", position_template_coeffs, templates) #B n_heads 64 64
+
+        #pad takes (left, right) pairs starting from the last dim, so this grows 64 64 to T T with zeros for the metadata
+        metadata_tokens = T - NUM_SQUARES
+        bias = F.pad(bias, (0, metadata_tokens, 0, metadata_tokens))
+        attention = attention + bias
+
         softmax_attention = self.attn_dropout(torch.softmax(attention, dim=-1))
 
         attention_weights = softmax_attention @ V_heads #B n_heads T T @ B n_heads T d_head, output is B n_heads T d_head
@@ -94,7 +108,7 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, dropout: float = 0.1):
         super().__init__()
         #the dim of the board input is 70, with a torch.long dtype
         self.d_model = d_model
@@ -104,8 +118,12 @@ class ChessTransformer(nn.Module):
 
         #we'll have one positional encoding per token position on the board
         self.position_embed = nn.Parameter(torch.randn(TOKENS_PER_BOARD, self.d_model))
-        
-        self.encoder = nn.Sequential(*[TransformerBlock(self.d_model, n_heads, dropout) for _ in range(num_layers)])
+
+        #positional bias templates per piece, each the size of the entire board
+        self.templates = nn.Parameter(torch.zeros(position_templates, NUM_SQUARES, NUM_SQUARES))
+
+        #a ModuleList since Sequential can only hand a block one input, and they need the templates too
+        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, dropout) for _ in range(num_layers)])
 
         self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
         self.register_buffer("to_squares", torch.tensor(MOVE_TO_SQUARES, dtype=torch.long))
@@ -133,7 +151,9 @@ class ChessTransformer(nn.Module):
         #pass through the model layers
         #this is of dim B tokens_per_board d_model
         #we also apply layernorm as is standard with prenorm
-        model_output = self.ln(self.encoder(embed_state))
+        for block in self.encoder:
+            embed_state = block(embed_state, self.templates)
+        model_output = self.ln(embed_state)
 
         with torch.autocast(device_type=board_state.device.type, enabled=False):
 
