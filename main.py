@@ -31,6 +31,13 @@ HISTORY = 0 #past plies the model is shown, as what changed on the board in each
 
 PEAK_LEARN_RATE = 6e-3
 WARMUP_STEPS = 500
+#what the learning rate does after the warmup:
+#   cosine    falls from the peak to zero along half a cosine, over the whole run
+#   hold      stays at the peak, then falls to zero in a straight line over the last DECAY_FRACTION of the run.
+#             The part at the peak does not depend on how long the run is, so a run can later be made longer from there
+#   constant  stays at the peak. Only to see what the decay is worth, the weights never settle
+SCHEDULE = "cosine"
+DECAY_FRACTION = 0.2
 BATCH_SIZE = 1024
 
 #minutes of pure training (compiling and evaluating are not counted), unless --minutes or --positions is given.
@@ -231,11 +238,18 @@ def load_dataloaders(training_set: str = TRAINING_SET, history: int = 0) -> tupl
     )
 
 #progress is how much of the run after the warmup is done, from 0 to 1
-def lr_multiplier(step: int, progress: float) -> float:
+def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE) -> float:
     if step <= WARMUP_STEPS:
         return (step + 1) / WARMUP_STEPS
 
-    multiplier = 0.5 * (1 + math.cos(math.pi * progress))
+    if schedule == "cosine":
+        multiplier = 0.5 * (1 + math.cos(math.pi * progress))
+    elif schedule == "hold":
+        multiplier = min(1.0, (1 - progress) / DECAY_FRACTION)
+    elif schedule == "constant":
+        multiplier = 1.0
+    else:
+        raise ValueError(f"unknown schedule {schedule}")
 
     return multiplier
 
@@ -262,7 +276,8 @@ def main(
     position_templates: int = POSITION_TEMPLATES,
     training_set: str = TRAINING_SET,
     value_loss_weight: float = VALUE_LOSS_WEIGHT,
-    history: int = HISTORY):
+    history: int = HISTORY,
+    schedule: str = SCHEDULE):
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -299,14 +314,14 @@ def main(
     #fused does the whole update in one gpu kernel, it only exists for parameters that are on the gpu
     optimizer = torch.optim.AdamW(model.parameters(), lr=peak_learn_rate, fused=(device.type == "cuda"))
 
-    #the cosine runs over the part of the budget that is left when the warmup ends
+    #the schedule runs over the part of the budget that is left when the warmup ends
     warmup_end = 0.0
     def current_lr_multiplier(step: int) -> float:
         nonlocal warmup_end
         if step <= WARMUP_STEPS:
             warmup_end = budget.progress()
-            return lr_multiplier(step, 0.0)
-        return lr_multiplier(step, (budget.progress() - warmup_end) / (1 - warmup_end))
+            return lr_multiplier(step, 0.0, schedule)
+        return lr_multiplier(step, (budget.progress() - warmup_end) / (1 - warmup_end), schedule)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, current_lr_multiplier)
 
@@ -326,6 +341,7 @@ def main(
         "model_settings": model_settings,
         "parameters": num_parameters,
         "peak_learn_rate": peak_learn_rate,
+        "schedule": schedule,
         "value_loss_weight": value_loss_weight,
         "budget": budget.describe(),
         "batch_size": BATCH_SIZE,
@@ -384,6 +400,7 @@ if __name__ == "__main__":
     parser.add_argument("--training-set", default=TRAINING_SET, help="name of a training set in processed_data/, several joined with + to mix them in equal shares (val is the first one's), or carlsen. Default %(default)s")
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT, help="weight of the value head's loss next to the move loss, default %(default)s")
     parser.add_argument("--history", type=int, default=HISTORY, help="past plies the model is shown, default %(default)s")
+    parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="what the learning rate does after the warmup, see SCHEDULE in main.py. Default %(default)s")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -391,4 +408,4 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history, arguments.schedule)
