@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import math
-from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
+from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, NUM_HISTORY_CODES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
 
 VALUE_TOKEN_DIM = 16
 NUM_RESULTS = 3
@@ -111,10 +111,12 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, dropout: float = 0.1):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, dropout: float = 0.1):
         super().__init__()
         #the dim of the board input is 70, with a torch.long dtype
         self.d_model = d_model
+
+        self.history = history
 
         #one mebedding per possible board token, each of d_model size
         self.embed = nn.Embedding(BOARD_VOCAB_SIZE, self.d_model)
@@ -140,6 +142,14 @@ class ChessTransformer(nn.Module):
             nn.Linear(self.d_model, NUM_RESULTS)
         )
 
+        self.learned_history = nn.ModuleList(
+            nn.Embedding(NUM_HISTORY_CODES, self.d_model, padding_idx=0)
+            for _ in range(self.history)
+        )
+
+        for embedding in self.learned_history:
+            nn.init.zeros_(embedding.weight)
+
         self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
         self.register_buffer("to_squares", torch.tensor(MOVE_TO_SQUARES, dtype=torch.long))
 
@@ -154,7 +164,7 @@ class ChessTransformer(nn.Module):
 
         self.ln = nn.LayerNorm(self.d_model)
 
-    def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, board_state: torch.Tensor, prev_boards: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         #input is B x TOKENS_PER_BOARD
         B = board_state.shape[0]
 
@@ -163,6 +173,12 @@ class ChessTransformer(nn.Module):
 
         #add the position embed which is already the right dim
         embed_state = embed_state + self.position_embed
+
+        #history is passed in B H 64, where H is self.history. Sparse board of mostly zeroes
+        #where numbers 1-12 represent "this square changed, this is the piece that used to be here"
+        for i in range(self.history):
+            curr_history = self.learned_history[i](prev_boards[:, i, :])
+            embed_state[:, :NUM_SQUARES] = embed_state[:, :NUM_SQUARES] + curr_history
 
         #pass through the model layers
         #this is of dim B tokens_per_board d_model
@@ -185,7 +201,7 @@ class ChessTransformer(nn.Module):
             #sorta like attention, when dot producted together, make a T T matrix that represents how much the piece on each square
             #wants to go to another square
 
-            #B T T 
+            #B T T  
             logits = (from_vector @ to_vector.transpose(1, 2)) / math.sqrt(self.d_model)
 
             #B d_vocab

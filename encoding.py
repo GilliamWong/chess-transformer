@@ -120,6 +120,35 @@ def encode_board(board: chess.Board) -> list[int]:
 
     return encoding
 
+#the history the model is given is what changed on the board in each of the last plies, one code per square:
+#0 this square did not change in that ply, otherwise 1 + what stood on it before (1 it was empty, 2-13 a piece)
+NUM_HISTORY_CODES = 1 + NUM_PIECE_CODES
+
+#the squares of an encoded board seen from the other side: ranks flipped, colours swapped. encode_board shows every
+#position from its own side to move, so a position one ply back has to be turned around to lie on top of the current one
+def flip_squares(squares: list[int]) -> list[int]:
+    flipped = []
+    for rank in reversed(range(8)):
+        for piece in squares[rank * 8:rank * 8 + 8]:
+            flipped.append(0 if piece == 0 else piece + NUM_PIECE_TYPES if piece <= NUM_PIECE_TYPES else piece - NUM_PIECE_TYPES)
+    return flipped
+
+#history lists of NUM_SQUARES codes, the latest ply first, all seen the way encode_board(board) sees the board.
+#plies from before the first move on the board's stack are all 0: nothing is known about them
+def encode_history(board: chess.Board, history: int) -> list[list[int]]:
+    past = board.copy()
+    newer = encode_board(past)[:NUM_SQUARES]
+    changes = []
+    while len(changes) < history and past.move_stack:
+        past.pop()
+        older = encode_board(past)[:NUM_SQUARES]
+        if past.turn != board.turn:
+            older = flip_squares(older)
+        changes.append([0 if old == new else 1 + old for old, new in zip(older, newer)])
+        newer = older
+
+    return changes + [[0] * NUM_SQUARES for _ in range(history - len(changes))]
+
 def decode_board(encoding: list[int]) -> chess.Board:
     board = chess.Board.empty() #white to move, which is how every board is encoded
 

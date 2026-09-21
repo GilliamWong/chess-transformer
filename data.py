@@ -1,6 +1,6 @@
 from pathlib import Path
 from dataclasses import dataclass
-from encoding import TOKENS_PER_BOARD, encode_board, encode_move_to_id
+from encoding import NUM_PIECE_TYPES, NUM_SQUARES, TOKENS_PER_BOARD, encode_board, encode_move_to_id
 from collections.abc import Iterator
 from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, Sampler, SequentialSampler
 import numpy as np
@@ -79,36 +79,50 @@ def split_data(games: list[Game], train_fraction: float = 0.8, seed: int = 42) -
     return train, val
 
 
+#a piece code seen from the other side: empty stays empty, the mover's pieces 1-6 and the opponent's 7-12 trade places
+SWAPPED_PIECES = torch.tensor([0] + list(range(NUM_PIECE_TYPES + 1, 2 * NUM_PIECE_TYPES + 1)) + list(range(1, NUM_PIECE_TYPES + 1)))
+
 class ChessGamesDataset(Dataset):
     """set of examples of chess games that we can use as a dataset"""
 
-    def __init__(self, games: list[Game]):
+    #history is how many past plies every item describes, see __getitem__
+    def __init__(self, games: list[Game], history: int = 0):
+        self.history = history
         #three tensors: the board positions, the moves and how the games ended
         boards = []
         moves = []
         results = []
+        plies = []
 
         for game in games:
-            for example in game:
+            for ply, example in enumerate(game):
                 boards.append(example.board)
                 moves.append(example.move)
                 results.append(example.result)
+                plies.append(ply)
 
         self.boards = torch.tensor(boards, dtype=torch.uint8)
         self.moves = torch.tensor(moves, dtype=torch.int16)
         self.results = torch.tensor(results, dtype=torch.int8)
+        #how many rows before this one belong to the same game. Games lie one after the other, so that is where
+        #the history of a position is found
+        self.plies = torch.tensor(plies, dtype=torch.int16)
 
     #for positions that are already arrays (load_training_set). They can be memory mapped and far too
     #many for a python list of games: the tensors share the arrays' memory, nothing is copied
     @classmethod
-    def from_arrays(cls, boards: np.ndarray, moves: np.ndarray, results: np.ndarray) -> "ChessGamesDataset":
+    def from_arrays(cls, boards: np.ndarray, moves: np.ndarray, results: np.ndarray, plies: np.ndarray | None = None, history: int = 0) -> "ChessGamesDataset":
         if not len(boards) == len(moves) == len(results):
             raise ValueError(f"{len(boards)} boards but {len(moves)} moves and {len(results)} results")
+        if history > 0 and (plies is None or len(plies) != len(boards)):
+            raise ValueError("history needs the ply of every position, to know which rows are the same game")
 
-        dataset = cls([])
+        dataset = cls([], history)
         dataset.boards = torch.from_numpy(boards)
         dataset.moves = torch.from_numpy(moves)
         dataset.results = torch.from_numpy(results)
+        if plies is not None:
+            dataset.plies = torch.from_numpy(plies)
 
         return dataset
 
@@ -116,9 +130,37 @@ class ChessGamesDataset(Dataset):
         return len(self.moves)
 
     #index is one position, or a list of positions that come back as one batch (see datasets_to_dataloaders)
+    #the squares of rows, turned around for the rows where flip is set
+    def squares(self, rows: torch.Tensor, flip: bool) -> torch.Tensor:
+        squares = self.boards[rows][:, :NUM_SQUARES].long()
+        if flip:
+            squares = SWAPPED_PIECES[squares.reshape(-1, 8, 8).flip(1).reshape(-1, NUM_SQUARES)]
+        return squares
+
+    #what encoding.encode_history gives, for whole batches and from the stored boards: the row k before a position is
+    #the position k plies earlier if the position's ply is at least k. Boards are stored from their own side to move,
+    #which alternates, so every second one is turned around. (positions, history, NUM_SQUARES)
+    def history_of(self, rows: torch.Tensor) -> torch.Tensor:
+        changes = torch.zeros((len(rows), self.history, NUM_SQUARES), dtype=torch.long)
+        if self.history == 0:
+            return changes
+
+        plies = self.plies[rows]
+        newer = self.squares(rows, flip=False)
+        for back in range(1, self.history + 1):
+            known = plies >= back
+            older = self.squares((rows - back).clamp(min=0), flip=back % 2 == 1)
+            changes[:, back - 1] = torch.where(known.unsqueeze(1) & (older != newer), 1 + older, 0)
+            newer = older
+        return changes
+
     #the result comes back as the class the value head predicts: 0 lost, 1 draw, 2 won
-    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.boards[index].long(), self.moves[index].long(), self.results[index].long() + 1
+    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows = torch.as_tensor(index)
+        history = self.history_of(rows.reshape(-1))
+        if rows.ndim == 0:
+            history = history[0]
+        return self.boards[index].long(), self.moves[index].long(), self.results[index].long() + 1, history
 
 
 #several training sets behind one index: the positions of the first, then of the second and so on. The sets stay
@@ -132,15 +174,14 @@ class MixedDataset(Dataset):
         return sum(len(dataset) for dataset in self.datasets)
 
     #a batch comes back grouped by set rather than in the order of index, which training does not care about
-    def __getitem__(self, index: list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: list[int]) -> tuple[torch.Tensor, ...]:
         indices = torch.as_tensor(index)
         parts = []
         for dataset, first_index in zip(self.datasets, self.first_indices):
             in_dataset = indices[(indices >= first_index) & (indices < first_index + len(dataset))] - first_index
             parts.append(dataset[in_dataset.tolist()])
 
-        boards, moves, results = zip(*parts)
-        return torch.cat(boards), torch.cat(moves), torch.cat(results)
+        return tuple(torch.cat(tensors) for tensors in zip(*parts))
 
 
 #batches for a MixedDataset with the same number of positions from every set, however different their sizes.
@@ -172,13 +213,14 @@ def create_dataloaders(
     train_batch_size: int = 256,
     val_batch_size: int = 512,
     train_fraction: float = 0.8,
-    seed: int = 42
+    seed: int = 42,
+    history: int = 0
 ) -> tuple[DataLoader, DataLoader]:
 
     train_data, val_data = split_data(games, train_fraction=train_fraction, seed=seed)
 
-    train_dataset = ChessGamesDataset(train_data)
-    val_dataset = ChessGamesDataset(val_data)
+    train_dataset = ChessGamesDataset(train_data, history)
+    val_dataset = ChessGamesDataset(val_data, history)
 
     return datasets_to_dataloaders(train_dataset, val_dataset, train_batch_size, val_batch_size)
 
@@ -211,9 +253,11 @@ def datasets_to_dataloaders(
 #
 #"baseline+fishtest" mixes sets: every train batch takes the same number of positions from each. The val positions
 #are those of the first set alone, so the val numbers of a mix can be compared with runs on that set
-def load_training_set(name: str) -> tuple[ChessGamesDataset | MixedDataset, ChessGamesDataset]:
+#
+#with history the items also describe that many past plies, which needs <name>_{train,val}_plies.bin
+def load_training_set(name: str, history: int = 0) -> tuple[ChessGamesDataset | MixedDataset, ChessGamesDataset]:
     if "+" in name:
-        train_datasets, val_datasets = zip(*(load_training_set(one_name) for one_name in name.split("+")))
+        train_datasets, val_datasets = zip(*(load_training_set(one_name, history) for one_name in name.split("+")))
         return MixedDataset(list(train_datasets)), val_datasets[0]
 
     datasets = []
@@ -231,6 +275,13 @@ def load_training_set(name: str) -> tuple[ChessGamesDataset | MixedDataset, Ches
         boards = np.memmap(boards_path, dtype=np.uint8, mode="c").reshape(-1, TOKENS_PER_BOARD)
         moves = np.memmap(moves_path, dtype=np.int16, mode="c")
         results = np.memmap(results_path, dtype=np.int8, mode="c")
-        datasets.append(ChessGamesDataset.from_arrays(boards, moves, results))
+
+        plies = None
+        if history > 0:
+            plies_path = PROCESSED_DATA_DIR / f"{name}_{split}_plies.bin"
+            if not plies_path.exists():
+                raise FileNotFoundError(f"{plies_path.name} is missing, scripts_used/add_plies.py writes it")
+            plies = np.memmap(plies_path, dtype=np.int16, mode="c")
+        datasets.append(ChessGamesDataset.from_arrays(boards, moves, results, plies, history))
 
     return datasets[0], datasets[1]

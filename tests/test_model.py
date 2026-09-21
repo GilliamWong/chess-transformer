@@ -19,7 +19,7 @@ def small_model() -> ChessTransformer:
 def batch(carlsen_games) -> tuple[torch.Tensor, torch.Tensor]:
     """the first positions of a real game, with the moves played from them"""
     dataset = ChessGamesDataset([game_to_examples(carlsen_games[0])])
-    boards, moves, _ = zip(*(dataset[index] for index in range(BATCH_SIZE)))
+    boards, moves, _, _ = zip(*(dataset[index] for index in range(BATCH_SIZE)))
     return torch.stack(boards), torch.stack(moves)
 
 
@@ -123,3 +123,29 @@ def test_can_overfit_one_batch(batch):
     assert first_loss > 5  #an untrained guess over 1968 moves is about ln(1968) = 7.6
     assert loss.item() < 0.3  #the final layer norm bounds the pooled vector, so the loss no longer races to zero
     assert (model(boards)[0].argmax(dim=1) == moves).all()
+
+
+#the history embeddings start at zero, so a new model with history is exactly the model without it
+def test_untrained_history_changes_nothing(batch):
+    boards, _ = batch
+    torch.manual_seed(0)
+    without = ChessTransformer(d_model=32, num_layers=2, n_heads=2, dropout=0.0).eval()
+    torch.manual_seed(0)
+    with_history = ChessTransformer(d_model=32, num_layers=2, n_heads=2, history=2, dropout=0.0).eval()
+    with_history.load_state_dict(without.state_dict(), strict=False)
+    history = torch.randint(0, 14, (BATCH_SIZE, 2, 64))
+
+    assert torch.equal(with_history(boards, history)[0], without(boards)[0])
+
+
+def test_trained_history_changes_the_output_but_not_for_code_zero(batch):
+    boards, _ = batch
+    model = ChessTransformer(d_model=32, num_layers=2, n_heads=2, history=1, dropout=0.0).eval()
+    with torch.no_grad():
+        model.learned_history[0].weight[1:].normal_()
+    nothing_changed = torch.zeros((BATCH_SIZE, 1, 64), dtype=torch.long)
+    something_changed = nothing_changed.clone()
+    something_changed[:, 0, 12] = 5
+
+    assert torch.equal(model(boards, nothing_changed)[0], model(boards, torch.zeros_like(nothing_changed))[0])
+    assert not torch.allclose(model(boards, something_changed)[0], model(boards, nothing_changed)[0])

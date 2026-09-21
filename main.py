@@ -27,6 +27,7 @@ D_MODEL = 128
 NUM_LAYERS = 4
 N_HEADS = 4
 POSITION_TEMPLATES = 16
+HISTORY = 0 #past plies the model is shown, as what changed on the board in each
 
 PEAK_LEARN_RATE = 6e-3
 WARMUP_STEPS = 500
@@ -49,10 +50,9 @@ VALUE_LOSS_WEIGHT = 1.0
 TRAINING_SET = "baseline"
 
 
-def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, ...]]:
     while True:
-        for batch, labels, results in data_loader:
-            yield batch, labels, results
+        yield from data_loader
 
 #the same batches, already on the device. A background thread reads the next few and copies them over while the gpu
 #works on the current one; reading them only when the step asks for them left the gpu waiting 4-5 ms of every 25.
@@ -100,9 +100,10 @@ def train(
                     bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}{postfix}]")
 
     #results is how each position's game ended for the side to move: 0 lost, 1 draw, 2 won
-    for batch, labels, results in batches_on_device(endless_batches(train_data_loader), device):
+    #history is what changed on the board in the plies before each position, empty for a model that is not shown any
+    for batch, labels, results, history in batches_on_device(endless_batches(train_data_loader), device):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits, value_logits = model(batch)
+            logits, value_logits = model(batch, history)
 
             loss = loss_function(logits, labels) + value_loss_weight * loss_function(value_logits, results)
 
@@ -180,14 +181,15 @@ def evaluate_model(
         #islice stops after num_batches, leave=False clears the bar afterwards
         progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False, dynamic_ncols=True)
 
-        for batch, labels, results in progress:
+        for batch, labels, results, history in progress:
             labels = labels.to(device)
             results = results.to(device)
             batch = batch.to(device)
+            history = history.to(device)
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 #should be of dim B 1 output_dim
-                logits, value_logits = model(batch)
+                logits, value_logits = model(batch, history)
 
                 model_preds = torch.softmax(logits, dim=-1).argmax(dim=-1)
 
@@ -208,7 +210,7 @@ def evaluate_model(
     return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples)
 
 
-def load_dataloaders(training_set: str = TRAINING_SET) -> tuple[DataLoader, DataLoader]:
+def load_dataloaders(training_set: str = TRAINING_SET, history: int = 0) -> tuple[DataLoader, DataLoader]:
     if training_set == "carlsen":
         print("parsing games, this takes a while")
         games = pgns_to_examples([CARLSEN_PGN])
@@ -216,10 +218,11 @@ def load_dataloaders(training_set: str = TRAINING_SET) -> tuple[DataLoader, Data
             games,
             train_batch_size=BATCH_SIZE,
             val_batch_size=BATCH_SIZE,
-            seed=SEED
+            seed=SEED,
+            history=history
         )
 
-    train_dataset, val_dataset = load_training_set(training_set)
+    train_dataset, val_dataset = load_training_set(training_set, history)
     return datasets_to_dataloaders(
         train_dataset,
         val_dataset,
@@ -258,7 +261,8 @@ def main(
     peak_learn_rate: float = PEAK_LEARN_RATE,
     position_templates: int = POSITION_TEMPLATES,
     training_set: str = TRAINING_SET,
-    value_loss_weight: float = VALUE_LOSS_WEIGHT):
+    value_loss_weight: float = VALUE_LOSS_WEIGHT,
+    history: int = HISTORY):
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -270,7 +274,7 @@ def main(
         run_name = f"d{d_model}_L{num_layers}_h{n_heads}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
 
     #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
-    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "dropout": DROPOUT}
+    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "history": history, "dropout": DROPOUT}
 
     #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
     if not budget.timed and budget.max_steps <= WARMUP_STEPS:
@@ -283,7 +287,7 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}")
 
-    train_data_loader, val_data_loader = load_dataloaders(training_set)
+    train_data_loader, val_data_loader = load_dataloaders(training_set, history)
     print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
 
     model = ChessTransformer(**model_settings).to(device)
@@ -379,6 +383,7 @@ if __name__ == "__main__":
     parser.add_argument("--templates", type=int, default=POSITION_TEMPLATES, help="attention bias templates the blocks mix, default %(default)s")
     parser.add_argument("--training-set", default=TRAINING_SET, help="name of a training set in processed_data/, several joined with + to mix them in equal shares (val is the first one's), or carlsen. Default %(default)s")
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT, help="weight of the value head's loss next to the move loss, default %(default)s")
+    parser.add_argument("--history", type=int, default=HISTORY, help="past plies the model is shown, default %(default)s")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -386,4 +391,4 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history)

@@ -16,7 +16,7 @@ from data import (
     pgns_to_examples,
     split_data,
 )
-from encoding import TOKENS_PER_BOARD, decode_board, decode_id_to_move, encode_board, encode_move_to_id
+from encoding import TOKENS_PER_BOARD, decode_board, decode_id_to_move, encode_board, encode_history, encode_move_to_id
 
 
 def make_board(fill: int) -> list[int]:
@@ -55,13 +55,13 @@ def test_dataset_flattens_games_in_order():
 
     assert len(dataset) == 3
     for index, (fill, move_id) in enumerate([(1, 10), (2, 20), (3, 30)]):
-        board, move, _ = dataset[index]
+        board, move, _, _ = dataset[index]
         assert board.tolist() == make_board(fill)
         assert move.item() == move_id
 
 
 def test_items_have_the_dtype_and_shape_the_model_needs():
-    board, move, result = ChessGamesDataset(TWO_GAMES)[0]
+    board, move, result, _ = ChessGamesDataset(TWO_GAMES)[0]
 
     #embedding lookups and CrossEntropyLoss targets both require int64
     assert board.dtype == torch.long and board.shape == (TOKENS_PER_BOARD,)
@@ -70,7 +70,7 @@ def test_items_have_the_dtype_and_shape_the_model_needs():
 
 
 def test_results_come_back_as_the_classes_of_the_value_head():
-    _, _, results = ChessGamesDataset(TWO_GAMES)[[0, 1, 2]]
+    _, _, results, _ = ChessGamesDataset(TWO_GAMES)[[0, 1, 2]]
 
     assert results.tolist() == [2, 0, 1]  #won, lost, draw
 
@@ -79,7 +79,7 @@ def test_largest_values_survive_compact_storage():
     #80 is the largest board token (en passant on h8), 1967 the largest move id
     dataset = ChessGamesDataset([[TrainingExample(make_board(80), 1967, 0)]])
 
-    board, move, _ = dataset[0]
+    board, move, _, _ = dataset[0]
     assert board.tolist() == make_board(80)
     assert move.item() == 1967
 
@@ -93,7 +93,7 @@ def test_value_too_large_for_storage_is_rejected():
 def test_dataloader_batches_boards_and_moves():
     loader = DataLoader(ChessGamesDataset(TWO_GAMES), batch_size=2, shuffle=False)
 
-    boards, moves, _ = next(iter(loader))
+    boards, moves, _, _ = next(iter(loader))
 
     assert boards.shape == (2, TOKENS_PER_BOARD)
     assert moves.tolist() == [10, 20]
@@ -106,7 +106,7 @@ def test_every_label_is_legal_in_its_position(carlsen_games):
 
     assert len(dataset) == sum(len(game) for game in games)
     for index in range(len(dataset)):
-        board, move, _ = dataset[index]
+        board, move, _, _ = dataset[index]
         position = decode_board(board.tolist())
         assert decode_id_to_move(move.item(), position.turn) in position.legal_moves, index
 
@@ -162,7 +162,7 @@ def test_split_rejects_a_percentage():
 
 def loader_moves(loader: DataLoader) -> list[int]:
     """every move id the loader yields in one epoch, in the order it yields them"""
-    return [move for _, moves, _ in loader for move in moves.tolist()]
+    return [move for _, moves, _, _ in loader for move in moves.tolist()]
 
 
 def write_pgn(pgn_path, games) -> None:
@@ -195,8 +195,8 @@ def test_dataloaders_keep_each_game_on_one_side_of_the_split():
 def test_dataloaders_use_their_own_batch_sizes():
     train_loader, val_loader = create_dataloaders(make_games(100), train_batch_size=16, val_batch_size=5)
 
-    train_boards, train_moves, _ = next(iter(train_loader))
-    val_boards, val_moves, _ = next(iter(val_loader))
+    train_boards, train_moves, _, _ = next(iter(train_loader))
+    val_boards, val_moves, _, _ = next(iter(val_loader))
 
     assert train_boards.shape == (16, TOKENS_PER_BOARD) and train_moves.shape == (16,)
     assert val_boards.shape == (5, TOKENS_PER_BOARD) and val_moves.shape == (5,)
@@ -245,7 +245,7 @@ def test_dataset_from_arrays_rejects_mismatched_lengths():
 
 
 def test_a_list_of_indices_comes_back_as_one_batch():
-    boards, moves, _ = ChessGamesDataset(TWO_GAMES)[[2, 0]]
+    boards, moves, _, _ = ChessGamesDataset(TWO_GAMES)[[2, 0]]
 
     assert boards.shape == (2, TOKENS_PER_BOARD)
     assert moves.tolist() == [30, 10]
@@ -268,7 +268,7 @@ def test_training_set_is_loaded_from_raw_arrays(tmp_path, monkeypatch):
     train_dataset, val_dataset = load_training_set("tiny")
 
     assert len(train_dataset) == 300 and len(val_dataset) == 20
-    boards, moves, results = train_dataset[[299, 0]]
+    boards, moves, results, _ = train_dataset[[299, 0]]
     assert boards.tolist() == [[5] * TOKENS_PER_BOARD] * 2
     assert moves.tolist() == [299, 0]  #large enough that reading the int16 moves as bytes would give something else
     assert results.tolist() == [0, 0]  #-1 in the file, a lost game
@@ -286,7 +286,7 @@ def test_mixed_training_sets_share_every_batch_equally(tmp_path, monkeypatch):
     train_loader, _ = datasets_to_dataloaders(train_dataset, val_dataset, train_batch_size=16, val_batch_size=16)
 
     assert len(train_dataset) == 3100 and len(val_dataset) == 20  #val is the first set's
-    for _, (boards, moves, results) in zip(range(20), train_loader):
+    for _, (boards, moves, results, _) in zip(range(20), train_loader):
         assert boards.shape == (16, TOKENS_PER_BOARD) and results.shape == (16,)
         assert (moves >= 10000).sum() == 8  #half of every batch although small is 3% of the positions
 
@@ -306,3 +306,38 @@ def test_training_set_with_mismatched_files_is_rejected(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError):
         load_training_set("broken")
+
+
+#the dataset finds the history in the rows before a position, the player takes it from the board's moves.
+#Both have to see the same thing, for both colours and through captures, castling, en passant and promotions
+def test_history_from_stored_rows_matches_history_from_the_board(carlsen_games):
+    games = [game_to_examples(game) for game in carlsen_games]
+    dataset = ChessGamesDataset(games, history=3)
+
+    row = 0
+    for game in carlsen_games:
+        board = game.board()
+        for move in game.mainline_moves():
+            assert dataset[row][3].tolist() == encode_history(board, 3), (row, board.fen())
+            board.push(move)
+            row += 1
+
+
+def test_history_of_a_capture_names_the_squares_and_what_stood_there():
+    board = chess.Board()
+    for san in ("e4", "d5", "exd5"):
+        board.push_san(san)
+
+    #black to move, so the board is seen from black's side: white's pawn went from e4 to d5, which are e5 and d4
+    #from there, and it is the opponent's pawn (7) that moved and the mover's own pawn (1) that was taken
+    last_ply, = encode_history(board, 1)
+    changed = {chess.square_name(square): code for square, code in enumerate(last_ply) if code != 0}
+    assert changed == {"e5": 1 + 7, "d4": 1 + 1}
+
+
+def test_history_is_empty_before_the_first_move_and_without_history():
+    dataset = ChessGamesDataset(TWO_GAMES, history=2)
+
+    assert dataset[0][3].tolist() == [[0] * 64, [0] * 64]  #the first position of a game
+    assert dataset[2][3].tolist() == [[0] * 64, [0] * 64]  #and of the next game, whatever the row before it holds
+    assert ChessGamesDataset(TWO_GAMES)[[0, 1]][3].shape == (2, 0, 64)
