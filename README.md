@@ -54,6 +54,29 @@ size can be played (`--checkpoint artifacts/runs/<name>/model.pt` plays an older
 that built it are in the git history (`preprocess.py`, `select_games.py`). A fresh clone has only the
 Carlsen games, so set `TRAINING_SET = "carlsen"`.
 
+### Stockfish's moves as the target
+
+`baseline_sf` is a copy of the first 10 million positions of `baseline` (whole games, so `--history` works) in
+which Stockfish has looked at every position: its 4 best moves and the score after each, at depth 10. The same
+positions can then be trained on with either target, which is the A/B test of the labels:
+
+```
+uv run main.py --training-set baseline_sf                            the move the human played
+uv run main.py --training-set baseline_sf --policy-target stockfish  Stockfish's best moves
+```
+
+With `stockfish` the target is a distribution over those moves: a softmax over the expected score after each
+(0 lost to 1 won), divided by `--target-temperature` (0.02: a move that gives up 2% of the expected score gets 1/e
+of the best move's share). Validation loss and accuracy are then against Stockfish's moves, so they are not
+comparable with a `human` run's. Compare the two on puzzles and Elo, or measure a checkpoint against the other target:
+
+```
+uv run python -m tools.evaluate_checkpoint artifacts/runs/<run>/model.pt --training-set baseline_sf --policy-target stockfish
+uv run python -m tools.label_with_stockfish     makes the set, about 4 hours for 10 million positions. Can be stopped and continued
+```
+
+In a mix (`baseline_sf+fishtest`) the sets without labels keep the move that was played.
+
 ## Play against it and measure its strength
 
 Windows only. Fetch Stockfish and Cute Chess once, then run a match:
@@ -89,6 +112,6 @@ Everything else is kept out of the way:
 
 | Folder | What is in it |
 |---|---|
-| `tools/` | Checkpoint saving and loading, the training budget, the run table and results page, the TensorBoard launcher, and `play/` (choosing the model's move, the UCI protocol, matches against Stockfish). Run as modules from the root: `python -m tools.<name>` |
+| `tools/` | Checkpoint saving and loading, the training budget, the run table and results page, the TensorBoard launcher, labelling a training set with Stockfish, and `play/` (choosing the model's move, the UCI protocol, matches against Stockfish). Run as modules from the root: `python -m tools.<name>` |
 | `artifacts/` | No code: the PGNs, preprocessed training sets, checkpoints, TensorBoard runs and chess engines. Only `pgn_data/Carlsen.pgn` is in git |
 | `tests/` | `uv run pytest` |

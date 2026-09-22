@@ -19,19 +19,20 @@ def small_model() -> ChessTransformer:
 def batch(carlsen_games) -> tuple[torch.Tensor, torch.Tensor]:
     """the first positions of a real game, with the moves played from them"""
     dataset = ChessGamesDataset([game_to_examples(carlsen_games[0])])
-    boards, moves, _, _ = zip(*(dataset[index] for index in range(BATCH_SIZE)))
-    return torch.stack(boards), torch.stack(moves)
+    boards, target_moves, _, _, _, _ = zip(*(dataset[index] for index in range(BATCH_SIZE)))
+    return torch.stack(boards), torch.stack(target_moves)[:, 0]  #the one target move of each position: the move played
 
 
 def test_one_set_of_move_logits_per_board(batch):
     boards, _ = batch
 
-    logits, value_logits = small_model()(boards)
+    logits, value_logits, future_logits = small_model()(boards)
 
     #not (batch, TOKENS_PER_BOARD, NUM_MOVE_IDS): the tokens have to be pooled into one answer per board
     assert boards.shape == (BATCH_SIZE, TOKENS_PER_BOARD)
     assert logits.shape == (BATCH_SIZE, NUM_MOVE_IDS)
     assert value_logits.shape == (BATCH_SIZE, 3)  #lost, draw, won
+    assert future_logits is None  #no future head unless asked for
 
 
 #without the positional embedding the model sees which pieces exist but not where they are
@@ -54,7 +55,7 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
     boards, _ = batch
 
     for alone, in_a_batch in zip(model(boards[:1]), model(boards)):
-        assert torch.allclose(alone, in_a_batch[:1], atol=1e-5)
+        assert alone is None or torch.allclose(alone, in_a_batch[:1], atol=1e-5)  #None is the missing future head
 
 
 #something added to every move changes no probability but can grow without limit, and did: training in bf16
@@ -62,7 +63,7 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
 def test_promotion_term_only_changes_promotion_logits(batch):
     model = small_model().eval()
     boards, _ = batch
-    before, _ = model(boards)
+    before, _, _ = model(boards)
 
     with torch.no_grad():
         model.promotion_projection.bias += 5.0
@@ -78,7 +79,7 @@ def test_promotion_term_only_changes_promotion_logits(batch):
 def test_attention_bias_starts_at_zero(batch):
     model = small_model().eval()
     boards, _ = batch
-    before, _ = model(boards)
+    before, _, _ = model(boards)
 
     with torch.no_grad():
         for block in model.encoder:
@@ -97,10 +98,14 @@ def test_every_parameter_gets_a_gradient(batch):
     with torch.no_grad():
         model.templates.normal_(std=0.1)
 
-    #both heads have to be in the loss, or the one left out gets no gradient
-    logits, value_logits = model(boards)
+    #every head has to be in the loss, or the one left out gets no gradient
+    model = ChessTransformer(d_model=32, num_layers=2, n_heads=2, future=2, dropout=0.0)
+    with torch.no_grad():
+        model.templates.normal_(std=0.1)
+    logits, value_logits, future_logits = model(boards)
     results = torch.ones(len(boards), dtype=torch.long)
-    (nn.CrossEntropyLoss()(logits, moves) + nn.CrossEntropyLoss()(value_logits, results)).backward()
+    future = torch.zeros((len(boards), 64), dtype=torch.long)
+    (nn.CrossEntropyLoss()(logits, moves) + nn.CrossEntropyLoss()(value_logits, results) + nn.CrossEntropyLoss()(future_logits.flatten(0, 1), future.flatten())).backward()
 
     for name, parameter in model.named_parameters():
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name

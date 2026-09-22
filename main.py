@@ -11,8 +11,9 @@ from collections.abc import Callable, Iterator
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from data import ARTIFACTS_DIR, CARLSEN_PGN, pgns_to_examples, create_dataloaders, datasets_to_dataloaders, load_training_set
+from data import FUTURE_UNKNOWN, ARTIFACTS_DIR, CARLSEN_PGN, pgns_to_examples, create_dataloaders, datasets_to_dataloaders, load_training_set
 import torch
+import torch.nn.functional as F
 import math
 from torch import nn
 from torch.utils.data import DataLoader
@@ -28,6 +29,8 @@ NUM_LAYERS = 4
 N_HEADS = 4
 POSITION_TEMPLATES = 16
 HISTORY = 0 #past plies the model is shown, as what changed on the board in each
+FUTURE = 0 #plies ahead the future head predicts the board's changes, 0 for no future head
+FUTURE_LOSS_WEIGHT = 0.5
 
 PEAK_LEARN_RATE = 6e-3
 WARMUP_STEPS = 500
@@ -51,6 +54,12 @@ SEED = 42 #of the model's first weights and of the order of the training positio
 DROPOUT = 0.0
 
 VALUE_LOSS_WEIGHT = 1.0
+
+#what the policy learns to predict: "human" is the move that was played, "stockfish" is stockfish's best moves for the
+#sets that tools/label_with_stockfish.py has labelled. How they share the probability is TARGET_TEMPERATURE, in expected
+#score (0 lost to 1 won): a move that gives up this much gets 1/e of the best move's share. See policy_target in data.py
+POLICY_TARGET = "human"
+TARGET_TEMPERATURE = 0.02
 
 #"carlsen" parses pgn_data/Carlsen.pgn, which is in the repository and takes 20 seconds.
 #anything else is the name of a training set in processed_data/ (see load_training_set in data.py)
@@ -81,6 +90,13 @@ def batches_on_device(batches: Iterator[tuple[torch.Tensor, ...]], device: torch
         yield ready.get()
 
 
+#cross entropy against a target that is a few moves with a probability each (B, moves) instead of one move.
+#With a single move at probability 1 it is nn.CrossEntropyLoss. Places at probability 0 add nothing, whatever their move
+def policy_loss(logits: torch.Tensor, target_moves: torch.Tensor, target_probabilities: torch.Tensor) -> torch.Tensor:
+    log_probabilities = torch.log_softmax(logits, dim=-1).gather(1, target_moves)
+    return -(target_probabilities * log_probabilities).sum(dim=-1).mean()
+
+
 def train(
     model: nn.Module,
     save_best_checkpoint: Callable[[], None],
@@ -93,7 +109,8 @@ def train(
     best_val_loss: float,
     budget: Budget,
     writer: SummaryWriter,
-    value_loss_weight: float = VALUE_LOSS_WEIGHT) -> None:
+    value_loss_weight: float = VALUE_LOSS_WEIGHT,
+    future_loss_weight: float = FUTURE_LOSS_WEIGHT) -> None:
 
     #kept on the device: adding to it does not make the cpu wait for the gpu the way loss.item() does
     loss_total = torch.zeros((), device=device)
@@ -106,13 +123,17 @@ def train(
     progress = tqdm(total=budget.total, desc="train", dynamic_ncols=True, unit="s" if budget.timed else "it",
                     bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}{postfix}]")
 
+    #target_moves and target_probabilities are the policy target: the move played, or stockfish's best few (policy_loss)
     #results is how each position's game ended for the side to move: 0 lost, 1 draw, 2 won
     #history is what changed on the board in the plies before each position, empty for a model that is not shown any
-    for batch, labels, results, history in batches_on_device(endless_batches(train_data_loader), device):
+    #future is what will have changed some plies ahead, the future head's target (all FUTURE_UNKNOWN without the head)
+    for batch, target_moves, target_probabilities, results, history, future in batches_on_device(endless_batches(train_data_loader), device):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits, value_logits = model(batch, history)
+            logits, value_logits, future_logits = model(batch, history)
 
-            loss = loss_function(logits, labels) + value_loss_weight * loss_function(value_logits, results)
+            loss = policy_loss(logits, target_moves, target_probabilities) + value_loss_weight * loss_function(value_logits, results)
+            if future_logits is not None:
+                loss = loss + future_loss_weight * future_loss(future_logits, future)
 
         optimizer.zero_grad()
 
@@ -125,8 +146,8 @@ def train(
         scheduler.step()
         step = budget.steps
 
-        loss_total += loss.detach() * len(labels)
-        total_examples += len(labels)
+        loss_total += loss.detach() * len(batch)
+        total_examples += len(batch)
 
         #the running average, a single batch's loss jumps around too much to read
         if step % POSTFIX_EVERY == 0:
@@ -136,11 +157,11 @@ def train(
         if step % EVAL_EVERY == 0 or budget.finished():
             train_loss = loss_total.item() / total_examples #also waits for the gpu, so the pause starts when the steps are really done
             budget.pause() #evaluating does not count towards a budget in minutes
-            val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
+            val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_future_loss = evaluate_model(model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
             model.train()
 
             #tqdm.write rather than print, which would cut through the progress bar
-            tqdm.write(f"step {step} ({budget.positions:,} positions, {budget.seconds / 60:.1f} min): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
+            tqdm.write(f"step {step} ({budget.positions:,} positions, {budget.seconds / 60:.1f} min): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}, future loss {val_future_loss:.3f}")
 
             #the part of the name before the slash groups the plots: both losses end up next to each other
             writer.add_scalar("loss/train", train_loss, step)
@@ -148,6 +169,7 @@ def train(
             writer.add_scalar("accuracy/val", val_accuracy, step)
             writer.add_scalar("loss/val_value", val_value_loss, step)
             writer.add_scalar("accuracy/val_value", val_value_accuracy, step)
+            writer.add_scalar("loss/val_future", val_future_loss, step)
             writer.add_scalar("learning_rate", scheduler.get_last_lr()[0], step)
 
             if val_loss < best_val_loss:
@@ -164,20 +186,28 @@ def train(
     progress.close()
 
 
+#cross entropy of the future head over every square whose future is known: logits are (B, squares, codes),
+#targets (B, squares) with FUTURE_UNKNOWN where the game ended first
+def future_loss(future_logits: torch.Tensor, future: torch.Tensor) -> torch.Tensor:
+    return F.cross_entropy(future_logits.flatten(0, 1), future.flatten(), ignore_index=FUTURE_UNKNOWN)
+
+
 #returns average loss and accuracy for the model on the test set, or on its first max_batches batches: first of the
-#moves, then of the value head. The move loss stays on its own so it can be compared with runs from before the value head.
+#moves, then of the value head, then the future head's loss (0 without the head). The move loss stays on its own so it
+#can be compared with runs from before the other heads.
 #the val loader is not shuffled, so those are the same positions every time and the numbers can be compared
 def evaluate_model(
     model: nn.Module, 
     test_data_loader: DataLoader, 
     loss_function: nn.Module, 
     device: torch.device,
-    max_batches: int | None = None) -> tuple[float, float, float, float]:
+    max_batches: int | None = None) -> tuple[float, float, float, float, float]:
 
     epoch_loss_total = 0.0
     total_correct_preds = 0
     value_loss_total = 0.0
     value_correct_preds = 0
+    future_loss_total = 0.0
     total_examples = 0
 
     model.eval()
@@ -188,37 +218,44 @@ def evaluate_model(
         #islice stops after num_batches, leave=False clears the bar afterwards
         progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False, dynamic_ncols=True)
 
-        for batch, labels, results, history in progress:
-            labels = labels.to(device)
+        for batch, target_moves, target_probabilities, results, history, future in progress:
+            target_moves = target_moves.to(device)
+            target_probabilities = target_probabilities.to(device)
             results = results.to(device)
             batch = batch.to(device)
             history = history.to(device)
+            future = future.to(device)
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 #should be of dim B 1 output_dim
-                logits, value_logits = model(batch, history)
+                logits, value_logits, future_logits = model(batch, history)
 
                 model_preds = torch.softmax(logits, dim=-1).argmax(dim=-1)
 
-                loss = loss_function(logits, labels)
+                loss = policy_loss(logits, target_moves, target_probabilities)
                 value_loss = loss_function(value_logits, results)
+                if future_logits is not None:
+                    future_loss_total += future_loss(future_logits, future).item() * len(batch)
 
-            epoch_loss_total += loss.item() * len(labels)
-            total_correct_preds += (model_preds == labels).sum().item()
-            value_loss_total += value_loss.item() * len(labels)
+            #accuracy is against the first target move: the move played, or the one stockfish likes best
+            epoch_loss_total += loss.item() * len(batch)
+            total_correct_preds += (model_preds == target_moves[:, 0]).sum().item()
+            value_loss_total += value_loss.item() * len(batch)
             value_correct_preds += (value_logits.argmax(dim=-1) == results).sum().item()
-            total_examples += len(labels)
+            total_examples += len(batch)
 
             progress.set_postfix(
                 loss=f"{epoch_loss_total / total_examples:.3f}",
                 accuracy=f"{total_correct_preds / total_examples:.1%}"
             )
 
-    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples)
+    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples), (future_loss_total / total_examples)
 
 
-def load_dataloaders(training_set: str = TRAINING_SET, history: int = 0) -> tuple[DataLoader, DataLoader]:
+def load_dataloaders(training_set: str = TRAINING_SET, history: int = 0, policy_target: str = POLICY_TARGET, target_temperature: float = TARGET_TEMPERATURE, future: int = 0) -> tuple[DataLoader, DataLoader]:
     if training_set == "carlsen":
+        if policy_target != "human":
+            raise ValueError("the carlsen games are parsed from their pgn and have no stockfish labels")
         print("parsing games, this takes a while")
         games = pgns_to_examples([CARLSEN_PGN])
         return create_dataloaders(
@@ -226,10 +263,11 @@ def load_dataloaders(training_set: str = TRAINING_SET, history: int = 0) -> tupl
             train_batch_size=BATCH_SIZE,
             val_batch_size=BATCH_SIZE,
             seed=SEED,
-            history=history
+            history=history,
+            future=future
         )
 
-    train_dataset, val_dataset = load_training_set(training_set, history)
+    train_dataset, val_dataset = load_training_set(training_set, history, policy_target, target_temperature, future)
     return datasets_to_dataloaders(
         train_dataset,
         val_dataset,
@@ -280,7 +318,11 @@ def main(
     schedule: str = SCHEDULE,
     swiglu: bool = False,
     seed: int = SEED,
-    mlp_ratio: float | None = None):
+    mlp_ratio: float | None = None,
+    policy_target: str = POLICY_TARGET,
+    target_temperature: float = TARGET_TEMPERATURE,
+    future: int = FUTURE,
+    future_loss_weight: float = FUTURE_LOSS_WEIGHT):
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -292,7 +334,7 @@ def main(
         run_name = f"d{d_model}_L{num_layers}_h{n_heads}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
 
     #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
-    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "history": history, "swiglu": swiglu, "mlp_ratio": mlp_ratio, "dropout": DROPOUT}
+    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "history": history, "future": future, "swiglu": swiglu, "mlp_ratio": mlp_ratio, "dropout": DROPOUT}
 
     #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
     if not budget.timed and budget.max_steps <= WARMUP_STEPS:
@@ -305,8 +347,8 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}")
 
-    train_data_loader, val_data_loader = load_dataloaders(training_set, history)
-    print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
+    train_data_loader, val_data_loader = load_dataloaders(training_set, history, policy_target, target_temperature, future)
+    print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions, policy target {policy_target}")
 
     model = ChessTransformer(**model_settings).to(device)
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -331,7 +373,7 @@ def main(
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
     #anything else means the data or the metrics are wrong
     #the value head starts at about ln(3) = 1.1 and a third right
-    val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
+    val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_future_loss = evaluate_model(compiled_model, val_data_loader, loss_function, device, max_batches=EVAL_BATCHES)
     print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
 
     print(f"budget: {budget.describe()}, batches of {BATCH_SIZE} positions, evaluating every {EVAL_EVERY} steps")
@@ -347,9 +389,13 @@ def main(
         "schedule": schedule,
         "seed": seed,
         "value_loss_weight": value_loss_weight,
+        "future_loss_weight": future_loss_weight,
         "budget": budget.describe(),
         "batch_size": BATCH_SIZE,
         "training_set": training_set,
+        #with "stockfish" the val loss and accuracy are against stockfish's moves, not comparable with a "human" run's
+        "policy_target": policy_target,
+        "target_temperature": target_temperature if policy_target == "stockfish" else None,
         "note": note,
         "commit": current_commit()
     }
@@ -359,11 +405,11 @@ def main(
     def save_best_checkpoint() -> None:
         save_checkpoint(model, model_settings, run_dir / "model.pt")
 
-    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight)
+    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, loss_function, optimizer, scheduler, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight, future_loss_weight=future_loss_weight)
 
     #the number to quote for this run: the final weights on the whole val set
-    val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, loss_function, device)
-    print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
+    val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_future_loss = evaluate_model(compiled_model, val_data_loader, loss_function, device)
+    print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}, future loss {val_future_loss:.3f}")
 
     writer.add_scalar("final/val_loss", val_loss, budget.steps)
     writer.add_scalar("final/val_accuracy", val_accuracy, budget.steps)
@@ -376,6 +422,7 @@ def main(
         final_val_accuracy=val_accuracy,
         final_val_value_loss=val_value_loss,
         final_val_value_accuracy=val_value_accuracy,
+        final_val_future_loss=val_future_loss,
         train_seconds=budget.seconds,
         positions_seen=budget.positions,
         finished_at=datetime.now().isoformat(timespec="seconds")
@@ -408,6 +455,10 @@ if __name__ == "__main__":
     parser.add_argument("--swiglu", action="store_true", help="a swiglu mlp in every block instead of the gelu one")
     parser.add_argument("--seed", type=int, default=SEED, help="runs that differ only in this show how much of a difference between two runs is chance. Default %(default)s")
     parser.add_argument("--mlp-ratio", type=float, help="hidden size of the mlp in every block as a multiple of d-model, default 4 (8/3 with --swiglu)")
+    parser.add_argument("--policy-target", choices=["human", "stockfish"], default=POLICY_TARGET, help="the move that was played, or stockfish's best moves for the sets that have them (baseline_sf). Default %(default)s")
+    parser.add_argument("--target-temperature", type=float, default=TARGET_TEMPERATURE, help="how stockfish's moves share the target, see TARGET_TEMPERATURE in main.py. Default %(default)s")
+    parser.add_argument("--future", type=int, default=FUTURE, help="plies ahead the future head predicts the board's changes, 0 for no future head, default %(default)s")
+    parser.add_argument("--future-weight", type=float, default=FUTURE_LOSS_WEIGHT, help="weight of the future head's loss, default %(default)s")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -415,4 +466,4 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history, arguments.schedule, arguments.swiglu, arguments.seed, arguments.mlp_ratio)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.history, arguments.schedule, arguments.swiglu, arguments.seed, arguments.mlp_ratio, arguments.policy_target, arguments.target_temperature, arguments.future, arguments.future_weight)

@@ -139,12 +139,13 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, swiglu: bool = False, mlp_ratio: float | None = None, dropout: float = 0.1):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, future: int = 0, swiglu: bool = False, mlp_ratio: float | None = None, dropout: float = 0.1):
         super().__init__()
         #the dim of the board input is 70, with a torch.long dtype
         self.d_model = d_model
 
         self.history = history
+        self.future = future
 
         #one mebedding per possible board token, each of d_model size
         self.embed = nn.Embedding(BOARD_VOCAB_SIZE, self.d_model)
@@ -177,6 +178,9 @@ class ChessTransformer(nn.Module):
 
         for embedding in self.learned_history:
             nn.init.zeros_(embedding.weight)
+
+        #predicts what will have changed on every square future plies from now, in the codes of the history input
+        self.future_head = nn.Linear(self.d_model, NUM_HISTORY_CODES) if future > 0 else None
 
         self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
         self.register_buffer("to_squares", torch.tensor(MOVE_TO_SQUARES, dtype=torch.long))
@@ -243,8 +247,12 @@ class ChessTransformer(nn.Module):
             compressed_board = self.board_down_project(model_output.float()).reshape(B, -1)
 
             #shape B 3, stored as loss, draw, win
-            board_value_logits = self.value_head(compressed_board)            
-        return combined_logits, board_value_logits
+            board_value_logits = self.value_head(compressed_board)
+
+            #B 64 NUM_HISTORY_CODES, or nothing for a model without the head
+            future_state = self.future_head(model_output[:, :NUM_SQUARES].float()) if self.future_head is not None else None
+
+        return combined_logits, board_value_logits, future_state
 
         
 
