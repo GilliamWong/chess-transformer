@@ -54,6 +54,42 @@ size can be played (`--checkpoint artifacts/runs/<name>/model.pt` plays an older
 that built it are in the git history (`preprocess.py`, `select_games.py`). A fresh clone has only the
 Carlsen games, so set `TRAINING_SET = "carlsen"`.
 
+### Multiple GPUs
+
+`train_ddp.py` is a separate Distributed Data Parallel trainer; `main.py` is unchanged.
+Use a Linux machine with a CUDA/NCCL PyTorch build and launch one process per GPU:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=2 train_ddp.py --minutes 30 --no-tensorboard
+uv run torchrun --standalone --nproc-per-node=4 train_ddp.py --positions 10_000_000 --batch-size 1024 --no-tensorboard
+```
+
+It supports the model, history, future-head, Stockfish-target and mixture options from `main.py`.
+`--batch-size` is the **global** batch: 1,024 means 512 positions per GPU with two GPUs, or 256 with four.
+It must divide evenly across GPUs. For a mixture, each GPU's batch must also divide evenly among the
+named shares (`baseline+baseline+baseline+fishtest` has four). Mixtures preserve those proportions and
+sample with replacement using independent random streams. Single datasets are shuffled into disjoint
+shards each epoch; incomplete global batches are dropped. Position budgets count all GPUs together
+and round down to whole global batches. The existing 500-step warmup still applies.
+
+`--minutes` measures training wall time, with the first step (including compilation), validation and
+checkpoint writing excluded. All processes share the same clock, learning-rate schedule and stop decision.
+Two GPUs for 30 minutes use 60 GPU-minutes: timed runs have a GPU-count suffix in the results table's
+budget group, and settings record `world_size`, `per_gpu_batch_size` and `gpu_seconds`.
+The future loss is normalized over all known future targets across GPUs, including batches where one
+GPU has no known targets.
+
+Validation runs on GPU 0 using the existing validation batch size and cohort; the other GPUs wait.
+Only process 0 writes logs, checkpoints and the results page. `model.pt` stores ordinary unwrapped
+weights and works with the existing playing and evaluation tools. A supplied `--name` must be a new run
+folder. As in `main.py`, checkpoints are selected on periodic validation, while final metrics describe
+the final weights on the full validation set. Training-resume checkpoints are not implemented.
+
+`--no-compile` enables eager execution for debugging. Native Windows does not supply NCCL, so this
+trainer's GPU mode requires Linux. `--device cpu --no-compile` uses Gloo for distributed smoke tests;
+it is not a substitute for measuring the CUDA path. The DDP tests use two and four CPU processes and
+temporary synthetic datasets.
+
 ### Stockfish's moves as the target
 
 `baseline_sf` is a copy of the first 10 million positions of `baseline` (whole games, so `--history` works) in
@@ -99,14 +135,15 @@ uv run pytest
 
 ## Layout
 
-The four files in the root are the project itself:
+The root training and model files are:
 
 | File | What it does |
 |---|---|
 | `encoding.py` | Boards to 70 tokens and back, moves to one of 1,968 ids and back |
 | `data.py` | PGN to training examples, the split by game, the dataset and loaders |
 | `model.py` | The transformer: board tokens in, a score for each move out |
-| `main.py` | The training loop |
+| `main.py` | The single-GPU training loop |
+| `train_ddp.py` | The separate multi-GPU DDP training loop |
 
 Everything else is kept out of the way:
 

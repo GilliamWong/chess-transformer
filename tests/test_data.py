@@ -346,24 +346,19 @@ def test_history_is_empty_before_the_first_move_and_without_history():
     assert ChessGamesDataset(TWO_GAMES)[[0, 1]][4].shape == (2, 0, 64)
 
 
-#the future target says what the board looks like k plies on, the way the history says what it looked like before:
-#the history of the position k plies later, seen from there, is the same information the other way round
-def test_future_target_matches_the_history_of_the_later_position(carlsen_games):
+#applying the changes must recover the later piece placement, including the occupants of changed squares
+def test_future_target_reconstructs_the_later_position(carlsen_games):
     games = [game_to_examples(game) for game in carlsen_games]
-    dataset = ChessGamesDataset(games, history=2, future=2)
+    dataset = ChessGamesDataset(games, future=2)
 
     row = 0
     for game in games:
         for ply in range(len(game)):
             future = dataset[row][5]
             if ply + 2 < len(game):
-                #two plies on it is the same side to move, so the later position's 2-ply history names the same squares
-                #and the same old contents as this position's future target
-                later_history = dataset[row + 2][4]
-                squares_changed = {square for square, code in enumerate(future.tolist()) if code != 0}
-                later_squares = {square for square, code in enumerate(later_history[1].tolist()) if code != 0} | {square for square, code in enumerate(later_history[0].tolist()) if code != 0}
-                assert squares_changed <= later_squares, (row, board_fen := None)
-                assert (future >= 0).all()
+                #two plies on it is the same side to move, so both boards use the same perspective
+                reconstructed = torch.where(future == 0, dataset.boards[row, :64].long(), future - 1)
+                assert torch.equal(reconstructed, dataset.boards[row + 2, :64].long())
             else:
                 assert (future == FUTURE_UNKNOWN).all(), row  #the game ends before then
             row += 1
@@ -378,8 +373,24 @@ def test_future_target_after_a_move_names_the_from_and_to_squares():
     game.append(TrainingExample(encode_board(board), 0, 0))
     dataset = ChessGamesDataset([game], future=1)
 
-    #one ply on it is the opponent's turn: from there, white's e2-e4 is a pawn (code 1) that left e2 and arrived on e4,
-    #seen from the current side (white): e2 had a white pawn (1 + 1), e4 was empty (1 + 0)
+    #seen from the current side (white): e2 will be empty (1 + 0), e4 will have a white pawn (1 + 1)
     changes = {chess.square_name(square): code for square, code in enumerate(dataset[0][5].tolist()) if code != 0}
-    assert changes == {"e2": 2, "e4": 1}
+    assert changes == {"e2": 1, "e4": 2}
     assert (dataset[2][5] == FUTURE_UNKNOWN).all()  #no position after the last one
+
+
+@pytest.mark.parametrize("piece", [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT])
+@pytest.mark.parametrize("black", [False, True])
+def test_future_target_identifies_the_promoted_piece(piece, black):
+    board = chess.Board("7k/P7/8/8/8/8/8/7K w - - 0 1")
+    if black:
+        board = board.mirror()
+    game = [TrainingExample(encode_board(board), 0, 0)]
+    board.push(chess.Move(chess.A2 if black else chess.A7, chess.A1 if black else chess.A8, promotion=piece))
+    game.append(TrainingExample(encode_board(board), 0, 0))
+    target = ChessGamesDataset([game], future=1)[0][5]
+
+    expected = torch.zeros(64, dtype=torch.long)
+    expected[chess.A7] = 1  #the pawn's old square will be empty
+    expected[chess.A8] = 1 + piece  #always seen from the original mover's perspective
+    assert torch.equal(target, expected)

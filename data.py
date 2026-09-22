@@ -212,7 +212,7 @@ class ChessGamesDataset(Dataset):
         return changes
 
     #the future head's target: what the board future plies ahead changes on every square, in the codes of history_of
-    #(0 unchanged, else 1 + what is there now), seen from the current side to move. A game's last positions have no
+    #(0 unchanged, else 1 + what will be there), seen from the current side to move. A game's last positions have no
     #board that far ahead and get FUTURE_UNKNOWN, which the loss ignores. (positions, NUM_SQUARES)
     def future_of(self, rows: torch.Tensor) -> torch.Tensor:
         if self.future == 0:
@@ -223,7 +223,7 @@ class ChessGamesDataset(Dataset):
         known = (self.plies[ahead] == self.plies[rows] + self.future) & (rows + self.future < len(self))
         now = self.squares(rows, flip=False)
         later = self.squares(ahead, flip=self.future % 2 == 1)
-        changes = torch.where(later != now, 1 + now, 0)
+        changes = torch.where(later != now, 1 + later, 0)
         return changes.masked_fill(~known.unsqueeze(1), FUTURE_UNKNOWN)
 
     #boards, the policy target (moves and their probabilities, see policy_target), results, history, the future target.

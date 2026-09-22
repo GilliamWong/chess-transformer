@@ -4,6 +4,7 @@
 import argparse
 import json
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -187,14 +188,14 @@ def train(
 
 
 #cross entropy of the future head over every square whose future is known: logits are (B, squares, codes),
-#targets (B, squares) with FUTURE_UNKNOWN where the game ended first
+#targets (B, squares) with FUTURE_UNKNOWN where the game ended first; no known targets gives zero loss
 def future_loss(future_logits: torch.Tensor, future: torch.Tensor) -> torch.Tensor:
-    return F.cross_entropy(future_logits.flatten(0, 1), future.flatten(), ignore_index=FUTURE_UNKNOWN)
+    return F.cross_entropy(future_logits.flatten(0, 1), future.flatten(), ignore_index=FUTURE_UNKNOWN, reduction="sum") / (future != FUTURE_UNKNOWN).sum().clamp_min(1)
 
 
 #returns average loss and accuracy for the model on the test set, or on its first max_batches batches: first of the
-#moves, then of the value head, then the future head's loss (0 without the head). The move loss stays on its own so it
-#can be compared with runs from before the other heads.
+#moves, then of the value head, then the future head's loss (0 without the head, NaN if no targets are known).
+#The move loss stays on its own so it can be compared with runs from before the other heads.
 #the val loader is not shuffled, so those are the same positions every time and the numbers can be compared
 def evaluate_model(
     model: nn.Module, 
@@ -208,6 +209,7 @@ def evaluate_model(
     value_loss_total = 0.0
     value_correct_preds = 0
     future_loss_total = 0.0
+    future_target_count = 0
     total_examples = 0
 
     model.eval()
@@ -235,7 +237,9 @@ def evaluate_model(
                 loss = policy_loss(logits, target_moves, target_probabilities)
                 value_loss = loss_function(value_logits, results)
                 if future_logits is not None:
-                    future_loss_total += future_loss(future_logits, future).item() * len(batch)
+                    known_squares = (future != FUTURE_UNKNOWN).sum().item()
+                    future_loss_total += future_loss(future_logits, future).item() * known_squares
+                    future_target_count += known_squares
 
             #accuracy is against the first target move: the move played, or the one stockfish likes best
             epoch_loss_total += loss.item() * len(batch)
@@ -249,7 +253,8 @@ def evaluate_model(
                 accuracy=f"{total_correct_preds / total_examples:.1%}"
             )
 
-    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples), (future_loss_total / total_examples)
+    val_future_loss = future_loss_total / future_target_count if future_target_count else (0.0 if future_logits is None else math.nan)
+    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples), val_future_loss
 
 
 def load_dataloaders(training_set: str = TRAINING_SET, history: int = 0, policy_target: str = POLICY_TARGET, target_temperature: float = TARGET_TEMPERATURE, future: int = 0) -> tuple[DataLoader, DataLoader]:
@@ -268,12 +273,32 @@ def load_dataloaders(training_set: str = TRAINING_SET, history: int = 0, policy_
         )
 
     train_dataset, val_dataset = load_training_set(training_set, history, policy_target, target_temperature, future)
+    warm_file_cache(train_dataset, val_dataset)
     return datasets_to_dataloaders(
         train_dataset,
         val_dataset,
         train_batch_size=BATCH_SIZE,
         val_batch_size=BATCH_SIZE
     )
+
+#reads every file of the sets once, front to back, so that the operating system has them in memory before the first
+#batch. Batches read random rows: from a file that is not in memory yet each row is a disk read, and a run on a set
+#that was just written or pushed out of memory by other work trained a quarter slower until enough of it had been
+#touched. Reading 12 GB in order takes about a minute; nothing to read takes seconds
+def warm_file_cache(*datasets) -> None:
+    #a set named several times in a mix is the same object several times, and is read once
+    sets = {id(one_dataset): one_dataset for dataset in datasets for one_dataset in getattr(dataset, "datasets", [dataset])}
+    tensors = [tensor for one_dataset in sets.values() for tensor in (one_dataset.boards, one_dataset.moves, one_dataset.results, one_dataset.plies, one_dataset.stockfish_moves, one_dataset.stockfish_evals) if tensor is not None]
+    total_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+    progress = tqdm(total=total_bytes, desc="reading the training files into memory", unit="B", unit_scale=True, dynamic_ncols=True, leave=False)
+    for tensor in tensors:
+        flat = tensor.reshape(-1).view(torch.uint8) if tensor.dtype != torch.uint8 else tensor.reshape(-1)
+        for start in range(0, len(flat), 1 << 28):
+            flat[start:start + (1 << 28)].sum() #touching the pages is what reads them
+            progress.update(min(1 << 28, len(flat) - start))
+    progress.close()
+
 
 #progress is how much of the run after the warmup is done, from 0 to 1
 def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE) -> float:
@@ -301,6 +326,10 @@ def current_commit() -> str:
     except (OSError, subprocess.CalledProcessError):
         return ""
 
+
+#"d256 L7 swiglu 4/3x, 24M positions (runpod)" -> "d256_L7_swiglu_4_3x_24M_positions_runpod", at most 60 characters
+def folder_name(note: str) -> str:
+    return re.sub(r"[^A-Za-z0-9.-]+", "_", note).strip("_")[:60]
 
 def main(
     positions_budget: int | None = None,
@@ -330,8 +359,16 @@ def main(
     else:
         budget = Budget(BATCH_SIZE, minutes=minutes_budget)
     if run_name is None:
-        #the settings that differ between experiments, so the plots in tensorboard label themselves
-        run_name = f"d{d_model}_L{num_layers}_h{n_heads}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
+        #the note names the run in tensorboard, made safe for a folder; without one, the settings that differ between experiments
+        run_name = folder_name(note) if note else f"d{d_model}_L{num_layers}_h{n_heads}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
+        #runs started in the same second (several gpus at once) must not share a folder: the folder is claimed here,
+        #and only the claim that made it decides the name
+        for number in range(1, 100):
+            try:
+                (RUNS_DIR / run_name).mkdir(parents=True)
+                break
+            except FileExistsError:
+                run_name = run_name.rsplit("_", 1)[0] + f"_{number}" if number > 1 else f"{run_name}_1"
 
     #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
     model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "history": history, "future": future, "swiglu": swiglu, "mlp_ratio": mlp_ratio, "dropout": DROPOUT}

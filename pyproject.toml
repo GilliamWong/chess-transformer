@@ -12,6 +12,7 @@ dependencies = [
     "tqdm>=4.66",
     # torch.compile needs triton. The Linux wheel of torch brings its own, Windows has only this community build.
     "triton-windows>=3.5; sys_platform == 'win32'",
+    "zstandard>=0.25.0",
 ]
 
 [dependency-groups]
