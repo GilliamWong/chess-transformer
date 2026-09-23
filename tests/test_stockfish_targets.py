@@ -26,7 +26,6 @@ def write_labelled_set(folder, name, stockfish_moves=STOCKFISH_MOVES, stockfish_
     positions = len(stockfish_moves)
     for split in ("train", "val"):
         (folder / f"{name}_{split}_boards.bin").write_bytes(np.full((positions, TOKENS_PER_BOARD), 5, dtype=np.uint8).tobytes())
-        (folder / f"{name}_{split}_moves.bin").write_bytes((np.arange(positions, dtype=np.int16) + 100).tobytes())
         (folder / f"{name}_{split}_stockfish_moves.bin").write_bytes(np.array(stockfish_moves, dtype=np.int16).tobytes())
         (folder / f"{name}_{split}_stockfish_evals.bin").write_bytes(np.array(stockfish_evals, dtype=np.int16).tobytes())
 
@@ -41,7 +40,7 @@ def test_stockfish_targets_share_the_probability_by_their_evals(tmp_path, monkey
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
     write_labelled_set(tmp_path, "labelled")
 
-    train_dataset, _ = load_training_set("labelled", policy_target="stockfish", target_temperature=TEMPERATURE)
+    train_dataset, _ = load_training_set("labelled", TEMPERATURE)
     _, target_moves, target_probabilities, _ = train_dataset[[0, 1, 2]]
 
     #places without a move become move 0 at probability 0, so they can be looked up in the logits and add nothing
@@ -53,24 +52,13 @@ def test_stockfish_targets_share_the_probability_by_their_evals(tmp_path, monkey
     assert target_probabilities[2, 0] > 0.99  #a mate against two pawns up
 
 
-def test_the_move_played_stays_the_target_unless_stockfish_is_asked_for(tmp_path, monkeypatch):
-    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
-    write_labelled_set(tmp_path, "labelled")
-
-    train_dataset, _ = load_training_set("labelled")
-
-    _, target_moves, target_probabilities, _ = train_dataset[[0, 1, 2]]
-    assert target_moves.tolist() == [[100], [101], [102]]
-    assert target_probabilities.tolist() == [[1.0]] * 3
-
-
 #a position stockfish has not reached yet is filled with NO_MOVE, which would otherwise train as "play move 0"
 def test_a_set_that_is_not_labelled_to_the_end_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
     write_labelled_set(tmp_path, "unfinished", STOCKFISH_MOVES[:2] + [[NO_MOVE] * 3], STOCKFISH_EVALS[:2] + [[NO_EVAL] * 3])
 
     with pytest.raises(ValueError, match="not labelled"):
-        load_training_set("unfinished", policy_target="stockfish", target_temperature=TEMPERATURE)
+        load_training_set("unfinished", TEMPERATURE)
 
 
 def test_policy_loss_with_one_move_is_cross_entropy():

@@ -17,7 +17,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import data
 import main as single
-from data import MixedDataset
 from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD
 from model import ChessTransformer
 from multi_gpu import train_ddp
@@ -39,26 +38,8 @@ def test_shuffled_shards_have_equal_full_batches_and_do_not_overlap(world_size):
     assert list(samplers[0]) != batches[0]
 
 
-def test_mixture_keeps_repeated_shares_and_independent_reproducible_streams():
-    dataset = MixedDataset([list(range(1000))] * 3 + [list(range(2000))])
-    first = train_ddp.TrainingSampler(dataset, 32, 0, 2, 42)
-    second = train_ddp.TrainingSampler(dataset, 32, 1, 2, 42)
-    left, right = next(iter(first)), next(iter(second))
-    for batch in (left, right):
-        assert len(batch) == 16
-        assert [sum(start <= index < stop for index in batch)
-                for start, stop in ((0, 1000), (1000, 2000), (2000, 3000), (3000, 5000))] == [4] * 4
-    assert left != right
-    torch.manual_seed(999)
-    assert next(iter(first)) == left  #model randomness must not perturb sampling
-    first.epoch = 1
-    assert next(iter(first)) != left
-
-
 @pytest.mark.parametrize("dataset,batch_size,world_size", [
     (list(range(32)), 7, 2), (list(range(8)), 16, 2),
-    (MixedDataset([list(range(100))] * 3), 16, 2),
-    (MixedDataset([[], list(range(100))]), 16, 2),
 ])
 def test_invalid_shards_fail_before_training(dataset, batch_size, world_size):
     with pytest.raises(ValueError):
@@ -135,7 +116,6 @@ def write_set(folder, name):
     for split, size in (("train", 32), ("val", 10)):
         arrays = dict(
             boards=np.full((size, TOKENS_PER_BOARD), 5, dtype=np.uint8),
-            moves=np.arange(size, dtype=np.int16),
             stockfish_moves=np.tile(np.array([0, 1], dtype=np.int16), (size, 1)),
             stockfish_evals=np.tile(np.array([120, -60], dtype=np.int16), (size, 1)),
         )
@@ -167,7 +147,7 @@ def distributed_worker(rank, folder, world_size):
             "--device", "cpu", "--no-compile", "--no-tensorboard", "--name", "smoke",
             "--positions", "192", "--batch-size", "16", "--d-model", "16", "--layers", "1",
             "--heads", "2", "--templates", "2",
-            "--training-set", "a+a+a+b", "--policy-target", "stockfish",
+            "--training-set", "a",
         ])
         train_ddp.run(args, torch.device("cpu"))
         model, settings = load_checkpoint(folder / "runs" / "smoke" / "model.pt", torch.device("cpu"))
@@ -184,7 +164,6 @@ def distributed_worker(rank, folder, world_size):
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_distributed_gradients_budgets_and_complete_training(tmp_path, world_size):
     write_set(tmp_path, "a")
-    write_set(tmp_path, "b")
     context = mp.spawn(distributed_worker, args=(str(tmp_path), world_size), nprocs=world_size, join=False)
     deadline = time.monotonic() + 180
     try:
@@ -203,6 +182,6 @@ def test_distributed_gradients_budgets_and_complete_training(tmp_path, world_siz
     assert settings["world_size"] == world_size
     assert settings["positions_seen"] == 192
     assert settings["batch_size"] == 16 and settings["per_gpu_batch_size"] == 16 // world_size
-    assert settings["policy_target"] == "stockfish"
+    assert settings["target_temperature"] == single.TARGET_TEMPERATURE
     assert settings["finished_at"] and settings["final_val_value_loss"] >= 0
     assert (tmp_path / "progress.html").exists()

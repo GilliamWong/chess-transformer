@@ -53,10 +53,9 @@ SEED = 42 #of the model's first weights and of the order of the training positio
 #the value head learns stockfish's eval of the position, as the expected score it stands for (see value_target_of in data.py)
 VALUE_LOSS_WEIGHT = 1.0
 
-#what the policy learns to predict: "human" is the move that was played, "stockfish" is stockfish's best moves for the
-#sets that tools/label_with_stockfish.py has labelled. How they share the probability is TARGET_TEMPERATURE, in expected
-#score (0 lost to 1 won): a move that gives up this much gets 1/e of the best move's share. See policy_target in data.py
-POLICY_TARGET = "stockfish"
+#the policy learns stockfish's best moves, which tools/label_with_stockfish.py has written next to every position.
+#How they share the probability is TARGET_TEMPERATURE, in expected score (0 lost to 1 won): a move that gives up this
+#much gets 1/e of the best move's share. See policy_target in data.py
 TARGET_TEMPERATURE = 0.02
 
 #the name of a training set in processed_data/ (see load_training_set in data.py).
@@ -129,7 +128,7 @@ def train(
     progress = tqdm(total=budget.total, desc="train", dynamic_ncols=True, unit="s" if budget.timed else "it",
                     bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}{postfix}]")
 
-    #target_moves and target_probabilities are the policy target: the move played, or stockfish's best few (policy_loss)
+    #target_moves and target_probabilities are the policy target: stockfish's best few moves (policy_loss)
     #values is the value head's target: stockfish's eval as an expected score (value_loss)
     for batch, target_moves, target_probabilities, values in batches_on_device(endless_batches(train_data_loader), device):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -226,7 +225,7 @@ def evaluate_model(
                 loss = policy_loss(logits, target_moves, target_probabilities)
                 batch_value_loss = value_loss(value_logits, values)
 
-            #accuracy is against the first target move: the move played, or the one stockfish likes best
+            #accuracy is against the first target move, the one stockfish likes best
             epoch_loss_total += loss.item() * len(batch)
             total_correct_preds += (model_preds == target_moves[:, 0]).sum().item()
             value_loss_total += batch_value_loss.item() * len(batch)
@@ -241,8 +240,8 @@ def evaluate_model(
     return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples)
 
 
-def load_dataloaders(training_set: str = TRAINING_SET, policy_target: str = POLICY_TARGET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE) -> tuple[DataLoader, DataLoader]:
-    train_dataset, val_dataset = load_training_set(training_set, policy_target, target_temperature)
+def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE) -> tuple[DataLoader, DataLoader]:
+    train_dataset, val_dataset = load_training_set(training_set, target_temperature)
     warm_file_cache(train_dataset, val_dataset)
     return datasets_to_dataloaders(
         train_dataset,
@@ -257,9 +256,7 @@ def load_dataloaders(training_set: str = TRAINING_SET, policy_target: str = POLI
 #that was just written or pushed out of memory by other work trained a quarter slower until enough of it had been
 #touched. Reading 12 GB in order takes about a minute; nothing to read takes seconds
 def warm_file_cache(*datasets) -> None:
-    #a set named several times in a mix is the same object several times, and is read once
-    sets = {id(one_dataset): one_dataset for dataset in datasets for one_dataset in getattr(dataset, "datasets", [dataset])}
-    tensors = [tensor for one_dataset in sets.values() for tensor in (one_dataset.boards, one_dataset.moves, one_dataset.stockfish_moves, one_dataset.stockfish_evals) if tensor is not None]
+    tensors = [tensor for dataset in datasets for tensor in (dataset.boards, dataset.stockfish_moves, dataset.stockfish_evals)]
     total_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
     progress = tqdm(total=total_bytes, desc="reading the training files into memory", unit="B", unit_scale=True, dynamic_ncols=True, leave=False)
@@ -317,7 +314,6 @@ def main(
     schedule: str = SCHEDULE,
     seed: int = SEED,
     mlp_ratio: float | None = None,
-    policy_target: str = POLICY_TARGET,
     target_temperature: float = TARGET_TEMPERATURE,
     qk_ratio: float | list[float] = 1.0,
     kv_heads: int | None = None,
@@ -354,8 +350,8 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}")
 
-    train_data_loader, val_data_loader = load_dataloaders(training_set, policy_target, target_temperature, seed, batch_size)
-    print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions, policy target {policy_target}")
+    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size)
+    print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
 
     model = ChessTransformer(**model_settings).to(device)
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -398,9 +394,7 @@ def main(
         "budget": budget.describe(),
         "batch_size": batch_size,
         "training_set": training_set,
-        #with "stockfish" the val loss and accuracy are against stockfish's moves, not comparable with a "human" run's
-        "policy_target": policy_target,
-        "target_temperature": target_temperature if policy_target == "stockfish" else None,
+        "target_temperature": target_temperature,
         "note": note,
         "commit": current_commit()
     }
@@ -455,12 +449,11 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=N_HEADS, help="attention heads, d-model has to divide by it, default %(default)s")
     parser.add_argument("--lr", type=float, default=PEAK_LEARN_RATE, help="peak learning rate, default %(default)s")
     parser.add_argument("--templates", type=int, default=POSITION_TEMPLATES, help="attention bias templates the blocks mix, default %(default)s")
-    parser.add_argument("--training-set", default=TRAINING_SET, help="name of a training set in processed_data/, several joined with + to mix them in equal shares (val is the first one's). Default %(default)s")
+    parser.add_argument("--training-set", default=TRAINING_SET, help="name of a training set in processed_data/ that tools.label_with_stockfish has labelled. Default %(default)s")
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT, help="weight of the value head's loss next to the move loss, default %(default)s")
     parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="what the learning rate does after the warmup, see SCHEDULE in main.py. Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="runs that differ only in this show how much of a difference between two runs is chance. Default %(default)s")
     parser.add_argument("--mlp-ratio", type=float, help="hidden size of the swiglu mlp in every block as a multiple of d-model, default 8/3")
-    parser.add_argument("--policy-target", choices=["human", "stockfish"], default=POLICY_TARGET, help="the move that was played, or stockfish's best moves for the sets that have them (baseline_sf). Default %(default)s")
     parser.add_argument("--target-temperature", type=float, default=TARGET_TEMPERATURE, help="how stockfish's moves share the target, see TARGET_TEMPERATURE in main.py. Default %(default)s")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="positions per step, for train and val. Lower it for a model that does not fit, default %(default)s")
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention). Default one for every head")
@@ -472,4 +465,4 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.schedule, arguments.seed, arguments.mlp_ratio, arguments.policy_target, arguments.target_temperature, arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio, arguments.kv_heads, arguments.batch_size)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.schedule, arguments.seed, arguments.mlp_ratio, arguments.target_temperature, arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio, arguments.kv_heads, arguments.batch_size)

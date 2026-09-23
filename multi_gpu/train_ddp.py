@@ -22,14 +22,13 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import main as single
-from data import MixedDataset
 from model import ChessTransformer
 from tools.budget import Budget
 from tools.checkpoint import RUNS_DIR, save_checkpoint
 
 
 class TrainingSampler(Sampler):
-    """Equal local batches, with epoch shuffling or independently drawn mixture shares."""
+    """Equal local batches, disjoint across processes and reshuffled every epoch."""
 
     def __init__(self, dataset, batch_size: int, rank: int, world_size: int, seed: int):
         if batch_size <= 0 or batch_size % world_size:
@@ -41,34 +40,17 @@ class TrainingSampler(Sampler):
         self.global_batch_size = batch_size
         self.rank, self.world_size, self.seed = rank, world_size, seed
         self.epoch = 0
-        if isinstance(dataset, MixedDataset):
-            if self.batch_size % len(dataset.datasets):
-                raise ValueError("per-process batch size must be divisible by the number of mixture shares")
-            if any(len(part) == 0 for part in dataset.datasets):
-                raise ValueError("every mixture share needs a nonempty training set")
 
     def __len__(self):
         return len(self.dataset) // self.global_batch_size
 
     def __iter__(self):
-        if not isinstance(self.dataset, MixedDataset):
-            sampler = DistributedSampler(
-                self.dataset, num_replicas=self.world_size, rank=self.rank,
-                shuffle=True, seed=self.seed, drop_last=True,
-            )
-            sampler.set_epoch(self.epoch)
-            yield from BatchSampler(sampler, self.batch_size, drop_last=True)
-            return
-
-        #Replacement sampling matches EqualSharesBatchSampler. A private generator
-        #keeps dropout/model RNG and other ranks from repeating the same draw stream.
-        generator = torch.Generator().manual_seed(self.seed + self.epoch * self.world_size + self.rank)
-        share = self.batch_size // len(self.dataset.datasets)
-        for _ in range(len(self)):
-            batch = []
-            for dataset, offset in zip(self.dataset.datasets, self.dataset.first_indices):
-                batch.extend((torch.randint(len(dataset), (share,), generator=generator) + offset).tolist())
-            yield batch
+        sampler = DistributedSampler(
+            self.dataset, num_replicas=self.world_size, rank=self.rank,
+            shuffle=True, seed=self.seed, drop_last=True,
+        )
+        sampler.set_epoch(self.epoch)
+        yield from BatchSampler(sampler, self.batch_size, drop_last=True)
 
 
 def endless_batches(loader: DataLoader):
@@ -199,7 +181,7 @@ def run(args, device: torch.device):
     #Only one process per host warms the OS file cache. Read-only mappings let
     #peers share cached pages without copying the data.
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    train_dataset, val_dataset = single.load_training_set(args.training_set, args.policy_target, args.target_temperature)
+    train_dataset, val_dataset = single.load_training_set(args.training_set, args.target_temperature)
     if local_rank == 0:
         single.warm_file_cache(train_dataset, val_dataset)
     val_loader = DataLoader(val_dataset, batch_size=None, sampler=BatchSampler(
@@ -241,8 +223,7 @@ def run(args, device: torch.device):
                 peak_learn_rate=args.lr, schedule=args.schedule, seed=args.seed,
                 value_loss_weight=args.value_weight,
                 budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=sampler.batch_size,
-                training_set=args.training_set, policy_target=args.policy_target,
-                target_temperature=args.target_temperature if args.policy_target == "stockfish" else None,
+                training_set=args.training_set, target_temperature=args.target_temperature,
                 note=args.note, commit=single.current_commit(), trainer="ddp", world_size=world_size,
                 init_from=str(args.init_from) if args.init_from is not None else None,
                 device=device.type, backend=dist.get_backend(), compile=not args.no_compile,
@@ -304,7 +285,6 @@ def parse_args(argv=None):
     parser.add_argument("--schedule", choices=("cosine", "hold", "constant"), default=single.SCHEDULE)
     parser.add_argument("--seed", type=int, default=single.SEED)
     parser.add_argument("--training-set", default=single.TRAINING_SET)
-    parser.add_argument("--policy-target", choices=("human", "stockfish"), default=single.POLICY_TARGET)
     parser.add_argument("--target-temperature", type=float, default=single.TARGET_TEMPERATURE)
     parser.add_argument("--value-weight", type=float, default=single.VALUE_LOSS_WEIGHT)
     return parser.parse_args(argv)
