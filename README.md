@@ -113,6 +113,49 @@ uv run python -m tools.label_with_stockfish     makes the set, about 4 hours for
 
 In a mix (`baseline_sf+fishtest`) the sets without labels keep the move that was played.
 
+## The current recipe
+
+What the September 2026 experiments settled on for the next large model. The evidence is in
+`artifacts/overnight_2026-09-23.md`: d128 models at 3x the standard compute, 2 seeds each, every one scored with
+4000 games against Stockfish.
+
+| Choice | Setting | Why |
+|---|---|---|
+| Input embedding | The small Leela embedding for the 64 squares: the whole board's pieces through one dense layer to 16 features per square (Leela's own size is d_model / 2), then Leela's gates, norms and small FFN (1.5x d_model). The blocks after it are `model.py`'s, templates in every layer | Every square sees the whole board before the first block. Best accuracy (+0.7 points over the plain model) and +13 Elo. About 2% of the FLOPs at d640 |
+| Attention | Narrower queries and keys in the early layers, `--qk-ratio 0.25 0.5 0.5 0.75` at 4 layers or `0.25 0.25` + `0.5` x5 + `0.75` x13 at 20, and half as many key/value heads as heads, `--kv-heads` (grouped-query attention) | The same quality at 17-20% fewer FLOPs |
+| History | `--history 0` | Earlier boards did not help |
+| Future head | `--future 0` | Did not help, and cost puzzle Elo in short runs |
+| Value head | `--value-target eval` | Neutral to +30-35 puzzle Elo |
+| Targets | `--policy-target stockfish --target-temperature 0.02` | 0.01 tied it, 0.05 was worse |
+| Learning rate | `--lr 6e-3` at d128 | 1e-2 was slightly worse at the longer budget. Untested at d640 |
+
+Tried and left out:
+- A whole-board term in every block's template mix (the board mix), and Leela's smolgen: little gain once the embedding
+  is there. The template-map embedding (below) plus the board mix tied the small Leela embedding in Elo (+14) but not in
+  accuracy.
+- The template-map embedding, a cheaper board-wide step before the first block: `model.py`'s embedding plus the square
+  features spread over the board by 8 learned 64x64 maps, the templates' way of mixing. It is what the 2026-09-23 overnight
+  run used. At 3x compute it was 0.5 accuracy points and 20 Elo behind the small Leela embedding; at the standard budget the
+  two tied within seed noise.
+- Cut-down Leela embeddings: its dense layer alone, or the dense layer plus an FFN. Close behind at d128, and the FFN added
+  nothing for its cost.
+
+Still open: the full-size Leela embedding (a dense layer of d_model / 2 per square) averaged slightly better than 16 at d128
+and equal compute (-0.006 loss, +0.25 accuracy points, the same Elo), though within seed noise: on one of the two seeds 16
+was as good. It was never tried at 3x or with the narrower queries and keys. At d640 it would add 17M parameters (30%) for
+only 0.7% more FLOPs than 16.
+
+At d640 every one of these embeddings costs under 3% of the model's FLOPs (2-16% at d128), so the choice is on quality.
+
+The small Leela embedding is `LeelaChessTransformer(block="templates", leela_embedding=True, embedding_dense=16)` in
+`model_leela.py`. So far only `leela_head_to_head.py` trains it; `main.py` and `train_ddp.py` cannot build it yet. Everything
+else is a `main.py` flag. The dense size of 16 was only tested at d128.
+
+At scale, train synchronously (`train_ddp.py`) at a global batch of about 4096, as the d640 run did. The measured gradient
+noise scale of a d640 model is 2.5k-7k positions while the learning rate is high, so a much bigger batch mostly wastes positions. Averaging the weights of
+150 preemptible GPUs (`train_hyak.py`) ended about 100 Elo below that run on 5.9x its compute. Stay within about 4 passes
+over the data: `full_sf8_20260922` has 290M positions, so about 1.2B per run, and a longer run needs more labelled positions.
+
 ## Play against it and measure its strength
 
 Windows only. Fetch Stockfish and Cute Chess once, then run a match:

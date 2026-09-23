@@ -68,7 +68,7 @@ def test_invalid_shards_fail_before_training(dataset, batch_size, world_size):
 def compare_update(rank, future_mode, compiled=False):
     torch.manual_seed(123)
     model = ChessTransformer(d_model=16, num_layers=1, n_heads=2, position_templates=2,
-                             history=1, future=int(future_mode != "disabled"), swiglu=True, dropout=0)
+                             history=1, future=int(future_mode != "disabled"), swiglu=True, dropout=0, value_target="result")
     with torch.no_grad():
         model.templates.normal_(std=0.1)
     distributed = DDP(model)
@@ -94,7 +94,7 @@ def compare_update(rank, future_mode, compiled=False):
     loss.backward()
 
     policy, value, future_logits = reference(batch[0], batch[4])
-    expected = single.policy_loss(policy, batch[1], batch[2]) + 0.8 * nn.functional.cross_entropy(value, batch[3])
+    expected = single.policy_loss(policy, batch[1], batch[2]) + 0.8 * single.value_loss(value, batch[3])
     if future_logits is not None:
         expected = expected + 0.5 * single.future_loss(future_logits, batch[5])
     expected.backward()
@@ -175,7 +175,7 @@ def distributed_worker(rank, folder, world_size):
             "--device", "cpu", "--no-compile", "--no-tensorboard", "--name", "smoke",
             "--positions", "192", "--batch-size", "16", "--d-model", "16", "--layers", "1",
             "--heads", "2", "--templates", "2", "--history", "1", "--future", "2", "--swiglu",
-            "--training-set", "a+a+a+b", "--policy-target", "stockfish",
+            "--training-set", "a+a+a+b", "--policy-target", "stockfish", "--value-target", "result",  #b has no evals
         ])
         train_ddp.run(args, torch.device("cpu"))
         model, settings = load_checkpoint(folder / "runs" / "smoke" / "model.pt", torch.device("cpu"))

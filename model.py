@@ -28,7 +28,7 @@ class SwiGLU(nn.Module):
         return output
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, position_templates: int, dropout: float, swiglu: bool = False, mlp_ratio: float | None = None):
+    def __init__(self, d_model: int, n_heads: int, position_templates: int, dropout: float, swiglu: bool = False, mlp_ratio: float | None = None, qk_ratio: float = 1.0, kv_heads: int | None = None):
         super().__init__()
         #this is all from memory so bear with me
         #the input is B TOKENS_PER_BOARD d_model
@@ -56,13 +56,21 @@ class TransformerBlock(nn.Module):
 
         self.d_model = d_model
         self.n_heads = n_heads
-        self.d_head = d_model // n_heads #these mmust be divisible 
+        self.d_head = d_model // n_heads #these mmust be divisible
+        #the queries and keys only decide where a head looks, so they can be narrower than the values it brings back
+        self.d_qk_head = max(1, round(qk_ratio * self.d_head))
+        #grouped-query attention: fewer key/value heads than query heads, each shared by a group of neighbouring heads.
+        #None is one for every head
+        self.kv_heads = kv_heads or n_heads
+        if n_heads % self.kv_heads != 0:
+            raise ValueError(f"{n_heads} heads cannot be split into groups for {self.kv_heads} key/value heads")
+        self.heads_per_kv = n_heads // self.kv_heads
         self.position_templates = position_templates
         self.dropout = dropout
 
-        self.Q = nn.Linear(self.d_model, self.d_model)
-        self.K = nn.Linear(self.d_model, self.d_model)
-        self.V = nn.Linear(self.d_model, self.d_model)
+        self.Q = nn.Linear(self.d_model, self.n_heads * self.d_qk_head)
+        self.K = nn.Linear(self.d_model, self.kv_heads * self.d_qk_head)
+        self.V = nn.Linear(self.d_model, self.kv_heads * self.d_head)
 
         self.ln1 = nn.LayerNorm(self.d_model)
         self.ln2 = nn.LayerNorm(self.d_model)
@@ -98,18 +106,22 @@ class TransformerBlock(nn.Module):
         x_norm = self.ln1(residual)
         
         #first create Q K V
-        Q = self.Q(x_norm) #shape B T d_model
-        K = self.K(x_norm) #shape B T d_model
-        V = self.V(x_norm) #shape B T d_model
+        Q = self.Q(x_norm) #shape B T n_heads * d_qk_head
+        K = self.K(x_norm) #shape B T kv_heads * d_qk_head
+        V = self.V(x_norm) #shape B T kv_heads * d_head
 
-        #reshape last dim into heads for q and k, we need to reshape first and then transpose to satisfy 
+        #reshape last dim into heads for q and k, we need to reshape first and then transpose to satisfy
         #the ever fickle nature of torch memory storage yay
-        Q_heads = Q.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2) #shape of all is is B n_heads T d_head
-        K_heads = K.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        V_heads = V.reshape(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        Q_heads = Q.reshape(B, T, self.n_heads, self.d_qk_head).transpose(1, 2) #shape of q and k is B n_heads T d_qk_head
+        K_heads = K.reshape(B, T, self.kv_heads, self.d_qk_head).transpose(1, 2)
+        V_heads = V.reshape(B, T, self.kv_heads, self.d_head).transpose(1, 2) #B kv_heads T d_head
+
+        #every key/value head serves its group of query heads: head h reads key/value head h // heads_per_kv
+        K_heads = K_heads.repeat_interleave(self.heads_per_kv, dim=1)
+        V_heads = V_heads.repeat_interleave(self.heads_per_kv, dim=1) #B n_heads T d_head
 
         #perform attention then softmax
-        attention = (Q_heads @ K_heads.transpose(-2, -1)) / math.sqrt(self.d_head) #should be B n_heads T T
+        attention = (Q_heads @ K_heads.transpose(-2, -1)) / math.sqrt(self.d_qk_head) #should be B n_heads T T
 
         #B 64 n_heads * position_templates, reshaped to B 64 n_heads position_templates
         position_template_coeffs = self.template_mix(x_norm[:, :NUM_SQUARES, :]).reshape(B, NUM_SQUARES, self.n_heads, self.position_templates)
@@ -139,13 +151,16 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, future: int = 0, swiglu: bool = False, mlp_ratio: float | None = None, dropout: float = 0.1):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 16, history: int = 0, future: int = 0, swiglu: bool = False, mlp_ratio: float | None = None, dropout: float = 0.1, value_target: str = "eval", qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None):
         super().__init__()
         #the dim of the board input is 70, with a torch.long dtype
         self.d_model = d_model
 
         self.history = history
         self.future = future
+        #"eval": one output, the logit of the expected score stockfish gives the position. "result": the three
+        #classes lost, draw, won of the game, what the checkpoints before 2026-09-22 were trained on
+        self.value_target = value_target
 
         #one mebedding per possible board token, each of d_model size
         self.embed = nn.Embedding(BOARD_VOCAB_SIZE, self.d_model)
@@ -156,19 +171,24 @@ class ChessTransformer(nn.Module):
         #positional bias templates per piece, each the size of the entire board
         self.templates = nn.Parameter(torch.zeros(position_templates, NUM_SQUARES, NUM_SQUARES))
 
+        #one q/k width for every block, or one per block: the first blocks of trained models use far fewer q/k dims
+        qk_ratios = list(qk_ratio) if isinstance(qk_ratio, (list, tuple)) else [qk_ratio] * num_layers
+        if len(qk_ratios) != num_layers:
+            raise ValueError(f"{len(qk_ratios)} qk ratios for {num_layers} blocks, give one or one per block")
+
         #a ModuleList since Sequential can only hand a block one input, and they need the templates too
-        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, dropout, swiglu, mlp_ratio) for _ in range(num_layers)])
+        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, dropout, swiglu, mlp_ratio, qk_ratios[layer], kv_heads) for layer in range(num_layers)])
 
         self.board_down_project = nn.Sequential(
             nn.Linear(self.d_model, VALUE_TOKEN_DIM),
             nn.GELU()
         ) 
 
-        #value head which predicts win loss or draw. Forces the model to learn some sense of long term planning from games. 
-        self.value_head = nn.Sequential(
+        #predicts centipawn eval of the current board
+        self.eval_head = nn.Sequential(
             nn.Linear(TOKENS_PER_BOARD * VALUE_TOKEN_DIM, self.d_model),
             nn.GELU(),
-            nn.Linear(self.d_model, NUM_RESULTS)
+            nn.Linear(self.d_model, 1 if value_target == "eval" else NUM_RESULTS)
         )
 
         self.learned_history = nn.ModuleList(
@@ -178,9 +198,6 @@ class ChessTransformer(nn.Module):
 
         for embedding in self.learned_history:
             nn.init.zeros_(embedding.weight)
-
-        #predicts what will have changed on every square future plies from now, in the codes of the history input
-        self.future_head = nn.Linear(self.d_model, NUM_HISTORY_CODES) if future > 0 else None
 
         self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
         self.register_buffer("to_squares", torch.tensor(MOVE_TO_SQUARES, dtype=torch.long))
@@ -195,6 +212,10 @@ class ChessTransformer(nn.Module):
         self.promotion_projection = nn.Linear(self.d_model, 4) #one per piece a pawn can become
 
         self.ln = nn.LayerNorm(self.d_model)
+
+        #predicts what will have changed on every square future plies from now, in the codes of the history input.
+        #built last so that with the same seed the rest of the model starts from the same weights with or without it
+        self.future_head = nn.Linear(self.d_model, NUM_HISTORY_CODES) if future > 0 else None
 
     def forward(self, board_state: torch.Tensor, prev_boards: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         #input is B x TOKENS_PER_BOARD
@@ -246,13 +267,17 @@ class ChessTransformer(nn.Module):
             #B T d_model turned to B T VALUE_TOKEN_DIM, then reshaped to B T * VALUE_TOKEN_DIM
             compressed_board = self.board_down_project(model_output.float()).reshape(B, -1)
 
-            #shape B 3, stored as loss, draw, win
-            board_value_logits = self.value_head(compressed_board)
+            #shape B 1, current board centipawn loss (B 3 for a result model)
+            board_eval_logits = self.eval_head(compressed_board)
+
+            #I wonder if we should instead take the model logits instead of the compressed board to predict evals
+            #or keep the current system and then add another head that uses the logits to predict the eval of the next move
+            #or, use the future state head somehow and roll this into that head?
 
             #B 64 NUM_HISTORY_CODES, or nothing for a model without the head
             future_state = self.future_head(model_output[:, :NUM_SQUARES].float()) if self.future_head is not None else None
 
-        return combined_logits, board_value_logits, future_state
+        return combined_logits, board_eval_logits, future_state
 
         
 

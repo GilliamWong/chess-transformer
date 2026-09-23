@@ -42,7 +42,7 @@ def test_validation_future_loss_is_independent_of_batch_grouping(batch_size, kno
         torch.arange(4).unsqueeze(1), torch.zeros(4, 1, dtype=torch.long), torch.ones(4, 1),
         torch.zeros(4, dtype=torch.long), torch.empty(4, 0, 64, dtype=torch.long), targets,
     )
-    measured = evaluate_model(FixedModel(), DataLoader(dataset, batch_size=batch_size), nn.CrossEntropyLoss(), torch.device("cpu"))[-1]
+    measured = evaluate_model(FixedModel(), DataLoader(dataset, batch_size=batch_size), torch.device("cpu"))[-1]
 
     if known_targets:
         #three labelled boards: one uniform prediction and two assigning logit 4 to the correct class

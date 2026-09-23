@@ -294,6 +294,24 @@ def test_mixed_training_sets_share_every_batch_equally(tmp_path, monkeypatch):
         assert (moves >= 10000).sum() == 8  #half of every batch although small is 3% of the positions
 
 
+@pytest.mark.parametrize("training_set", ["tiny", "tiny+other"])
+def test_train_order_depends_on_the_seed_alone(tmp_path, monkeypatch, training_set):
+    #building a model draws random numbers, a different amount for every architecture, which used to change the order
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    write_training_set(tmp_path, "tiny", {"train": 300, "val": 20})
+    write_training_set(tmp_path, "other", {"train": 300, "val": 20})
+    train_dataset, val_dataset = load_training_set(training_set)
+
+    def first_batches(seed: int, draws_before: int) -> list[list[int]]:
+        torch.manual_seed(0)
+        torch.randn(draws_before)
+        train_loader, _ = datasets_to_dataloaders(train_dataset, val_dataset, train_batch_size=16, val_batch_size=16, seed=seed)
+        return [moves[:, 0].tolist() for _, (_, moves, *_) in zip(range(5), train_loader)]
+
+    assert first_batches(seed=3, draws_before=10) == first_batches(seed=3, draws_before=1000)
+    assert first_batches(seed=3, draws_before=10) != first_batches(seed=4, draws_before=10)
+
+
 def test_missing_training_set_is_reported(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
 

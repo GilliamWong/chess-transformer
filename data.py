@@ -87,6 +87,9 @@ SWAPPED_PIECES = torch.tensor([0] + list(range(NUM_PIECE_TYPES + 1, 2 * NUM_PIEC
 
 #what the policy learns to predict: the move that was played, or stockfish's best moves (tools/label_with_stockfish.py)
 POLICY_TARGETS = ("human", "stockfish")
+#what the value head learns to predict: "result", how the game ended (a class: lost, draw, won), or "eval", stockfish's
+#score of the position as the expected score it stands for (a float from 0 to 1), for the sets that have the evals
+VALUE_TARGETS = ("result", "eval")
 
 #the future target of a square whose future is not in the data: the game ended first. nn.CrossEntropyLoss skips it
 FUTURE_UNKNOWN = -100
@@ -126,6 +129,9 @@ class ChessGamesDataset(Dataset):
         self.stockfish_moves = None
         self.stockfish_evals = None
         self.target_temperature = None
+        #and the value target is the game's result until with_eval_targets
+        self.value_target = "result"
+        self.position_evals = None
 
     #for positions that are already arrays (load_training_set). They can be memory mapped and far too
     #many for a python list of games: the tensors share the arrays' memory, nothing is copied
@@ -152,21 +158,38 @@ class ChessGamesDataset(Dataset):
     #from here on the policy target is stockfish's best moves and not the move played. moves and evals are
     #(positions, top moves) the way tools/label_with_stockfish.py writes them, the best move first
     def with_stockfish_targets(self, moves: np.ndarray, evals: np.ndarray, target_temperature: float) -> "ChessGamesDataset":
+        if target_temperature <= 0:
+            raise ValueError(f"the target temperature must be above 0, got {target_temperature}")
+        self.stockfish_moves, self.stockfish_evals = self.stockfish_labels(moves, evals)
+        self.target_temperature = target_temperature
+        return self
+
+    #from here on the value target is stockfish's eval of the position (the first column of evals, the score after
+    #its best move) instead of how the game ended. Independent of the policy target: a set can keep the moves that
+    #were played and still learn stockfish's evals
+    def with_eval_targets(self, moves: np.ndarray, evals: np.ndarray) -> "ChessGamesDataset":
+        _, label_evals = self.stockfish_labels(moves, evals)
+        self.position_evals = label_evals[:, 0]
+        self.value_target = "eval"
+        return self
+
+    #the labels as tensors, once they are known to fit this set, for the policy and the value targets above
+    def stockfish_labels(self, moves: np.ndarray, evals: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         if moves.shape != evals.shape or len(moves) != len(self):
             raise ValueError(f"stockfish moves {moves.shape} and evals {evals.shape} for {len(self)} positions")
         #an unlabelled position would come out as a confident target for move 0
         unlabelled = int((moves[:, 0] == NO_MOVE).sum())
         if unlabelled:
             raise ValueError(f"{unlabelled:,} of {len(self):,} positions are not labelled yet, tools.label_with_stockfish finishes them")
-        if target_temperature <= 0:
-            raise ValueError(f"the target temperature must be above 0, got {target_temperature}")
-
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
-            self.stockfish_moves = torch.from_numpy(moves)
-            self.stockfish_evals = torch.from_numpy(evals)
-        self.target_temperature = target_temperature
-        return self
+            return torch.from_numpy(moves), torch.from_numpy(evals)
+
+    #the value head's target for rows: the result as a class (0 lost, 1 draw, 2 won), or the eval as an expected score
+    def value_target_of(self, index: int | list[int]) -> torch.Tensor:
+        if self.value_target == "eval":
+            return torch.sigmoid(EXPECTED_SCORE_PER_CENTIPAWN * self.position_evals[index].float())
+        return self.results[index].long() + 1
 
     def __len__(self):
         return len(self.moves)
@@ -226,8 +249,8 @@ class ChessGamesDataset(Dataset):
         changes = torch.where(later != now, 1 + later, 0)
         return changes.masked_fill(~known.unsqueeze(1), FUTURE_UNKNOWN)
 
-    #boards, the policy target (moves and their probabilities, see policy_target), results, history, the future target.
-    #the result comes back as the class the value head predicts: 0 lost, 1 draw, 2 won
+    #boards, the policy target (moves and their probabilities, see policy_target), the value target (see value_target_of),
+    #history, the future target
     def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         rows = torch.as_tensor(index)
         history = self.history_of(rows.reshape(-1))
@@ -235,7 +258,7 @@ class ChessGamesDataset(Dataset):
         if rows.ndim == 0:
             history, future = history[0], future[0]
         target_moves, target_probabilities = self.policy_target(index)
-        return self.boards[index].long(), target_moves, target_probabilities, self.results[index].long() + 1, history, future
+        return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index), history, future
 
 
 #several training sets behind one index: the positions of the first, then of the second and so on. The sets stay
@@ -271,11 +294,12 @@ class MixedDataset(Dataset):
 #Positions are drawn at random with replacement: over a run that sees a fraction of tens of millions of positions
 #that is the same as shuffling, and no set runs out before the others
 class EqualSharesBatchSampler(Sampler):
-    def __init__(self, dataset: MixedDataset, batch_size: int):
+    def __init__(self, dataset: MixedDataset, batch_size: int, generator: torch.Generator | None = None):
         if batch_size % len(dataset.datasets) != 0:
             raise ValueError(f"a batch of {batch_size} cannot be shared equally between {len(dataset.datasets)} sets")
         self.dataset = dataset
         self.batch_size = batch_size
+        self.generator = generator
 
     def __len__(self):
         return len(self.dataset) // self.batch_size
@@ -285,7 +309,7 @@ class EqualSharesBatchSampler(Sampler):
         for _ in range(len(self)):
             batch = []
             for dataset, first_index in zip(self.dataset.datasets, self.dataset.first_indices):
-                batch += (torch.randint(len(dataset), (share,)) + first_index).tolist()
+                batch += (torch.randint(len(dataset), (share,), generator=self.generator) + first_index).tolist()
             yield batch
 
 
@@ -315,15 +339,20 @@ def datasets_to_dataloaders(
     train_dataset: ChessGamesDataset | MixedDataset,
     val_dataset: ChessGamesDataset,
     train_batch_size: int = 256,
-    val_batch_size: int = 512
+    val_batch_size: int = 512,
+    seed: int | None = None
 ) -> tuple[DataLoader, DataLoader]:
 
     #train is reshuffled every epoch so a batch is not 256 positions of the same few games.
     #val is only measured, so its order does not matter
+    #with a seed the train order has a generator of its own, so it depends on the seed alone and not on how many random
+    #numbers were drawn before training (building a model draws a different number for every architecture). Without
+    #one it comes from torch's global generator
+    generator = torch.Generator().manual_seed(seed) if seed is not None else None
     if isinstance(train_dataset, MixedDataset):
-        train_sampler = EqualSharesBatchSampler(train_dataset, train_batch_size)
+        train_sampler = EqualSharesBatchSampler(train_dataset, train_batch_size, generator)
     else:
-        train_sampler = BatchSampler(RandomSampler(train_dataset), batch_size=train_batch_size, drop_last=False)
+        train_sampler = BatchSampler(RandomSampler(train_dataset, generator=generator), batch_size=train_batch_size, drop_last=False)
     val_sampler = BatchSampler(SequentialSampler(val_dataset), batch_size=val_batch_size, drop_last=False)
 
     train_loader = DataLoader(train_dataset, sampler=train_sampler, batch_size=None)
@@ -344,9 +373,14 @@ def datasets_to_dataloaders(
 #policy_target "stockfish" makes the policy target stockfish's best moves, for the sets that have them
 #(<name>_{train,val}_stockfish_{moves,evals}.bin, written by tools/label_with_stockfish.py). In a mix the other sets keep
 #the move that was played: fishtest's are stockfish's own moves already. Which set got which target is printed
-def load_training_set(name: str, history: int = 0, policy_target: str = "human", target_temperature: float | None = None, future: int = 0) -> tuple[ChessGamesDataset | MixedDataset, ChessGamesDataset]:
+#
+#value_target "eval" makes the value target stockfish's eval of the position from the same files; every set of a mix
+#needs them then, since the batches of a mix hold one kind of value target
+def load_training_set(name: str, history: int = 0, policy_target: str = "human", target_temperature: float | None = None, future: int = 0, value_target: str = "result") -> tuple[ChessGamesDataset | MixedDataset, ChessGamesDataset]:
     if policy_target not in POLICY_TARGETS:
         raise ValueError(f"policy target {policy_target} is not one of {POLICY_TARGETS}")
+    if value_target not in VALUE_TARGETS:
+        raise ValueError(f"value target {value_target} is not one of {VALUE_TARGETS}")
 
     if "+" in name:
         #a set that is named several times is opened once and gets that many shares of every batch
@@ -357,7 +391,7 @@ def load_training_set(name: str, history: int = 0, policy_target: str = "human",
             if "stockfish" not in targets.values():
                 raise FileNotFoundError(f"none of {names} has stockfish labels, tools.label_with_stockfish writes them")
             print(f"policy targets: {targets}")
-        loaded = {one_name: load_training_set(one_name, history, targets[one_name], target_temperature, future) for one_name in targets}
+        loaded = {one_name: load_training_set(one_name, history, targets[one_name], target_temperature, future, value_target) for one_name in targets}
         return MixedDataset([loaded[one_name][0] for one_name in names]), loaded[names[0]][1]
 
     datasets = []
@@ -385,9 +419,7 @@ def load_training_set(name: str, history: int = 0, policy_target: str = "human",
             plies = np.memmap(plies_path, dtype=np.int16, mode="r")
         dataset = ChessGamesDataset.from_arrays(boards, moves, results, plies, history, future)
 
-        if policy_target == "stockfish":
-            if target_temperature is None:
-                raise ValueError("stockfish targets need a target temperature")
+        if policy_target == "stockfish" or value_target == "eval":
             if not stockfish_moves_path(name, split).exists():
                 raise FileNotFoundError(f"{stockfish_moves_path(name, split).name} is missing, tools.label_with_stockfish writes it")
             #(positions, top moves), and the size of the file says how many top moves that is
@@ -395,7 +427,13 @@ def load_training_set(name: str, history: int = 0, policy_target: str = "human",
             stockfish_evals = np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_stockfish_evals.bin", dtype=np.int16, mode="r")
             if len(stockfish_moves) == 0 or len(stockfish_moves) % len(dataset) != 0:
                 raise ValueError(f"{len(stockfish_moves):,} stockfish moves cannot be shared between {len(dataset):,} positions")
-            dataset.with_stockfish_targets(stockfish_moves.reshape(len(dataset), -1), stockfish_evals.reshape(len(dataset), -1), target_temperature)
+            stockfish_moves, stockfish_evals = stockfish_moves.reshape(len(dataset), -1), stockfish_evals.reshape(len(dataset), -1)
+            if policy_target == "stockfish":
+                if target_temperature is None:
+                    raise ValueError("stockfish targets need a target temperature")
+                dataset.with_stockfish_targets(stockfish_moves, stockfish_evals, target_temperature)
+            if value_target == "eval":
+                dataset.with_eval_targets(stockfish_moves, stockfish_evals)
         datasets.append(dataset)
 
     return datasets[0], datasets[1]

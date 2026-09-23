@@ -80,9 +80,9 @@ def endless_batches(loader: DataLoader):
 def distributed_loss(outputs, batch, value_weight: float, future_weight: float):
     """DDP averages gradients; the masked future loss needs a GLOBAL denominator."""
     logits, value_logits, future_logits = outputs
-    _, moves, probabilities, results, _, future = batch
+    _, moves, probabilities, values, _, future = batch
     loss = single.policy_loss(logits, moves, probabilities)
-    loss = loss + value_weight * nn.functional.cross_entropy(value_logits, results)
+    loss = loss + value_weight * single.value_loss(value_logits, values)
     if future_logits is not None:
         known = (future != FUTURE_UNKNOWN).sum()
         global_known = known.clone()
@@ -127,7 +127,7 @@ def evaluate(model, loader, device, max_batches=None):
     #The original validation loader retains exactly the single-GPU validation cohort.
     metrics = torch.zeros(5, dtype=torch.float64, device=device)
     if dist.get_rank() == 0:
-        values = single.evaluate_model(model, loader, nn.CrossEntropyLoss(), device, max_batches)
+        values = single.evaluate_model(model, loader, device, max_batches)
         metrics.copy_(torch.tensor(values, dtype=torch.float64, device=device))
     dist.broadcast(metrics, src=0)
     return metrics.tolist()
@@ -216,11 +216,11 @@ def run(args, device: torch.device):
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     if args.training_set == "carlsen":
         original_train, val_loader = single.load_dataloaders(
-            args.training_set, args.history, args.policy_target, args.target_temperature, args.future)
+            args.training_set, args.history, args.policy_target, args.target_temperature, args.future, args.value_target)
         train_dataset = original_train.dataset
     else:
         train_dataset, val_dataset = single.load_training_set(
-            args.training_set, args.history, args.policy_target, args.target_temperature, args.future)
+            args.training_set, args.history, args.policy_target, args.target_temperature, args.future, args.value_target)
         if local_rank == 0:
             single.warm_file_cache(train_dataset, val_dataset)
         val_loader = DataLoader(val_dataset, batch_size=None, sampler=BatchSampler(
@@ -235,7 +235,8 @@ def run(args, device: torch.device):
 
     model_settings = dict(d_model=args.d_model, num_layers=args.layers, n_heads=args.heads,
                           position_templates=args.templates, history=args.history, future=args.future,
-                          swiglu=args.swiglu, mlp_ratio=args.mlp_ratio, dropout=single.DROPOUT)
+                          swiglu=args.swiglu, mlp_ratio=args.mlp_ratio, dropout=single.DROPOUT, value_target=args.value_target,
+                          qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads)
     raw_model = ChessTransformer(**model_settings).to(device)
     if args.init_from is not None:
         #weights only: the optimizer and the schedule start afresh, so this is a restart with new settings, not a resume
@@ -262,7 +263,7 @@ def run(args, device: torch.device):
             settings = dict(
                 model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
                 peak_learn_rate=args.lr, schedule=args.schedule, seed=args.seed,
-                value_loss_weight=args.value_weight, future_loss_weight=args.future_weight,
+                value_loss_weight=args.value_weight, value_target=args.value_target, future_loss_weight=args.future_weight,
                 budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=sampler.batch_size,
                 training_set=args.training_set, policy_target=args.policy_target,
                 target_temperature=args.target_temperature if args.policy_target == "stockfish" else None,
@@ -284,6 +285,8 @@ def run(args, device: torch.device):
 
         train(model, raw_model, train_loader, val_loader, optimizer, scheduler, budget, device,
               args.value_weight, args.future_weight, writer, save_best if rank == 0 else None)
+        if rank == 0:
+            save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
         if rank == 0:
             log_validation(writer, metrics, budget.steps, final=True)
@@ -322,6 +325,8 @@ def parse_args(argv=None):
     parser.add_argument("--future", type=int, default=single.FUTURE)
     parser.add_argument("--swiglu", action="store_true")
     parser.add_argument("--mlp-ratio", type=float)
+    parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention)")
+    parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="width of the queries and keys as a multiple of the values', one for every block or one per block")
     parser.add_argument("--lr", type=float, default=single.PEAK_LEARN_RATE)
     parser.add_argument("--schedule", choices=("cosine", "hold", "constant"), default=single.SCHEDULE)
     parser.add_argument("--seed", type=int, default=single.SEED)
@@ -329,6 +334,7 @@ def parse_args(argv=None):
     parser.add_argument("--policy-target", choices=("human", "stockfish"), default=single.POLICY_TARGET)
     parser.add_argument("--target-temperature", type=float, default=single.TARGET_TEMPERATURE)
     parser.add_argument("--value-weight", type=float, default=single.VALUE_LOSS_WEIGHT)
+    parser.add_argument("--value-target", choices=("eval", "result"), default=single.VALUE_TARGET)
     parser.add_argument("--future-weight", type=float, default=single.FUTURE_LOSS_WEIGHT)
     return parser.parse_args(argv)
 
