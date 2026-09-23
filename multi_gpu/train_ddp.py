@@ -22,7 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import main as single
-from data import FUTURE_UNKNOWN, MixedDataset
+from data import MixedDataset
 from model import ChessTransformer
 from tools.budget import Budget
 from tools.checkpoint import RUNS_DIR, save_checkpoint
@@ -77,22 +77,6 @@ def endless_batches(loader: DataLoader):
         loader.sampler.epoch += 1
 
 
-def distributed_loss(outputs, batch, value_weight: float, future_weight: float):
-    """DDP averages gradients; the masked future loss needs a GLOBAL denominator."""
-    logits, value_logits, future_logits = outputs
-    _, moves, probabilities, values, _, future = batch
-    loss = single.policy_loss(logits, moves, probabilities)
-    loss = loss + value_weight * single.value_loss(value_logits, values)
-    if future_logits is not None:
-        known = (future != FUTURE_UNKNOWN).sum()
-        global_known = known.clone()
-        dist.all_reduce(global_known)
-        #Keep the head in autograd even when this rank (or every rank) has no targets.
-        future_sum = single.future_loss(future_logits, future) * known
-        loss = loss + future_weight * future_sum * dist.get_world_size() / global_known.clamp_min(1)
-    return loss
-
-
 def step_budget(budget: Budget, device: torch.device) -> None:
     """Rank zero owns elapsed time; all ranks use its progress for LR and stopping."""
     if device.type == "cuda":
@@ -125,7 +109,7 @@ def make_scheduler(optimizer, budget: Budget, schedule: str):
 def evaluate(model, loader, device, max_batches=None):
     #Use the unwrapped model: rank-zero-only DDP.forward could wait for other ranks.
     #The original validation loader retains exactly the single-GPU validation cohort.
-    metrics = torch.zeros(5, dtype=torch.float64, device=device)
+    metrics = torch.zeros(4, dtype=torch.float64, device=device)
     if dist.get_rank() == 0:
         values = single.evaluate_model(model, loader, device, max_batches)
         metrics.copy_(torch.tensor(values, dtype=torch.float64, device=device))
@@ -133,17 +117,17 @@ def evaluate(model, loader, device, max_batches=None):
     return metrics.tolist()
 
 
-METRIC_NAMES = ("val_loss", "val_accuracy", "val_value_loss", "val_value_accuracy", "val_future_loss")
+METRIC_NAMES = ("val_loss", "val_accuracy", "val_value_loss", "val_value_accuracy")
 
 
 def log_validation(writer, metrics, step, final=False):
-    tags = ("loss/val", "accuracy/val", "loss/val_value", "accuracy/val_value", "loss/val_future")
+    tags = ("loss/val", "accuracy/val", "loss/val_value", "accuracy/val_value")
     for name, tag, value in zip(METRIC_NAMES, tags, metrics):
         writer.add_scalar(f"final/{name}" if final else tag, value, step)
 
 
 def train(model, raw_model, train_loader, val_loader, optimizer, scheduler, budget, device,
-          value_weight, future_weight, writer=None, save_best=None):
+          value_weight, writer=None, save_best=None):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     best_val_loss = float("inf")  #the best trained checkpoint, even if the first update regresses
     loss_total = torch.zeros((), device=device)
@@ -156,7 +140,8 @@ def train(model, raw_model, train_loader, val_loader, optimizer, scheduler, budg
             batch = tuple(tensor.to(device, non_blocking=True) for tensor in cpu_batch)
             optimizer.zero_grad()
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                loss = distributed_loss(model(batch[0], batch[4]), batch, value_weight, future_weight)
+                logits, value_logits = model(batch[0])
+                loss = single.policy_loss(logits, batch[1], batch[2]) + value_weight * single.value_loss(value_logits, batch[3])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -214,17 +199,11 @@ def run(args, device: torch.device):
     #Only one process per host warms the OS file cache. Read-only mappings let
     #peers share cached pages without copying the data.
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    if args.training_set == "carlsen":
-        original_train, val_loader = single.load_dataloaders(
-            args.training_set, args.history, args.policy_target, args.target_temperature, args.future, args.value_target)
-        train_dataset = original_train.dataset
-    else:
-        train_dataset, val_dataset = single.load_training_set(
-            args.training_set, args.history, args.policy_target, args.target_temperature, args.future, args.value_target)
-        if local_rank == 0:
-            single.warm_file_cache(train_dataset, val_dataset)
-        val_loader = DataLoader(val_dataset, batch_size=None, sampler=BatchSampler(
-            SequentialSampler(val_dataset), single.BATCH_SIZE, drop_last=False))
+    train_dataset, val_dataset = single.load_training_set(args.training_set, args.policy_target, args.target_temperature)
+    if local_rank == 0:
+        single.warm_file_cache(train_dataset, val_dataset)
+    val_loader = DataLoader(val_dataset, batch_size=None, sampler=BatchSampler(
+        SequentialSampler(val_dataset), single.BATCH_SIZE, drop_last=False))
     dist.barrier()
     if not len(val_loader.dataset):
         raise ValueError("validation needs at least one position")
@@ -234,8 +213,7 @@ def run(args, device: torch.device):
                               generator=torch.Generator().manual_seed(args.seed + rank))
 
     model_settings = dict(d_model=args.d_model, num_layers=args.layers, n_heads=args.heads,
-                          position_templates=args.templates, history=args.history, future=args.future,
-                          swiglu=args.swiglu, mlp_ratio=args.mlp_ratio, dropout=single.DROPOUT, value_target=args.value_target,
+                          position_templates=args.templates, mlp_ratio=args.mlp_ratio,
                           qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads)
     raw_model = ChessTransformer(**model_settings).to(device)
     if args.init_from is not None:
@@ -244,8 +222,6 @@ def run(args, device: torch.device):
     model = DDP(raw_model, device_ids=[device.index] if device.type == "cuda" else None)
     if not args.no_compile:
         model = torch.compile(model)
-    #Weights start identically; stochastic layers get independent streams after DDP initialization.
-    torch.manual_seed(args.seed + rank)
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.lr, fused=device.type == "cuda")
     scheduler = make_scheduler(optimizer, budget, args.schedule)
     metrics = evaluate(raw_model, val_loader, device, single.EVAL_BATCHES)
@@ -263,7 +239,7 @@ def run(args, device: torch.device):
             settings = dict(
                 model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
                 peak_learn_rate=args.lr, schedule=args.schedule, seed=args.seed,
-                value_loss_weight=args.value_weight, value_target=args.value_target, future_loss_weight=args.future_weight,
+                value_loss_weight=args.value_weight,
                 budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=sampler.batch_size,
                 training_set=args.training_set, policy_target=args.policy_target,
                 target_temperature=args.target_temperature if args.policy_target == "stockfish" else None,
@@ -284,7 +260,7 @@ def run(args, device: torch.device):
             save_checkpoint(raw_model, model_settings, run_dir / "model.pt")
 
         train(model, raw_model, train_loader, val_loader, optimizer, scheduler, budget, device,
-              args.value_weight, args.future_weight, writer, save_best if rank == 0 else None)
+              args.value_weight, writer, save_best if rank == 0 else None)
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
@@ -321,9 +297,6 @@ def parse_args(argv=None):
     parser.add_argument("--layers", type=int, default=single.NUM_LAYERS)
     parser.add_argument("--heads", type=int, default=single.N_HEADS)
     parser.add_argument("--templates", type=int, default=single.POSITION_TEMPLATES)
-    parser.add_argument("--history", type=int, default=single.HISTORY)
-    parser.add_argument("--future", type=int, default=single.FUTURE)
-    parser.add_argument("--swiglu", action="store_true")
     parser.add_argument("--mlp-ratio", type=float)
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention)")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="width of the queries and keys as a multiple of the values', one for every block or one per block")
@@ -334,8 +307,6 @@ def parse_args(argv=None):
     parser.add_argument("--policy-target", choices=("human", "stockfish"), default=single.POLICY_TARGET)
     parser.add_argument("--target-temperature", type=float, default=single.TARGET_TEMPERATURE)
     parser.add_argument("--value-weight", type=float, default=single.VALUE_LOSS_WEIGHT)
-    parser.add_argument("--value-target", choices=("eval", "result"), default=single.VALUE_TARGET)
-    parser.add_argument("--future-weight", type=float, default=single.FUTURE_LOSS_WEIGHT)
     return parser.parse_args(argv)
 
 

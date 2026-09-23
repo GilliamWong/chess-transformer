@@ -27,7 +27,6 @@ def write_labelled_set(folder, name, stockfish_moves=STOCKFISH_MOVES, stockfish_
     for split in ("train", "val"):
         (folder / f"{name}_{split}_boards.bin").write_bytes(np.full((positions, TOKENS_PER_BOARD), 5, dtype=np.uint8).tobytes())
         (folder / f"{name}_{split}_moves.bin").write_bytes((np.arange(positions, dtype=np.int16) + 100).tobytes())
-        (folder / f"{name}_{split}_results.bin").write_bytes(np.zeros(positions, dtype=np.int8).tobytes())
         (folder / f"{name}_{split}_stockfish_moves.bin").write_bytes(np.array(stockfish_moves, dtype=np.int16).tobytes())
         (folder / f"{name}_{split}_stockfish_evals.bin").write_bytes(np.array(stockfish_evals, dtype=np.int16).tobytes())
 
@@ -43,7 +42,7 @@ def test_stockfish_targets_share_the_probability_by_their_evals(tmp_path, monkey
     write_labelled_set(tmp_path, "labelled")
 
     train_dataset, _ = load_training_set("labelled", policy_target="stockfish", target_temperature=TEMPERATURE)
-    _, target_moves, target_probabilities, _, _, _ = train_dataset[[0, 1, 2]]
+    _, target_moves, target_probabilities, _ = train_dataset[[0, 1, 2]]
 
     #places without a move become move 0 at probability 0, so they can be looked up in the logits and add nothing
     assert target_moves.tolist() == [[5, 9, 2], [7, 0, 0], [1, 3, 0]]
@@ -60,7 +59,7 @@ def test_the_move_played_stays_the_target_unless_stockfish_is_asked_for(tmp_path
 
     train_dataset, _ = load_training_set("labelled")
 
-    _, target_moves, target_probabilities, _, _, _ = train_dataset[[0, 1, 2]]
+    _, target_moves, target_probabilities, _ = train_dataset[[0, 1, 2]]
     assert target_moves.tolist() == [[100], [101], [102]]
     assert target_probabilities.tolist() == [[1.0]] * 3
 
@@ -72,25 +71,6 @@ def test_a_set_that_is_not_labelled_to_the_end_is_rejected(tmp_path, monkeypatch
 
     with pytest.raises(ValueError, match="not labelled"):
         load_training_set("unfinished", policy_target="stockfish", target_temperature=TEMPERATURE)
-
-
-def test_a_mix_keeps_the_move_played_for_the_sets_without_labels(tmp_path, monkeypatch):
-    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
-    write_labelled_set(tmp_path, "labelled")
-    write_labelled_set(tmp_path, "played")
-    for split in ("train", "val"):
-        for kind in ("moves", "evals"):
-            (tmp_path / f"played_{split}_stockfish_{kind}.bin").unlink()
-
-    train_dataset, _ = load_training_set("labelled+played", policy_target="stockfish", target_temperature=TEMPERATURE)
-    _, target_moves, target_probabilities, _, _, _ = train_dataset[[1, 4]]  #the second position of both sets
-
-    #one move is as wide as three once it is filled up, and still a probability of 1
-    assert target_moves.tolist() == [[7, 0, 0], [101, 0, 0]]
-    assert target_probabilities.tolist() == [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
-
-    with pytest.raises(FileNotFoundError):
-        load_training_set("played+played", policy_target="stockfish", target_temperature=TEMPERATURE)
 
 
 def test_policy_loss_with_one_move_is_cross_entropy():

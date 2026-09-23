@@ -1,7 +1,7 @@
 import chess.pgn
 import pytest
 
-from data import CARLSEN_PGN
+from tools.play.evaluate_elo import CARLSEN_PGN
 
 NUM_PGN_GAMES_TO_REPLAY = 5
 

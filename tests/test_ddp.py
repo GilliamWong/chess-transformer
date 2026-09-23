@@ -17,8 +17,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import data
 import main as single
-from data import FUTURE_UNKNOWN, MixedDataset
-from encoding import BOARD_VOCAB_SIZE, NUM_HISTORY_CODES, TOKENS_PER_BOARD
+from data import MixedDataset
+from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD
 from model import ChessTransformer
 from multi_gpu import train_ddp
 from tools.budget import Budget
@@ -65,10 +65,14 @@ def test_invalid_shards_fail_before_training(dataset, batch_size, world_size):
         train_ddp.TrainingSampler(dataset, batch_size, 0, world_size, 42)
 
 
-def compare_update(rank, future_mode, compiled=False):
+def training_loss(model, batch):
+    policy, value = model(batch[0])
+    return single.policy_loss(policy, batch[1], batch[2]) + 0.8 * single.value_loss(value, batch[3])
+
+
+def compare_update(rank, compiled=False):
     torch.manual_seed(123)
-    model = ChessTransformer(d_model=16, num_layers=1, n_heads=2, position_templates=2,
-                             history=1, future=int(future_mode != "disabled"), swiglu=True, dropout=0, value_target="result")
+    model = ChessTransformer(d_model=16, num_layers=1, n_heads=2, position_templates=2)
     with torch.no_grad():
         model.templates.normal_(std=0.1)
     distributed = DDP(model)
@@ -76,27 +80,18 @@ def compare_update(rank, future_mode, compiled=False):
     if compiled:
         distributed = torch.compile(distributed, backend="aot_eager")
     generator = torch.Generator().manual_seed(18)
-    future = torch.randint(NUM_HISTORY_CODES, (8, 64), generator=generator)
-    #One rank has no supervision; the other has uneven supervision within its batch.
-    future[:4] = FUTURE_UNKNOWN
-    future[4, :32] = FUTURE_UNKNOWN
-    if future_mode == "unknown":
-        future.fill_(FUTURE_UNKNOWN)
     batch = (
         torch.randint(BOARD_VOCAB_SIZE, (8, TOKENS_PER_BOARD), generator=generator),
         torch.arange(16).reshape(8, 2), torch.tensor([[0.7, 0.3]] * 8),
-        torch.arange(8) % 3, torch.randint(NUM_HISTORY_CODES, (8, 1, 64), generator=generator), future,
+        torch.rand(8, generator=generator),
     )
     world_size = dist.get_world_size()
     local_size = 8 // world_size
     local = tuple(tensor[rank * local_size:(rank + 1) * local_size] for tensor in batch)
-    loss = train_ddp.distributed_loss(distributed(local[0], local[4]), local, 0.8, 0.5)
+    loss = training_loss(distributed, local)
     loss.backward()
 
-    policy, value, future_logits = reference(batch[0], batch[4])
-    expected = single.policy_loss(policy, batch[1], batch[2]) + 0.8 * single.value_loss(value, batch[3])
-    if future_logits is not None:
-        expected = expected + 0.5 * single.future_loss(future_logits, batch[5])
+    expected = training_loss(reference, batch)
     expected.backward()
     averaged_loss = loss.detach().clone()
     dist.all_reduce(averaged_loss)
@@ -136,16 +131,14 @@ def check_shared_clock(rank):
                     budget.resume()
 
 
-def write_set(folder, name, labelled):
+def write_set(folder, name):
     for split, size in (("train", 32), ("val", 10)):
         arrays = dict(
             boards=np.full((size, TOKENS_PER_BOARD), 5, dtype=np.uint8),
-            moves=np.arange(size, dtype=np.int16), results=np.zeros(size, dtype=np.int8),
-            plies=(np.arange(size) % 5).astype(np.int16),
+            moves=np.arange(size, dtype=np.int16),
+            stockfish_moves=np.tile(np.array([0, 1], dtype=np.int16), (size, 1)),
+            stockfish_evals=np.tile(np.array([120, -60], dtype=np.int16), (size, 1)),
         )
-        if labelled:
-            arrays.update(stockfish_moves=np.tile(np.array([0, 1], dtype=np.int16), (size, 1)),
-                          stockfish_evals=np.tile(np.array([120, -60], dtype=np.int16), (size, 1)))
         for field, array in arrays.items():
             (folder / f"{name}_{split}_{field}.bin").write_bytes(array.tobytes())
 
@@ -156,9 +149,8 @@ def distributed_worker(rank, folder, world_size):
     dist.init_process_group("gloo", init_method=(folder / "rendezvous").as_uri(),
                             rank=rank, world_size=world_size, timeout=timedelta(seconds=90))
     try:
-        for mode in ("disabled", "uneven", "unknown"):
-            compare_update(rank, mode)
-        compare_update(rank, "uneven", compiled=True)
+        compare_update(rank)
+        compare_update(rank, compiled=True)
         single.WARMUP_STEPS = 1
         check_shared_clock(rank)
 
@@ -174,12 +166,12 @@ def distributed_worker(rank, folder, world_size):
         args = train_ddp.parse_args([
             "--device", "cpu", "--no-compile", "--no-tensorboard", "--name", "smoke",
             "--positions", "192", "--batch-size", "16", "--d-model", "16", "--layers", "1",
-            "--heads", "2", "--templates", "2", "--history", "1", "--future", "2", "--swiglu",
-            "--training-set", "a+a+a+b", "--policy-target", "stockfish", "--value-target", "result",  #b has no evals
+            "--heads", "2", "--templates", "2",
+            "--training-set", "a+a+a+b", "--policy-target", "stockfish",
         ])
         train_ddp.run(args, torch.device("cpu"))
         model, settings = load_checkpoint(folder / "runs" / "smoke" / "model.pt", torch.device("cpu"))
-        assert settings["future"] == 2 and settings["history"] == 1
+        assert settings["d_model"] == 16 and settings["position_templates"] == 2
         assert isinstance(model, ChessTransformer)
         states = [None] * dist.get_world_size()
         dist.all_gather_object(states, {name: tensor.tolist() for name, tensor in model.state_dict().items()})
@@ -191,8 +183,8 @@ def distributed_worker(rank, folder, world_size):
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_distributed_gradients_budgets_and_complete_training(tmp_path, world_size):
-    write_set(tmp_path, "a", labelled=True)
-    write_set(tmp_path, "b", labelled=False)
+    write_set(tmp_path, "a")
+    write_set(tmp_path, "b")
     context = mp.spawn(distributed_worker, args=(str(tmp_path), world_size), nprocs=world_size, join=False)
     deadline = time.monotonic() + 180
     try:
@@ -212,5 +204,5 @@ def test_distributed_gradients_budgets_and_complete_training(tmp_path, world_siz
     assert settings["positions_seen"] == 192
     assert settings["batch_size"] == 16 and settings["per_gpu_batch_size"] == 16 // world_size
     assert settings["policy_target"] == "stockfish"
-    assert settings["finished_at"] and settings["final_val_future_loss"] >= 0
+    assert settings["finished_at"] and settings["final_val_value_loss"] >= 0
     assert (tmp_path / "progress.html").exists()

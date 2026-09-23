@@ -1,9 +1,10 @@
+from itertools import islice
+
 import pytest
 import torch
 from torch import nn
 
-from data import ChessGamesDataset, game_to_examples
-from encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD
+from encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD, encode_board, encode_move_to_id
 from model import ChessTransformer
 
 BATCH_SIZE = 16
@@ -12,27 +13,30 @@ BATCH_SIZE = 16
 def small_model() -> ChessTransformer:
     """small enough to train for a few hundred steps inside a test"""
     torch.manual_seed(0)
-    return ChessTransformer(d_model=32, num_layers=2, n_heads=2, dropout=0.0)
+    return ChessTransformer(d_model=32, num_layers=2, n_heads=2)
 
 
 @pytest.fixture(scope="module")
 def batch(carlsen_games) -> tuple[torch.Tensor, torch.Tensor]:
     """the first positions of a real game, with the moves played from them"""
-    dataset = ChessGamesDataset([game_to_examples(carlsen_games[0])])
-    boards, target_moves, _, _, _, _ = zip(*(dataset[index] for index in range(BATCH_SIZE)))
-    return torch.stack(boards), torch.stack(target_moves)[:, 0]  #the one target move of each position: the move played
+    board = carlsen_games[0].board()
+    boards, moves = [], []
+    for move in islice(carlsen_games[0].mainline_moves(), BATCH_SIZE):
+        boards.append(encode_board(board))
+        moves.append(encode_move_to_id(move, board.turn))
+        board.push(move)
+    return torch.tensor(boards), torch.tensor(moves)
 
 
 def test_one_set_of_move_logits_per_board(batch):
     boards, _ = batch
 
-    logits, value_logits, future_logits = small_model()(boards)
+    logits, value_logits = small_model()(boards)
 
     #not (batch, TOKENS_PER_BOARD, NUM_MOVE_IDS): the tokens have to be pooled into one answer per board
     assert boards.shape == (BATCH_SIZE, TOKENS_PER_BOARD)
     assert logits.shape == (BATCH_SIZE, NUM_MOVE_IDS)
     assert value_logits.shape == (BATCH_SIZE, 1)  #the logit of the expected score
-    assert future_logits is None  #no future head unless asked for
 
 
 #without the positional embedding the model sees which pieces exist but not where they are
@@ -55,7 +59,7 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
     boards, _ = batch
 
     for alone, in_a_batch in zip(model(boards[:1]), model(boards)):
-        assert alone is None or torch.allclose(alone, in_a_batch[:1], atol=1e-5)  #None is the missing future head
+        assert torch.allclose(alone, in_a_batch[:1], atol=1e-5)
 
 
 #something added to every move changes no probability but can grow without limit, and did: training in bf16
@@ -63,7 +67,7 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
 def test_promotion_term_only_changes_promotion_logits(batch):
     model = small_model().eval()
     boards, _ = batch
-    before, _, _ = model(boards)
+    before, _ = model(boards)
 
     with torch.no_grad():
         model.promotion_projection.bias += 5.0
@@ -79,7 +83,7 @@ def test_promotion_term_only_changes_promotion_logits(batch):
 def test_attention_bias_starts_at_zero(batch):
     model = small_model().eval()
     boards, _ = batch
-    before, _, _ = model(boards)
+    before, _ = model(boards)
 
     with torch.no_grad():
         for block in model.encoder:
@@ -98,14 +102,10 @@ def test_every_parameter_gets_a_gradient(batch):
     with torch.no_grad():
         model.templates.normal_(std=0.1)
 
-    #every head has to be in the loss, or the one left out gets no gradient
-    model = ChessTransformer(d_model=32, num_layers=2, n_heads=2, future=2, dropout=0.0)
-    with torch.no_grad():
-        model.templates.normal_(std=0.1)
-    logits, value_logits, future_logits = model(boards)
+    #both heads have to be in the loss, or the one left out gets no gradient
+    logits, value_logits = model(boards)
     values = torch.full((len(boards),), 0.7)
-    future = torch.zeros((len(boards), 64), dtype=torch.long)
-    (nn.CrossEntropyLoss()(logits, moves) + nn.functional.binary_cross_entropy_with_logits(value_logits.squeeze(-1), values) + nn.CrossEntropyLoss()(future_logits.flatten(0, 1), future.flatten())).backward()
+    (nn.CrossEntropyLoss()(logits, moves) + nn.functional.binary_cross_entropy_with_logits(value_logits.squeeze(-1), values)).backward()
 
     for name, parameter in model.named_parameters():
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
@@ -130,34 +130,21 @@ def test_can_overfit_one_batch(batch):
     assert (model(boards)[0].argmax(dim=1) == moves).all()
 
 
-#the history embeddings start at zero, so a new model with history is exactly the model without it
-def test_untrained_history_changes_nothing(batch):
-    boards, _ = batch
-    torch.manual_seed(0)
-    without = ChessTransformer(d_model=32, num_layers=2, n_heads=2, dropout=0.0).eval()
-    torch.manual_seed(0)
-    with_history = ChessTransformer(d_model=32, num_layers=2, n_heads=2, history=2, dropout=0.0).eval()
-    with_history.load_state_dict(without.state_dict(), strict=False)
-    history = torch.randint(0, 14, (BATCH_SIZE, 2, 64))
-
-    assert torch.equal(with_history(boards, history)[0], without(boards)[0])
-
-
 def test_a_smaller_qk_ratio_narrows_only_the_queries_and_keys(batch):
     boards, _ = batch
     torch.manual_seed(0)
-    model = ChessTransformer(d_model=32, num_layers=2, n_heads=2, dropout=0.0, qk_ratio=0.5)
+    model = ChessTransformer(d_model=32, num_layers=2, n_heads=2, qk_ratio=0.5)
     block = model.encoder[0]
 
     assert block.Q.weight.shape == block.K.weight.shape == (16, 32) #8 dims a head for the dot products
     assert block.V.weight.shape == (32, 32) #the values each head brings back keep their 16
-    logits, _, _ = model(boards)
+    logits, _ = model(boards)
     assert logits.shape == (BATCH_SIZE, NUM_MOVE_IDS)
 
 
 def test_a_qk_ratio_per_block_gives_each_block_its_own_width(batch):
     boards, _ = batch
-    model = ChessTransformer(d_model=32, num_layers=2, n_heads=2, dropout=0.0, qk_ratio=[0.25, 1.0])
+    model = ChessTransformer(d_model=32, num_layers=2, n_heads=2, qk_ratio=[0.25, 1.0])
 
     assert [block.Q.weight.shape[0] for block in model.encoder] == [8, 32]
     assert model(boards)[0].shape == (BATCH_SIZE, NUM_MOVE_IDS)
@@ -169,8 +156,8 @@ def test_grouped_query_attention_is_heads_sharing_their_keys_and_values(batch):
     #2 key/value heads for 4 heads must give what 4 give when heads 0, 1 and heads 2, 3 have the same key/value weights
     boards, _ = batch
     torch.manual_seed(0)
-    grouped = ChessTransformer(d_model=32, num_layers=2, n_heads=4, dropout=0.0, kv_heads=2).eval()
-    full = ChessTransformer(d_model=32, num_layers=2, n_heads=4, dropout=0.0).eval()
+    grouped = ChessTransformer(d_model=32, num_layers=2, n_heads=4, kv_heads=2).eval()
+    full = ChessTransformer(d_model=32, num_layers=2, n_heads=4).eval()
     weights = grouped.state_dict()
     for name in [f"encoder.{block}.{projection}.{kind}" for block in range(2) for projection in "KV" for kind in ("weight", "bias")]:
         #the rows are grouped by head, 8 each: every key/value head's rows again for the second head of its group
@@ -178,31 +165,6 @@ def test_grouped_query_attention_is_heads_sharing_their_keys_and_values(batch):
     full.load_state_dict(weights)
 
     for grouped_output, full_output in zip(grouped(boards), full(boards)):
-        assert grouped_output is None or torch.allclose(grouped_output, full_output, atol=1e-5)
+        assert torch.allclose(grouped_output, full_output, atol=1e-5)
     with pytest.raises(ValueError):
         ChessTransformer(d_model=32, num_layers=2, n_heads=4, kv_heads=3)
-
-
-def test_the_future_head_leaves_the_other_starting_weights_alone():
-    #so that two runs with the same seed, one with the head and one without, differ by the head and nothing else
-    torch.manual_seed(0)
-    without = ChessTransformer(d_model=32, num_layers=2, n_heads=2, dropout=0.0)
-    torch.manual_seed(0)
-    with_future = ChessTransformer(d_model=32, num_layers=2, n_heads=2, future=2, dropout=0.0)
-    with_future_weights = with_future.state_dict()
-
-    for name, weights in without.state_dict().items():
-        assert torch.equal(weights, with_future_weights[name]), name
-
-
-def test_trained_history_changes_the_output_but_not_for_code_zero(batch):
-    boards, _ = batch
-    model = ChessTransformer(d_model=32, num_layers=2, n_heads=2, history=1, dropout=0.0).eval()
-    with torch.no_grad():
-        model.learned_history[0].weight[1:].normal_()
-    nothing_changed = torch.zeros((BATCH_SIZE, 1, 64), dtype=torch.long)
-    something_changed = nothing_changed.clone()
-    something_changed[:, 0, 12] = 5
-
-    assert torch.equal(model(boards, nothing_changed)[0], model(boards, torch.zeros_like(nothing_changed))[0])
-    assert not torch.allclose(model(boards, something_changed)[0], model(boards, nothing_changed)[0])
