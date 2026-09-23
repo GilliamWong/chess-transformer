@@ -17,10 +17,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import data
 import main as single
-import train_ddp
 from data import FUTURE_UNKNOWN, MixedDataset
 from encoding import BOARD_VOCAB_SIZE, NUM_HISTORY_CODES, TOKENS_PER_BOARD
 from model import ChessTransformer
+from multi_gpu import train_ddp
 from tools.budget import Budget
 from tools.checkpoint import load_checkpoint
 

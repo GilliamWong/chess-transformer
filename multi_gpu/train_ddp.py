@@ -1,6 +1,6 @@
-"""Separate DDP trainer. Example (Linux, two GPUs):
+"""Separate DDP trainer. Example (Linux, two GPUs), from the repository root:
 
-uv run torchrun --standalone --nproc-per-node=2 train_ddp.py --minutes 30
+uv run torchrun --standalone --nproc-per-node=2 -m multi_gpu.train_ddp --minutes 30
 
 --batch-size and --positions are global, across all processes. The model, targets,
 loss definitions, validation and checkpoint format are shared with main.py.
@@ -342,7 +342,7 @@ def parse_args(argv=None):
 def main():
     args = parse_args()
     if "RANK" not in os.environ or "LOCAL_RANK" not in os.environ:
-        raise SystemExit("launch with: uv run torchrun --standalone --nproc-per-node=2 train_ddp.py [options]")
+        raise SystemExit("launch from the repository root with: uv run torchrun --standalone --nproc-per-node=2 -m multi_gpu.train_ddp [options]")
     local_rank = int(os.environ["LOCAL_RANK"])
     if args.device == "cuda":
         if not dist.is_nccl_available():

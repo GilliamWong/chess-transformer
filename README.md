@@ -56,12 +56,12 @@ Carlsen games, so set `TRAINING_SET = "carlsen"`.
 
 ### Multiple GPUs
 
-`train_ddp.py` is a separate Distributed Data Parallel trainer; `main.py` is unchanged.
-Use a Linux machine with a CUDA/NCCL PyTorch build and launch one process per GPU:
+`multi_gpu/train_ddp.py` is a separate Distributed Data Parallel trainer; `main.py` is unchanged.
+Use a Linux machine with a CUDA/NCCL PyTorch build and launch one process per GPU, as a module from the repository root:
 
 ```bash
-uv run torchrun --standalone --nproc-per-node=2 train_ddp.py --minutes 30 --no-tensorboard
-uv run torchrun --standalone --nproc-per-node=4 train_ddp.py --positions 10_000_000 --batch-size 1024 --no-tensorboard
+uv run torchrun --standalone --nproc-per-node=2 -m multi_gpu.train_ddp --minutes 30 --no-tensorboard
+uv run torchrun --standalone --nproc-per-node=4 -m multi_gpu.train_ddp --positions 10_000_000 --batch-size 1024 --no-tensorboard
 ```
 
 It supports the model, history, future-head, Stockfish-target and mixture options from `main.py`.
@@ -151,7 +151,7 @@ The small Leela embedding is `LeelaChessTransformer(block="templates", leela_emb
 `model_leela.py`. So far only `leela_head_to_head.py` trains it; `main.py` and `train_ddp.py` cannot build it yet. Everything
 else is a `main.py` flag. The dense size of 16 was only tested at d128.
 
-At scale, train synchronously (`train_ddp.py`) at a global batch of about 4096, as the d640 run did. The measured gradient
+At scale, train synchronously (`multi_gpu/train_ddp.py`) at a global batch of about 4096, as the d640 run did. The measured gradient
 noise scale of a d640 model is 2.5k-7k positions while the learning rate is high, so a much bigger batch mostly wastes positions. Averaging the weights of
 150 preemptible GPUs (`train_hyak.py`) ended about 100 Elo below that run on 5.9x its compute. Stay within about 4 passes
 over the data: `full_sf8_20260922` has 290M positions, so about 1.2B per run, and a longer run needs more labelled positions.
@@ -186,12 +186,12 @@ The root training and model files are:
 | `data.py` | PGN to training examples, the split by game, the dataset and loaders |
 | `model.py` | The transformer: board tokens in, a score for each move out |
 | `main.py` | The single-GPU training loop |
-| `train_ddp.py` | The separate multi-GPU DDP training loop |
 
 Everything else is kept out of the way:
 
 | Folder | What is in it |
 |---|---|
+| `multi_gpu/` | `train_ddp.py`, the separate multi-GPU DDP training loop. Run as a module from the root under `torchrun` |
 | `tools/` | Checkpoint saving and loading, the training budget, the run table and results page, the TensorBoard launcher, labelling a training set with Stockfish, and `play/` (choosing the model's move, the UCI protocol, matches against Stockfish). Run as modules from the root: `python -m tools.<name>` |
 | `artifacts/` | No code: the PGNs, preprocessed training sets, checkpoints, TensorBoard runs and chess engines. Only `pgn_data/Carlsen.pgn` is in git |
 | `tests/` | `uv run pytest` |
