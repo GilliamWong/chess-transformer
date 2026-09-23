@@ -44,6 +44,15 @@ def test_bare_weights_are_rejected_with_an_explanation(tmp_path):
         load_checkpoint(tmp_path / "old.pt", CPU)
 
 
+#the settings every checkpoint from before the cleanup has, which the model no longer takes
+@pytest.mark.parametrize("old_settings", [{"dropout": 0.0}, {"history": 0, "future": 0, "swiglu": True, "dropout": 0.0, "value_target": "eval"}])
+def test_checkpoint_from_before_the_cleanup_points_to_the_tag(tmp_path, old_settings):
+    torch.save({"model_settings": {**SETTINGS, **old_settings}, "state_dict": {}}, tmp_path / "old.pt")
+
+    with pytest.raises(ValueError, match="pre-cleanup-2026-09-23"):
+        load_checkpoint(tmp_path / "old.pt", CPU)
+
+
 def test_latest_checkpoint_is_the_run_that_finished_last(tmp_path, monkeypatch):
     monkeypatch.setattr(checkpoint, "RUNS_DIR", tmp_path)
     runs = {"older": "2026-09-20T10:00:00", "newer": "2026-09-21T09:00:00", "still_training": None, "no_checkpoint": "2026-09-22T09:00:00"}
