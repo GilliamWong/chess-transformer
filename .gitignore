@@ -39,3 +39,6 @@ artifacts/pgn_data/fishtest/*.pgn.gz
 # OTB games (lumbras), 855 MB, and any other pgn collections: only Carlsen.pgn is small enough for git
 artifacts/pgn_data/lumbras_otb_elite/
 artifacts/pgn_data/*.7z
+
+# Lichess puzzle database, 1.1 GB, downloaded by tools/puzzles.py when missing (database.lichess.org)
+artifacts/puzzles/lichess_db_puzzle.csv
