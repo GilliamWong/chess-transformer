@@ -42,3 +42,6 @@ artifacts/pgn_data/*.7z
 
 # Lichess puzzle database, 1.1 GB, downloaded by tools/puzzles.py when missing (database.lichess.org)
 artifacts/puzzles/lichess_db_puzzle.csv
+
+# What our search found in the last evaluate_elo.py match, written into match.pgn when it ends
+artifacts/match_searches/

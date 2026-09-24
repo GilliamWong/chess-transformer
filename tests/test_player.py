@@ -1,10 +1,17 @@
+import json
+import math
+from pathlib import Path
+
 import chess
+import chess.pgn
 import pytest
 import torch
 
-from tools.play.evaluate_elo import elo_difference, parse_score
+from data import EXPECTED_SCORE_PER_CENTIPAWN
+from encoding import encode_board
+from tools.play.evaluate_elo import annotate_searches, elo_difference, model_engine, parse_score
 from model import ChessTransformer
-from tools.play.player import choose_move
+from tools.play.player import CudaGraphModel, choose_move, score_to_centipawns, search_move
 from tools.play.uci import parse_position
 
 CPU = torch.device("cpu")
@@ -52,6 +59,78 @@ def test_no_move_to_choose_when_the_game_is_over(untrained_model):
 
     with pytest.raises(ValueError):
         choose_move(untrained_model, checkmate, CPU)
+
+
+#a search of one or two simulations visits at most the policy's favourite move, so it has to play what argmax plays
+@pytest.mark.parametrize("simulations", [1, 2])
+def test_a_search_without_room_to_search_plays_the_argmax_move(untrained_model, carlsen_games, simulations):
+    board = carlsen_games[0].board()
+    for played_move in list(carlsen_games[0].mainline_moves())[:30]:
+        assert choose_move(untrained_model, board, CPU, "mcts", simulations=simulations) == choose_move(untrained_model, board, CPU)
+        board.push(played_move)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a gpu")
+def test_the_cuda_graph_gives_the_models_outputs(carlsen_games):
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval().cuda()
+    graphed = CudaGraphModel(model)
+
+    board = carlsen_games[1].board()
+    for played_move in list(carlsen_games[1].mainline_moves())[:20]:
+        boards = torch.tensor(encode_board(board), dtype=torch.long).unsqueeze(0)
+        with torch.no_grad():
+            expected_moves, expected_eval = model(boards.cuda())
+        graphed_moves, graphed_eval = graphed(boards)
+        assert graphed_moves.device.type == "cpu"
+        assert torch.allclose(graphed_moves, expected_moves.cpu(), atol=1e-5)
+        assert torch.allclose(graphed_eval, expected_eval.cpu(), atol=1e-5)
+        board.push(played_move)
+
+
+#the scores a search reports have to be on the same scale as the centipawns the training data turned into expected scores
+def test_reported_centipawns_invert_the_training_curve():
+    assert score_to_centipawns(0.5) == 0
+    assert score_to_centipawns(1 / (1 + math.exp(-EXPECTED_SCORE_PER_CENTIPAWN * 300))) == 300
+    assert score_to_centipawns(1.0) == -score_to_centipawns(0.0) > 2000 #capped rather than infinite
+
+
+def test_a_search_reports_the_line_of_the_move_it_plays(untrained_model, carlsen_games):
+    board = carlsen_games[2].board()
+    for played_move in list(carlsen_games[2].mainline_moves())[:12]:
+        board.push(played_move)
+
+    move, report = search_move(untrained_model, board, CPU, 64)
+
+    assert report.line[0] == move and report.simulations == 64
+    assert 0 <= report.score <= 1
+    line_board = board.copy()
+    for line_move in report.line:
+        assert line_move in line_board.legal_moves
+        line_board.push(line_move)
+
+
+#a score is logged for the side that moved, but viewers plot [%eval] from white's side: black's good move is negative
+def test_searches_are_written_next_to_their_moves_from_whites_side(tmp_path):
+    pgn_path = tmp_path / "match.pgn"
+    pgn_path.write_text('[Event "?"]\n\n1. e4 e5 2. Nf3 *\n')
+    after_e4 = chess.Board()
+    after_e4.push_san("e4")
+    record = {"fen": after_e4.fen(), "move": "e7e5", "score": 0.8, "simulations": 64, "line": ["e7e5", "g1f3"], "root_moves": [["e7e5", 50], ["c7c5", 10]]}
+    (tmp_path / "1234.jsonl").write_text(json.dumps(record) + "\n")
+
+    assert annotate_searches(pgn_path, tmp_path) == 1
+
+    e4, e5, _ = chess.pgn.read_game(open(pgn_path)).mainline()
+    assert e4.eval() is None
+    assert e5.eval().white().score() == -score_to_centipawns(0.8) < 0
+    assert "expects 1...e5 2. Nf3" in e5.comment and "searched e5 50, c5 10 of 64" in e5.comment
+
+
+#a searching model with a clock of 0.1 s a move would lose on time: only it gets an infinite one
+def test_only_a_searching_model_plays_without_a_clock():
+    assert "tc=inf" in model_engine(Path("model.pt"), searches=True)
+    assert "tc=inf" not in model_engine(Path("model.pt"))
 
 
 def test_position_from_the_start_position_and_moves():
