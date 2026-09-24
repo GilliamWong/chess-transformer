@@ -6,20 +6,22 @@
 #   python mcts.py artifacts/runs/rl_start_d128_4min/model.pt --fen "<fen>" --simulations 800 --cpu
 #
 #a score is an expected score, 0 lost to 1 won, like the eval head's
+from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
 import time
+from typing import TYPE_CHECKING
 import chess
 import chess.syzygy
 import numpy as np
-import torch
-from torch import nn
 from encoding import encode_board, encode_move_to_id
-from tools.checkpoint import latest_checkpoint
-from tools.play.player import load_model
 from tools.tablebase import covers, open_tablebase, ranked_moves, wdl_score
+#torch is imported where the network runs: self play's workers import this file for its constants and never run it
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
 
 SIMULATIONS = 200
 DRAW = 0.5
@@ -61,6 +63,7 @@ def evaluate(model: nn.Module, board: chess.Board, device: torch.device) -> tupl
 #evaluate for several positions in one call of the network, which costs about what a call for one position does: self play
 #evaluates the leaves of many games at once
 def evaluate_many(model: nn.Module, boards: list[chess.Board], device: torch.device) -> list[tuple[dict[chess.Move, float], float]]:
+    import torch
     legal_moves = [list(board.legal_moves) for board in boards]
     for board, moves in zip(boards, legal_moves):
         if len(moves) == 0:
@@ -230,6 +233,7 @@ def print_search(root: Node, board: chess.Board, top: int = 10) -> None:
         print(f"{board.san(move):<8}{child.prior:>8.1%}{child.visit_count:>8}{score:>8}")
 
 def main(checkpoint_path: Path, fen: str, simulations: int, device: torch.device, use_tablebase: bool = False) -> None:
+    from tools.play.player import load_model
     global tablebase
     if use_tablebase:
         tablebase = open_tablebase()
@@ -257,6 +261,8 @@ def main(checkpoint_path: Path, fen: str, simulations: int, device: torch.device
 
 
 if __name__ == "__main__":
+    import torch
+    from tools.checkpoint import latest_checkpoint
     parser = argparse.ArgumentParser(description="one search from a position, to watch what it does")
     parser.add_argument("checkpoint", nargs="?", type=Path, help="a model.pt, default the run that finished last")
     parser.add_argument("--fen", default=chess.STARTING_FEN, help="the position to search, default the start")

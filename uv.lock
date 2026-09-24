@@ -48,6 +48,9 @@ dependencies = [
 dev = [
     { name = "pytest" },
 ]
+selfplay = [
+    { name = "selfplay-rs" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -64,6 +67,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]
+selfplay = [{ name = "selfplay-rs", directory = "selfplay_rs" }]
 
 [[package]]
 name = "colorama"
@@ -1585,6 +1589,11 @@ sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
 ]
+
+[[package]]
+name = "selfplay-rs"
+version = "0.1.0"
+source = { directory = "selfplay_rs" }
 
 [[package]]
 name = "setuptools"

@@ -31,6 +31,10 @@ N_HEADS = 4
 POSITION_TEMPLATES = 8
 
 PEAK_LEARN_RATE = 6e-3
+#the peak for a fine-tune (--init-checkpoint), from weights that already work. At PEAK_LEARN_RATE the first fine-tune on
+#self play fell from 72.8% to 61.4% top move accuracy on its val set during the warmup and spent the rest of the run
+#climbing back (71.3% at the end)
+FINE_TUNE_LEARN_RATE = 1e-3
 WARMUP_STEPS = 500
 #what the learning rate does after the warmup:
 #   cosine    falls from the peak to zero along half a cosine, over the whole run
@@ -312,7 +316,7 @@ def main(
     d_model: int = D_MODEL,
     num_layers: int = NUM_LAYERS,
     n_heads: int = N_HEADS,
-    peak_learn_rate: float = PEAK_LEARN_RATE,
+    peak_learn_rate: float | None = None,
     position_templates: int = POSITION_TEMPLATES,
     training_set: str = TRAINING_SET,
     value_loss_weight: float = VALUE_LOSS_WEIGHT,
@@ -338,6 +342,8 @@ def main(
         model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads, "template_maps": template_maps}
     if mix_set is not None and not 0 < mix_share < 1:
         raise ValueError(f"--mix-share is the share of every batch from {mix_set}, between 0 and 1, got {mix_share}")
+    if peak_learn_rate is None:
+        peak_learn_rate = FINE_TUNE_LEARN_RATE if init_checkpoint is not None else PEAK_LEARN_RATE
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -471,6 +477,10 @@ def main(
     from tools.compare_runs import write_progress_page
     print(f"progress page: {write_progress_page()}")
 
+    #the matches every model has been measured with (artifacts/mcts_ladder_2026-09-23.md), the policy alone and the search
+    measure = f"python -m tools.play.evaluate_elo --checkpoint {(run_dir / 'model.pt').relative_to(ARTIFACTS_DIR.parent)} --elo 1700 --games 200"
+    print(f"measure it: {measure} --concurrency 12\n       and: {measure} --select mcts --simulations 64")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="train the chess transformer")
@@ -484,7 +494,7 @@ if __name__ == "__main__":
     parser.add_argument("--d-model", type=int, default=D_MODEL, help="width of the model, default %(default)s")
     parser.add_argument("--layers", type=int, default=NUM_LAYERS, help="number of transformer blocks, default %(default)s")
     parser.add_argument("--heads", type=int, default=N_HEADS, help="attention heads, d-model has to divide by it, default %(default)s")
-    parser.add_argument("--lr", type=float, default=PEAK_LEARN_RATE, help="peak learning rate, default %(default)s")
+    parser.add_argument("--lr", type=float, help=f"peak learning rate, default {PEAK_LEARN_RATE:g} ({FINE_TUNE_LEARN_RATE:g} with --init-checkpoint)")
     parser.add_argument("--templates", type=int, default=POSITION_TEMPLATES, help="attention bias templates the blocks mix, default %(default)s")
     parser.add_argument("--training-set", default=TRAINING_SET, help="name of a training set in processed_data/ that tools.label_with_stockfish has labelled. Default %(default)s")
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT, help="weight of the value head's loss next to the move loss, default %(default)s")

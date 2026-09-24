@@ -45,3 +45,9 @@ artifacts/puzzles/lichess_db_puzzle.csv
 
 # What our search found in the last evaluate_elo.py match, written into match.pgn when it ends
 artifacts/match_searches/
+
+# TensorBoard runs moved out of artifacts/runs so TensorBoard stays fast; point --logdir at it to see them
+artifacts/runs_archive/
+
+# What cargo builds from selfplay_rs/, a few hundred MB
+selfplay_rs/target/

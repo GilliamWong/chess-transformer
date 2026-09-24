@@ -1,4 +1,9 @@
+from contextlib import contextmanager
 from pathlib import Path
+import subprocess
+import sys
+import threading
+from types import SimpleNamespace
 
 import chess
 import numpy as np
@@ -10,7 +15,8 @@ import data
 import selfplay
 from data import SelfPlayDataset, load_training_set
 from encoding import NUM_MOVE_IDS, encode_move_to_id
-from selfplay import TOP_MOVES, Game, SelfPlaySet, play_game, play_games
+from inference import cpu_batches, serve
+from selfplay import TOP_MOVES, Game, RemoteNetwork, SelfPlaySet, Slot, play_game, play_games, play_games_in_rust, slot_arrays
 from tools.label_with_stockfish import NO_MOVE
 
 CPU = torch.device("cpu")
@@ -173,3 +179,84 @@ def test_a_set_from_before_tree_reuse_carries_on_without_it(tmp_path):
     with pytest.raises(ValueError, match="--no-tree-reuse"):
         SelfPlaySet(tmp_path, "played", {**SETTINGS, "tree_reuse": True})
     assert SelfPlaySet(tmp_path, "played", {**SETTINGS, "tree_reuse": False}).positions() == 2
+
+
+#an answer that depends on the board, so answers handed to the wrong worker, or games crossed between slots, show
+class BoardModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weights = torch.randn(70, NUM_MOVE_IDS, generator=torch.Generator().manual_seed(0))
+
+    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        tokens = boards.float()
+        return tokens @ self.weights / 100, tokens.sum(dim=1, keepdim=True) / 1000
+
+
+#the inference process's loop in a thread, serving the given slots with evaluate_boards
+@contextmanager
+def serving(slots: list[Slot], evaluate_boards, games_per_process: int):
+    stop = threading.Event()
+    arrays = [slot_arrays(slot.boards.name, slot.answers.name, games_per_process) for slot in slots]
+    counts = SimpleNamespace(value=0), SimpleNamespace(value=0)
+    thread = threading.Thread(target=serve, args=(evaluate_boards, [boards for _, boards, _ in arrays], [answers for _, _, answers in arrays],
+                                                  [slot.server_end for slot in slots], stop, *counts), daemon=True)
+    thread.start()
+    try:
+        yield counts
+    finally:
+        stop.set()
+        thread.join()
+        for memories, _, _ in arrays:
+            for memory in memories:
+                memory.close()
+        for slot in slots:
+            slot.close()
+
+
+#two workers asking at the same moment are served in one batch, and each gets back the answers to its own boards
+def test_every_worker_gets_the_answers_to_its_own_boards():
+    slots = [Slot(8), Slot(8)]
+    network = BoardModel()
+    with serving(slots, cpu_batches(network), 8) as (calls, positions):
+        remotes = [RemoteNetwork(slot.boards.name, slot.answers.name, slot.worker_end, 8) for slot in slots]
+        asked = [np.random.default_rng(index).integers(0, 13, (count, 70), dtype=np.uint8) for index, count in enumerate((5, 8))]
+        answers = [None, None]
+        def ask(index: int) -> None:
+            for _ in range(20):
+                answers[index] = remotes[index](asked[index]).copy()
+        threads = [threading.Thread(target=ask, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        for answer, boards in zip(answers, asked):
+            assert np.allclose(answer, cpu_batches(network).evaluate_boards(boards), atol=1e-5)
+        assert positions.value == 20 * (5 + 8) and calls.value <= 40
+        for remote in remotes:
+            for memory in remote.memories:
+                memory.close()
+
+
+#games whose leaves go through the inference process are the games played with the network in the same process
+def test_games_through_the_inference_process_are_the_games_played_directly():
+    network = cpu_batches(BoardModel())
+    alone = sorted(play_games_in_rust(network.evaluate_boards, 8, range(4), size=2, max_plies=10), key=lambda game: game.number)
+    slot = Slot(2)
+    with serving([slot], network, 2):
+        remote = RemoteNetwork(slot.boards.name, slot.answers.name, slot.worker_end, 2)
+        served = sorted(play_games_in_rust(remote, 8, range(4), size=2, max_plies=10), key=lambda game: game.number)
+        for memory in remote.memories:
+            memory.close()
+
+    for direct, through in zip(alone, served):
+        assert np.array_equal(direct.boards, through.boards)
+        assert np.array_equal(direct.visit_moves, through.visit_moves)
+        assert np.allclose(direct.root_scores, through.root_scores)
+
+
+#every worker imports selfplay.py, and torch would take about half a gigabyte in each
+def test_a_worker_does_not_import_torch():
+    imported = subprocess.run([sys.executable, "-c", "import sys, selfplay; print('torch' in sys.modules)"], capture_output=True, text=True,
+                              check=True, cwd=Path(selfplay.__file__).parent)
+    assert imported.stdout.strip() == "False"

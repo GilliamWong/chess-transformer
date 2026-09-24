@@ -16,6 +16,10 @@ uv sync
 This installs Python and every dependency, including the CUDA 13.0 build of PyTorch. Training needs an
 NVIDIA GPU with a recent driver.
 
+Self-play's games are compiled from Rust (`selfplay_rs/`), so install [Rust](https://rustup.rs) first: uv builds them
+on the first `uv sync` or `uv run`, and again whenever their source changes. A machine that only trains can leave them
+out with `uv sync --no-group selfplay`.
+
 ## Train
 
 ```
@@ -48,6 +52,10 @@ A step is one batch of `BATCH_SIZE` (1024) positions. The other settings are con
 The checkpoint with the best validation loss is saved to `artifacts/runs/<name>/model.pt`, so every run keeps
 its own and none is overwritten. The tools play and measure the run that finished last unless told otherwise. It holds the model's settings as well as its weights, so a model of any
 size can be played (`--checkpoint artifacts/runs/<name>/model.pt` plays an older run).
+
+Older runs are in `artifacts/runs_archive/`, moved out of `artifacts/runs` on 2026-09-23 so that TensorBoard stays quick
+(runs kept: the d384 and first d640 overnight runs, `rl_start_d128_4min`, and the `elo` and `selfplay` charts).
+`uv run tensorboard --logdir artifacts/runs_archive --port 6007` shows them, and their checkpoints load from there.
 
 Checkpoints trained before the 2026-09-23 cleanup, the d640 run's included, load only from a checkout of the tag
 `pre-cleanup-2026-09-23` (for example `git worktree add ../chess-transformer-pre-cleanup pre-cleanup-2026-09-23`):
@@ -192,8 +200,15 @@ uv run python -m tools.play.evaluate_elo                     100 games against S
 uv run python -m tools.play.evaluate_elo --elo 1500          a stronger setting
 uv run python -m tools.play.evaluate_elo --opponent random   random moves, as a sanity check
 uv run python -m tools.play.evaluate_elo --opponent human    opens a board so you can play it yourself
-uv run python -m tools.play.evaluate_elo --select mcts --simulations 256 --concurrency 12   with mcts.py's search and no clock (--gpu for a game or two at a time)
+uv run python -m tools.play.evaluate_elo --select mcts --simulations 256   with mcts.py's search and no clock
 ```
+
+A match of the search against Stockfish (`tools/play/search_match.py`) plays every game in one process: the searches
+run in Rust (the same search as `mcts.py`, visit for visit, like self-play's), and the leaves of all the games go through
+the network together on the GPU, 32 games at a time by default. It replays the ladder's 64 simulation rung (83.2% against
+the 81.8% of `artifacts/mcts_ladder_2026-09-23.md`) in 90 seconds, and plays 200 games at 800 simulations in about
+6 minutes. At most 12 Stockfish think at once, each on a core of its own as in the ladder's matches. Its openings are drawn from the same Carlsen games, though not the same ones cutechess-cli draws. Every other
+match runs under cutechess-cli with `tools/play/uci.py` as our engine.
 
 Matches run at below-normal priority, so the computer stays usable. After a match with the search, every move of the
 model in `artifacts/match.pgn` carries its score as `[%eval]`, the line it expected and its most searched moves: import
@@ -210,7 +225,7 @@ A round of expert iteration trains the policy towards the search's own choices:
 
 ```
 uv run selfplay.py artifacts/runs/rl_start_d128_4min/model.pt --name selfplay_r1 --positions 1_000_000 --tablebase
-uv run main.py --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix --lr 1e-3 --positions 3_000_000 --name rl_r1
+uv run main.py --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix --positions 3_000_000 --name rl_r1
 uv run python -m tools.play.evaluate_elo --checkpoint artifacts/runs/rl_r1/model.pt --elo 1700 --games 200 --concurrency 12
 ```
 
@@ -221,17 +236,23 @@ with the game's result and the root's mean score, which training blends half and
 played keeps its subtree for the next search (tree reuse: the same target quality, measured against an 800 simulation
 search, for 38 new simulations a move instead of 64; `--no-tree-reuse` turns it off).
 
-Each of its 12 processes plays 64 games at once and sends all their leaves through the network on the GPU in one call:
-about 3.7 million positions an hour (1 million in about 16 minutes), at below-normal priority, leaving 4 cores free.
-While it runs, `+` and `-` add and remove a process (up to 24; past about 16 the GPU is the limit, and 32 do not fit in
-its memory). When it reaches `--positions` it starts no new games and finishes the ones being played, so every game begun
-is saved; ctrl+c does the same, and a second ctrl+c stops at once. Run again with the same flags (or a larger
-`--positions`), it carries on where it stopped. `--compile` compiles the model in every process: slower for the d128
-(the processes share the GPU worse), maybe worth trying for larger models.
+Its worker processes play 256 games each on the CPU, in Rust (`selfplay_rs/`): the search of `mcts.py` and the rules of
+`selfplay.py`, move for move (`tests/test_selfplay_rs.py` plays games both ways and compares every number), about 65
+times faster than the Python. A change to the search or to the rules has to be made in `selfplay_rs/src` as well, and
+that test says when the two have drifted apart. One inference process (`inference.py`) runs the network for all the
+workers on the GPU: every round it takes the boards of all the waiting workers in one batch, through CUDA graphs of a
+compiled model in bf16 (`--no-compile`, `--precision tf32`). With the d128 and the default 2 workers the GPU is the limit:
+about 12.5 million positions an hour over a whole run (1 million in under 5 minutes), with 10% of the CPU busy and 75 MB
+of memory a worker. `+` and `-` add and remove a worker while it runs (up to 8), and everything runs at below-normal
+priority. When it reaches
+`--positions` it starts no new games and finishes the ones being played, so every game begun is saved; ctrl+c does the
+same, and a second ctrl+c stops at once. Run again with the same flags (or a larger `--positions`), it carries on where it
+stopped.
 
-`main.py --init-checkpoint` fine-tunes the checkpoint, `--mix-set` keeps a quarter of every batch (`--mix-share`) from a
-Stockfish-labelled set so that the model does not forget it, and the run ends with the model's accuracy on that set's val
-positions next to the self-play ones. The test of a round is the policy alone against the same Stockfish as before: the
+`main.py --init-checkpoint` fine-tunes the checkpoint, at a peak learning rate of 1e-3 unless `--lr` says otherwise (the
+6e-3 of a run from scratch undid a good part of what the starting model knew during the warmup). `--mix-set` keeps a
+quarter of every batch (`--mix-share`) from a Stockfish-labelled set so that the model does not forget it, and the run
+ends with the model's accuracy on that set's val positions next to the self-play ones, and the commands that measure it. The test of a round is the policy alone against the same Stockfish as before: the
 starting model scored 1569.
 
 TensorBoard (`uv run tensorboard --logdir artifacts/runs`) shows, next to the training runs, `selfplay/<name>` (positions
@@ -258,12 +279,14 @@ The root training and model files are:
 | `main.py` | The single-GPU training loop |
 | `mcts.py` | Monte Carlo tree search over the model, `--tablebase` to score endgames from the tables |
 | `selfplay.py` | The model playing itself with the search, saved as a training set for expert iteration |
+| `inference.py` | Self-play's inference process: the network on the GPU for every self-play worker at once |
 
 Everything else is kept out of the way:
 
 | Folder | What is in it |
 |---|---|
 | `multi_gpu/` | `train_ddp.py`, the separate multi-GPU DDP training loop. Run as a module from the root under `torchrun` |
+| `selfplay_rs/` | Self-play's games in Rust, which uv builds into the environment as the `selfplay_rs` module |
 | `tools/` | Checkpoint saving and loading, the training budget, the run table and results page, the TensorBoard launcher, labelling a training set with Stockfish, measuring a checkpoint (`evaluate_checkpoint`, `puzzles`), plotting its templates, and `play/` (choosing the model's move, the UCI protocol, matches against Stockfish). Run as modules from the root: `python -m tools.<name>` |
 | `artifacts/` | No code: the PGNs, preprocessed training sets, checkpoints, TensorBoard runs and chess engines. Of the PGNs only `pgn_data/Carlsen.pgn` is in git: the openings of every match, and the games the tests replay |
 | `tests/` | `uv run pytest` |

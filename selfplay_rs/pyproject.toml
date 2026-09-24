@@ -1,0 +1,13 @@
+#selfplay.py's games in rust, built into the project's environment by uv (a dependency of the root pyproject.toml)
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "selfplay-rs"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+#rebuilt whenever the rust changes, not only when the version does
+[tool.uv]
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "Cargo.lock" }, { file = "src/**/*.rs" }]
