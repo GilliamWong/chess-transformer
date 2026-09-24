@@ -5,7 +5,8 @@ import torch
 from torch import nn
 
 from encoding import MOVE_TO_ID, NUM_MOVE_IDS, NUM_SQUARES
-from mcts import DRAW, Node, evaluate, game_result, most_visited_move, search
+from mcts import DRAW, Node, evaluate, evaluate_many, game_result, most_visited_move, search
+from model import ChessTransformer
 
 CPU = torch.device("cpu")
 
@@ -172,3 +173,22 @@ def test_root_noise_moves_the_priors_the_same_way_for_the_same_seed():
     assert sum(priors[0]) == pytest.approx(1.0)
     assert priors[0] == priors[1] != priors[2]
     assert max(priors[0]) > 1 / 20 + 0.01 #20 moves at the start, equally likely without the noise
+
+
+#self play evaluates many leaves in one call: each has to get what it would have got on its own
+def test_positions_evaluated_together_get_what_they_get_alone(carlsen_games):
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval()
+    board = carlsen_games[0].board()
+    boards = []
+    for move in list(carlsen_games[0].mainline_moves())[:6]:
+        board.push(move)
+        boards.append(board.copy())
+
+    together = evaluate_many(model, boards, CPU)
+
+    for position, (priors, value) in zip(boards, together):
+        alone_priors, alone_value = evaluate_many(model, [position], CPU)[0]
+        assert value == pytest.approx(alone_value, abs=1e-5)
+        assert list(priors) == list(alone_priors)
+        assert list(priors.values()) == pytest.approx(list(alone_priors.values()), abs=1e-5)

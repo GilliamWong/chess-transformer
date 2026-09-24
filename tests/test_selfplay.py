@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import chess
 import numpy as np
 import pytest
@@ -5,9 +7,10 @@ import torch
 from torch import nn
 
 import data
+import selfplay
 from data import SelfPlayDataset, load_training_set
 from encoding import NUM_MOVE_IDS, encode_move_to_id
-from selfplay import TOP_MOVES, Game, SelfPlaySet, play_game
+from selfplay import TOP_MOVES, Game, SelfPlaySet, play_game, play_games
 from tools.label_with_stockfish import NO_MOVE
 
 CPU = torch.device("cpu")
@@ -87,3 +90,55 @@ def test_a_self_play_set_continues_after_an_interruption(tmp_path, monkeypatch):
     assert len(train) == 2
     with pytest.raises(ValueError):
         SelfPlaySet(tmp_path, "played", {"simulations": 64})
+
+
+#games played together in one batch, their leaves evaluated in shared calls and finished games replaced by the next
+#number, come out exactly as each game played on its own: nothing of one game leaks into another
+def test_games_played_together_are_the_games_played_alone():
+    alone = [play_game(UniformModel(), CPU, 8, number, max_plies=12) for number in range(5)]
+
+    together = sorted(play_games(UniformModel(), CPU, 8, range(5), size=3, max_plies=12), key=lambda game: game.number)
+
+    assert [game.number for game in together] == list(range(5))
+    for single, batched in zip(alone, together):
+        assert np.array_equal(single.boards, batched.boards)
+        assert np.array_equal(single.visit_moves, batched.visit_moves)
+        assert np.array_equal(single.visit_shares, batched.visit_shares)
+        assert np.array_equal(single.root_scores, batched.root_scores)
+
+
+#another program holding the record open makes windows refuse the move for a moment: the write is tried again
+def test_a_record_write_that_fails_for_a_moment_is_tried_again(tmp_path, monkeypatch):
+    games = SelfPlaySet(tmp_path, "played", SETTINGS)
+    replace = Path.replace
+    refusals = iter([True, True, False])
+    def refuse_twice(path, target):
+        if next(refusals):
+            raise PermissionError("in use")
+        return replace(path, target)
+    monkeypatch.setattr(Path, "replace", refuse_twice)
+
+    assert games.add(two_games()[0], 1.0)
+    assert SelfPlaySet.read_record(tmp_path / "played_selfplay.json")["games"] == 1
+
+
+#the move of the record kept failing (what stopped a run on 2026-09-23): the game's positions and its record in the .part
+#are both written, so opening the set again keeps that game instead of cutting it off
+def test_a_game_whose_record_could_not_be_moved_into_place_is_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    first, second = two_games()
+    games = SelfPlaySet(tmp_path, "played", SETTINGS)
+    games.add(first, 1.0)
+    def refuse(path, target):
+        raise PermissionError("in use")
+    monkeypatch.setattr(Path, "replace", refuse)
+    monkeypatch.setattr(selfplay, "RECORD_ATTEMPTS", 2)
+
+    assert not games.add(second, 1.0)
+    monkeypatch.undo()
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+
+    reopened = SelfPlaySet(tmp_path, "played", SETTINGS)
+    assert reopened.record["games"] == 2 and reopened.positions() == 4
+    train, val = load_training_set("played", 0.02)
+    assert len(train) == len(val) == 2

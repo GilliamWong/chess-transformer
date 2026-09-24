@@ -172,3 +172,24 @@ Elo difference: -288.1 +/- 80.2, LOS: 0.0 %, DrawRatio: 8.0 %
 """
 
     assert parse_score(output) == (12, 80, 8)
+
+
+#a graph recorded for a batch takes fewer boards too (self play, when some games need no network this round)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a gpu")
+def test_a_cuda_graph_for_a_batch_takes_fewer_boards(carlsen_games):
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval().cuda()
+    graphed = CudaGraphModel(model, batch_size=4)
+    board = carlsen_games[1].board()
+    positions = []
+    for played_move in list(carlsen_games[1].mainline_moves())[:3]:
+        board.push(played_move)
+        positions.append(encode_board(board))
+    boards = torch.tensor(positions, dtype=torch.long)
+
+    graphed_moves, graphed_eval = graphed(boards)
+
+    with torch.no_grad():
+        expected_moves, expected_eval = model(boards.cuda())
+    assert graphed_moves.shape == (3, expected_moves.shape[1])
+    assert torch.allclose(graphed_moves, expected_moves.cpu(), atol=1e-5) and torch.allclose(graphed_eval, expected_eval.cpu(), atol=1e-5)

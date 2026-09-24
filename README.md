@@ -153,6 +153,20 @@ against Stockfish 1700:
 - In a deeper model none of it matters: at d256 with 8 layers, no embedding, both Leela embeddings and 192 maps all
   landed within 0.005 loss and 6 Elo (one seed).
 
+The best template setting by model size, each against no board-wide embedding at equal compute (Elo against Stockfish 1700
+at 0.1 s, 4000 games, about +-12):
+
+| Model | Best `template_maps` | Val loss and Elo | Seeds | How it was trained |
+|---|---|---|---|---|
+| d128, 4 layers, 4 heads | **192** (384 as good: 1.8180, 1794 on one seed; 64 or fewer, and 768, are worse) | 1.8171 and 1780, against 1.8561 and 1746 without | 3 | `--qk-ratio 0.25 0.5 0.5 0.75 --kv-heads 2 --mlp-ratio 1.333 --lr 1e-2`, 6.6 PF (about 80M positions), fp16 |
+| d256, 4 layers, 8 heads | **192** (the only count tried) | 1.7842 and 1824, against 1.7988 and 1809 without | 1 | `--qk-ratio 0.25 0.5 0.5 0.75 --kv-heads 4 --mlp-ratio 1.333 --lr 5e-3`, 13.2 PF (about 45M positions), fp16 |
+| d256, 8 layers, 8 heads | **0**: 192 maps 1.7297 and 1904, no embedding 1.7328 and 1901, the Leela embeddings in between | noise | 1 | `--qk-ratio 0.25 0.25 0.5 0.5 0.75 0.75 0.75 0.75 --kv-heads 4 --mlp-ratio 1.333 --lr 5e-3`, 26.5 PF (about 45M positions), fp16 |
+| d640, 20 layers | **0** expected: untested, extrapolated from the depth trend above | - | - | - |
+
+The d128 numbers without an embedding are the earlier control runs (2 seeds), which also differ in precision (bf16) and
+attention (full-width queries and keys, no grouped-query attention); every other number is fp16. Every run is in
+`artifacts/leela_head_to_head.jsonl` and `artifacts/overnight_2026-09-23.md`.
+
 Tried and left out:
 - A whole-board term in every block's template mix (the board mix), and Leela's smolgen: little gain once the embedding
   is there. The template-map embedding plus the board mix tied the small Leela embedding in Elo (+14) but not in
@@ -202,9 +216,12 @@ uv run python -m tools.play.evaluate_elo --checkpoint artifacts/runs/rl_r1/model
 `selfplay.py` plays the model against itself with 64 simulations a move: noise in every root's priors and the first 30
 plies drawn from the visit counts, so that games differ; a game ends by the rules, at 5 pieces with the tablebase's
 result, or as a draw after 600 plies. Every position is saved with the search's visit shares (the policy target) and
-with the game's result and the root's mean score, which training blends half and half (`--result-weight`). About
-200,000 positions an hour on 12 processes (one of them on the GPU) at below-normal priority; it can be stopped and
-started again. `main.py --init-checkpoint` fine-tunes the checkpoint, `--mix-set` keeps a quarter of every batch
+with the game's result and the root's mean score, which training blends half and half (`--result-weight`). Each of its
+12 processes plays 64 games at once and sends all their leaves through the network on the GPU in one call: about 3.4
+million positions an hour once the first games have ended (1 million in about 20 minutes), at below-normal priority,
+leaving 4 cores free. When it reaches `--positions` it starts no new games and finishes the ones being played, so every
+game begun is saved; ctrl+c does the same, and a second ctrl+c stops at once. Run again with the same flags (or a larger
+`--positions`), it carries on where it stopped. `main.py --init-checkpoint` fine-tunes the checkpoint, `--mix-set` keeps a quarter of every batch
 (`--mix-share`) from a Stockfish-labelled set so that the model does not forget it, and the run ends with the model's
 accuracy on that set's val positions next to the self-play ones. The test of a round is the policy alone against the
 same Stockfish as before: the starting model scored 1569.

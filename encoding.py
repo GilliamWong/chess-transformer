@@ -71,6 +71,8 @@ def _build_move_dict() -> dict[chess.Move, int]:
     return output
 
 MOVE_TO_ID = _build_move_dict()
+#the same ids by the move's squares and promotion, for encode_move_to_id
+MOVE_IDS_BY_SQUARES = {(move.from_square, move.to_square, move.promotion): move_id for move, move_id in MOVE_TO_ID.items()}
 
 #move from and to are both length 1968, store the starting and ending squares of every possible move
 MOVE_FROM_SQUARES = tuple(move.from_square for move in ALL_POSSIBLE_MOVES)
@@ -90,33 +92,31 @@ PROMOTION_PIECES = tuple(ALL_POSSIBLE_MOVES[move_id].promotion - chess.KNIGHT fo
 #the board is always encoded from the side to move: with black to move it is mirrored first (ranks flipped,
 #colours swapped), so "white" below means the side to move and its pieces always start at the bottom.
 #the turn token keeps the real colour, which is how decode_board knows to mirror back
+#
+#the mirror is done square by square (square ^ 56 flips the rank) rather than with board.mirror(), which copies the board
+#and every move played so far: the search encodes thousands of boards a second
 def encode_board(board: chess.Board) -> list[int]:
     turn = board.turn
-    if turn == chess.BLACK:
-        board = board.mirror()
+    opponent = not turn
+    flip = 0 if turn == chess.WHITE else 56
 
-    encoding = [0 for _ in range(NUM_SQUARES)]
+    encoding = [0 for _ in range(NUM_SQUARES)] #we use 0 to denote an empty square
 
-    for square in chess.SQUARES: #integers 0-63
-        piece_encoding = 0 #we use 0 to denote an empty square
-        piece  = board.piece_at(square)
-
-        if piece is not None:
-            if piece.color == chess.WHITE:
-                piece_encoding = piece.piece_type
-            else:
-                piece_encoding = piece.piece_type + NUM_PIECE_TYPES
-
-        encoding[square] = piece_encoding
+    #the side to move's pieces are 1-6 and the other side's 7-12, read straight from the board's bitboards
+    for piece_type in chess.PIECE_TYPES:
+        for square in chess.scan_forward(board.pieces_mask(piece_type, turn)):
+            encoding[square ^ flip] = piece_type
+        for square in chess.scan_forward(board.pieces_mask(piece_type, opponent)):
+            encoding[square ^ flip] = piece_type + NUM_PIECE_TYPES
 
     encoding.append(TURN_TOKEN_OFFSET + (1 if turn == chess.WHITE else 0)) #64
-    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_kingside_castling_rights(chess.WHITE) else 0)) #65
-    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_queenside_castling_rights(chess.WHITE) else 0)) #66
+    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_kingside_castling_rights(turn) else 0)) #65
+    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_queenside_castling_rights(turn) else 0)) #66
 
-    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_kingside_castling_rights(chess.BLACK) else 0)) #67
-    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_queenside_castling_rights(chess.BLACK) else 0)) #68
+    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_kingside_castling_rights(opponent) else 0)) #67
+    encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_queenside_castling_rights(opponent) else 0)) #68
 
-    encoding.append(EN_PASSANT_TOKEN_OFFSET + (board.ep_square if board.ep_square is not None and board.has_legal_en_passant() else 0)) #69
+    encoding.append(EN_PASSANT_TOKEN_OFFSET + (board.ep_square ^ flip if board.ep_square is not None and board.has_legal_en_passant() else 0)) #69
 
     return encoding
 
@@ -148,11 +148,11 @@ def decode_board(encoding: list[int]) -> chess.Board:
 def mirror_move(move: chess.Move) -> chess.Move:
     return chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square), promotion=move.promotion)
 
-#turn is the side playing the move. Black's moves are mirrored, to match the board encode_board gives
+#turn is the side playing the move. Black's moves are mirrored, to match the board encode_board gives: square ^ 56 is the
+#square on the mirrored board, and looking three numbers up is faster than building the mirrored move
 def encode_move_to_id(move: chess.Move, turn: chess.Color) -> int:
-    if turn == chess.BLACK:
-        move = mirror_move(move)
-    return MOVE_TO_ID[move]
+    flip = 0 if turn == chess.WHITE else 56
+    return MOVE_IDS_BY_SQUARES[move.from_square ^ flip, move.to_square ^ flip, move.promotion]
 
 
 def decode_id_to_move(move_id: int, turn: chess.Color) -> chess.Move:

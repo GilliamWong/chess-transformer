@@ -1,8 +1,15 @@
+from random import Random
+
 import chess
 import pytest
 
 from encoding import (
     ALL_POSSIBLE_MOVES,
+    CASTLING_TOKEN_OFFSET,
+    EN_PASSANT_TOKEN_OFFSET,
+    MOVE_TO_ID,
+    NUM_PIECE_TYPES,
+    TURN_TOKEN_OFFSET,
     BLACK_KINGSIDE_INDEX,
     BLACK_QUEENSIDE_INDEX,
     EN_PASSANT_INDEX,
@@ -384,3 +391,51 @@ def test_promotion_tables_describe_every_promotion_and_nothing_else():
         assert move.to_square == to_square
         assert move.promotion == pieces[piece]
 
+
+
+#the encoding as it was first written: mirror the board with python-chess, then read it square by square. Kept as the
+#reference the faster encode_board and encode_move_to_id have to match exactly
+def reference_encode_board(board: chess.Board) -> list[int]:
+    turn = board.turn
+    if turn == chess.BLACK:
+        board = board.mirror()
+    encoding = []
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        encoding.append(0 if piece is None else piece.piece_type + (0 if piece.color == chess.WHITE else NUM_PIECE_TYPES))
+    encoding.append(TURN_TOKEN_OFFSET + (1 if turn == chess.WHITE else 0))
+    for color in (chess.WHITE, chess.BLACK):
+        encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_kingside_castling_rights(color) else 0))
+        encoding.append(CASTLING_TOKEN_OFFSET + (1 if board.has_queenside_castling_rights(color) else 0))
+    encoding.append(EN_PASSANT_TOKEN_OFFSET + (board.ep_square if board.ep_square is not None and board.has_legal_en_passant() else 0))
+    return encoding
+
+def reference_move_id(move: chess.Move, turn: chess.Color) -> int:
+    if turn == chess.BLACK:
+        move = chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square), promotion=move.promotion)
+    return MOVE_TO_ID[move]
+
+#real games, and random ones: random play reaches promotions, en passant and castling rights lost in odd ways
+def many_positions(carlsen_games) -> list[chess.Board]:
+    boards = []
+    for game in carlsen_games:
+        board = game.board()
+        for move in game.mainline_moves():
+            boards.append(board.copy())
+            board.push(move)
+    random = Random(0)
+    for _ in range(60):
+        board = chess.Board()
+        while not board.is_game_over() and board.ply() < 300:
+            boards.append(board.copy())
+            board.push(random.choice(list(board.legal_moves)))
+    return boards
+
+def test_the_encoding_matches_the_reference_everywhere(carlsen_games):
+    boards = many_positions(carlsen_games)
+    assert any(board.has_legal_en_passant() for board in boards) and any(board.turn == chess.BLACK for board in boards)
+
+    for board in boards:
+        assert encode_board(board) == reference_encode_board(board), board.fen()
+        for move in board.legal_moves:
+            assert encode_move_to_id(move, board.turn) == reference_move_id(move, board.turn), (board.fen(), move)

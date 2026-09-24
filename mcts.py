@@ -41,7 +41,8 @@ ROOT_NOISE_SHARE = 0.25
 tablebase: chess.syzygy.Tablebase | None = None
 
 
-@dataclass
+#slots: a search makes a node for every legal move of every position it expands, and slotted ones are quicker to make and read
+@dataclass(slots=True)
 class Node:
     prior: float #the policy's probability of the move that leads here
     visit_count: int = 0
@@ -55,28 +56,37 @@ class Node:
 #the network's view of a position that is not over: the prior of every legal move (adding up to 1), and the score of the
 #side to move
 def evaluate(model: nn.Module, board: chess.Board, device: torch.device) -> tuple[dict[chess.Move, float], float]:
-    legal_moves = list(board.legal_moves)
-    if len(legal_moves) == 0:
-        raise ValueError(f"the game is over here, game_result scores it: {board.fen()}")
+    return evaluate_many(model, [board], device)[0]
 
-    legal_move_ids = [encode_move_to_id(move, board.turn) for move in legal_moves]
-    boards = torch.tensor(encode_board(board), dtype=torch.long, device=device).unsqueeze(0)
+#evaluate for several positions in one call of the network, which costs about what a call for one position does: self play
+#evaluates the leaves of many games at once
+def evaluate_many(model: nn.Module, boards: list[chess.Board], device: torch.device) -> list[tuple[dict[chess.Move, float], float]]:
+    legal_moves = [list(board.legal_moves) for board in boards]
+    for board, moves in zip(boards, legal_moves):
+        if len(moves) == 0:
+            raise ValueError(f"the game is over here, game_result scores it: {board.fen()}")
 
+    encoded = torch.tensor([encode_board(board) for board in boards], dtype=torch.long, device=device)
     with torch.no_grad():
-        move_logits, value_logits = model(boards)
+        move_logits, value_logits = model(encoded)
+    move_logits = move_logits.float().cpu().numpy()
+    values = torch.sigmoid(value_logits[:, 0].float()).cpu().tolist()
 
-    #a softmax over the legal moves alone, the same as setting every illegal one to -inf first
-    priors = torch.softmax(move_logits[0, legal_move_ids], dim=0).tolist()
-    value = torch.sigmoid(value_logits[0, 0]).item()
-
-    return dict(zip(legal_moves, priors)), value
+    evaluations = []
+    for board, moves, logits, value in zip(boards, legal_moves, move_logits, values):
+        #a softmax over the legal moves alone, the same as setting every illegal one to -inf first
+        legal_logits = logits[[encode_move_to_id(move, board.turn) for move in moves]]
+        weights = np.exp(legal_logits - legal_logits.max())
+        evaluations.append((dict(zip(moves, (weights / weights.sum()).tolist())), value))
+    return evaluations
 
 #the score of the side to move if the game is over here or the tablebase knows how it ends, None while it goes on.
-#Checkmate is checked first because a mate on the fifty move limit still wins
+#Checkmate is checked first because a mate on the fifty move limit still wins. Without a legal move the side to move is
+#mated when in check and stalemated otherwise: one look for a legal move, where is_checkmate and is_stalemate take one each
 def game_result(board: chess.Board) -> float | None:
-    if board.is_checkmate():
-        return 0.0
-    if board.is_stalemate() or board.is_insufficient_material() or board.is_fifty_moves() or board.is_repetition(REPETITIONS_FOR_A_DRAW):
+    if not any(board.generate_legal_moves()):
+        return 0.0 if board.is_check() else DRAW
+    if board.is_insufficient_material() or board.is_fifty_moves() or board.is_repetition(REPETITIONS_FOR_A_DRAW):
         return DRAW
     if tablebase is not None and covers(board):
         return wdl_score(tablebase.probe_wdl(board))
@@ -91,8 +101,11 @@ def select_child(node: Node) -> tuple[chess.Move, Node]:
     children_visits = max(node.visit_count - 1, 1)
     visited_policy = sum(child.prior for child in node.children.values() if child.visit_count > 0)
     first_play_urgency = (1 - node.value_sum / node.visit_count) - FPU_REDUCTION * math.sqrt(visited_policy)
+    sqrt_children_visits = math.sqrt(children_visits)
 
-    children_U = []
+    #one pass that keeps the first child with the highest score, the one max() would pick: the search spends much of its
+    #time here
+    best_move, best_child, best_U = None, None, -math.inf
     for move, child in node.children.items():
         P = child.prior
         N = child.visit_count
@@ -100,9 +113,9 @@ def select_child(node: Node) -> tuple[chess.Move, Node]:
             Q = child.value_sum / N
         else:
             Q = first_play_urgency
-        children_U.append((move, child, Q + (c_puct * P * (math.sqrt(children_visits) / (1 + N)))))
-
-    best_move, best_child, _ = max(children_U, key=lambda item: item[2])
+        U = Q + (c_puct * P * (sqrt_children_visits / (1 + N)))
+        if U > best_U:
+            best_move, best_child, best_U = move, child, U
     return best_move, best_child
 
 
@@ -122,6 +135,23 @@ def backup(path: list[Node], value: float) -> None:
 #one simulation: walk down to a node without children, score its position and back the score up. board starts at the root
 #position and is a copy of its own, so push moves freely
 def run_simulation(root: Node, board: chess.Board, model: nn.Module, device: torch.device) -> None:
+    leaf = descend(root, board)
+    if leaf.value is None:
+        priors, value = evaluate(model, board, device)
+        finish(leaf, priors, value)
+    else:
+        finish(leaf, None, leaf.value)
+
+#a simulation halfway, at its leaf: the path from the root down, and the leaf's score for its side to move when the game
+#or a repetition decides it. None when the network has to evaluate the leaf
+@dataclass
+class Leaf:
+    path: list[Node]
+    value: float | None
+
+#the first half of a simulation, up to the network: walk down to a node without children, pushing every move onto board,
+#which is left at the leaf. Self play runs this for many games before evaluating all their leaves at once
+def descend(root: Node, board: chess.Board) -> Leaf:
     node = root
     path = [root]
     #the positions on the path, root first, keyed the way is_repetition compares them
@@ -134,16 +164,18 @@ def run_simulation(root: Node, board: chess.Board, model: nn.Module, device: tor
         positions.append(board._transposition_key())
 
     value = game_result(board)
-    if value is None:
-        #a position already on the path came round because neither side left the loop, so like leela it is scored as the
-        #draw the loop heads for. A repeat of the game before the root still waits for the third time (game_result)
-        if positions[-1] in positions[:-1]:
-            value = DRAW
-        else:
-            priors, value = evaluate(model, board, device)
-            expand(node, priors)
+    #a position already on the path came round because neither side left the loop, so like leela it is scored as the
+    #draw the loop heads for. A repeat of the game before the root still waits for the third time (game_result)
+    if value is None and positions[-1] in positions[:-1]:
+        value = DRAW
+    return Leaf(path, value)
 
-    backup(path, value)
+#the second half: expand the leaf with the network's priors when it was evaluated (None when its value was decided
+#without the network), and back its score up the path
+def finish(leaf: Leaf, priors: dict[chess.Move, float] | None, value: float) -> None:
+    if priors is not None:
+        expand(leaf.path[-1], priors)
+    backup(leaf.path, value)
 
 
 #runs the simulations from board, which is left as it was, and returns the root: its children hold what the search found
