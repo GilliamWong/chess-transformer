@@ -3,8 +3,32 @@ from torch import nn
 import torch.nn.functional as F
 import math
 from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, NUM_MOVE_IDS, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
+from encoding import (NUM_PIECE_CODES, NUM_FLAG_VALUES, NUM_EN_PASSANT_VALUES, TURN_INDEX, WHITE_KINGSIDE_INDEX, BLACK_QUEENSIDE_INDEX,
+                      EN_PASSANT_INDEX, TURN_TOKEN_OFFSET, CASTLING_TOKEN_OFFSET, EN_PASSANT_TOKEN_OFFSET)
 
 VALUE_TOKEN_DIM = 16
+
+#the planes the template embedding reads per square: the 12 piece planes first (the maps spread those), then empty, side to
+#move, the four castling rights and the en passant square, the last ones the same on every square
+NUM_PIECE_PLANES = NUM_PIECE_CODES - 1
+NUM_CASTLING_SLOTS = BLACK_QUEENSIDE_INDEX - WHITE_KINGSIDE_INDEX + 1
+NUM_INPUT_PLANES = NUM_PIECE_CODES + NUM_FLAG_VALUES + NUM_CASTLING_SLOTS * NUM_FLAG_VALUES + NUM_EN_PASSANT_VALUES #87
+TEMPLATE_EMBEDDING_NORM_EPSILON = 1e-3 #leela's
+
+#a truncated normal cut at 2 standard deviations, the std corrected for the cut: how leela's (flax's) weights start
+def truncated_normal_(tensor: torch.Tensor, variance: float) -> torch.Tensor:
+    std = math.sqrt(variance) / 0.87962566103423978
+    with torch.no_grad():
+        return nn.init.trunc_normal_(tensor, std=std, a=-2 * std, b=2 * std)
+
+#an nn.Linear started like leela's: lecun normal weights, or deepnorm's (variance beta / fan_avg) when deepnorm_beta is
+#given, and a zero bias
+def leela_linear(in_features: int, out_features: int, deepnorm_beta: float | None = None) -> nn.Linear:
+    linear = nn.Linear(in_features, out_features)
+    variance = 1 / in_features if deepnorm_beta is None else deepnorm_beta / ((in_features + out_features) / 2)
+    truncated_normal_(linear.weight, variance)
+    nn.init.zeros_(linear.bias)
+    return linear
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_hidden: int):
@@ -137,14 +161,73 @@ class TransformerBlock(nn.Module):
         return residual
 
 
+class TemplateEmbedding(nn.Module):
+    #the square tokens built from the whole board before the first block, so every square starts out knowing more than its
+    #own piece. Each piece gives one feature per map (piece_features), and map m, a learned 64x64 grid like the blocks'
+    #templates, spreads that feature from the piece's square to every square. A square's own planes and those features
+    #then go through leela chess zero's input embedding (lczero-training, embedding.py): a linear layer, mish, a norm, a
+    #multiplicative and an additive gate per square and channel, and a small ffn.
+    #Shallow models gain a lot from it, deep ones nothing: 192 maps against model.py's plain embedding, +0.039 val loss at
+    #d128 with 4 layers, +0.015 at d256 with 4, +0.003 (noise) at d256 with 8 (README, "The current recipe")
+    def __init__(self, d_model: int, maps: int, num_layers: int, token_embed: nn.Embedding):
+        super().__init__()
+        self.piece_features = nn.Linear(NUM_PIECE_PLANES, maps, bias=False)
+        #scaled so a square's sum over the 64 others keeps the features' size
+        self.maps = nn.Parameter(torch.randn(maps, NUM_SQUARES, NUM_SQUARES) / NUM_SQUARES ** 0.5)
+
+        self.embedding = leela_linear(NUM_INPUT_PLANES + maps, d_model)
+        self.norm = nn.LayerNorm(d_model, eps=TEMPLATE_EMBEDDING_NORM_EPSILON)
+        #the multiplicative gate goes through relu and starts at 1, the additive one starts at 0
+        self.mult_gate = nn.Parameter(torch.ones(NUM_SQUARES, d_model))
+        self.add_gate = nn.Parameter(torch.zeros(NUM_SQUARES, d_model))
+
+        #leela's deepnorm scaling for the ffn: its output times alpha, its weights starting at variance beta / fan_avg
+        self.alpha = (2 * num_layers) ** -0.25
+        beta = (8 * num_layers) ** -0.25
+        d_hidden = d_model * 3 // 2
+        self.ffn_in = leela_linear(d_model, d_hidden, deepnorm_beta=beta)
+        self.ffn_out = leela_linear(d_hidden, d_model, deepnorm_beta=beta)
+        self.out_norm = nn.LayerNorm(d_model, eps=TEMPLATE_EMBEDDING_NORM_EPSILON)
+
+        #the six metadata tokens keep model.py's embedding
+        self.token_embed = token_embed
+
+    #B 64 NUM_INPUT_PLANES of 0s and 1s
+    def planes(self, board_state: torch.Tensor) -> torch.Tensor:
+        B = board_state.shape[0]
+        pieces = F.one_hot(board_state[:, :NUM_SQUARES], NUM_PIECE_CODES) #B 64 13, code 0 is an empty square
+        turn = F.one_hot(board_state[:, TURN_INDEX] - TURN_TOKEN_OFFSET, NUM_FLAG_VALUES)
+        castling = F.one_hot(board_state[:, WHITE_KINGSIDE_INDEX:BLACK_QUEENSIDE_INDEX + 1] - CASTLING_TOKEN_OFFSET, NUM_FLAG_VALUES).reshape(B, -1)
+        en_passant = F.one_hot(board_state[:, EN_PASSANT_INDEX] - EN_PASSANT_TOKEN_OFFSET, NUM_EN_PASSANT_VALUES)
+        metadata = torch.cat([turn, castling, en_passant], dim=-1).unsqueeze(1).expand(-1, NUM_SQUARES, -1)
+        return torch.cat([pieces[..., 1:], pieces[..., :1], metadata], dim=-1).to(self.embedding.weight.dtype)
+
+    def forward(self, board_state: torch.Tensor) -> torch.Tensor:
+        planes = self.planes(board_state)
+        #B 64 maps: map m spreads every square's feature m over the board, square to square
+        features = self.piece_features(planes[..., :NUM_PIECE_PLANES])
+        board = torch.einsum("mij,bjm->bim", self.maps, features)
+
+        squares = self.norm(F.mish(self.embedding(torch.cat([planes, board], dim=-1))))
+        squares = squares * F.relu(self.mult_gate) + self.add_gate
+        squares = self.out_norm(squares + self.ffn_out(F.mish(self.ffn_in(squares))) * self.alpha)
+
+        metadata = self.token_embed(board_state[:, NUM_SQUARES:])
+        return torch.cat([squares, metadata], dim=1) #B TOKENS_PER_BOARD d_model
+
+
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_ratio: float | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_ratio: float | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, template_maps: int = 0):
         super().__init__()
         #the dim of the board input is 70, with a torch.long dtype
         self.d_model = d_model
 
         #one mebedding per possible board token, each of d_model size
         self.embed = nn.Embedding(BOARD_VOCAB_SIZE, self.d_model)
+        #or with template_maps, the square tokens built from the whole board by that many template maps (TemplateEmbedding),
+        #which pays off in shallow models
+        if template_maps:
+            self.embed = TemplateEmbedding(self.d_model, template_maps, num_layers, self.embed)
 
         #we'll have one positional encoding per token position on the board
         self.position_embed = nn.Parameter(torch.randn(TOKENS_PER_BOARD, self.d_model))

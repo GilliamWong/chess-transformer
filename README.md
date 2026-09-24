@@ -126,33 +126,32 @@ Some of it is now simply how the model works, and the code for the alternatives 
 
 | Choice | Setting | Why |
 |---|---|---|
-| Input embedding | The full Leela embedding for the 64 squares (below). `model.py` does not have it yet; the code that trained it is at tag `pre-cleanup-2026-09-23` (`LeelaChessTransformer(block="templates", leela_embedding=True)` in `model_leela.py`) | Best of four board-wide embeddings at 3x compute and equal FLOPs, on every seed (below) |
+| Input embedding | Depends on depth. With 4 layers: 192-384 template maps before the first block, `ChessTransformer(template_maps=192)` (`--template-maps` in `multi_gpu/train_ddp.py`). With 8 or more layers: none (`template_maps=0`, the default), since a deep model learns the board's geometry itself | 192 maps against no embedding: +0.039 loss and about +34 Elo at d128/4 layers, +0.015 and +15 at d256/4 layers, +0.003 and +3 (noise) at d256/8 layers |
 | Attention | Narrower queries and keys in the early layers, `--qk-ratio 0.25 0.5 0.5 0.75` at 4 layers or `0.25 0.25` + `0.5` x5 + `0.75` x13 at 20, and half as many key/value heads as heads, `--kv-heads` (grouped-query attention) | The same quality at 17-20% fewer FLOPs |
 | Learning rate | `--lr 6e-3` at d128 | 1e-2 was slightly worse at the longer budget. Untested at d640 |
 
-The input embedding comparison (2026-09-23): d128 with the narrower queries and keys and grouped-query attention, 3x the
-standard compute (each model gets the positions its FLOPs buy), 3 seeds each, all in fp16, every model scored with 4000 games
+The input embeddings compared (2026-09-23, in `artifacts/overnight_2026-09-23.md`): d128 with 4 layers, the narrower
+queries and keys and grouped-query attention, 3x the standard compute, 1-3 seeds, fp16, every model scored with 4000 games
 against Stockfish 1700:
 
-| Embedding | Parameters | Val loss | Accuracy | Puzzles | Elo |
-|---|---|---|---|---|---|
-| Full Leela embedding | 3.89M | **1.8271** | **46.50%** | **61.4%** | **1773** |
-| Small Leela embedding | 1.52M | 1.8337 | 46.27% | 61.3% | 1763 |
-| Template maps with Leela's processing | 0.77M | 1.8427 | 45.98% | 60.2% | 1752 |
-| Template-map embedding | 0.71M | 1.8458 | 45.83% | 60.3% | 1748 |
+| Board summary before the first block | Seeds | Parameters | Val loss | Elo |
+|---|---|---|---|---|
+| 192 template maps | 3 | 1.55M | **1.8171** | 1780 |
+| 384 template maps | 1 | 2.36M | 1.8180 | **1794** |
+| 64 template maps | 3 | 1.01M | 1.8256 | 1772 |
+| Full Leela embedding | 3 | 3.89M | 1.8271 | 1773 |
+| Small Leela embedding | 3 | 1.52M | 1.8337 | 1763 |
+| 8 template maps (the overnight run's embedding) | 3 | 0.71M | 1.8458 | 1748 |
 
-- The full Leela embedding: the whole board's pieces through one dense layer to d_model / 2 features per square (64 at
-  d128), next to each square's own planes, then a linear layer to d_model, mish, a norm, per-square gates and a small FFN
-  (1.5x d_model). The small one is the same with 16 features per square. `model.py`'s blocks follow either, with templates
-  in every layer.
-- It beat the small one on every seed (loss 1.8270-1.8272 against 1.8316-1.8369, +4 to +13 Elo), although at d128 it costs
-  7% more FLOPs a position and so saw 6% fewer positions.
-- The template-map embedding spreads each square's features over the board with 8 learned 64x64 maps, the templates' way of
-  mixing: a factorised version of Leela's dense layer. It was last, 0.019 loss and 21-31 Elo behind the full Leela embedding
-  on every seed. Giving it Leela's processing after the maps (the third row) did not close the gap: what helps is the dense
-  layer, a learned weight for every square, piece and receiving square.
-- At d640 the full Leela embedding adds 17M parameters (d_model / 2 = 320 features per square) and 2.8% of the FLOPs, the
-  small one 2.2M and 2.1%. The dense size was only tested at d128.
+- `model.TemplateEmbedding` is the tested embedding exactly (checked output for output against the experiment code). The
+  tested d128 models also had a narrower MLP than `model.py`'s default: `mlp_ratio=1.333` reproduces them to the parameter.
+- Template maps here are learned 64x64 maps, shared by every piece and weighted by it, spreading the board's pieces to
+  every square; one feature per map, then Leela's processing (a linear layer, mish, a norm, per-square gates and a small
+  FFN). Leela's embedding does the same with a dense layer, which amounts to a separate map for every piece and feature.
+  Its weights learn each piece's moves (pictures in `artifacts/embedding_plots/`).
+- More maps help up to about 192-384. 768 cost 17% more FLOPs a position at d128 and do worse.
+- In a deeper model none of it matters: at d256 with 8 layers, no embedding, both Leela embeddings and 192 maps all
+  landed within 0.005 loss and 6 Elo (one seed).
 
 Tried and left out:
 - A whole-board term in every block's template mix (the board mix), and Leela's smolgen: little gain once the embedding
@@ -160,9 +159,9 @@ Tried and left out:
   accuracy.
 - Cut-down Leela embeddings: its dense layer alone, or the dense layer plus an FFN. Close behind at d128, and the FFN added
   nothing for its cost.
-- The template-map embedding, and template maps with Leela's processing (above).
 
-At d640 every one of these embeddings costs under 3% of the model's FLOPs (2-16% at d128), so the choice is on quality.
+A 20-layer d640 should gain nothing measurable from any of them. For a shallow model, 192 template maps cost about 1.3M
+parameters and 0.5% of the FLOPs at d640, against 15.7M parameters for the full Leela embedding.
 
 At scale, train synchronously (`multi_gpu/train_ddp.py`) at a global batch of about 4096, as the d640 run did. The measured gradient
 noise scale of a d640 model is 2.5k-7k positions while the learning rate is high, so a much bigger batch mostly wastes positions. Averaging the weights of
@@ -189,6 +188,27 @@ the PGN into a Lichess study to replay the games with an evaluation graph. In th
 
 The games of the last match are saved to `artifacts/match.pgn`.
 
+## Self-play (expert iteration)
+
+The search is far stronger than the policy alone (`artifacts/mcts_ladder_2026-09-23.md`: +390 Elo at 64 simulations).
+A round of expert iteration trains the policy towards the search's own choices:
+
+```
+uv run selfplay.py artifacts/runs/rl_start_d128_4min/model.pt --name selfplay_r1 --positions 1_000_000 --tablebase
+uv run main.py --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix --lr 1e-3 --positions 3_000_000 --name rl_r1
+uv run python -m tools.play.evaluate_elo --checkpoint artifacts/runs/rl_r1/model.pt --elo 1700 --games 200 --concurrency 12
+```
+
+`selfplay.py` plays the model against itself with 64 simulations a move: noise in every root's priors and the first 30
+plies drawn from the visit counts, so that games differ; a game ends by the rules, at 5 pieces with the tablebase's
+result, or as a draw after 600 plies. Every position is saved with the search's visit shares (the policy target) and
+with the game's result and the root's mean score, which training blends half and half (`--result-weight`). About
+200,000 positions an hour on 12 processes (one of them on the GPU) at below-normal priority; it can be stopped and
+started again. `main.py --init-checkpoint` fine-tunes the checkpoint, `--mix-set` keeps a quarter of every batch
+(`--mix-share`) from a Stockfish-labelled set so that the model does not forget it, and the run ends with the model's
+accuracy on that set's val positions next to the self-play ones. The test of a round is the policy alone against the
+same Stockfish as before: the starting model scored 1569.
+
 ## Tests
 
 ```
@@ -206,6 +226,7 @@ The root training and model files are:
 | `model.py` | The transformer: board tokens in, a score for each move and an eval out |
 | `main.py` | The single-GPU training loop |
 | `mcts.py` | Monte Carlo tree search over the model, `--tablebase` to score endgames from the tables |
+| `selfplay.py` | The model playing itself with the search, saved as a training set for expert iteration |
 
 Everything else is kept out of the way:
 

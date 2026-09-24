@@ -196,7 +196,8 @@ def run(args, device: torch.device):
 
     model_settings = dict(d_model=args.d_model, num_layers=args.layers, n_heads=args.heads,
                           position_templates=args.templates, mlp_ratio=args.mlp_ratio,
-                          qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads)
+                          qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads,
+                          template_maps=args.template_maps)
     raw_model = ChessTransformer(**model_settings).to(device)
     if args.init_from is not None:
         #weights only: the optimizer and the schedule start afresh, so this is a restart with new settings, not a resume
@@ -280,6 +281,8 @@ def parse_args(argv=None):
     parser.add_argument("--templates", type=int, default=single.POSITION_TEMPLATES)
     parser.add_argument("--mlp-ratio", type=float)
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention)")
+    parser.add_argument("--template-maps", type=int, default=0, help="template maps building the square tokens from the whole board "
+                        "before the first block (model.TemplateEmbedding), 0 for none. Worth it for shallow models, e.g. 192 at 4 layers")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="width of the queries and keys as a multiple of the values', one for every block or one per block")
     parser.add_argument("--lr", type=float, default=single.PEAK_LEARN_RATE)
     parser.add_argument("--schedule", choices=("cosine", "hold", "constant"), default=single.SCHEDULE)

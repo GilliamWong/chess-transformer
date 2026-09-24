@@ -4,6 +4,7 @@ import chess
 import pytest
 import torch
 
+from encoding import encode_board
 from tools import checkpoint
 from tools.checkpoint import load_checkpoint, save_checkpoint
 from model import ChessTransformer
@@ -25,6 +26,25 @@ def test_model_of_any_size_comes_back_with_the_same_weights(tmp_path):
 
     assert loaded_settings == SETTINGS
     for loaded_output, output in zip(loaded.eval()(boards), model(boards)):
+        assert torch.equal(loaded_output, output)
+
+
+#the template embedding is rebuilt from its setting too; real boards, since it reads the metadata tokens as flags
+def test_model_with_template_maps_comes_back_with_the_same_weights(tmp_path):
+    settings = {**SETTINGS, "template_maps": 16}
+    torch.manual_seed(0)
+    model = ChessTransformer(**settings).eval()
+    board = chess.Board()
+    boards = []
+    for move in ["e4", "c5", "Nf3", "d6"]:
+        boards.append(encode_board(board))
+        board.push_san(move)
+    save_checkpoint(model, settings, tmp_path / "model.pt")
+
+    loaded, loaded_settings = load_checkpoint(tmp_path / "model.pt", CPU)
+
+    assert loaded_settings == settings
+    for loaded_output, output in zip(loaded.eval()(torch.tensor(boards)), model(torch.tensor(boards))):
         assert torch.equal(loaded_output, output)
 
 

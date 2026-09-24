@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import data
-from data import EXPECTED_SCORE_PER_CENTIPAWN, ChessGamesDataset, datasets_to_dataloaders, load_training_set
+from data import EXPECTED_SCORE_PER_CENTIPAWN, ChessGamesDataset, MixedLoader, SelfPlayDataset, datasets_to_dataloaders, load_training_set
 from encoding import TOKENS_PER_BOARD
 from tools.label_with_stockfish import NO_EVAL, NO_MOVE
 
@@ -133,3 +133,24 @@ def test_dataset_rejects_mismatched_lengths():
 
     with pytest.raises(ValueError):
         ChessGamesDataset(np.zeros((3, TOKENS_PER_BOARD), dtype=np.uint8), labels, labels, TEMPERATURE)
+
+
+#self play keeps 8 target moves and these stockfish sets 2: the mix pads the narrower part with move 0 at probability 0,
+#and starts the smaller set over when it runs out (72 self play positions take 6 batches, 24 of the 20 stockfish ones)
+def test_mixed_batches_take_a_fixed_share_from_each_set(tiny):
+    _, stockfish = tiny
+    positions = 72
+    self_play = SelfPlayDataset(np.full((positions, TOKENS_PER_BOARD), 3, dtype=np.uint8), np.tile(np.arange(8, dtype=np.int16), (positions, 1)),
+                                np.full((positions, 8), 1 / 8, dtype=np.float32), np.ones(positions, dtype=np.float32),
+                                np.zeros(positions, dtype=np.float32), result_weight=0.5)
+    self_play_loader, _ = datasets_to_dataloaders(self_play, self_play, train_batch_size=12, val_batch_size=12, seed=0)
+    stockfish_loader, _ = datasets_to_dataloaders(stockfish, stockfish, train_batch_size=4, val_batch_size=4, seed=1)
+
+    batches = list(MixedLoader(self_play_loader, stockfish_loader))
+
+    assert len(batches) == 6
+    for boards, moves, probabilities, values in batches:
+        assert boards.shape == (16, TOKENS_PER_BOARD) and moves.shape == probabilities.shape == (16, 8)
+        assert probabilities.sum(dim=1).tolist() == pytest.approx([1.0] * 16)
+        assert moves[12:, 2:].eq(0).all() and probabilities[12:, 2:].eq(0).all()
+        assert values[:12].tolist() == pytest.approx([0.5] * 12)

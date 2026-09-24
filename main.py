@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterator
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from data import ARTIFACTS_DIR, datasets_to_dataloaders, load_training_set
+from data import ARTIFACTS_DIR, RESULT_WEIGHT, MixedLoader, datasets_to_dataloaders, load_training_set
 import torch
 import torch.nn.functional as F
 import math
@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from tools.budget import Budget
-from tools.checkpoint import RUNS_DIR, save_checkpoint
+from tools.checkpoint import RUNS_DIR, load_checkpoint, save_checkpoint
 from model import ChessTransformer
 
 #the model, each of these has a command line flag (python main.py --help)
@@ -63,8 +63,12 @@ TARGET_TEMPERATURE = 0.02
 #lichess elite 68% (a third of it blitz), fishtest 29%, otb 3%
 TRAINING_SET = "full_sf8_30M_mix"
 
+#with --mix-set, this share of every batch comes from that set: fine-tuning on self play keeps stockfish labelled
+#positions in the batches so the model does not forget them
+MIX_SHARE = 0.25
 
-def endless_batches(data_loader: DataLoader) -> Iterator[tuple[torch.Tensor, ...]]:
+
+def endless_batches(data_loader: DataLoader | MixedLoader) -> Iterator[tuple[torch.Tensor, ...]]:
     while True:
         yield from data_loader
 
@@ -107,7 +111,7 @@ def value_correct(value_logits: torch.Tensor, targets: torch.Tensor) -> int:
 def train(
     model: nn.Module,
     save_best_checkpoint: Callable[[], None],
-    train_data_loader: DataLoader,
+    train_data_loader: DataLoader | MixedLoader,
     val_data_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
@@ -240,8 +244,9 @@ def evaluate_model(
     return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples)
 
 
-def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE) -> tuple[DataLoader, DataLoader]:
-    train_dataset, val_dataset = load_training_set(training_set, target_temperature)
+def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE,
+                     result_weight: float = RESULT_WEIGHT) -> tuple[DataLoader, DataLoader]:
+    train_dataset, val_dataset = load_training_set(training_set, target_temperature, result_weight)
     warm_file_cache(train_dataset, val_dataset)
     return datasets_to_dataloaders(
         train_dataset,
@@ -256,7 +261,7 @@ def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float
 #that was just written or pushed out of memory by other work trained a quarter slower until enough of it had been
 #touched. Reading 12 GB in order takes about a minute; nothing to read takes seconds
 def warm_file_cache(*datasets) -> None:
-    tensors = [tensor for dataset in datasets for tensor in (dataset.boards, dataset.stockfish_moves, dataset.stockfish_evals)]
+    tensors = [tensor for dataset in datasets for tensor in dataset.tensors()]
     total_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
     progress = tqdm(total=total_bytes, desc="reading the training files into memory", unit="B", unit_scale=True, dynamic_ncols=True, leave=False)
@@ -317,7 +322,22 @@ def main(
     target_temperature: float = TARGET_TEMPERATURE,
     qk_ratio: float | list[float] = 1.0,
     kv_heads: int | None = None,
-    batch_size: int = BATCH_SIZE):
+    batch_size: int = BATCH_SIZE,
+    init_checkpoint: Path | None = None,
+    mix_set: str | None = None,
+    mix_share: float = MIX_SHARE,
+    result_weight: float = RESULT_WEIGHT,
+    template_maps: int = 0):
+
+    #fine-tuning starts from a checkpoint's weights, and the model is the size the checkpoint says, whatever the flags say
+    initial_model = None
+    if init_checkpoint is not None:
+        initial_model, model_settings = load_checkpoint(init_checkpoint, torch.device("cpu"))
+    else:
+        #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
+        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads, "template_maps": template_maps}
+    if mix_set is not None and not 0 < mix_share < 1:
+        raise ValueError(f"--mix-share is the share of every batch from {mix_set}, between 0 and 1, got {mix_share}")
 
     #a budget in positions is only used when one is asked for
     if positions_budget is not None:
@@ -326,7 +346,7 @@ def main(
         budget = Budget(batch_size, minutes=minutes_budget)
     if run_name is None:
         #the note names the run in tensorboard, made safe for a folder; without one, the settings that differ between experiments
-        run_name = folder_name(note) if note else f"d{d_model}_L{num_layers}_h{n_heads}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
+        run_name = folder_name(note) if note else f"d{model_settings['d_model']}_L{model_settings['num_layers']}_h{model_settings['n_heads']}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
         #runs started in the same second (several gpus at once) must not share a folder: the folder is claimed here,
         #and only the claim that made it decides the name
         for number in range(1, 100):
@@ -335,9 +355,6 @@ def main(
                 break
             except FileExistsError:
                 run_name = run_name.rsplit("_", 1)[0] + f"_{number}" if number > 1 else f"{run_name}_1"
-
-    #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
-    model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads}
 
     #a run this short would end during the warmup, without ever reaching PEAK_LEARN_RATE
     if not budget.timed and budget.max_steps <= WARMUP_STEPS:
@@ -350,10 +367,17 @@ def main(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}")
 
-    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size)
+    #with a mix set, its share of every batch is taken off the training set's
+    mix_batch_size = round(batch_size * mix_share) if mix_set is not None else 0
+    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size - mix_batch_size, result_weight)
     print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
+    mix_val_loader = None
+    if mix_set is not None:
+        mix_train_loader, mix_val_loader = load_dataloaders(mix_set, target_temperature, seed + 1, mix_batch_size)
+        train_data_loader = MixedLoader(train_data_loader, mix_train_loader)
+        print(f"{mix_set}: {mix_batch_size} of every {batch_size} positions")
 
-    model = ChessTransformer(**model_settings).to(device)
+    model = (initial_model if initial_model is not None else ChessTransformer(**model_settings)).to(device)
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
     print(f"model: {model_settings}, {num_parameters:,} parameters")
 
@@ -376,7 +400,7 @@ def main(
     #anything else means the data or the metrics are wrong
     #the value head starts at about ln(2) = 0.69 and half right
     val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, device, max_batches=EVAL_BATCHES)
-    print(f"untrained: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
+    print(f"{'starting point' if init_checkpoint is not None else 'untrained'}: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
 
     print(f"budget: {budget.describe()}, batches of {batch_size} positions, evaluating every {EVAL_EVERY} steps")
     run_dir = RUNS_DIR / run_name
@@ -395,6 +419,10 @@ def main(
         "batch_size": batch_size,
         "training_set": training_set,
         "target_temperature": target_temperature,
+        "init_checkpoint": str(init_checkpoint) if init_checkpoint is not None else None,
+        "mix_set": mix_set,
+        "mix_share": mix_share if mix_set is not None else None,
+        "result_weight": result_weight,
         "note": note,
         "commit": current_commit()
     }
@@ -417,6 +445,15 @@ def main(
     writer.add_scalar("final/val_accuracy", val_accuracy, budget.steps)
     writer.add_scalar("final/val_value_loss", val_value_loss, budget.steps)
     writer.add_scalar("final/val_value_accuracy", val_value_accuracy, budget.steps)
+
+    #how much of the mix set the model still knows: comparable with the final val numbers of a run trained on that set
+    if mix_val_loader is not None:
+        mix_val_loss, mix_val_accuracy, mix_val_value_loss, mix_val_value_accuracy = evaluate_model(compiled_model, mix_val_loader, device)
+        print(f"final, on all {len(mix_val_loader.dataset):,} val positions of {mix_set}: val loss {mix_val_loss:.3f}, val accuracy {mix_val_accuracy:.1%}, value loss {mix_val_value_loss:.3f}, value accuracy {mix_val_value_accuracy:.1%}")
+        writer.add_scalar("final/mix_val_loss", mix_val_loss, budget.steps)
+        writer.add_scalar("final/mix_val_accuracy", mix_val_accuracy, budget.steps)
+        run_settings.update(final_mix_val_loss=mix_val_loss, final_mix_val_accuracy=mix_val_accuracy,
+                            final_mix_val_value_loss=mix_val_value_loss, final_mix_val_value_accuracy=mix_val_value_accuracy)
     writer.close()
 
     run_settings.update(
@@ -457,7 +494,12 @@ if __name__ == "__main__":
     parser.add_argument("--target-temperature", type=float, default=TARGET_TEMPERATURE, help="how stockfish's moves share the target, see TARGET_TEMPERATURE in main.py. Default %(default)s")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="positions per step, for train and val. Lower it for a model that does not fit, default %(default)s")
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention). Default one for every head")
+    parser.add_argument("--template-maps", type=int, default=0, help="template maps building the square tokens from the whole board before the first block, 0 for none. Worth it for shallow models, e.g. 192 at 4 layers. Default 0")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="width of the queries and keys as a multiple of the values', rounded to whole dims per head. One for every block or one per block, e.g. --qk-ratio 0.25 0.5 0.5 0.75. Default 1")
+    parser.add_argument("--init-checkpoint", type=Path, help="start from this model.pt's weights (fine-tuning); the model is the checkpoint's size and the size flags are ignored")
+    parser.add_argument("--mix-set", help="a second training set that fills --mix-share of every batch, e.g. full_sf8_30M_mix when fine-tuning on self play")
+    parser.add_argument("--mix-share", type=float, default=MIX_SHARE, help="share of every batch from --mix-set, default %(default)s")
+    parser.add_argument("--result-weight", type=float, default=RESULT_WEIGHT, help="for a self play set: how much of the value target is the game's result, the rest the search's score. Default %(default)s")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -465,4 +507,6 @@ if __name__ == "__main__":
         from tools.tensorboard_server import start_tensorboard
         start_tensorboard()
 
-    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.schedule, arguments.seed, arguments.mlp_ratio, arguments.target_temperature, arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio, arguments.kv_heads, arguments.batch_size)
+    main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.schedule, arguments.seed, arguments.mlp_ratio, arguments.target_temperature, arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio, arguments.kv_heads, arguments.batch_size,
+         init_checkpoint=arguments.init_checkpoint, mix_set=arguments.mix_set, mix_share=arguments.mix_share, result_weight=arguments.result_weight,
+         template_maps=arguments.template_maps)

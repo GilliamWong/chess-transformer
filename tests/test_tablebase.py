@@ -7,6 +7,7 @@ import mcts
 from encoding import NUM_MOVE_IDS, encode_move_to_id
 from tools.label_with_stockfish import NO_EVAL, NO_MOVE
 from tools.label_with_tablebase import TABLEBASE_WIN_EVAL, label_position
+from selfplay import final_result
 from tools.play.player import choose_move
 from tools.tablebase import open_tablebase
 
@@ -86,3 +87,12 @@ def test_the_player_takes_the_tables_move_once_they_know_the_position(tablebase,
     move = choose_move(UniformModel(), chess.Board("k7/8/1K6/8/8/8/8/7R w - - 0 1"), CPU, "mcts", simulations=16)
 
     assert move == chess.Move.from_uci("h1h8")
+
+
+#with the tables, a self play game ends once they know the result, which is scored from white's side
+def test_self_play_ends_a_game_the_tables_know(tablebase, monkeypatch):
+    monkeypatch.setattr(mcts, "tablebase", tablebase)
+
+    assert final_result(chess.Board("k7/8/1K6/8/8/8/8/7R b - - 0 1")) == 1.0 #black to move, and lost
+    assert final_result(chess.Board("6k1/5r2/8/8/8/8/1R6/2K5 w - - 0 1")) == 0.5
+    assert final_result(chess.Board("6k1/7p/8/3r4/8/8/P7/3Q2K1 w - - 0 1")) is None #6 pieces

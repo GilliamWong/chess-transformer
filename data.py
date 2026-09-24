@@ -17,6 +17,26 @@ PROCESSED_DATA_DIR = ARTIFACTS_DIR / "processed_data"
 #the curve lichess fitted to its games. A pawn is worth a lot at 0 and next to nothing at +800, which centipawns do not show
 EXPECTED_SCORE_PER_CENTIPAWN = 0.00368208
 
+#the value target of a self play position: this much of the game's result, the rest the search's mean score at the root.
+#The result is the truth about the model's own play but one noisy label for a whole game, the search's score is a label
+#of its own for every position but mostly the network grading itself. Half of each did better than either in AlphaZero
+#style training (Oracle's "Lessons from AlphaZero"), and leela blends them too
+RESULT_WEIGHT = 0.5
+
+#the files selfplay.py writes next to <name>_{split}_boards.bin, per position, and their dtypes:
+#   visit_moves    the most visited moves of the search at the root, (positions, top moves), NO_MOVE where there were fewer
+#   visit_shares   each one's share of the visits to those moves, adding up to 1
+#   outcomes       the game's result for the side to move (0 lost, 0.5 drawn, 1 won)
+#   root_scores    the search's mean score at the root for the side to move, from 0 to 1
+SELF_PLAY_FILES = {"visit_moves": np.int16, "visit_shares": np.float32, "outcomes": np.float32, "root_scores": np.float32}
+
+#the arrays may be read-only memory maps. torch warns that writing through the tensor would be undefined, and nothing
+#here ever writes to them
+def shared_tensor(array: np.ndarray) -> torch.Tensor:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
+        return torch.from_numpy(array)
+
 class ChessGamesDataset(Dataset):
     """set of examples of chess games that we can use as a dataset"""
 
@@ -33,14 +53,14 @@ class ChessGamesDataset(Dataset):
         if unlabelled:
             raise ValueError(f"{unlabelled:,} of {len(boards):,} positions are not labelled yet, tools.label_with_stockfish finishes them")
 
-        #the arrays may be read-only memory maps. torch warns that writing through the tensor would be undefined,
-        #and nothing here ever writes to them
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
-            self.boards = torch.from_numpy(boards)
-            self.stockfish_moves = torch.from_numpy(stockfish_moves)
-            self.stockfish_evals = torch.from_numpy(stockfish_evals)
+        self.boards = shared_tensor(boards)
+        self.stockfish_moves = shared_tensor(stockfish_moves)
+        self.stockfish_evals = shared_tensor(stockfish_evals)
         self.target_temperature = target_temperature
+
+    #everything the set reads from disk
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return self.boards, self.stockfish_moves, self.stockfish_evals
 
     #the value head's target for rows: stockfish's eval of the position (the first column of the evals, the score after
     #its best move) as the expected score it stands for, a float from 0 to 1
@@ -68,12 +88,84 @@ class ChessGamesDataset(Dataset):
         return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index)
 
 
+#the positions of selfplay.py's games with what the search found at each (SELF_PLAY_FILES), in the same four tensors as
+#ChessGamesDataset: the policy learns the search's visit shares, the value head a blend of the result and the root's score
+class SelfPlayDataset(Dataset):
+    def __init__(self, boards: np.ndarray, visit_moves: np.ndarray, visit_shares: np.ndarray, outcomes: np.ndarray,
+                 root_scores: np.ndarray, result_weight: float):
+        if not 0 <= result_weight <= 1:
+            raise ValueError(f"the result weight is a share from 0 to 1, got {result_weight}")
+        if visit_moves.shape != visit_shares.shape or not len(boards) == len(visit_moves) == len(outcomes) == len(root_scores):
+            raise ValueError(f"{len(boards)} boards, visit moves {visit_moves.shape}, shares {visit_shares.shape}, "
+                             f"{len(outcomes)} outcomes and {len(root_scores)} root scores do not belong together")
+
+        self.boards = shared_tensor(boards)
+        self.visit_moves = shared_tensor(visit_moves)
+        self.visit_shares = shared_tensor(visit_shares)
+        self.outcomes = shared_tensor(outcomes)
+        self.root_scores = shared_tensor(root_scores)
+        self.result_weight = result_weight
+
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return self.boards, self.visit_moves, self.visit_shares, self.outcomes, self.root_scores
+
+    def __len__(self):
+        return len(self.boards)
+
+    def value_target_of(self, index: int | list[int]) -> torch.Tensor:
+        return self.result_weight * self.outcomes[index] + (1 - self.result_weight) * self.root_scores[index]
+
+    #places without a move are move 0 at share 0, as in ChessGamesDataset
+    def policy_target(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+        moves = self.visit_moves[index].long()
+        no_move = moves == NO_MOVE
+        return moves.masked_fill(no_move, 0), self.visit_shares[index].masked_fill(no_move, 0.0)
+
+    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        target_moves, target_probabilities = self.policy_target(index)
+        return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index)
+
+
+TrainingDataset = ChessGamesDataset | SelfPlayDataset
+
+
+#batches that take a fixed share of their positions from a second loader: fine-tuning on self play keeps some stockfish
+#labelled positions in every batch, so the model does not forget what it learned from them. The second loader starts
+#over whenever it runs out; one pass over the first is still one epoch
+class MixedLoader:
+    def __init__(self, main_loader: DataLoader, mix_loader: DataLoader):
+        self.main_loader = main_loader
+        self.mix_loader = mix_loader
+        self.dataset = main_loader.dataset #what the rest of the code reads the size of the set from
+        self.mix_batches = iter(())
+
+    def __len__(self):
+        return len(self.main_loader)
+
+    def __iter__(self):
+        for main_batch in self.main_loader:
+            mix_batch = next(self.mix_batches, None)
+            if mix_batch is None:
+                self.mix_batches = iter(self.mix_loader)
+                mix_batch = next(self.mix_batches)
+            yield concatenate_batches(main_batch, mix_batch)
+
+#two batches as one. The sets may keep a different number of target moves: the narrower one is padded with move 0 at
+#probability 0, which adds nothing to the loss
+def concatenate_batches(first: tuple[torch.Tensor, ...], second: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    boards, moves, probabilities, values = zip(first, second)
+    width = max(part.shape[1] for part in moves)
+    moves = [torch.nn.functional.pad(part, (0, width - part.shape[1])) for part in moves]
+    probabilities = [torch.nn.functional.pad(part, (0, width - part.shape[1])) for part in probabilities]
+    return torch.cat(boards), torch.cat(moves), torch.cat(probabilities), torch.cat(values)
+
+
 #the samplers hand the dataset a whole batch of indices at once (batch_size=None turns the loader's own
 #batching off), so a batch is one tensor lookup instead of one __getitem__ call per position plus a collate.
 #measured on 580k positions: 0.2s per epoch instead of 3.0s, which starts to matter at 70 million
 def datasets_to_dataloaders(
-    train_dataset: ChessGamesDataset,
-    val_dataset: ChessGamesDataset,
+    train_dataset: TrainingDataset,
+    val_dataset: TrainingDataset,
     train_batch_size: int = 256,
     val_batch_size: int = 512,
     seed: int | None = None
@@ -97,21 +189,30 @@ def datasets_to_dataloaders(
 #<name>_{train,val}_stockfish_{moves,evals}.bin (written by tools/label_with_stockfish.py): its best moves, which share
 #the policy target at target_temperature, and its eval, the value target. The arrays are memory mapped,
 #so 71 million positions cost no memory up front: pages are read from disk as batches touch them, and the
-#first epoch is a little slower than the rest while the operating system caches the file
-def load_training_set(name: str, target_temperature: float) -> tuple[ChessGamesDataset, ChessGamesDataset]:
+#first epoch is a little slower than the rest while the operating system caches the file.
+#A self play set (selfplay.py writes SELF_PLAY_FILES instead of stockfish's labels) comes back as SelfPlayDataset,
+#its value target blended by result_weight
+def load_training_set(name: str, target_temperature: float, result_weight: float = RESULT_WEIGHT) -> tuple[TrainingDataset, TrainingDataset]:
     datasets = []
     for split in ("train", "val"):
         boards_path = PROCESSED_DATA_DIR / f"{name}_{split}_boards.bin"
         stockfish_moves_path = PROCESSED_DATA_DIR / f"{name}_{split}_stockfish_moves.bin"
         if not boards_path.exists():
             raise FileNotFoundError(f"{boards_path.name} is missing from {PROCESSED_DATA_DIR}")
-        if not stockfish_moves_path.exists():
-            raise FileNotFoundError(f"{stockfish_moves_path.name} is missing, tools.label_with_stockfish writes it")
 
         #the files are raw arrays without a header, in the dtypes ChessGamesDataset stores: uint8 boards, int16 stockfish
         #moves and evals. mode "r", read-only. Copy on write ("c") looks harmless but makes windows reserve memory for the
         #whole file: with a set named three times an overnight run held 35 GB of reservations for 12 GB of data
         boards = np.memmap(boards_path, dtype=np.uint8, mode="r").reshape(-1, TOKENS_PER_BOARD)
+
+        if (PROCESSED_DATA_DIR / f"{name}_{split}_visit_moves.bin").exists():
+            arrays = {kind: np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin", dtype=dtype, mode="r") for kind, dtype in SELF_PLAY_FILES.items()}
+            datasets.append(SelfPlayDataset(boards, arrays["visit_moves"].reshape(len(boards), -1), arrays["visit_shares"].reshape(len(boards), -1),
+                                            arrays["outcomes"], arrays["root_scores"], result_weight))
+            continue
+
+        if not stockfish_moves_path.exists():
+            raise FileNotFoundError(f"{stockfish_moves_path.name} is missing, tools.label_with_stockfish writes it")
         #(positions, top moves), and the size of the file says how many top moves that is
         stockfish_moves = np.memmap(stockfish_moves_path, dtype=np.int16, mode="r")
         stockfish_evals = np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_stockfish_evals.bin", dtype=np.int16, mode="r")

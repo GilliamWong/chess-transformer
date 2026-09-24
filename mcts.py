@@ -13,6 +13,7 @@ from pathlib import Path
 import time
 import chess
 import chess.syzygy
+import numpy as np
 import torch
 from torch import nn
 from encoding import encode_board, encode_move_to_id
@@ -30,6 +31,10 @@ C_PUCT = 1.745 / 2
 C_PUCT_FACTOR = 3.894 / 2
 C_PUCT_BASE = 38739
 FPU_REDUCTION = 0.33 / 2
+#self play mixes dirichlet noise into the root's priors (search's root_noise), so that games can leave the moves the
+#policy is already sure of and the search sees what it would otherwise miss. alphazero's values for chess
+ROOT_NOISE_ALPHA = 0.3
+ROOT_NOISE_SHARE = 0.25
 
 #the endgame tablebase once main loads one (--tablebase). game_result scores the positions it covers, so the search stops
 #there as it does at the end of a game
@@ -142,16 +147,26 @@ def run_simulation(root: Node, board: chess.Board, model: nn.Module, device: tor
 
 
 #runs the simulations from board, which is left as it was, and returns the root: its children hold what the search found
-def search(model: nn.Module, board: chess.Board, device: torch.device, simulations: int = SIMULATIONS) -> Node:
+#root_noise, the random numbers of a self play game, mixes dirichlet noise into the root's priors (add_root_noise)
+def search(model: nn.Module, board: chess.Board, device: torch.device, simulations: int = SIMULATIONS,
+           root_noise: np.random.Generator | None = None) -> Node:
     if game_result(board) is not None:
         raise ValueError(f"the game is over or the tablebase knows it, there is nothing to search: {board.fen()}")
 
     root = Node(prior=1.0)
-    for _ in range(simulations):
+    for simulation in range(simulations):
         #copied with the moves played so far, which is how game_result sees repetitions
         run_simulation(root, board.copy(), model, device)
+        #the first simulation expanded the root, and no child has been chosen yet
+        if simulation == 0 and root_noise is not None:
+            add_root_noise(root, root_noise)
 
     return root
+
+def add_root_noise(root: Node, random: np.random.Generator) -> None:
+    noise = random.dirichlet([ROOT_NOISE_ALPHA] * len(root.children))
+    for child, amount in zip(root.children.values(), noise):
+        child.prior = (1 - ROOT_NOISE_SHARE) * child.prior + ROOT_NOISE_SHARE * amount
 
 #the move searched the most. Its visit count is steadier than its mean score, which a few lucky visits can lift. Ties go to
 #the better mean score, then to the policy (leela's order), so a search too short to visit anything plays the policy's move
