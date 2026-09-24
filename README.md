@@ -200,7 +200,8 @@ model in `artifacts/match.pgn` carries its score as `[%eval]`, the line it expec
 the PGN into a Lichess study to replay the games with an evaluation graph. In the Cute Chess GUI, the engine
 "ChessTransformer MCTS" shows the same live while it plays (`python -m tools.play.download_engines` registers it).
 
-The games of the last match are saved to `artifacts/match.pgn`.
+The games of the last match are saved to `artifacts/match.pgn`, and the result against Stockfish is added to
+`artifacts/elo_results.jsonl` and the `elo` chart in TensorBoard.
 
 ## Self-play (expert iteration)
 
@@ -216,15 +217,28 @@ uv run python -m tools.play.evaluate_elo --checkpoint artifacts/runs/rl_r1/model
 `selfplay.py` plays the model against itself with 64 simulations a move: noise in every root's priors and the first 30
 plies drawn from the visit counts, so that games differ; a game ends by the rules, at 5 pieces with the tablebase's
 result, or as a draw after 600 plies. Every position is saved with the search's visit shares (the policy target) and
-with the game's result and the root's mean score, which training blends half and half (`--result-weight`). Each of its
-12 processes plays 64 games at once and sends all their leaves through the network on the GPU in one call: about 3.4
-million positions an hour once the first games have ended (1 million in about 20 minutes), at below-normal priority,
-leaving 4 cores free. When it reaches `--positions` it starts no new games and finishes the ones being played, so every
-game begun is saved; ctrl+c does the same, and a second ctrl+c stops at once. Run again with the same flags (or a larger
-`--positions`), it carries on where it stopped. `main.py --init-checkpoint` fine-tunes the checkpoint, `--mix-set` keeps a quarter of every batch
-(`--mix-share`) from a Stockfish-labelled set so that the model does not forget it, and the run ends with the model's
-accuracy on that set's val positions next to the self-play ones. The test of a round is the policy alone against the
-same Stockfish as before: the starting model scored 1569.
+with the game's result and the root's mean score, which training blends half and half (`--result-weight`). The move
+played keeps its subtree for the next search (tree reuse: the same target quality, measured against an 800 simulation
+search, for 38 new simulations a move instead of 64; `--no-tree-reuse` turns it off).
+
+Each of its 12 processes plays 64 games at once and sends all their leaves through the network on the GPU in one call:
+about 3.7 million positions an hour (1 million in about 16 minutes), at below-normal priority, leaving 4 cores free.
+While it runs, `+` and `-` add and remove a process (up to 24; past about 16 the GPU is the limit, and 32 do not fit in
+its memory). When it reaches `--positions` it starts no new games and finishes the ones being played, so every game begun
+is saved; ctrl+c does the same, and a second ctrl+c stops at once. Run again with the same flags (or a larger
+`--positions`), it carries on where it stopped. `--compile` compiles the model in every process: slower for the d128
+(the processes share the GPU worse), maybe worth trying for larger models.
+
+`main.py --init-checkpoint` fine-tunes the checkpoint, `--mix-set` keeps a quarter of every batch (`--mix-share`) from a
+Stockfish-labelled set so that the model does not forget it, and the run ends with the model's accuracy on that set's val
+positions next to the self-play ones. The test of a round is the policy alone against the same Stockfish as before: the
+starting model scored 1569.
+
+TensorBoard (`uv run tensorboard --logdir artifacts/runs`) shows, next to the training runs, `selfplay/<name>` (positions
+an hour, processes, game length and results as a run goes) and `elo`: every match `evaluate_elo` plays against Stockfish
+is logged to `artifacts/elo_results.jsonl` and charted per lineage of models, the round of self play along the bottom
+(round 0 is the model trained from scratch, each `--init-checkpoint` one round more) and a line per way of playing (the
+policy alone, or the search at a number of simulations).
 
 ## Tests
 

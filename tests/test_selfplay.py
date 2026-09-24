@@ -142,3 +142,34 @@ def test_a_game_whose_record_could_not_be_moved_into_place_is_kept(tmp_path, mon
     assert reopened.record["games"] == 2 and reopened.positions() == 4
     train, val = load_training_set("played", 0.02)
     assert len(train) == len(val) == 2
+
+
+#counts the positions it evaluates, every move equally likely and every position even
+class CountingModel(UniformModel):
+    def __init__(self):
+        super().__init__()
+        self.positions = 0
+
+    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.positions += len(boards)
+        return super().forward(boards)
+
+#the move played keeps its subtree, so the next search already has visits and needs fewer evaluations for the same 64
+def test_tree_reuse_needs_fewer_evaluations_for_the_same_visits():
+    fresh, reused = CountingModel(), CountingModel()
+
+    fresh_game = play_game(fresh, CPU, 64, 0, max_plies=10, tree_reuse=False)
+    reused_game = play_game(reused, CPU, 64, 0, max_plies=10, tree_reuse=True)
+
+    assert len(fresh_game.boards) == len(reused_game.boards) == 10
+    assert reused.positions < fresh.positions
+    assert np.allclose(reused_game.visit_shares.sum(axis=1), 1.0)
+
+
+#a set played before tree reuse existed has no such setting: it counts as played without, and only carries on without
+def test_a_set_from_before_tree_reuse_carries_on_without_it(tmp_path):
+    SelfPlaySet(tmp_path, "played", SETTINGS).add(two_games()[0], 1.0)
+
+    with pytest.raises(ValueError, match="--no-tree-reuse"):
+        SelfPlaySet(tmp_path, "played", {**SETTINGS, "tree_reuse": True})
+    assert SelfPlaySet(tmp_path, "played", {**SETTINGS, "tree_reuse": False}).positions() == 2
