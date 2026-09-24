@@ -6,10 +6,11 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import chess
 import numpy as np
 import torch
 from torch import nn
-from encoding import TOKENS_PER_BOARD
+from encoding import TOKENS_PER_BOARD, encode_board
 from selfplay import ANSWER_WIDTH, set_priority, slot_arrays
 from tools.play.player import load_model
 
@@ -59,7 +60,8 @@ class GraphedBatches:
     def __init__(self, model: nn.Module, max_batch: int):
         self.sizes = graph_sizes(max_batch)
         largest = self.sizes[-1]
-        self.boards = torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, device="cuda")
+        #real boards (the start position): the graphs are recorded on them and the rows past a batch keep them
+        self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
         self.boards_host = [torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, pin_memory=True) for _ in range(2)]
         self.answers_host = [torch.zeros(largest, ANSWER_WIDTH, dtype=torch.float32, pin_memory=True) for _ in range(2)]
         self.turn = 0

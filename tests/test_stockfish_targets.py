@@ -93,6 +93,21 @@ def test_a_copied_set_ends_at_the_end_of_a_game():
     assert whole_games_prefix(plies, 100) == 9
 
 
+#a self play set has no plies to cut at: its boards are copied, each position once where it first comes, and the first
+#num_positions of those
+def test_a_self_play_set_is_copied_as_its_distinct_boards(tmp_path):
+    boards = np.repeat(np.array([[1], [2], [1], [3]], dtype=np.uint8), TOKENS_PER_BOARD, axis=1)
+    boards.tofile(tmp_path / "played_train_boards.bin")
+    np.zeros((4, 8), dtype=np.int16).tofile(tmp_path / "played_train_visit_moves.bin")
+
+    label_with_stockfish.copy_prefix(tmp_path, "played", "played_sf", "train", 100)
+    label_with_stockfish.copy_prefix(tmp_path, "played", "played_short_sf", "train", 2)
+
+    copied = np.fromfile(tmp_path / "played_sf_train_boards.bin", dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
+    assert copied[:, 0].tolist() == [1, 2, 3] and (copied == copied[:, :1]).all()
+    assert np.fromfile(tmp_path / "played_short_sf_train_boards.bin", dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)[:, 0].tolist() == [1, 2]
+
+
 def test_scores_are_stored_like_the_fishtest_evals():
     assert score_to_eval(chess.engine.Cp(-37)) == -37
     assert score_to_eval(chess.engine.Cp(31000)) == MATE_EVAL - 1  #a score is never mistaken for a mate

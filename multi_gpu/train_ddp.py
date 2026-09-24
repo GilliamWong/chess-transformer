@@ -11,13 +11,14 @@ import json
 import math
 import os
 from datetime import datetime, timedelta
+from itertools import islice
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import BatchSampler, DataLoader, DistributedSampler, Sampler, SequentialSampler
+from torch.utils.data import BatchSampler, DataLoader, Sampler, SequentialSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -25,6 +26,9 @@ import main as single
 from model import ChessTransformer
 from tools.budget import Budget
 from tools.checkpoint import RUNS_DIR, save_checkpoint
+
+#steps between two looks at rank zero's clock under a budget of minutes (see step_budget)
+CLOCK_EVERY = 20
 
 
 class TrainingSampler(Sampler):
@@ -45,12 +49,13 @@ class TrainingSampler(Sampler):
         return len(self.dataset) // self.global_batch_size
 
     def __iter__(self):
-        sampler = DistributedSampler(
-            self.dataset, num_replicas=self.world_size, rank=self.rank,
-            shuffle=True, seed=self.seed, drop_last=True,
-        )
-        sampler.set_epoch(self.epoch)
-        yield from BatchSampler(sampler, self.batch_size, drop_last=True)
+        #the epoch's order as one tensor, 4 bytes a position, and every local batch a slice of it. DistributedSampler
+        #built it as a python list, about 36 bytes a position: 10 GB in every process on the 290M set
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(self.dataset), generator=generator, dtype=torch.int32)
+        for start in range(0, len(self) * self.global_batch_size, self.global_batch_size):
+            local_start = start + self.rank * self.batch_size
+            yield order[local_start:local_start + self.batch_size].long()
 
 
 def endless_batches(loader: DataLoader):
@@ -59,19 +64,25 @@ def endless_batches(loader: DataLoader):
         loader.sampler.epoch += 1
 
 
-def step_budget(budget: Budget, device: torch.device) -> None:
-    """Rank zero owns elapsed time; all ranks use its progress for LR and stopping."""
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+def make_budget(args) -> Budget:
+    return (Budget(args.batch_size, positions=args.positions) if args.positions is not None
+            else Budget(args.batch_size, minutes=args.minutes))
+
+
+def step_budget(budget: Budget, clock: Budget | None, device: torch.device) -> None:
+    """Count a step. clock is rank zero's own timer (None on the other ranks); budget is what every rank decides the
+    learning rate and the stop on, so it only changes the same way everywhere. A budget of positions is the same
+    steps on every rank and shares nothing. A budget of minutes takes rank zero's clock every CLOCK_EVERY steps: a
+    broadcast waits for the gpu, and one every step left the gpu idle while the next step was launched."""
     if budget.steps == 0:
         dist.barrier()  #all first-step compilation is outside the timed budget
-    if dist.get_rank() == 0:
-        budget.step_done()
-    else:
-        budget.steps += 1
-    seconds = torch.tensor(budget.seconds, dtype=torch.float64, device=device)
-    dist.broadcast(seconds, src=0)
-    budget.seconds = seconds.item()
+    budget.steps += 1
+    if clock is not None:
+        clock.step_done()
+    if budget.timed and budget.steps % CLOCK_EVERY == 0:
+        seconds = torch.tensor(clock.seconds if clock is not None else 0.0, dtype=torch.float64, device=device)
+        dist.broadcast(seconds, src=0)
+        budget.seconds = seconds.item()
 
 
 def make_scheduler(optimizer, budget: Budget, schedule: str):
@@ -89,14 +100,21 @@ def make_scheduler(optimizer, budget: Budget, schedule: str):
 
 
 def evaluate(model, loader, device, max_batches=None):
-    #Use the unwrapped model: rank-zero-only DDP.forward could wait for other ranks.
-    #The original validation loader retains exactly the single-GPU validation cohort.
-    metrics = torch.zeros(4, dtype=torch.float64, device=device)
-    if dist.get_rank() == 0:
-        values = single.evaluate_model(model, loader, device, max_batches)
-        metrics.copy_(torch.tensor(values, dtype=torch.float64, device=device))
-    dist.broadcast(metrics, src=0)
-    return metrics.tolist()
+    """main.py's val batches (the first max_batches, or all), shared out: every rank measures every world_size-th
+    batch and the totals are added up, so the numbers are the single-GPU ones and the other GPUs do not wait.
+    The unwrapped model, whose forward waits for no other rank."""
+    rank, world_size = dist.get_rank(), dist.get_world_size()
+    count = len(loader) if max_batches is None else min(max_batches, len(loader))
+    own_batches = [indices for number, indices in enumerate(islice(loader.sampler, count)) if number % world_size == rank]
+    #loss, accuracy, value loss and value accuracy, each times the positions measured, then the positions
+    totals = torch.zeros(5, dtype=torch.float64, device=device)
+    if own_batches:
+        positions = sum(len(indices) for indices in own_batches)
+        own_loader = DataLoader(loader.dataset, sampler=own_batches, batch_size=None)
+        averages = single.evaluate_model(model, own_loader, device, show_progress=rank == 0)
+        totals.copy_(torch.tensor([average * positions for average in averages] + [positions], dtype=torch.float64))
+    dist.all_reduce(totals)
+    return (totals[:4] / totals[4]).tolist()
 
 
 METRIC_NAMES = ("val_loss", "val_accuracy", "val_value_loss", "val_value_accuracy")
@@ -108,8 +126,8 @@ def log_validation(writer, metrics, step, final=False):
         writer.add_scalar(f"final/{name}" if final else tag, value, step)
 
 
-def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, device,
-          value_weight, writer=None, save_best=None):
+def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
+          value_weight, eval_every, writer=None, save_best=None):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     best_val_loss = float("inf")  #the best trained checkpoint, even if the first update regresses
     loss_total = torch.zeros((), device=device)
@@ -118,8 +136,8 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
                     unit="s" if budget.timed else "it")
     model.train()
     try:
-        for cpu_batch in endless_batches(train_loader):
-            batch = tuple(tensor.to(device, non_blocking=True) for tensor in cpu_batch)
+        #main.py's prefetch: a thread reads the next batches and copies them over while the gpu works
+        for batch in single.batches_on_device(endless_batches(train_loader), device):
             for optimizer in optimizers:
                 optimizer.zero_grad()
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -132,7 +150,7 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
                 optimizer.step()
 
             before = budget.seconds
-            step_budget(budget, device)
+            step_budget(budget, clock, device)
             for scheduler in schedulers:
                 scheduler.step()
             progress.update(budget.seconds - before if budget.timed else 1)
@@ -140,14 +158,14 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
             interval_steps += 1
             finished = budget.finished()  #one shared decision, before rank zero pauses its clock
 
-            if budget.steps % single.EVAL_EVERY == 0 or finished:
-                if rank == 0:
-                    budget.pause()
+            if budget.steps % eval_every == 0 or finished:
                 dist.all_reduce(loss_total)
-                train_loss = loss_total.item() / (interval_steps * world_size)
+                train_loss = loss_total.item() / (interval_steps * world_size)  #waits for the gpu, so the pause starts when the steps are done
+                if rank == 0:
+                    clock.pause()
                 metrics = evaluate(raw_model, val_loader, device, single.EVAL_BATCHES)
                 if rank == 0:
-                    tqdm.write(f"step {budget.steps} ({budget.positions:,} positions, {budget.seconds / 60:.1f} min): "
+                    tqdm.write(f"step {budget.steps} ({budget.positions:,} positions, {clock.seconds / 60:.1f} min): "
                                f"train loss {train_loss:.3f}, val loss {metrics[0]:.3f}, val accuracy {metrics[1]:.1%}")
                     if writer is not None:
                         writer.add_scalar("loss/train", train_loss, budget.steps)
@@ -162,7 +180,7 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
                 interval_steps = 0
                 dist.barrier()  #checkpoint/logging time is excluded on every process
                 if rank == 0 and not finished:
-                    budget.resume()
+                    clock.resume()
             if finished:
                 break
     finally:
@@ -174,8 +192,8 @@ def run(args, device: torch.device):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     if args.batch_size <= 0 or args.batch_size % world_size:
         raise ValueError("--batch-size must be positive and divisible by the process count")
-    budget = (Budget(args.batch_size, positions=args.positions) if args.positions is not None
-              else Budget(args.batch_size, minutes=args.minutes))
+    budget = make_budget(args)
+    clock = make_budget(args) if rank == 0 else None  #see step_budget
     if not budget.timed and budget.max_steps <= single.WARMUP_STEPS:
         raise ValueError(f"the position budget must exceed {single.WARMUP_STEPS} global warmup steps")
     if budget.timed and (not math.isfinite(args.minutes) or args.minutes < 1):
@@ -194,8 +212,8 @@ def run(args, device: torch.device):
     if not len(val_loader.dataset):
         raise ValueError("validation needs at least one position")
     sampler = TrainingSampler(train_dataset, args.batch_size, rank, world_size, args.seed)
+    #not pinned here: batches_on_device pins them in its thread
     train_loader = DataLoader(train_dataset, batch_size=None, sampler=sampler,
-                              pin_memory=device.type == "cuda",
                               generator=torch.Generator().manual_seed(args.seed + rank))
 
     model_settings = dict(d_model=args.d_model, num_layers=args.layers, n_heads=args.heads,
@@ -207,7 +225,7 @@ def run(args, device: torch.device):
         raw_model.load_state_dict(torch.load(args.init_from, map_location=device)["state_dict"])
     model = DDP(raw_model, device_ids=[device.index] if device.type == "cuda" else None)
     if not args.no_compile:
-        model = torch.compile(model)
+        model = torch.compile(model) if args.compile_mode == "default" else torch.compile(model, mode=args.compile_mode)
     optimizers = single.make_optimizers(raw_model, args.lr, device)
     schedulers = [make_scheduler(optimizer, budget, args.schedule) for optimizer in optimizers]
     if device.type == "cuda" and not args.no_compile:
@@ -232,7 +250,8 @@ def run(args, device: torch.device):
                 training_set=args.training_set, target_temperature=args.target_temperature,
                 note=args.note, commit=single.current_commit(), trainer="ddp", world_size=world_size,
                 init_from=str(args.init_from) if args.init_from is not None else None,
-                device=device.type, backend=dist.get_backend(), compile=not args.no_compile, optimizer="muon",
+                device=device.type, backend=dist.get_backend(), compile=not args.no_compile,
+                compile_mode=args.compile_mode, eval_every=args.eval_every, optimizer="muon",
             )
             settings_path = run_dir / "settings.json"
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
@@ -246,16 +265,16 @@ def run(args, device: torch.device):
         def save_best():
             save_checkpoint(raw_model, model_settings, run_dir / "model.pt")
 
-        train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, device,
-              args.value_weight, writer, save_best if rank == 0 else None)
+        train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
+              args.value_weight, args.eval_every, writer, save_best if rank == 0 else None)
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
         if rank == 0:
             log_validation(writer, metrics, budget.steps, final=True)
             settings.update({f"final_{name}": value for name, value in zip(METRIC_NAMES, metrics)})
-            settings.update(train_seconds=budget.seconds, positions_seen=budget.positions,
-                            gpu_seconds=budget.seconds * world_size if device.type == "cuda" else 0,
+            settings.update(train_seconds=clock.seconds, positions_seen=budget.positions,
+                            gpu_seconds=clock.seconds * world_size if device.type == "cuda" else 0,
                             finished_at=datetime.now().isoformat(timespec="seconds"))
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
             from tools.compare_runs import write_progress_page
@@ -279,6 +298,10 @@ def parse_args(argv=None):
     parser.add_argument("--note", default="")
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument("--no-compile", action="store_true", help="use eager execution for debugging")
+    parser.add_argument("--compile-mode", choices=("default", "max-autotune-no-cudagraphs"), default="default",
+                        help="torch.compile's mode: autotune tries fused matrix product kernels for every shape, a slower first compile")
+    parser.add_argument("--eval-every", type=int, default=single.EVAL_EVERY,
+                        help="steps between two looks at the val set, default %(default)s; a long run can look less often")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda", help="CPU/Gloo is for distributed smoke tests")
     parser.add_argument("--d-model", type=int, default=single.D_MODEL)
     parser.add_argument("--layers", type=int, default=single.NUM_LAYERS)

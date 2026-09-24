@@ -113,6 +113,7 @@ score after Stockfish's best move) as an expected score.
 ```
 uv run python -m tools.evaluate_checkpoint artifacts/runs/<run>/model.pt --training-set full_sf8_30M    a checkpoint on another set's val positions
 uv run python -m tools.label_with_stockfish     labels a copy of the first games of a set, about 4 hours for 10 million positions. Can be stopped and continued
+uv run python -m tools.label_with_stockfish --source selfplay_r1_reuse --name selfplay_r1_reuse_sf    the same for the positions of the model's own games (a self-play set), each position once
 uv run python -m tools.tablebase                downloads the Syzygy endgame tables for up to 5 pieces, about 1 GB
 uv run python -m tools.label_with_tablebase     a copy of a set whose positions of up to 5 pieces carry the tables' moves and results (--measure: only how far Stockfish's were off)
 ```
@@ -257,7 +258,9 @@ same, and a second ctrl+c stops at once. Run again with the same flags (or a lar
 stopped.
 
 `main.py --init-checkpoint` fine-tunes the checkpoint, at a peak learning rate of 1e-3 unless `--lr` says otherwise (the
-6e-3 of a run from scratch undid a good part of what the starting model knew during the warmup). `--mix-set` keeps a
+6e-3 of a run from scratch undid a good part of what the starting model knew during the warmup). `--visit-temperature`
+sharpens the visit shares the policy learns (1 as recorded, 0 the most visited move alone): at 64 simulations the recorded
+shares are broad, and on average a worse move than the policy's own (`VISIT_TEMPERATURE` in `data.py`). `--mix-set` keeps a
 quarter of every batch (`--mix-share`) from a Stockfish-labelled set so that the model does not forget it, and the run
 ends with the model's accuracy on that set's val positions next to the self-play ones, and the commands that measure it. The test of a round is the policy alone against the same Stockfish as before: the
 starting model scored 1569.

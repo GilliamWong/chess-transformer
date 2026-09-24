@@ -22,6 +22,12 @@ EXPECTED_SCORE_PER_CENTIPAWN = 0.00368208
 #of its own for every position but mostly the network grading itself. Half of each did better than either in AlphaZero
 #style training (Oracle's "Lessons from AlphaZero"), and leela blends them too
 RESULT_WEIGHT = 0.5
+#the policy target of a self play position: the search's visit shares of its top moves raised to 1 / VISIT_TEMPERATURE and
+#made to add up to 1 again, 1 the shares as recorded and 0 the most visited move alone. At 64 simulations the recorded
+#shares are broad (the most visited move has 46% of the visits) and on average a worse move than the policy's own; sharpened
+#they are better. Stockfish at depth 12 on 2,000 positions of selfplay_r1_reuse, in expected score lost: 0.0348 at 1, 0.0226
+#at 0.5, 0.0189 at 0.25, 0.0177 at 0.1, against 0.0293 for the start model's own move
+VISIT_TEMPERATURE = 1.0
 
 #the files selfplay.py writes next to <name>_{split}_boards.bin, per position, and their dtypes:
 #   visit_moves    the most visited moves of the search at the root, (positions, top moves), NO_MOVE where there were fewer
@@ -92,9 +98,11 @@ class ChessGamesDataset(Dataset):
 #ChessGamesDataset: the policy learns the search's visit shares, the value head a blend of the result and the root's score
 class SelfPlayDataset(Dataset):
     def __init__(self, boards: np.ndarray, visit_moves: np.ndarray, visit_shares: np.ndarray, outcomes: np.ndarray,
-                 root_scores: np.ndarray, result_weight: float):
+                 root_scores: np.ndarray, result_weight: float, visit_temperature: float = VISIT_TEMPERATURE):
         if not 0 <= result_weight <= 1:
             raise ValueError(f"the result weight is a share from 0 to 1, got {result_weight}")
+        if visit_temperature < 0:
+            raise ValueError(f"the visit temperature is 0 or more, got {visit_temperature}")
         if visit_moves.shape != visit_shares.shape or not len(boards) == len(visit_moves) == len(outcomes) == len(root_scores):
             raise ValueError(f"{len(boards)} boards, visit moves {visit_moves.shape}, shares {visit_shares.shape}, "
                              f"{len(outcomes)} outcomes and {len(root_scores)} root scores do not belong together")
@@ -105,6 +113,7 @@ class SelfPlayDataset(Dataset):
         self.outcomes = shared_tensor(outcomes)
         self.root_scores = shared_tensor(root_scores)
         self.result_weight = result_weight
+        self.visit_temperature = visit_temperature
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         return self.boards, self.visit_moves, self.visit_shares, self.outcomes, self.root_scores
@@ -119,11 +128,22 @@ class SelfPlayDataset(Dataset):
     def policy_target(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor]:
         moves = self.visit_moves[index].long()
         no_move = moves == NO_MOVE
-        return moves.masked_fill(no_move, 0), self.visit_shares[index].masked_fill(no_move, 0.0)
+        shares = self.visit_shares[index].masked_fill(no_move, 0.0)
+        if self.visit_temperature != 1:
+            shares = sharpened(shares, self.visit_temperature)
+        return moves.masked_fill(no_move, 0), shares
 
     def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_moves, target_probabilities = self.policy_target(index)
         return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index)
+
+
+#visit shares raised to 1 / temperature and made to add up to 1, divided by the largest first so that a low temperature does
+#not round them all to 0. At 0 the most visited move alone, shared out between moves with as many visits
+def sharpened(shares: torch.Tensor, temperature: float) -> torch.Tensor:
+    relative = shares / shares.amax(dim=-1, keepdim=True).clamp_min(1e-30)
+    weights = (relative == 1).float() if temperature == 0 else relative ** (1 / temperature)
+    return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-30)
 
 
 TrainingDataset = ChessGamesDataset | SelfPlayDataset
@@ -191,8 +211,9 @@ def datasets_to_dataloaders(
 #so 71 million positions cost no memory up front: pages are read from disk as batches touch them, and the
 #first epoch is a little slower than the rest while the operating system caches the file.
 #A self play set (selfplay.py writes SELF_PLAY_FILES instead of stockfish's labels) comes back as SelfPlayDataset,
-#its value target blended by result_weight
-def load_training_set(name: str, target_temperature: float, result_weight: float = RESULT_WEIGHT) -> tuple[TrainingDataset, TrainingDataset]:
+#its value target blended by result_weight and its policy target sharpened by visit_temperature
+def load_training_set(name: str, target_temperature: float, result_weight: float = RESULT_WEIGHT,
+                      visit_temperature: float = VISIT_TEMPERATURE) -> tuple[TrainingDataset, TrainingDataset]:
     datasets = []
     for split in ("train", "val"):
         boards_path = PROCESSED_DATA_DIR / f"{name}_{split}_boards.bin"
@@ -208,7 +229,7 @@ def load_training_set(name: str, target_temperature: float, result_weight: float
         if (PROCESSED_DATA_DIR / f"{name}_{split}_visit_moves.bin").exists():
             arrays = {kind: np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin", dtype=dtype, mode="r") for kind, dtype in SELF_PLAY_FILES.items()}
             datasets.append(SelfPlayDataset(boards, arrays["visit_moves"].reshape(len(boards), -1), arrays["visit_shares"].reshape(len(boards), -1),
-                                            arrays["outcomes"], arrays["root_scores"], result_weight))
+                                            arrays["outcomes"], arrays["root_scores"], result_weight, visit_temperature))
             continue
 
         if not stockfish_moves_path.exists():

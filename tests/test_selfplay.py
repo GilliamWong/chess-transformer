@@ -80,6 +80,22 @@ def test_a_self_play_set_is_read_back_for_training(tmp_path, monkeypatch):
     assert train.value_target_of([0, 1]).tolist() == pytest.approx([0.65, 0.3]) #game 1 was a draw
 
 
+#a lower visit temperature sharpens the policy target and keeps it a distribution: shares of 0.75 and 0.25 are 0.9 and 0.1
+#at 0.5 (squared, 9 to 1), and the most visited move alone at 0. A position with one visited move keeps it whole
+def test_the_visit_temperature_sharpens_the_policy_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    games = SelfPlaySet(tmp_path, "played", SETTINGS)
+    for game in two_games():
+        games.add(game, 1.0)
+
+    for temperature, expected in ((1.0, [0.75, 0.25]), (0.5, [0.9, 0.1]), (0.0, [1.0, 0.0])):
+        _, val = load_training_set("played", 0.02, visit_temperature=temperature)
+        _, moves, shares, _ = val[[0, 1]]
+        assert shares[0, :2].tolist() == pytest.approx(expected) and shares[1, :2].tolist() == pytest.approx([1.0, 0.0])
+        assert shares.sum(dim=1).tolist() == pytest.approx([1.0, 1.0])
+        assert moves[:, :2].tolist() == [[5, 9], [7, 3]]
+
+
 #an interruption can leave part of a game in the files after the last record: opening the set again cuts it off
 def test_a_self_play_set_continues_after_an_interruption(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)

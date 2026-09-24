@@ -637,6 +637,9 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
                 if workers.all_done() and not finishing:
                     raise RuntimeError("every self play process has stopped")
                 continue
+            except InterruptedError:
+                #on windows a ctrl+c breaks off the wait after interrupt has run, and python does not wait again itself
+                continue
             if message is None:
                 workers.finished(worker_id)
                 continue

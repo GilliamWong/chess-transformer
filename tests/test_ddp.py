@@ -28,14 +28,14 @@ from tools.checkpoint import load_checkpoint
 def test_shuffled_shards_have_equal_full_batches_and_do_not_overlap(world_size):
     dataset = list(range(67))
     samplers = [train_ddp.TrainingSampler(dataset, 16, rank, world_size, 42) for rank in range(world_size)]
-    batches = [list(sampler) for sampler in samplers]
+    batches = [[batch.tolist() for batch in sampler] for sampler in samplers]
     shards = [[index for batch in rank_batches for index in batch] for rank_batches in batches]
     assert all(len(rank_batches) == 4 for rank_batches in batches)
     assert all(len(batch) == 16 // world_size for rank_batches in batches for batch in rank_batches)
     assert len({index for shard in shards for index in shard}) == 64
-    assert list(samplers[0]) == batches[0]
+    assert [batch.tolist() for batch in samplers[0]] == batches[0]
     samplers[0].epoch = 1
-    assert list(samplers[0]) != batches[0]
+    assert [batch.tolist() for batch in samplers[0]] != batches[0]
 
 
 @pytest.mark.parametrize("dataset,batch_size,world_size", [
@@ -87,29 +87,47 @@ def compare_update(rank, compiled=False):
 
 
 def check_shared_clock(rank):
+    #the shared budget takes rank zero's clock every CLOCK_EVERY steps and keeps it in between, on every rank alike
     budget = Budget(16, minutes=1)
+    clock = Budget(16, minutes=1) if rank == 0 else None
     optimizer = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.1)
     scheduler = train_ddp.make_scheduler(optimizer, budget, "cosine")
     now = [100.0 + 1000 * rank]
-    with patch("tools.budget.time.perf_counter", side_effect=lambda: now[0]):
-        for step, expected_seconds in enumerate((0, 30, 60), start=1):
-            now[0] += 30 if rank == 0 else 300  #rank one has a deliberately different clock
+    with patch("tools.budget.time.perf_counter", side_effect=lambda: now[0]), patch.object(train_ddp, "CLOCK_EVERY", 2):
+        for step, expected_seconds in enumerate((0, 30, 30, 90), start=1):
+            now[0] += 30 if rank == 0 else 300  #the other ranks have deliberately different clocks
             optimizer.step()
-            train_ddp.step_budget(budget, torch.device("cpu"))
+            train_ddp.step_budget(budget, clock, torch.device("cpu"))
             scheduler.step()
             assert budget.steps == step
             assert budget.positions == 16 * step
             assert budget.seconds == expected_seconds
-            assert budget.finished() == (step == 3)
+            assert budget.finished() == (step == 4)
             states = [None] * dist.get_world_size()
             dist.all_gather_object(states, (budget.progress(), scheduler.get_last_lr()))
             assert all(state == states[0] for state in states[1:])
             if step == 2:
                 if rank == 0:
-                    budget.pause()
+                    clock.pause()
                 now[0] += 600  #validation is outside the budget
                 if rank == 0:
-                    budget.resume()
+                    clock.resume()
+
+
+def check_shared_evaluation():
+    #the ranks' shares of the val batches add up to main.py's numbers on the same batches, also when some ranks get none
+    rows = np.random.default_rng(5)
+    size = 11
+    val_dataset = data.ChessGamesDataset(
+        rows.integers(0, BOARD_VOCAB_SIZE, (size, TOKENS_PER_BOARD)).astype(np.uint8),
+        rows.integers(0, 1968, (size, 2)).astype(np.int16), rows.integers(-300, 300, (size, 2)).astype(np.int16),
+        single.TARGET_TEMPERATURE)
+    _, val_loader = data.datasets_to_dataloaders(val_dataset, val_dataset, val_batch_size=4, seed=0)  #batches of 4, 4 and 3
+    torch.manual_seed(7)
+    model = ChessTransformer(d_model=16, num_layers=1, n_heads=2, position_templates=2)
+    for max_batches in (None, 2):
+        expected = single.evaluate_model(model, val_loader, torch.device("cpu"), max_batches)
+        assert train_ddp.evaluate(model, val_loader, torch.device("cpu"), max_batches) == pytest.approx(expected, rel=1e-6)
 
 
 def write_set(folder, name):
@@ -131,6 +149,7 @@ def distributed_worker(rank, folder, world_size):
     try:
         compare_update(rank)
         compare_update(rank, compiled=True)
+        check_shared_evaluation()
         single.WARMUP_STEPS = 1
         check_shared_clock(rank)
 

@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from data import ARTIFACTS_DIR, RESULT_WEIGHT, MixedLoader, datasets_to_dataloaders, load_training_set
+from data import ARTIFACTS_DIR, RESULT_WEIGHT, VISIT_TEMPERATURE, MixedLoader, datasets_to_dataloaders, load_training_set
 import torch
 import torch.nn.functional as F
 import math
@@ -127,7 +127,8 @@ def train(
     best_val_loss: float,
     budget: Budget,
     writer: SummaryWriter,
-    value_loss_weight: float = VALUE_LOSS_WEIGHT) -> None:
+    value_loss_weight: float = VALUE_LOSS_WEIGHT,
+    eval_every: int = EVAL_EVERY) -> None:
 
     #kept on the device: adding to it does not make the cpu wait for the gpu the way loss.item() does
     loss_total = torch.zeros((), device=device)
@@ -170,7 +171,7 @@ def train(
             progress.set_postfix(loss=f"{loss_total.item() / total_examples:.3f}")
 
         #the last step is always evaluated, so the final weights get their chance to be the checkpoint
-        if step % EVAL_EVERY == 0 or budget.finished():
+        if step % eval_every == 0 or budget.finished():
             train_loss = loss_total.item() / total_examples #also waits for the gpu, so the pause starts when the steps are really done
             budget.pause() #evaluating does not count towards a budget in minutes
             val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(model, val_data_loader, device, max_batches=EVAL_BATCHES)
@@ -209,7 +210,8 @@ def evaluate_model(
     model: nn.Module,
     test_data_loader: DataLoader,
     device: torch.device,
-    max_batches: int | None = None) -> tuple[float, float, float, float]:
+    max_batches: int | None = None,
+    show_progress: bool = True) -> tuple[float, float, float, float]:
 
     epoch_loss_total = 0.0
     total_correct_preds = 0
@@ -222,8 +224,9 @@ def evaluate_model(
     with torch.no_grad():
 
         num_batches = len(test_data_loader) if max_batches is None else min(max_batches, len(test_data_loader))
-        #islice stops after num_batches, leave=False clears the bar afterwards
-        progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False, dynamic_ncols=True)
+        #islice stops after num_batches, leave=False clears the bar afterwards. show_progress=False where several
+        #processes evaluate at once (multi_gpu/train_ddp.py), one bar is enough
+        progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False, dynamic_ncols=True, disable=not show_progress)
 
         for batch, target_moves, target_probabilities, values in progress:
             target_moves = target_moves.to(device)
@@ -256,8 +259,8 @@ def evaluate_model(
 
 
 def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE,
-                     result_weight: float = RESULT_WEIGHT) -> tuple[DataLoader, DataLoader]:
-    train_dataset, val_dataset = load_training_set(training_set, target_temperature, result_weight)
+                     result_weight: float = RESULT_WEIGHT, visit_temperature: float = VISIT_TEMPERATURE) -> tuple[DataLoader, DataLoader]:
+    train_dataset, val_dataset = load_training_set(training_set, target_temperature, result_weight, visit_temperature)
     warm_file_cache(train_dataset, val_dataset)
     return datasets_to_dataloaders(
         train_dataset,
@@ -364,7 +367,10 @@ def main(
     init_checkpoint: Path | None = None,
     mix_set: str | None = None,
     mix_share: float = MIX_SHARE,
-    result_weight: float = RESULT_WEIGHT):
+    result_weight: float = RESULT_WEIGHT,
+    visit_temperature: float = VISIT_TEMPERATURE,
+    eval_every: int = EVAL_EVERY,
+    compile_mode: str = "default"):
 
     #fine-tuning starts from a checkpoint's weights, and the model is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -408,7 +414,7 @@ def main(
 
     #with a mix set, its share of every batch is taken off the training set's
     mix_batch_size = round(batch_size * mix_share) if mix_set is not None else 0
-    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size - mix_batch_size, result_weight)
+    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size - mix_batch_size, result_weight, visit_temperature)
     print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
     mix_val_loader = None
     if mix_set is not None:
@@ -420,7 +426,8 @@ def main(
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
     print(f"model: {model_settings}, {num_parameters:,} parameters")
 
-    compiled_model = torch.compile(model)
+    #max-autotune-no-cudagraphs tries fused matrix product kernels for every shape and keeps the fastest: a slower first compile
+    compiled_model = torch.compile(model) if compile_mode == "default" else torch.compile(model, mode=compile_mode)
     optimizers = make_optimizers(model, peak_learn_rate, device)
 
     #the schedule runs over the part of the budget that is left when the warmup ends
@@ -442,7 +449,7 @@ def main(
     val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, device, max_batches=EVAL_BATCHES)
     print(f"{'starting point' if init_checkpoint is not None else 'untrained'}: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
 
-    print(f"budget: {budget.describe()}, batches of {batch_size} positions, evaluating every {EVAL_EVERY} steps")
+    print(f"budget: {budget.describe()}, batches of {batch_size} positions, evaluating every {eval_every} steps")
     run_dir = RUNS_DIR / run_name
     print(f"logging to {run_dir.relative_to(ARTIFACTS_DIR.parent)}")
     writer = SummaryWriter(log_dir=str(run_dir))
@@ -463,6 +470,9 @@ def main(
         "mix_set": mix_set,
         "mix_share": mix_share if mix_set is not None else None,
         "result_weight": result_weight,
+        "visit_temperature": visit_temperature,
+        "eval_every": eval_every,
+        "compile_mode": compile_mode,
         "optimizer": "muon", #runs before 2026-09-24 trained everything with AdamW
         "note": note,
         "commit": current_commit()
@@ -473,7 +483,8 @@ def main(
     def save_best_checkpoint() -> None:
         save_checkpoint(model, model_settings, run_dir / "model.pt")
 
-    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, optimizers, schedulers, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight)
+    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, optimizers, schedulers, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight,
+          eval_every=eval_every)
 
     #the final weights as well: model.pt is the best evaluation's, which is usually but not always the last one
     save_checkpoint(model, model_settings, run_dir / "final.pt")
@@ -544,6 +555,10 @@ if __name__ == "__main__":
     parser.add_argument("--mix-set", help="a second training set that fills --mix-share of every batch, e.g. full_sf8_30M_mix when fine-tuning on self play")
     parser.add_argument("--mix-share", type=float, default=MIX_SHARE, help="share of every batch from --mix-set, default %(default)s")
     parser.add_argument("--result-weight", type=float, default=RESULT_WEIGHT, help="for a self play set: how much of the value target is the game's result, the rest the search's score. Default %(default)s")
+    parser.add_argument("--eval-every", type=int, default=EVAL_EVERY, help="steps between two looks at the val set, default %(default)s. A long run can look less often: each look costs about EVAL_BATCHES / 3 steps")
+    parser.add_argument("--compile-mode", choices=["default", "max-autotune-no-cudagraphs"], default="default", help="torch.compile's mode, see train_speed measurements. Default %(default)s")
+    parser.add_argument("--visit-temperature", type=float, default=VISIT_TEMPERATURE, help="for a self play set: sharpens the visit shares the policy learns, "
+                                                                                           "1 as recorded, 0 the most visited move alone (see VISIT_TEMPERATURE in data.py). Default %(default)s")
     arguments = parser.parse_args()
 
     if not arguments.no_tensorboard:
@@ -552,4 +567,6 @@ if __name__ == "__main__":
         start_tensorboard()
 
     main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.schedule, arguments.seed, arguments.mlp_ratio, arguments.target_temperature, arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio, arguments.kv_heads, arguments.batch_size,
-         init_checkpoint=arguments.init_checkpoint, mix_set=arguments.mix_set, mix_share=arguments.mix_share, result_weight=arguments.result_weight)
+         init_checkpoint=arguments.init_checkpoint, mix_set=arguments.mix_set, mix_share=arguments.mix_share, result_weight=arguments.result_weight,
+         visit_temperature=arguments.visit_temperature,
+         eval_every=arguments.eval_every, compile_mode=arguments.compile_mode)
