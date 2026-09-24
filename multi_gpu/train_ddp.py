@@ -108,7 +108,7 @@ def log_validation(writer, metrics, step, final=False):
         writer.add_scalar(f"final/{name}" if final else tag, value, step)
 
 
-def train(model, raw_model, train_loader, val_loader, optimizer, scheduler, budget, device,
+def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, device,
           value_weight, writer=None, save_best=None):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     best_val_loss = float("inf")  #the best trained checkpoint, even if the first update regresses
@@ -120,17 +120,21 @@ def train(model, raw_model, train_loader, val_loader, optimizer, scheduler, budg
     try:
         for cpu_batch in endless_batches(train_loader):
             batch = tuple(tensor.to(device, non_blocking=True) for tensor in cpu_batch)
-            optimizer.zero_grad()
+            for optimizer in optimizers:
+                optimizer.zero_grad()
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 logits, value_logits = model(batch[0])
                 loss = single.policy_loss(logits, batch[1], batch[2]) + value_weight * single.value_loss(value_logits, batch[3])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            #every rank has the same averaged gradients after backward, so each steps all of the weights itself, Muon's too
+            for optimizer in optimizers:
+                optimizer.step()
 
             before = budget.seconds
             step_budget(budget, device)
-            scheduler.step()
+            for scheduler in schedulers:
+                scheduler.step()
             progress.update(budget.seconds - before if budget.timed else 1)
             loss_total += loss.detach()
             interval_steps += 1
@@ -147,7 +151,7 @@ def train(model, raw_model, train_loader, val_loader, optimizer, scheduler, budg
                                f"train loss {train_loss:.3f}, val loss {metrics[0]:.3f}, val accuracy {metrics[1]:.1%}")
                     if writer is not None:
                         writer.add_scalar("loss/train", train_loss, budget.steps)
-                        writer.add_scalar("learning_rate", scheduler.get_last_lr()[0], budget.steps)
+                        writer.add_scalar("learning_rate", schedulers[0].get_last_lr()[0], budget.steps)
                         log_validation(writer, metrics, budget.steps)
                     if metrics[0] < best_val_loss:
                         best_val_loss = metrics[0]
@@ -196,8 +200,7 @@ def run(args, device: torch.device):
 
     model_settings = dict(d_model=args.d_model, num_layers=args.layers, n_heads=args.heads,
                           position_templates=args.templates, mlp_ratio=args.mlp_ratio,
-                          qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads,
-                          template_maps=args.template_maps)
+                          qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads)
     raw_model = ChessTransformer(**model_settings).to(device)
     if args.init_from is not None:
         #weights only: the optimizer and the schedule start afresh, so this is a restart with new settings, not a resume
@@ -205,8 +208,10 @@ def run(args, device: torch.device):
     model = DDP(raw_model, device_ids=[device.index] if device.type == "cuda" else None)
     if not args.no_compile:
         model = torch.compile(model)
-    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=args.lr, fused=device.type == "cuda")
-    scheduler = make_scheduler(optimizer, budget, args.schedule)
+    optimizers = single.make_optimizers(raw_model, args.lr, device)
+    schedulers = [make_scheduler(optimizer, budget, args.schedule) for optimizer in optimizers]
+    if device.type == "cuda" and not args.no_compile:
+        single.compile_muon_step(optimizers)
     metrics = evaluate(raw_model, val_loader, device, single.EVAL_BATCHES)
     writer = None
     try:
@@ -227,7 +232,7 @@ def run(args, device: torch.device):
                 training_set=args.training_set, target_temperature=args.target_temperature,
                 note=args.note, commit=single.current_commit(), trainer="ddp", world_size=world_size,
                 init_from=str(args.init_from) if args.init_from is not None else None,
-                device=device.type, backend=dist.get_backend(), compile=not args.no_compile,
+                device=device.type, backend=dist.get_backend(), compile=not args.no_compile, optimizer="muon",
             )
             settings_path = run_dir / "settings.json"
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
@@ -241,7 +246,7 @@ def run(args, device: torch.device):
         def save_best():
             save_checkpoint(raw_model, model_settings, run_dir / "model.pt")
 
-        train(model, raw_model, train_loader, val_loader, optimizer, scheduler, budget, device,
+        train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, device,
               args.value_weight, writer, save_best if rank == 0 else None)
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
@@ -281,8 +286,6 @@ def parse_args(argv=None):
     parser.add_argument("--templates", type=int, default=single.POSITION_TEMPLATES)
     parser.add_argument("--mlp-ratio", type=float)
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention)")
-    parser.add_argument("--template-maps", type=int, default=0, help="template maps building the square tokens from the whole board "
-                        "before the first block (model.TemplateEmbedding), 0 for none. Worth it for shallow models, e.g. 192 at 4 layers")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="width of the queries and keys as a multiple of the values', one for every block or one per block")
     parser.add_argument("--lr", type=float, default=single.PEAK_LEARN_RATE)
     parser.add_argument("--schedule", choices=("cosine", "hold", "constant"), default=single.SCHEDULE)

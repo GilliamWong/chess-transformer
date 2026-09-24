@@ -183,5 +183,6 @@ def test_distributed_gradients_budgets_and_complete_training(tmp_path, world_siz
     assert settings["positions_seen"] == 192
     assert settings["batch_size"] == 16 and settings["per_gpu_batch_size"] == 16 // world_size
     assert settings["target_temperature"] == single.TARGET_TEMPERATURE
+    assert settings["optimizer"] == "muon"
     assert settings["finished_at"] and settings["final_val_value_loss"] >= 0
     assert (tmp_path / "progress.html").exists()

@@ -8,7 +8,7 @@ import re
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
@@ -44,6 +44,10 @@ WARMUP_STEPS = 500
 SCHEDULE = "cosine"
 DECAY_FRACTION = 0.2
 BATCH_SIZE = 1024
+
+#for Muon and AdamW both (see make_optimizers). AdamW's own default, which every run before Muon trained with; torch's
+#Muon defaults to 0.1
+WEIGHT_DECAY = 0.01
 
 #minutes of pure training (compiling and evaluating are not counted), unless --minutes or --positions is given.
 #runs with the same budget are comparable, so architecture experiments should all use this one
@@ -117,8 +121,8 @@ def train(
     save_best_checkpoint: Callable[[], None],
     train_data_loader: DataLoader | MixedLoader,
     val_data_loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    optimizers: Sequence[torch.optim.Optimizer],
+    schedulers: Sequence[torch.optim.lr_scheduler.LRScheduler],
     device: torch.device,
     best_val_loss: float,
     budget: Budget,
@@ -144,15 +148,18 @@ def train(
 
             loss = policy_loss(logits, target_moves, target_probabilities) + value_loss_weight * value_loss(eval_logits, values)
 
-        optimizer.zero_grad()
+        for optimizer in optimizers:
+            optimizer.zero_grad()
 
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-        optimizer.step()
+        for optimizer in optimizers:
+            optimizer.step()
         progress.update(budget.step_done())
-        scheduler.step()
+        for scheduler in schedulers:
+            scheduler.step()
         step = budget.steps
 
         loss_total += loss.detach() * len(batch)
@@ -178,7 +185,7 @@ def train(
             writer.add_scalar("accuracy/val", val_accuracy, step)
             writer.add_scalar("loss/val_value", val_value_loss, step)
             writer.add_scalar("accuracy/val_value", val_value_accuracy, step)
-            writer.add_scalar("learning_rate", scheduler.get_last_lr()[0], step)
+            writer.add_scalar("learning_rate", schedulers[0].get_last_lr()[0], step)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -294,6 +301,33 @@ def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE) -> float
     return multiplier
 
 
+#Muon moves a weight matrix equally far along every direction its gradient points in: newton-schulz iterations set
+#all singular values of the momentum to about 1 (in a d256's gradients the strongest direction is 20-90 times the
+#median one). That is a step for a linear layer, so Muon only takes the weight matrices inside the blocks, 87% of a
+#d256's parameters; the embeddings, the template bank, the heads, the biases and the layer norms stay with AdamW.
+#match_rms_adamw scales Muon's steps to the size AdamW's usually have, so both share the learning rate and its schedule.
+#Measured against AdamW for everything (d128, 4 layers, 4 minutes, the same start and data): val loss 1.9414 against
+#1.9929 with 8% fewer positions, as much as twice the training time gave.
+#AdamW comes first in the list, the training loop logs its learning rate
+def make_optimizers(model: ChessTransformer, learn_rate: float, device: torch.device) -> list[torch.optim.Optimizer]:
+    block_matrices = [parameter for parameter in model.encoder.parameters() if parameter.ndim == 2]
+    in_muon = {id(parameter) for parameter in block_matrices}
+    rest = [parameter for parameter in model.parameters() if id(parameter) not in in_muon]
+    #a tensor, because compile_muon_step's graph reads it: a float would be baked into the graph and recompiled every
+    #time the schedule changes it
+    muon = torch.optim.Muon(block_matrices, lr=torch.tensor(learn_rate, device=device), weight_decay=WEIGHT_DECAY, adjust_lr_fn="match_rms_adamw") #type: ignore[arg-type]
+    #fused does the whole update in one gpu kernel, it only exists for parameters that are on the gpu
+    return [torch.optim.AdamW(rest, lr=learn_rate, weight_decay=WEIGHT_DECAY, fused=device.type == "cuda"), muon]
+
+#Muon's step as one compiled cuda graph. Eager, its newton-schulz iterations are ~20 small matrix products a matrix,
+#one kernel launch each, and the step took 28 ms next to a d256 training step of ~80 ms; graphed 5 ms.
+#Only once the schedulers exist: a scheduler wraps optimizer.step and needs it to still be a method
+def compile_muon_step(optimizers: list[torch.optim.Optimizer]) -> None:
+    for optimizer in optimizers:
+        if isinstance(optimizer, torch.optim.Muon):
+            optimizer.step = torch.compile(optimizer.step, mode="reduce-overhead") #type: ignore[method-assign]
+
+
 #the commit the code was at, with a + when there were uncommitted changes on top of it
 def current_commit() -> str:
     try:
@@ -330,8 +364,7 @@ def main(
     init_checkpoint: Path | None = None,
     mix_set: str | None = None,
     mix_share: float = MIX_SHARE,
-    result_weight: float = RESULT_WEIGHT,
-    template_maps: int = 0):
+    result_weight: float = RESULT_WEIGHT):
 
     #fine-tuning starts from a checkpoint's weights, and the model is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -339,7 +372,7 @@ def main(
         initial_model, model_settings = load_checkpoint(init_checkpoint, torch.device("cpu"))
     else:
         #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
-        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads, "template_maps": template_maps}
+        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads}
     if mix_set is not None and not 0 < mix_share < 1:
         raise ValueError(f"--mix-share is the share of every batch from {mix_set}, between 0 and 1, got {mix_share}")
     if peak_learn_rate is None:
@@ -388,8 +421,7 @@ def main(
     print(f"model: {model_settings}, {num_parameters:,} parameters")
 
     compiled_model = torch.compile(model)
-    #fused does the whole update in one gpu kernel, it only exists for parameters that are on the gpu
-    optimizer = torch.optim.AdamW(model.parameters(), lr=peak_learn_rate, fused=(device.type == "cuda"))
+    optimizers = make_optimizers(model, peak_learn_rate, device)
 
     #the schedule runs over the part of the budget that is left when the warmup ends
     warmup_end = 0.0
@@ -400,7 +432,9 @@ def main(
             return lr_multiplier(step, 0.0, schedule)
         return lr_multiplier(step, (budget.progress() - warmup_end) / (1 - warmup_end), schedule)
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, current_lr_multiplier)
+    schedulers = [torch.optim.lr_scheduler.LambdaLR(optimizer, current_lr_multiplier) for optimizer in optimizers]
+    if device.type == "cuda":
+        compile_muon_step(optimizers)
 
     #before any training the loss should be about ln(1968) = 7.6 and the accuracy about 0,
     #anything else means the data or the metrics are wrong
@@ -429,6 +463,7 @@ def main(
         "mix_set": mix_set,
         "mix_share": mix_share if mix_set is not None else None,
         "result_weight": result_weight,
+        "optimizer": "muon", #runs before 2026-09-24 trained everything with AdamW
         "note": note,
         "commit": current_commit()
     }
@@ -438,7 +473,7 @@ def main(
     def save_best_checkpoint() -> None:
         save_checkpoint(model, model_settings, run_dir / "model.pt")
 
-    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, optimizer, scheduler, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight)
+    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, optimizers, schedulers, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight)
 
     #the final weights as well: model.pt is the best evaluation's, which is usually but not always the last one
     save_checkpoint(model, model_settings, run_dir / "final.pt")
@@ -504,7 +539,6 @@ if __name__ == "__main__":
     parser.add_argument("--target-temperature", type=float, default=TARGET_TEMPERATURE, help="how stockfish's moves share the target, see TARGET_TEMPERATURE in main.py. Default %(default)s")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="positions per step, for train and val. Lower it for a model that does not fit, default %(default)s")
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention). Default one for every head")
-    parser.add_argument("--template-maps", type=int, default=0, help="template maps building the square tokens from the whole board before the first block, 0 for none. Worth it for shallow models, e.g. 192 at 4 layers. Default 0")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="width of the queries and keys as a multiple of the values', rounded to whole dims per head. One for every block or one per block, e.g. --qk-ratio 0.25 0.5 0.5 0.75. Default 1")
     parser.add_argument("--init-checkpoint", type=Path, help="start from this model.pt's weights (fine-tuning); the model is the checkpoint's size and the size flags are ignored")
     parser.add_argument("--mix-set", help="a second training set that fills --mix-share of every batch, e.g. full_sf8_30M_mix when fine-tuning on self play")
@@ -518,5 +552,4 @@ if __name__ == "__main__":
         start_tensorboard()
 
     main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.schedule, arguments.seed, arguments.mlp_ratio, arguments.target_temperature, arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio, arguments.kv_heads, arguments.batch_size,
-         init_checkpoint=arguments.init_checkpoint, mix_set=arguments.mix_set, mix_share=arguments.mix_share, result_weight=arguments.result_weight,
-         template_maps=arguments.template_maps)
+         init_checkpoint=arguments.init_checkpoint, mix_set=arguments.mix_set, mix_share=arguments.mix_share, result_weight=arguments.result_weight)

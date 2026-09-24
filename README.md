@@ -131,10 +131,16 @@ Some of it is now simply how the model works, and the code for the alternatives 
   result.
 - Its targets are Stockfish's moves at `--target-temperature 0.02`: 0.01 tied it, 0.05 was worse.
 - 8 position templates, which every recent experiment used, SwiGLU MLPs and no dropout.
+- No board-wide input embedding: the template maps (below) only helped shallow models, and the code came out on
+  2026-09-24 (it is at commit `634f2e3`; `tools/checkpoint.py` points there for the two d128 recipe runs that used it).
+- Muon trains the weight matrices inside the blocks and AdamW everything else, at one learning rate
+  (`main.make_optimizers`): on d128 with 4 layers for 4 minutes, from the same start on the same data, val loss 1.9414
+  against 1.9929 with AdamW for everything, with 8% fewer positions (its steps are slower); about what twice the training
+  time gave. It reached AdamW's final loss 60% of the way through its run. Runs before 2026-09-24 used AdamW alone.
 
 | Choice | Setting | Why |
 |---|---|---|
-| Input embedding | Depends on depth. With 4 layers: 192-384 template maps before the first block, `ChessTransformer(template_maps=192)` (`--template-maps` in `multi_gpu/train_ddp.py`). With 8 or more layers: none (`template_maps=0`, the default), since a deep model learns the board's geometry itself | 192 maps against no embedding: +0.039 loss and about +34 Elo at d128/4 layers, +0.015 and +15 at d256/4 layers, +0.003 and +3 (noise) at d256/8 layers |
+| Input embedding | None, model.py's token embedding: a deep model learns the board's geometry itself | 192 template maps against no embedding: +0.039 loss and about +34 Elo at d128/4 layers, +0.015 and +15 at d256/4 layers, +0.003 and +3 (noise) at d256/8 layers |
 | Attention | Narrower queries and keys in the early layers, `--qk-ratio 0.25 0.5 0.5 0.75` at 4 layers or `0.25 0.25` + `0.5` x5 + `0.75` x13 at 20, and half as many key/value heads as heads, `--kv-heads` (grouped-query attention) | The same quality at 17-20% fewer FLOPs |
 | Learning rate | `--lr 6e-3` at d128 | 1e-2 was slightly worse at the longer budget. Untested at d640 |
 
@@ -151,8 +157,9 @@ against Stockfish 1700:
 | Small Leela embedding | 3 | 1.52M | 1.8337 | 1763 |
 | 8 template maps (the overnight run's embedding) | 3 | 0.71M | 1.8458 | 1748 |
 
-- `model.TemplateEmbedding` is the tested embedding exactly (checked output for output against the experiment code). The
-  tested d128 models also had a narrower MLP than `model.py`'s default: `mlp_ratio=1.333` reproduces them to the parameter.
+- `model.TemplateEmbedding` (removed 2026-09-24, at commit `634f2e3`) was the tested embedding exactly (checked output for
+  output against the experiment code). The tested d128 models also had a narrower MLP than `model.py`'s default:
+  `mlp_ratio=1.333` reproduces them to the parameter.
 - Template maps here are learned 64x64 maps, shared by every piece and weighted by it, spreading the board's pieces to
   every square; one feature per map, then Leela's processing (a linear layer, mish, a norm, per-square gates and a small
   FFN). Leela's embedding does the same with a dense layer, which amounts to a separate map for every piece and feature.

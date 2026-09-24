@@ -4,7 +4,6 @@ import chess
 import pytest
 import torch
 
-from encoding import encode_board
 from tools import checkpoint
 from tools.checkpoint import load_checkpoint, save_checkpoint
 from model import ChessTransformer
@@ -29,23 +28,26 @@ def test_model_of_any_size_comes_back_with_the_same_weights(tmp_path):
         assert torch.equal(loaded_output, output)
 
 
-#the template embedding is rebuilt from its setting too; real boards, since it reads the metadata tokens as flags
-def test_model_with_template_maps_comes_back_with_the_same_weights(tmp_path):
-    settings = {**SETTINGS, "template_maps": 16}
+#checkpoints from before the template embedding came out name template_maps, 0 in all the recipe runs (the d512 among
+#them): those still load, the setting dropped
+def test_checkpoint_without_template_maps_still_loads(tmp_path):
     torch.manual_seed(0)
-    model = ChessTransformer(**settings).eval()
-    board = chess.Board()
-    boards = []
-    for move in ["e4", "c5", "Nf3", "d6"]:
-        boards.append(encode_board(board))
-        board.push_san(move)
-    save_checkpoint(model, settings, tmp_path / "model.pt")
+    model = ChessTransformer(**SETTINGS).eval()
+    boards = torch.randint(0, 13, (4, 70))
+    save_checkpoint(model, {**SETTINGS, "template_maps": 0}, tmp_path / "model.pt")
 
     loaded, loaded_settings = load_checkpoint(tmp_path / "model.pt", CPU)
 
-    assert loaded_settings == settings
-    for loaded_output, output in zip(loaded.eval()(torch.tensor(boards)), model(torch.tensor(boards))):
+    assert loaded_settings == SETTINGS
+    for loaded_output, output in zip(loaded.eval()(boards), model(boards)):
         assert torch.equal(loaded_output, output)
+
+
+def test_checkpoint_with_template_maps_points_to_the_commit_that_has_them(tmp_path):
+    torch.save({"model_settings": {**SETTINGS, "template_maps": 192}, "state_dict": {}}, tmp_path / "old.pt")
+
+    with pytest.raises(ValueError, match="634f2e3"):
+        load_checkpoint(tmp_path / "old.pt", CPU)
 
 
 def test_player_loads_a_model_that_is_not_the_default_size(tmp_path):

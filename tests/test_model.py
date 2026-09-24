@@ -1,6 +1,5 @@
 from itertools import islice
 
-import chess
 import pytest
 import torch
 from torch import nn
@@ -11,10 +10,10 @@ from model import ChessTransformer
 BATCH_SIZE = 16
 
 
-def small_model(template_maps: int = 0) -> ChessTransformer:
+def small_model() -> ChessTransformer:
     """small enough to train for a few hundred steps inside a test"""
     torch.manual_seed(0)
-    return ChessTransformer(d_model=32, num_layers=2, n_heads=2, template_maps=template_maps)
+    return ChessTransformer(d_model=32, num_layers=2, n_heads=2)
 
 
 @pytest.fixture(scope="module")
@@ -94,9 +93,8 @@ def test_attention_bias_starts_at_zero(batch):
 
 
 #a layer that forward never uses gets no gradient and would silently never train
-@pytest.mark.parametrize("template_maps", [0, 8], ids=["token embedding", "template embedding"])
-def test_every_parameter_gets_a_gradient(batch, template_maps):
-    model = small_model(template_maps)
+def test_every_parameter_gets_a_gradient(batch):
+    model = small_model()
     boards, moves = batch
 
     #the bias is template_mix times templates, so while the templates are zero template_mix cannot get a gradient.
@@ -111,19 +109,6 @@ def test_every_parameter_gets_a_gradient(batch, template_maps):
 
     for name, parameter in model.named_parameters():
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
-
-
-#the template embedding's point: a square's token depends on the whole board, not only on its own piece
-def test_template_maps_let_every_square_see_the_whole_board(batch):
-    boards, _ = batch
-    without_pawn = boards[:1].clone()
-    without_pawn[0, chess.A2] = 0  #the a2 pawn gone, far from h8
-
-    for template_maps, h8_changes in ((0, False), (8, True)):
-        embed = small_model(template_maps).embed
-        with torch.no_grad():
-            before, after = embed(boards[:1])[0, chess.H8], embed(without_pawn)[0, chess.H8]
-        assert (not torch.equal(before, after)) == h8_changes, template_maps
 
 
 #memorising one batch proves nothing about playing chess, only that the whole model can learn
