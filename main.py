@@ -149,8 +149,10 @@ def train(
     eval_every: int = EVAL_EVERY,
     blunder_weight: float = BLUNDER_WEIGHT) -> None:
 
-    #kept on the device: adding to it does not make the cpu wait for the gpu the way loss.item() does
+    #kept on the device: adding to it does not make the cpu wait for the gpu the way loss.item() does.
+    #loss/train stays the policy and value loss the older runs logged, the blunder penalty is logged on its own
     loss_total = torch.zeros((), device=device)
+    penalty_total = torch.zeros((), device=device)
     total_examples = 0
 
     model.train()
@@ -168,13 +170,12 @@ def train(
             logits, eval_logits = model(batch)
 
             loss = policy_loss(logits, target_moves, target_probabilities) + value_loss_weight * value_loss(eval_logits, values)
-            if blunder_weight:
-                loss = loss + blunder_weight * blunder_loss(logits, blunders)
+            penalty = blunder_loss(logits, blunders) if blunder_weight else torch.zeros((), device=device)
 
         for optimizer in optimizers:
             optimizer.zero_grad()
 
-        loss.backward()
+        (loss + blunder_weight * penalty).backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -186,6 +187,7 @@ def train(
         step = budget.steps
 
         loss_total += loss.detach() * len(batch)
+        penalty_total += penalty.detach() * len(batch)
         total_examples += len(batch)
 
         #the running average, a single batch's loss jumps around too much to read
@@ -204,6 +206,8 @@ def train(
 
             #the part of the name before the slash groups the plots: both losses end up next to each other
             writer.add_scalar("loss/train", train_loss, step)
+            if blunder_weight:
+                writer.add_scalar("loss/train_blunder", penalty_total.item() / total_examples, step)
             writer.add_scalar("loss/val", val_loss, step)
             writer.add_scalar("accuracy/val", val_accuracy, step)
             writer.add_scalar("loss/val_value", val_value_loss, step)
@@ -215,6 +219,7 @@ def train(
                 save_best_checkpoint()
 
             loss_total.zero_()
+            penalty_total.zero_()
             total_examples = 0
             budget.resume()
 
@@ -551,9 +556,10 @@ def main(
     from tools.compare_runs import write_progress_page
     print(f"progress page: {write_progress_page()}")
 
-    #the matches every model has been measured with (artifacts/mcts_ladder_2026-09-23.md), the policy alone and the search
+    #the matches every model has been measured with (artifacts/mcts_ladder_2026-09-23.md), the policy alone and the search.
+    #The policy with avoid-repetition, evaluate_elo's default since 2026-09-24 (earlier logged results are argmax)
     measure = f"python -m tools.play.evaluate_elo --checkpoint {(run_dir / 'model.pt').relative_to(ARTIFACTS_DIR.parent)} --elo 1700 --games 200"
-    print(f"measure it: {measure} --concurrency 12\n       and: {measure} --select mcts --simulations 64")
+    print(f"measure it: {measure} --select avoid-repetition --concurrency 12\n       and: {measure} --select mcts --simulations 64")
 
 
 if __name__ == "__main__":

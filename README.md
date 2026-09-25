@@ -214,7 +214,7 @@ Windows only. Fetch Stockfish and Cute Chess once, then run a match:
 
 ```
 uv run python -m tools.play.download_engines
-uv run python -m tools.play.evaluate_elo                     100 games against Stockfish limited to 1320 Elo
+uv run python -m tools.play.evaluate_elo                     100 games against Stockfish limited to 1320 Elo, the policy playing avoid-repetition (the default)
 uv run python -m tools.play.evaluate_elo --elo 1500          a stronger setting
 uv run python -m tools.play.evaluate_elo --opponent random   random moves, as a sanity check
 uv run python -m tools.play.evaluate_elo --opponent human    opens a board so you can play it yourself

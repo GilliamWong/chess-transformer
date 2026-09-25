@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import os
+import time
 from datetime import datetime, timedelta
 from itertools import islice
 from pathlib import Path
@@ -29,6 +30,8 @@ from tools.checkpoint import RUNS_DIR, save_checkpoint
 
 #steps between two looks at rank zero's clock under a budget of minutes (see step_budget)
 CLOCK_EVERY = 20
+#a --resume run's saved state in its folder (save_resume_state), removed once the run has finished
+RESUME_FILE = "resume.pt"
 
 
 class TrainingSampler(Sampler):
@@ -44,6 +47,7 @@ class TrainingSampler(Sampler):
         self.global_batch_size = batch_size
         self.rank, self.world_size, self.seed = rank, world_size, seed
         self.epoch = 0
+        self.skip = 0  #batches of this epoch a resumed run already trained on: only the next pass leaves them out
 
     def __len__(self):
         return len(self.dataset) // self.global_batch_size
@@ -53,7 +57,8 @@ class TrainingSampler(Sampler):
         #built it as a python list, about 36 bytes a position: 10 GB in every process on the 290M set
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
         order = torch.randperm(len(self.dataset), generator=generator, dtype=torch.int32)
-        for start in range(0, len(self) * self.global_batch_size, self.global_batch_size):
+        first, self.skip = self.skip, 0
+        for start in range(first * self.global_batch_size, len(self) * self.global_batch_size, self.global_batch_size):
             local_start = start + self.rank * self.batch_size
             yield order[local_start:local_start + self.batch_size].long()
 
@@ -86,12 +91,15 @@ def step_budget(budget: Budget, clock: Budget | None, device: torch.device) -> N
 
 
 def make_scheduler(optimizer, budget: Budget, schedule: str):
-    warmup_end = 0.0
+    #the budget's progress when the warmup ends, where the decay starts. A budget of positions knows it in advance, which
+    #makes the learning rate a function of the step alone and lets a resumed run carry on with it; minutes measure it
+    warmup_end = 0.0 if budget.timed else min(1.0, single.WARMUP_STEPS / budget.max_steps)
 
     def multiplier(step):
         nonlocal warmup_end
         if step <= single.WARMUP_STEPS:
-            warmup_end = budget.progress()
+            if budget.timed:
+                warmup_end = budget.progress()
             return single.lr_multiplier(step, 0.0, schedule)
         progress = (budget.progress() - warmup_end) / max(1 - warmup_end, 1e-12)
         return single.lr_multiplier(step, progress, schedule)
@@ -127,13 +135,19 @@ def log_validation(writer, metrics, step, final=False):
 
 
 def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
-          value_weight, eval_every, writer=None, save_best=None, blunder_weight=single.BLUNDER_WEIGHT):
+          value_weight, eval_every, writer=None, save_best=None, blunder_weight=single.BLUNDER_WEIGHT,
+          best_val_loss=float("inf"), save_resume=None, resume_every_seconds=None):
+    """best_val_loss is the best evaluation so far (a resumed run's), so the best checkpoint is kept even if the first
+    update regresses. save_resume(best_val_loss) is rank zero's, called every resume_every_seconds of its wall clock:
+    only rank zero writes, and the weights and optimizer states it writes are every rank's, so no rank waits for it."""
     rank, world_size = dist.get_rank(), dist.get_world_size()
-    best_val_loss = float("inf")  #the best trained checkpoint, even if the first update regresses
-    loss_total = torch.zeros((), device=device)
+    #summed on the device over an evaluation interval: the loss main.py and the older runs log (policy + value), the
+    #blunder penalty on its own (unweighted), and the gradient norm before clipping, the first sign of a run going wrong
+    totals = torch.zeros(3, device=device)
     interval_steps = 0
-    progress = tqdm(total=budget.total, desc="train", dynamic_ncols=True, disable=rank != 0,
-                    unit="s" if budget.timed else "it")
+    last_resume_save = time.monotonic()
+    progress = tqdm(total=budget.total, initial=0 if budget.timed else budget.steps, desc="train", dynamic_ncols=True,
+                    disable=rank != 0, unit="s" if budget.timed else "it")
     model.train()
     try:
         #main.py's prefetch: a thread reads the next batches and copies them over while the gpu works
@@ -143,10 +157,9 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 logits, value_logits = model(batch[0])
                 loss = single.policy_loss(logits, batch[1], batch[2]) + value_weight * single.value_loss(value_logits, batch[3])
-                if blunder_weight:
-                    loss = loss + blunder_weight * single.blunder_loss(logits, batch[4])
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                penalty = single.blunder_loss(logits, batch[4]) if blunder_weight else torch.zeros((), device=device)
+            (loss + blunder_weight * penalty).backward()
+            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             #every rank has the same averaged gradients after backward, so each steps all of the weights itself, Muon's too
             for optimizer in optimizers:
                 optimizer.step()
@@ -156,13 +169,14 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
             for scheduler in schedulers:
                 scheduler.step()
             progress.update(budget.seconds - before if budget.timed else 1)
-            loss_total += loss.detach()
+            totals += torch.stack([loss.detach(), penalty.detach(), gradient_norm.detach()]).float()
             interval_steps += 1
             finished = budget.finished()  #one shared decision, before rank zero pauses its clock
 
             if budget.steps % eval_every == 0 or finished:
-                dist.all_reduce(loss_total)
-                train_loss = loss_total.item() / (interval_steps * world_size)  #waits for the gpu, so the pause starts when the steps are done
+                dist.all_reduce(totals)
+                #waits for the gpu, so the pause starts when the steps are done
+                train_loss, train_penalty, gradient_norm = (totals / (interval_steps * world_size)).tolist()
                 if rank == 0:
                     clock.pause()
                 metrics = evaluate(raw_model, val_loader, device, single.EVAL_BATCHES)
@@ -171,6 +185,9 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
                                f"train loss {train_loss:.3f}, val loss {metrics[0]:.3f}, val accuracy {metrics[1]:.1%}")
                     if writer is not None:
                         writer.add_scalar("loss/train", train_loss, budget.steps)
+                        if blunder_weight:
+                            writer.add_scalar("loss/train_blunder", train_penalty, budget.steps)
+                        writer.add_scalar("gradient_norm/train", gradient_norm, budget.steps)
                         writer.add_scalar("learning_rate", schedulers[0].get_last_lr()[0], budget.steps)
                         log_validation(writer, metrics, budget.steps)
                     if metrics[0] < best_val_loss:
@@ -178,15 +195,30 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
                         if save_best is not None:
                             save_best()
                 model.train()
-                loss_total.zero_()
+                totals.zero_()
                 interval_steps = 0
                 dist.barrier()  #checkpoint/logging time is excluded on every process
                 if rank == 0 and not finished:
                     clock.resume()
             if finished:
                 break
+            if save_resume is not None and time.monotonic() - last_resume_save >= resume_every_seconds:
+                save_resume(best_val_loss)
+                last_resume_save = time.monotonic()
     finally:
         progress.close()
+
+
+def save_resume_state(path: Path, raw_model, optimizers, schedulers, budget: Budget, clock: Budget, best_val_loss: float):
+    """What a requeued job needs to carry on where this one is: the weights, both optimizers' states, the schedules and
+    the step (which also fixes the data position, see run). Written under another name and renamed, so a job killed
+    while writing leaves the previous state whole. Rank zero's clock, so train_seconds counts every job's training."""
+    state = dict(steps=budget.steps, seconds=clock.seconds, best_val_loss=best_val_loss, model=raw_model.state_dict(),
+                 optimizers=[optimizer.state_dict() for optimizer in optimizers],
+                 schedulers=[scheduler.state_dict() for scheduler in schedulers])
+    temporary = path.with_name(path.name + ".tmp")
+    torch.save(state, temporary)
+    os.replace(temporary, path)
 
 
 def run(args, device: torch.device):
@@ -200,6 +232,20 @@ def run(args, device: torch.device):
         raise ValueError(f"the position budget must exceed {single.WARMUP_STEPS} global warmup steps")
     if budget.timed and (not math.isfinite(args.minutes) or args.minutes < 1):
         raise ValueError("--minutes must be finite and at least 1")
+    resumed = None
+    if args.resume:
+        if args.name is None or budget.timed:
+            #every rank has to find the same folder, and a budget of minutes has no step at which to carry on
+            raise ValueError("--resume needs --name and a budget of --positions")
+        #the run folder is on a filesystem every rank sees (gscratch on hyak), so each rank reads the state itself
+        settings_path = RUNS_DIR / args.name / "settings.json"
+        if settings_path.exists() and "finished_at" in json.loads(settings_path.read_text(encoding="utf-8")):
+            if rank == 0:
+                print(f"{args.name} has finished already, nothing to resume")  #a job requeued after its run finished
+            return
+        resume_path = RUNS_DIR / args.name / RESUME_FILE
+        if resume_path.exists():
+            resumed = torch.load(resume_path, map_location=device, weights_only=True)
     torch.manual_seed(args.seed)
 
     #Only one process per host warms the OS file cache. Read-only mappings let
@@ -223,16 +269,31 @@ def run(args, device: torch.device):
                           qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads,
                           loops=args.loops)
     raw_model = ChessTransformer(**model_settings).to(device)
-    if args.init_from is not None:
+    if resumed is not None:
+        raw_model.load_state_dict(resumed["model"])
+    elif args.init_from is not None:
         #weights only: the optimizer and the schedule start afresh, so this is a restart with new settings, not a resume
         raw_model.load_state_dict(torch.load(args.init_from, map_location=device)["state_dict"])
     model = DDP(raw_model, device_ids=[device.index] if device.type == "cuda" else None)
     if not args.no_compile:
         model = torch.compile(model) if args.compile_mode == "default" else torch.compile(model, mode=args.compile_mode)
     optimizers = single.make_optimizers(raw_model, args.lr, device)
+    #the schedulers first: making one sets its optimizer's learning rate for step 0, which the saved states then replace
     schedulers = [make_scheduler(optimizer, budget, args.schedule) for optimizer in optimizers]
+    best_val_loss = float("inf")
+    if resumed is not None:
+        for optimizer, state in zip(optimizers, resumed["optimizers"]):
+            optimizer.load_state_dict(state)
+        for scheduler, state in zip(schedulers, resumed["schedulers"]):
+            scheduler.load_state_dict(state)
+        budget.steps = resumed["steps"]
+        if clock is not None:
+            clock.steps, clock.seconds = resumed["steps"], resumed["seconds"]
+        #one batch a step, so the step says where in which epoch's order the run was
+        sampler.epoch, sampler.skip = divmod(resumed["steps"], len(sampler))
+        best_val_loss = resumed["best_val_loss"]
     if device.type == "cuda" and not args.no_compile:
-        single.compile_muon_step(optimizers)
+        single.compile_muon_step(optimizers)  #after loading: the graph captures the learning rate tensor it finds
     metrics = evaluate(raw_model, val_loader, device, single.EVAL_BATCHES)
     writer = None
     try:
@@ -243,24 +304,31 @@ def run(args, device: torch.device):
                                      f"ddp{world_size}_d{args.d_model}_L{args.layers}_h{args.heads}_"
                                      f"{budget.describe()}_{datetime.now():%Y%m%d_%H-%M-%S_%f}")
             run_dir = RUNS_DIR / run_name
-            run_dir.mkdir(parents=True)  #a named run must not overwrite an earlier run
-            writer = SummaryWriter(str(run_dir))
-            settings = dict(
-                model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
-                peak_learn_rate=args.lr, schedule=args.schedule, seed=args.seed,
-                value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight,
-                blunder_labels=getattr(train_dataset, "worst_moves", None) is not None,
-                budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=sampler.batch_size,
-                training_set=args.training_set, target_temperature=args.target_temperature,
-                note=args.note, commit=single.current_commit(), trainer="ddp", world_size=world_size,
-                init_from=str(args.init_from) if args.init_from is not None else None,
-                device=device.type, backend=dist.get_backend(), compile=not args.no_compile,
-                compile_mode=args.compile_mode, eval_every=args.eval_every, optimizer="muon",
-            )
             settings_path = run_dir / "settings.json"
+            #a named run must not overwrite an earlier run, except its own --resume jobs. purge_step hides what an
+            #earlier job logged after the state it left, whose steps this job trains again (from step 0 if it left none)
+            run_dir.mkdir(parents=True, exist_ok=args.resume)
+            writer = SummaryWriter(str(run_dir), purge_step=budget.steps + 1 if args.resume else None)
+            if resumed is not None:
+                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                settings["resumed"] = settings.get("resumed", []) + [dict(step=budget.steps, at=datetime.now().isoformat(timespec="seconds"))]
+            else:
+                settings = dict(
+                    model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
+                    peak_learn_rate=args.lr, schedule=args.schedule, seed=args.seed,
+                    value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight,
+                    blunder_labels=getattr(train_dataset, "worst_moves", None) is not None,
+                    budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=sampler.batch_size,
+                    training_set=args.training_set, target_temperature=args.target_temperature,
+                    note=args.note, commit=single.current_commit(), trainer="ddp", world_size=world_size,
+                    init_from=str(args.init_from) if args.init_from is not None else None,
+                    device=device.type, backend=dist.get_backend(), compile=not args.no_compile,
+                    compile_mode=args.compile_mode, eval_every=args.eval_every, optimizer="muon",
+                )
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
             print(f"DDP: {world_size} processes on {device.type}, global batch {args.batch_size}, "
-                  f"local batch {sampler.batch_size}; untrained val loss {metrics[0]:.3f}")
+                  f"local batch {sampler.batch_size}; " + (f"resumed at step {budget.steps:,}, val loss {metrics[0]:.3f}"
+                                                           if resumed is not None else f"untrained val loss {metrics[0]:.3f}"))
             print(f"logging to {run_dir}")
             if not args.no_tensorboard:
                 from tools.tensorboard_server import start_tensorboard
@@ -269,8 +337,12 @@ def run(args, device: torch.device):
         def save_best():
             save_checkpoint(raw_model, model_settings, run_dir / "model.pt")
 
+        def save_resume(best_val_loss):
+            save_resume_state(run_dir / RESUME_FILE, raw_model, optimizers, schedulers, budget, clock, best_val_loss)
+
         train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
-              args.value_weight, args.eval_every, writer, save_best if rank == 0 else None, args.blunder_weight)
+              args.value_weight, args.eval_every, writer, save_best if rank == 0 else None, args.blunder_weight,
+              best_val_loss, save_resume if rank == 0 and args.resume else None, args.checkpoint_minutes * 60)
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
@@ -281,6 +353,7 @@ def run(args, device: torch.device):
                             gpu_seconds=clock.seconds * world_size if device.type == "cuda" else 0,
                             finished_at=datetime.now().isoformat(timespec="seconds"))
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
+            (run_dir / RESUME_FILE).unlink(missing_ok=True)  #finished_at now tells a requeued job there is nothing left
             from tools.compare_runs import write_progress_page
             print(f"final val loss {metrics[0]:.3f}, accuracy {metrics[1]:.1%}; "
                   f"progress page: {write_progress_page()}")
@@ -297,7 +370,12 @@ def parse_args(argv=None):
                          help="wall minutes of training, excluding first-step compilation and evaluation")
     budgets.add_argument("--positions", type=int, help="positions across all GPUs, rounded down to full global batches")
     parser.add_argument("--batch-size", type=int, default=single.BATCH_SIZE, help="GLOBAL batch size, default %(default)s")
-    parser.add_argument("--name", help="new run folder name; existing folders are rejected")
+    parser.add_argument("--name", help="new run folder name; existing folders are rejected (except by --resume)")
+    parser.add_argument("--resume", action="store_true",
+                        help="for jobs that can be stopped and requeued: carry on the --name run from the state it last saved, "
+                             "or start it if it has none. Needs --positions")
+    parser.add_argument("--checkpoint-minutes", type=float, default=10,
+                        help="with --resume: minutes of wall clock between two saved states, the most a stopped job loses. Default %(default)s")
     parser.add_argument("--init-from", type=Path, help="model.pt to start the weights from (same architecture flags); optimizer and schedule start afresh")
     parser.add_argument("--note", default="")
     parser.add_argument("--no-tensorboard", action="store_true")

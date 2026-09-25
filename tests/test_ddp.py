@@ -179,6 +179,77 @@ def distributed_worker(rank, folder, world_size):
         dist.destroy_process_group()
 
 
+def write_varied_set(folder, name):
+    #different rows and blunder labels, so a resumed run that trained on the wrong batches ends with different weights
+    rows = np.random.default_rng(11)
+    for split, size in (("train", 32), ("val", 10)):
+        arrays = dict(
+            boards=rows.integers(0, BOARD_VOCAB_SIZE, (size, TOKENS_PER_BOARD)).astype(np.uint8),
+            stockfish_moves=rows.integers(0, 1968, (size, 2)).astype(np.int16),
+            stockfish_evals=rows.integers(-300, 300, (size, 2)).astype(np.int16),
+            worst_moves=np.where(rows.random((size, 4)) < 0.5, rows.integers(0, 1968, (size, 4)), -1).astype(np.int16),
+            worst_losses=np.full((size, 4), 0.5, dtype=np.float16),
+        )
+        for field, array in arrays.items():
+            (folder / f"{name}_{split}_{field}.bin").write_bytes(array.tobytes())
+
+
+class Preempted(Exception):
+    """a job killed between two steps, the way a preempted or time-limited slurm job stops"""
+
+
+def resume_worker(rank, folder, world_size):
+    torch.set_num_threads(1)
+    folder = Path(folder)
+    dist.init_process_group("gloo", init_method=(folder / "rendezvous").as_uri(),
+                            rank=rank, world_size=world_size, timeout=timedelta(seconds=90))
+    try:
+        data.PROCESSED_DATA_DIR = folder
+        train_ddp.RUNS_DIR = folder / "runs"
+        import tools.compare_runs as reports
+        reports.RUNS_DIR = train_ddp.RUNS_DIR
+        reports.PROGRESS_PAGE = folder / "progress.html"
+        single.BATCH_SIZE, single.EVAL_BATCHES = 8, 1
+        single.WARMUP_STEPS = 2  #the stop comes after the warmup, where the schedule needs the warmup's end
+        #20 steps of 2 batches an epoch: the stop after step 7 is in the middle of the fourth epoch
+        flags = ["--device", "cpu", "--no-compile", "--no-tensorboard", "--positions", "320", "--batch-size", "16",
+                 "--d-model", "16", "--layers", "1", "--heads", "2", "--templates", "2", "--training-set", "b",
+                 "--eval-every", "3", "--resume", "--checkpoint-minutes", "0"]
+        train_ddp.run(train_ddp.parse_args(flags + ["--name", "whole"]), torch.device("cpu"))
+
+        batches_on_device = single.batches_on_device
+        def stopped_before_step_8(batches, device):
+            for number, batch in enumerate(batches_on_device(batches, device)):
+                if number == 7:
+                    raise Preempted
+                yield batch
+        with patch.object(single, "batches_on_device", stopped_before_step_8), pytest.raises(Preempted):
+            train_ddp.run(train_ddp.parse_args(flags + ["--name", "stopped"]), torch.device("cpu"))
+        dist.barrier()
+        train_ddp.run(train_ddp.parse_args(flags + ["--name", "stopped"]), torch.device("cpu"))  #the requeued job
+        train_ddp.run(train_ddp.parse_args(flags + ["--name", "stopped"]), torch.device("cpu"))  #requeued once more, after the end
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
+def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopped(tmp_path):
+    #catches anything the saved state misses: the optimizers' moments (Muon's and AdamW's), the schedule, the position
+    #in the epoch's order, or the best evaluation that picks model.pt
+    write_varied_set(tmp_path, "b")
+    mp.spawn(resume_worker, args=(str(tmp_path), 2), nprocs=2)
+    runs = tmp_path / "runs"
+    for checkpoint in ("final.pt", "model.pt"):
+        whole = torch.load(runs / "whole" / checkpoint)["state_dict"]
+        stopped = torch.load(runs / "stopped" / checkpoint)["state_dict"]
+        assert whole.keys() == stopped.keys()
+        assert all(torch.equal(whole[name], stopped[name]) for name in whole), checkpoint
+    settings = json.loads((runs / "stopped" / "settings.json").read_text())
+    assert [entry["step"] for entry in settings["resumed"]] == [7]
+    assert settings["positions_seen"] == 320 and settings["blunder_labels"]
+    assert not (runs / "stopped" / train_ddp.RESUME_FILE).exists()
+
+
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_distributed_gradients_budgets_and_complete_training(tmp_path, world_size):

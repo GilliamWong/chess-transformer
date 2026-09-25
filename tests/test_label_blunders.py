@@ -52,3 +52,20 @@ def test_labelled_chunks_merge_into_the_set_files_and_are_not_labelled_twice(tmp
     hangs_the_queen = encode_move_to_id(chess.Board(QUEEN_ATTACKED).parse_san("Ke7"), chess.BLACK)
     assert hangs_the_queen in moves[0] and hangs_the_queen in moves[2]
     assert (moves[1] == NO_MOVE).all()
+
+
+#--chunks: two tasks share a file, each labelling its own chunks; together they cover it
+def test_a_chunk_range_labels_only_those_chunks(tmp_path, monkeypatch):
+    monkeypatch.setattr(label_blunders, "CHUNK", 1)
+    boards = np.array([encode_board(chess.Board(QUEEN_ATTACKED))] * 3, dtype=np.uint8)
+    boards_path = tmp_path / "shared_boards.bin"
+    boards.tofile(boards_path)
+
+    label_blunders.label(boards_path, tmp_path / "chunks", workers=1, engine=STOCKFISH, chunk_range=range(0, 2))
+    saved = [label_blunders.chunk_paths(tmp_path / "chunks", boards_path, chunk)[1].exists() for chunk in range(3)]
+    label_blunders.label(boards_path, tmp_path / "chunks", workers=1, engine=STOCKFISH, chunk_range=range(2, 3))
+
+    assert saved == [True, True, False]
+    label_blunders.merge(tmp_path / "chunks", [boards_path], tmp_path / "shared_train")
+    assert (tmp_path / "shared_train_worst_moves.bin").stat().st_size == 3 * SLOTS * 2
+
