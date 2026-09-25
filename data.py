@@ -20,8 +20,9 @@ RESULT_WEIGHT = 0.5
 #self play policy target: visit shares raised to 1 / VISIT_TEMPERATURE and renormalised (0 = most visited move alone)
 VISIT_TEMPERATURE = 1.0
 
-#labelled moves that give away at least this much expected score against stockfish's best count as blunders
-BLUNDER_THRESHOLD = 0.2
+#labelled moves that give away at least this much expected score against stockfish's best count as blunders.
+#0.1, 0.2 and 0.3 played the same Elo (4000 games each, two seeds); 0.3 costs the policy 0.033 less val loss
+BLUNDER_THRESHOLD = 0.3
 #optional blunder labels next to a set (tools/label_blunders.py), both (positions, slots), NO_MOVE where empty
 WORST_FILES = {"worst_moves": np.int16, "worst_losses": np.float16}
 

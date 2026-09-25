@@ -46,8 +46,8 @@ SCHEDULE = "cosine"
 DECAY_FRACTION = 0.2
 BATCH_SIZE = 1024
 
-#for Muon and AdamW both: AdamW's default (torch's Muon defaults to 0.1)
-WEIGHT_DECAY = 0.01
+#for Muon and AdamW both: 0.1 beat 0.01 by 0.007 val loss on two seeds (d128 L6, 10M positions)
+WEIGHT_DECAY = 0.1
 #torch's Muon default
 MUON_MOMENTUM = 0.95
 

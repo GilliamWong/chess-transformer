@@ -82,9 +82,12 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
   0.044 against 0.054 for a single logit on a d128, the policy unchanged (at weight 1 it lost 0.02 val loss), and
   about +40 Elo in both a policy and a 64-simulation match, each inside its 200-game margin.
 - Muon for the weight matrices inside the blocks, AdamW for the rest, one learning rate: d128 val loss 1.9414 against
-  1.9929 with AdamW alone.
+  1.9929 with AdamW alone. Weight decay 0.1 for both (`--weight-decay`): 0.007 better val loss than 0.01 on two seeds;
+  learning rates of 4e-3 and 1e-2 and Muon momentum 0.9 all lost to 6e-3 and 0.95 (d128 L6, 10M positions, 2026-09-25).
 - The blunder penalty, `--blunder-weight 4`: +27 Elo on a d128. It needs blunder labels next to the set
-  (`<set>_{split}_worst_{moves,losses}.bin`); a set without them trains as if the weight were 0.
+  (`<set>_{split}_worst_{moves,losses}.bin`); a set without them trains as if the weight were 0. A move counts as a
+  blunder from 0.3 expected score lost (`--blunder-threshold`): thresholds 0.1, 0.2 and 0.3 played the same Elo
+  (4000 games each against Stockfish 1700, two seeds) and 0.3 leaves the policy 0.033 val loss better than 0.2.
 - Narrower queries and keys in the early layers (`--qk-ratio 0.25 0.5 0.5 0.75` at 4 layers, `0.25 0.25` + `0.5` x5 +
   `0.75` x13 at 20) and half as many key/value heads (`--kv-heads`): the same quality at 17-20% fewer FLOPs.
 - d128 with 6 layers as the quick model (`--lr 6e-3`). Looping the same layers (`--loops`) lost to real depth.
