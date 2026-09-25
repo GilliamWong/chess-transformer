@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from data import ARTIFACTS_DIR, RESULT_WEIGHT, VISIT_TEMPERATURE, MixedLoader, datasets_to_dataloaders, load_training_set
+from data import ARTIFACTS_DIR, BLUNDER_THRESHOLD, RESULT_WEIGHT, VISIT_TEMPERATURE, MixedLoader, datasets_to_dataloaders, load_training_set
 import torch
 import torch.nn.functional as F
 import math
@@ -48,6 +48,8 @@ BATCH_SIZE = 1024
 
 #for Muon and AdamW both: AdamW's default (torch's Muon defaults to 0.1)
 WEIGHT_DECAY = 0.01
+#torch's Muon default
+MUON_MOMENTUM = 0.95
 
 #minutes of pure training (compiling and evaluating not counted) unless --minutes or --positions is given
 TRAIN_MINUTES_BUDGET = 4
@@ -277,8 +279,9 @@ def evaluate_model(
 
 
 def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE,
-                     result_weight: float = RESULT_WEIGHT, visit_temperature: float = VISIT_TEMPERATURE) -> tuple[DataLoader, DataLoader]:
-    train_dataset, val_dataset = load_training_set(training_set, target_temperature, result_weight, visit_temperature)
+                     result_weight: float = RESULT_WEIGHT, visit_temperature: float = VISIT_TEMPERATURE,
+                     blunder_threshold: float = BLUNDER_THRESHOLD) -> tuple[DataLoader, DataLoader]:
+    train_dataset, val_dataset = load_training_set(training_set, target_temperature, result_weight, visit_temperature, blunder_threshold)
     warm_file_cache(train_dataset, val_dataset)
     return datasets_to_dataloaders(
         train_dataset,
@@ -322,13 +325,14 @@ def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE) -> float
 
 #Muon for the weight matrices inside the blocks, AdamW for the rest; match_rms_adamw lets both share one learning rate.
 #d128: val loss 1.9414 against 1.9929 with AdamW alone. AdamW comes first, the training loop logs its learning rate
-def make_optimizers(model: ChessTransformer, learn_rate: float, device: torch.device) -> list[torch.optim.Optimizer]:
+def make_optimizers(model: ChessTransformer, learn_rate: float, device: torch.device, weight_decay: float = WEIGHT_DECAY,
+                    muon_momentum: float = MUON_MOMENTUM) -> list[torch.optim.Optimizer]:
     block_matrices = [parameter for parameter in model.encoder.parameters() if parameter.ndim == 2]
     in_muon = {id(parameter) for parameter in block_matrices}
     rest = [parameter for parameter in model.parameters() if id(parameter) not in in_muon]
     #a tensor: compile_muon_step's graph would bake a float in and recompile whenever the schedule changes it
-    muon = torch.optim.Muon(block_matrices, lr=torch.tensor(learn_rate, device=device), weight_decay=WEIGHT_DECAY, adjust_lr_fn="match_rms_adamw") #type: ignore[arg-type]
-    return [torch.optim.AdamW(rest, lr=learn_rate, weight_decay=WEIGHT_DECAY, fused=device.type == "cuda"), muon]
+    muon = torch.optim.Muon(block_matrices, lr=torch.tensor(learn_rate, device=device), weight_decay=weight_decay, momentum=muon_momentum, adjust_lr_fn="match_rms_adamw") #type: ignore[arg-type]
+    return [torch.optim.AdamW(rest, lr=learn_rate, weight_decay=weight_decay, fused=device.type == "cuda"), muon]
 
 #Muon's step as one compiled cuda graph: eager 28 ms next to an 80 ms d256 training step, graphed 5 ms.
 #Call after making the schedulers, which wrap optimizer.step and need it to still be a method
@@ -380,7 +384,10 @@ def main(
     compile_mode: str = "default",
     loops: int = 1,
     blunder_weight: float = BLUNDER_WEIGHT,
-    value_bins: int = VALUE_BINS):
+    value_bins: int = VALUE_BINS,
+    blunder_threshold: float = BLUNDER_THRESHOLD,
+    weight_decay: float = WEIGHT_DECAY,
+    muon_momentum: float = MUON_MOMENTUM):
 
     #a fine-tune is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -420,7 +427,7 @@ def main(
     print(f"training on {device}")
 
     mix_batch_size = round(batch_size * mix_share) if mix_set is not None else 0
-    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size - mix_batch_size, result_weight, visit_temperature)
+    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size - mix_batch_size, result_weight, visit_temperature, blunder_threshold)
     print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
     mix_val_loader = None
     if mix_set is not None:
@@ -433,7 +440,7 @@ def main(
     print(f"model: {model_settings}, {num_parameters:,} parameters")
 
     compiled_model = torch.compile(model) if compile_mode == "default" else torch.compile(model, mode=compile_mode)
-    optimizers = make_optimizers(model, peak_learn_rate, device)
+    optimizers = make_optimizers(model, peak_learn_rate, device, weight_decay, muon_momentum)
 
     #the schedule runs over the part of the budget left when the warmup ends
     warmup_end = 0.0
@@ -466,6 +473,9 @@ def main(
         "seed": seed,
         "value_loss_weight": value_loss_weight,
         "blunder_weight": blunder_weight,
+        "blunder_threshold": blunder_threshold,
+        "weight_decay": weight_decay,
+        "muon_momentum": muon_momentum,
         #the blunder penalty only acts on a set with blunder labels
         "blunder_labels": getattr(train_data_loader.dataset, "worst_moves", None) is not None,
         "budget": budget.describe(),
@@ -552,6 +562,9 @@ if __name__ == "__main__":
     parser.add_argument("--training-set", default=TRAINING_SET, help="a labelled training set in processed_data/, default %(default)s")
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT, help="weight of the value head's loss next to the move loss, default %(default)s")
     parser.add_argument("--blunder-weight", type=float, default=BLUNDER_WEIGHT, help="weight of the push off labelled blunders, 0 for none. Default %(default)s")
+    parser.add_argument("--blunder-threshold", type=float, default=BLUNDER_THRESHOLD, help="a labelled move losing at least this much expected score is a blunder. Default %(default)s")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="for Muon and AdamW both, default %(default)s")
+    parser.add_argument("--muon-momentum", type=float, default=MUON_MOMENTUM, help="default %(default)s")
     parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="the learning rate after the warmup, see SCHEDULE. Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
     parser.add_argument("--mlp-ratio", type=float, help="hidden size of the swiglu mlp as a multiple of d-model, default 8/3")
@@ -600,4 +613,7 @@ if __name__ == "__main__":
          compile_mode=arguments.compile_mode,
          loops=arguments.loops,
          blunder_weight=arguments.blunder_weight,
-         value_bins=arguments.value_bins)
+         value_bins=arguments.value_bins,
+         blunder_threshold=arguments.blunder_threshold,
+         weight_decay=arguments.weight_decay,
+         muon_momentum=arguments.muon_momentum)

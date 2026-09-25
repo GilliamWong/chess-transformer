@@ -35,6 +35,11 @@ def test_muon_takes_the_weight_matrices_inside_the_blocks_and_adamw_the_rest():
     assert muon.param_groups[0]["weight_decay"] == adamw.param_groups[0]["weight_decay"] == WEIGHT_DECAY
     assert muon.param_groups[0]["lr"].item() == pytest.approx(adamw.param_groups[0]["lr"])
 
+    #the sweep settings reach both
+    adamw, muon = make_optimizers(model, 1e-3, CPU, weight_decay=0.1, muon_momentum=0.9)
+    assert muon.param_groups[0]["weight_decay"] == adamw.param_groups[0]["weight_decay"] == 0.1
+    assert muon.param_groups[0]["momentum"] == 0.9
+
 
 #Muon's learning rate is a tensor; the schedule has to move it just like AdamW's float
 def test_the_schedule_moves_both_learning_rates_alike():

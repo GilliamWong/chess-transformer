@@ -181,6 +181,12 @@ def test_blunders_are_the_labelled_moves_that_give_away_enough(tmp_path, monkeyp
     #val has no blunder labels of its own
     assert val_dataset[[0, 1]][4].tolist() == [[NO_MOVE], [NO_MOVE]]
 
+    #a higher threshold leaves only the bigger loss, a lower one takes the harmless move too
+    strict, _ = load_training_set("blunders", TEMPERATURE, blunder_threshold=0.5)
+    assert strict[[0]][4].tolist() == [[700, NO_MOVE, NO_MOVE]]
+    lenient, _ = load_training_set("blunders", TEMPERATURE, blunder_threshold=0.05)
+    assert lenient[[0]][4].tolist() == [[700, 701, 702]]
+
 
 def test_blunder_labels_must_come_in_pairs_of_the_same_shape():
     boards = np.zeros((2, TOKENS_PER_BOARD), dtype=np.uint8)

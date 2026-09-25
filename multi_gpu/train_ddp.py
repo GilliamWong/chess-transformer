@@ -238,7 +238,7 @@ def run(args, device: torch.device):
 
     #one process per host warms the file cache; read-only mappings share the cached pages
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    train_dataset, val_dataset = single.load_training_set(args.training_set, args.target_temperature)
+    train_dataset, val_dataset = single.load_training_set(args.training_set, args.target_temperature, blunder_threshold=args.blunder_threshold)
     if local_rank == 0:
         single.warm_file_cache(train_dataset, val_dataset)
     val_loader = DataLoader(val_dataset, batch_size=None, sampler=BatchSampler(
@@ -264,7 +264,7 @@ def run(args, device: torch.device):
     model = DDP(raw_model, device_ids=[device.index] if device.type == "cuda" else None)
     if not args.no_compile:
         model = torch.compile(model) if args.compile_mode == "default" else torch.compile(model, mode=args.compile_mode)
-    optimizers = single.make_optimizers(raw_model, args.lr, device)
+    optimizers = single.make_optimizers(raw_model, args.lr, device, args.weight_decay, args.muon_momentum)
     #the schedulers first: making one sets its optimizer's learning rate for step 0, which the saved states then replace
     schedulers = [make_scheduler(optimizer, budget, args.schedule) for optimizer in optimizers]
     best_val_loss = float("inf")
@@ -303,7 +303,8 @@ def run(args, device: torch.device):
                 settings = dict(
                     model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
                     peak_learn_rate=args.lr, schedule=args.schedule, seed=args.seed,
-                    value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight,
+                    value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight, blunder_threshold=args.blunder_threshold,
+                    weight_decay=args.weight_decay, muon_momentum=args.muon_momentum,
                     blunder_labels=getattr(train_dataset, "worst_moves", None) is not None,
                     budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=sampler.batch_size,
                     training_set=args.training_set, target_temperature=args.target_temperature,
@@ -386,6 +387,10 @@ def parse_args(argv=None):
     parser.add_argument("--value-weight", type=float, default=single.VALUE_LOSS_WEIGHT)
     parser.add_argument("--blunder-weight", type=float, default=single.BLUNDER_WEIGHT,
                         help="weight of the push off labelled blunders, 0 for none")
+    parser.add_argument("--blunder-threshold", type=float, default=single.BLUNDER_THRESHOLD,
+                        help="a labelled move losing at least this much expected score is a blunder")
+    parser.add_argument("--weight-decay", type=float, default=single.WEIGHT_DECAY, help="for Muon and AdamW both")
+    parser.add_argument("--muon-momentum", type=float, default=single.MUON_MOMENTUM)
     return parser.parse_args(argv)
 
 

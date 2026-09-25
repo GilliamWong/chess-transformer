@@ -40,9 +40,11 @@ class ChessGamesDataset(Dataset):
     #boards, stockfish's best moves and the score after each as (positions, top moves), best first. The tensors share
     #the (possibly memory mapped) arrays' memory. worst_moves and worst_losses are the optional blunder labels
     def __init__(self, boards: np.ndarray, stockfish_moves: np.ndarray, stockfish_evals: np.ndarray, target_temperature: float,
-                 worst_moves: np.ndarray | None = None, worst_losses: np.ndarray | None = None):
+                 worst_moves: np.ndarray | None = None, worst_losses: np.ndarray | None = None, blunder_threshold: float = BLUNDER_THRESHOLD):
         if target_temperature <= 0:
             raise ValueError(f"the target temperature must be above 0, got {target_temperature}")
+        if blunder_threshold <= 0:
+            raise ValueError(f"the blunder threshold is an expected score lost, above 0, got {blunder_threshold}")
         if stockfish_moves.shape != stockfish_evals.shape or len(stockfish_moves) != len(boards):
             raise ValueError(f"stockfish moves {stockfish_moves.shape} and evals {stockfish_evals.shape} for {len(boards)} positions")
         #an unlabelled position would come out as a confident target for move 0
@@ -60,19 +62,20 @@ class ChessGamesDataset(Dataset):
         self.target_temperature = target_temperature
         self.worst_moves = shared_tensor(worst_moves) if worst_moves is not None else None
         self.worst_losses = shared_tensor(worst_losses) if worst_losses is not None else None
+        self.blunder_threshold = blunder_threshold
 
     #everything the set reads from disk
     def tensors(self) -> tuple[torch.Tensor, ...]:
         blunder_labels = (self.worst_moves, self.worst_losses) if self.worst_moves is not None else ()
         return self.boards, self.stockfish_moves, self.stockfish_evals, *blunder_labels
 
-    #labelled moves at or above BLUNDER_THRESHOLD, NO_MOVE elsewhere; one NO_MOVE column without blunder labels
+    #labelled moves at or above the blunder threshold, NO_MOVE elsewhere; one NO_MOVE column without blunder labels
     def blunders_of(self, index: int | list[int]) -> torch.Tensor:
         if self.worst_moves is None:
             return torch.full_like(self.stockfish_moves[index][..., :1], NO_MOVE, dtype=torch.long)
         moves = self.worst_moves[index].long()
         #compared in float16: 0.2 is stored as 0.19995 and still counts as at the threshold
-        threshold = torch.tensor(BLUNDER_THRESHOLD, dtype=self.worst_losses.dtype)
+        threshold = torch.tensor(self.blunder_threshold, dtype=self.worst_losses.dtype)
         return moves.masked_fill(self.worst_losses[index] < threshold, NO_MOVE)
 
     #stockfish's eval of the position (first column) as an expected score from 0 to 1
@@ -209,7 +212,7 @@ def datasets_to_dataloaders(
 #opens <name>_{train,val}_*.bin from processed_data/ as memory mapped datasets: stockfish labelled sets as
 #ChessGamesDataset, self play sets (SELF_PLAY_FILES) as SelfPlayDataset
 def load_training_set(name: str, target_temperature: float, result_weight: float = RESULT_WEIGHT,
-                      visit_temperature: float = VISIT_TEMPERATURE) -> tuple[TrainingDataset, TrainingDataset]:
+                      visit_temperature: float = VISIT_TEMPERATURE, blunder_threshold: float = BLUNDER_THRESHOLD) -> tuple[TrainingDataset, TrainingDataset]:
     datasets = []
     for split in ("train", "val"):
         boards_path = PROCESSED_DATA_DIR / f"{name}_{split}_boards.bin"
@@ -239,6 +242,6 @@ def load_training_set(name: str, target_temperature: float, result_weight: float
             worst = {kind: np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin", dtype=dtype, mode="r").reshape(len(boards), -1)
                      for kind, dtype in WORST_FILES.items()}
         datasets.append(ChessGamesDataset(boards, stockfish_moves.reshape(len(boards), -1), stockfish_evals.reshape(len(boards), -1), target_temperature,
-                                          worst.get("worst_moves"), worst.get("worst_losses")))
+                                          worst.get("worst_moves"), worst.get("worst_losses"), blunder_threshold))
 
     return datasets[0], datasets[1]
