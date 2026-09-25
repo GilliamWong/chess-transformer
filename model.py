@@ -138,10 +138,15 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_ratio: float | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_ratio: float | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, loops: int = 1):
         super().__init__()
         #the dim of the board input is 70, with a torch.long dtype
         self.d_model = d_model
+        #looped depth: the whole stack of blocks runs this many times, the same weights every time. The compute of
+        #loops * num_layers blocks with the parameters of num_layers
+        if loops < 1:
+            raise ValueError(f"loops is how many times the blocks run, at least 1, got {loops}")
+        self.loops = loops
 
         #one mebedding per possible board token, each of d_model size
         self.embed = nn.Embedding(BOARD_VOCAB_SIZE, self.d_model)
@@ -199,8 +204,9 @@ class ChessTransformer(nn.Module):
         #pass through the model layers
         #this is of dim B tokens_per_board d_model
         #we also apply layernorm as is standard with prenorm
-        for block in self.encoder:
-            embed_state = block(embed_state, self.templates)
+        for _ in range(self.loops):
+            for block in self.encoder:
+                embed_state = block(embed_state, self.templates)
         model_output = self.ln(embed_state)
 
         with torch.autocast(device_type=board_state.device.type, enabled=False):

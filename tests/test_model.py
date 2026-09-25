@@ -111,6 +111,28 @@ def test_every_parameter_gets_a_gradient(batch):
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
 
 
+#looped depth runs the same blocks again: one block looped twice is two blocks with the same weights
+def test_a_looped_block_is_the_same_block_twice(batch):
+    boards, _ = batch
+    torch.manual_seed(0)
+    looped = ChessTransformer(d_model=32, num_layers=1, n_heads=2, loops=2).eval()
+    with torch.no_grad():
+        looped.templates.normal_(std=0.1)  #zero templates would leave the attention bias out of the comparison
+    unrolled = ChessTransformer(d_model=32, num_layers=2, n_heads=2).eval()
+    weights = looped.state_dict()
+    weights.update({name.replace("encoder.0.", "encoder.1."): tensor for name, tensor in weights.items() if name.startswith("encoder.0.")})
+    unrolled.load_state_dict(weights)
+
+    for looped_output, unrolled_output in zip(looped(boards), unrolled(boards)):
+        assert torch.equal(looped_output, unrolled_output)
+    assert sum(parameter.numel() for parameter in looped.parameters()) < sum(parameter.numel() for parameter in unrolled.parameters())
+
+
+def test_the_blocks_run_at_least_once():
+    with pytest.raises(ValueError):
+        ChessTransformer(d_model=32, num_layers=2, n_heads=2, loops=0)
+
+
 #memorising one batch proves nothing about playing chess, only that the whole model can learn
 def test_can_overfit_one_batch(batch):
     model = small_model()

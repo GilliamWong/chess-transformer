@@ -370,7 +370,8 @@ def main(
     result_weight: float = RESULT_WEIGHT,
     visit_temperature: float = VISIT_TEMPERATURE,
     eval_every: int = EVAL_EVERY,
-    compile_mode: str = "default"):
+    compile_mode: str = "default",
+    loops: int = 1):
 
     #fine-tuning starts from a checkpoint's weights, and the model is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -378,7 +379,7 @@ def main(
         initial_model, model_settings = load_checkpoint(init_checkpoint, torch.device("cpu"))
     else:
         #everything ChessTransformer is built from: saved in the checkpoint so it can be rebuilt when loading
-        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads}
+        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads, "loops": loops}
     if mix_set is not None and not 0 < mix_share < 1:
         raise ValueError(f"--mix-share is the share of every batch from {mix_set}, between 0 and 1, got {mix_share}")
     if peak_learn_rate is None:
@@ -550,6 +551,7 @@ if __name__ == "__main__":
     parser.add_argument("--target-temperature", type=float, default=TARGET_TEMPERATURE, help="how stockfish's moves share the target, see TARGET_TEMPERATURE in main.py. Default %(default)s")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="positions per step, for train and val. Lower it for a model that does not fit, default %(default)s")
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention). Default one for every head")
+    parser.add_argument("--loops", type=int, default=1, help="how many times the whole stack of blocks runs, the same weights every time (looped depth). Default %(default)s")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="width of the queries and keys as a multiple of the values', rounded to whole dims per head. One for every block or one per block, e.g. --qk-ratio 0.25 0.5 0.5 0.75. Default 1")
     parser.add_argument("--init-checkpoint", type=Path, help="start from this model.pt's weights (fine-tuning); the model is the checkpoint's size and the size flags are ignored")
     parser.add_argument("--mix-set", help="a second training set that fills --mix-share of every batch, e.g. full_sf8_30M_mix when fine-tuning on self play")
@@ -569,4 +571,4 @@ if __name__ == "__main__":
     main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.schedule, arguments.seed, arguments.mlp_ratio, arguments.target_temperature, arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio, arguments.kv_heads, arguments.batch_size,
          init_checkpoint=arguments.init_checkpoint, mix_set=arguments.mix_set, mix_share=arguments.mix_share, result_weight=arguments.result_weight,
          visit_temperature=arguments.visit_temperature,
-         eval_every=arguments.eval_every, compile_mode=arguments.compile_mode)
+         eval_every=arguments.eval_every, compile_mode=arguments.compile_mode, loops=arguments.loops)

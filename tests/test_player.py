@@ -6,12 +6,13 @@ import chess
 import chess.pgn
 import pytest
 import torch
+from torch import nn
 
 from data import EXPECTED_SCORE_PER_CENTIPAWN
-from encoding import encode_board
+from encoding import NUM_MOVE_IDS, encode_board, encode_move_to_id
 from tools.play.evaluate_elo import annotate_searches, elo_difference, model_engine, parse_score
 from model import ChessTransformer
-from tools.play.player import CudaGraphModel, choose_move, score_to_centipawns, search_move
+from tools.play.player import AHEAD_SCORE, CudaGraphModel, choose_move, score_to_centipawns, search_move
 from tools.play.uci import parse_position
 
 CPU = torch.device("cpu")
@@ -193,3 +194,48 @@ def test_a_cuda_graph_for_a_batch_takes_fewer_boards(carlsen_games):
         expected_moves, expected_eval = model(boards.cuda())
     assert graphed_moves.shape == (3, expected_moves.shape[1])
     assert torch.allclose(graphed_moves, expected_moves.cpu(), atol=1e-5) and torch.allclose(graphed_eval, expected_eval.cpu(), atol=1e-5)
+
+
+#a model that always gives the same answer: the logits of the given moves (every other move far below) and a value
+class FixedModel(nn.Module):
+    def __init__(self, board: chess.Board, move_logits: dict[str, float], expected_score: float):
+        super().__init__()
+        self.move_logits = torch.full((1, NUM_MOVE_IDS), -20.0)
+        for san, logit in move_logits.items():
+            self.move_logits[0, encode_move_to_id(board.parse_san(san), board.turn)] = logit
+        self.value_logits = torch.logit(torch.tensor([[expected_score]]))
+
+    def forward(self, boards):
+        return self.move_logits, self.value_logits
+
+
+#lichess game dwCvJZkh after 116...Rc8+: the rook endgame is a draw, Kf7 brings back the position after 115. Re1 and the
+#only other legal move, Re8, hangs the rook
+def rook_ending_before_the_repetition() -> chess.Board:
+    board = chess.Board("2r5/5K2/4RP1k/8/8/8/8/8 w - - 0 1")
+    for uci in ("e6e1", "c8c7", "f7g8", "c7c8"):
+        board.push_uci(uci)
+    return board
+
+
+def test_a_repetition_is_kept_in_a_level_position():
+    board = rook_ending_before_the_repetition()
+    model = FixedModel(board, {"Kf7": 0.0, "Re8": -1.0}, expected_score=0.51)
+
+    assert board.san(choose_move(model, board, CPU, "avoid-repetition")) == "Kf7"
+
+
+#the loss of dwCvJZkh: clearly ahead by the value head, but the only move that does not repeat is one the policy rejects
+def test_a_repetition_is_kept_rather_than_a_move_the_policy_rejects():
+    board = rook_ending_before_the_repetition()
+    model = FixedModel(board, {"Kf7": 4.0, "Re8": 0.0}, expected_score=0.9)
+
+    assert board.san(choose_move(model, board, CPU, "avoid-repetition")) == "Kf7"
+
+
+def test_a_repetition_is_avoided_when_clearly_ahead_with_a_move_the_policy_rates():
+    board = rook_ending_before_the_repetition()
+    model = FixedModel(board, {"Kf7": 0.0, "Re8": -1.0}, expected_score=AHEAD_SCORE + 0.05)
+
+    assert board.san(choose_move(model, board, CPU, "avoid-repetition")) == "Re8"
+    assert board.san(choose_move(model, board, CPU, "argmax")) == "Kf7"
