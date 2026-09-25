@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from main import WEIGHT_DECAY, make_optimizers, policy_loss
+from main import WEIGHT_DECAY, blunder_loss, make_optimizers, policy_loss
+from tools.label_with_stockfish import NO_MOVE
 from model import ChessTransformer
 
 CPU = torch.device("cpu")
@@ -78,3 +79,22 @@ def test_training_with_muon_learns_a_batch():
     assert losses[-1] < losses[0] / 2
     for name in ["encoder.0.Q.weight", "encoder.1.mlp.down_projection.weight", "embed.weight", "from_projection.weight"]:
         assert not torch.equal(dict(model.named_parameters())[name], weights_before[name]), name
+
+
+def test_the_blunder_loss_is_minus_log_of_the_probability_left_to_other_moves():
+    logits = torch.log(torch.tensor([[0.5, 0.3, 0.2]]))
+
+    #no blunders: nothing to push off
+    assert blunder_loss(logits, torch.tensor([[NO_MOVE, NO_MOVE]])).item() == pytest.approx(0.0, abs=1e-6)
+    #moves 1 and 2 are blunders: they hold 0.5 of the probability together
+    assert blunder_loss(logits, torch.tensor([[1, 2]])).item() == pytest.approx(-torch.log(torch.tensor(0.5)).item(), rel=1e-5)
+
+
+def test_the_blunder_loss_pushes_the_blunder_down_and_the_rest_up():
+    logits = torch.zeros(1, 4, requires_grad=True)
+
+    blunder_loss(logits, torch.tensor([[2, NO_MOVE]])).backward()
+
+    assert logits.grad[0, 2] > 0
+    assert (logits.grad[0, [0, 1, 3]] < 0).all()
+

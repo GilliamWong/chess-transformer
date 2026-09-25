@@ -23,7 +23,7 @@ out with `uv sync --no-group selfplay`.
 ## Train
 
 ```
-uv run main.py                          4 minutes of training (TRAIN_MINUTES_BUDGET), the standard budget for comparing models
+uv run main.py                          4 minutes of training (TRAIN_MINUTES_BUDGET) of a d128 with 6 layers, the standard comparison
 uv run main.py --note "final layer norm"    the same, with a note for the results page
 uv run main.py --minutes 30             a longer run
 uv run main.py --positions 10_000_000   a budget in positions instead, about 3 minutes per 10 million on an RTX 5070 Ti
@@ -138,6 +138,16 @@ Some of it is now simply how the model works, and the code for the alternatives 
   (`main.make_optimizers`): on d128 with 4 layers for 4 minutes, from the same start on the same data, val loss 1.9414
   against 1.9929 with AdamW for everything, with 8% fewer positions (its steps are slower); about what twice the training
   time gave. It reached AdamW's final loss 60% of the way through its run. Runs before 2026-09-24 used AdamW alone.
+- A penalty on blunders, `main.blunder_loss` at `--blunder-weight 4`: -log(1 - the probability the policy gives the moves
+  that throw away at least 0.2 expected score against Stockfish's best). On a d128 over 8M positions, 800 games against
+  Stockfish 1700 per run and two seeds, +27 Elo against no penalty (1615 against 1588 on average), although the move
+  loss got worse. Weight 8 was no better and cost accuracy; only the 4 worst moves did little, since the policy already
+  gives those almost nothing. It needs blunder labels next to the set (`<set>_{split}_worst_moves.bin` and
+  `_worst_losses.bin`, the worst moves of every position and what each gives away, see `data.WORST_FILES`); a set without
+  them trains as before, and settings.json records whether a run had them.
+- The standard quick model is a d128 with 6 layers (`NUM_LAYERS`), no longer 4: at the same training compute 6 layers
+  reached val loss 1.904 against 1.937 with 4 and 1.901 with 8. Looping the same layers (weights shared across depth)
+  lost to real depth at every setting tried; the one looped change that helped was a layer norm between passes.
 
 | Choice | Setting | Why |
 |---|---|---|

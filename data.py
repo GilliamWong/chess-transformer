@@ -29,6 +29,15 @@ RESULT_WEIGHT = 0.5
 #at 0.5, 0.0189 at 0.25, 0.0177 at 0.1, against 0.0293 for the start model's own move
 VISIT_TEMPERATURE = 1.0
 
+#the policy's blunders: the labelled moves that give away at least this much expected score against stockfish's best
+#move. main.blunder_loss pushes the policy's probability off them. Optional files next to a set, written by
+#tools/label_blunders.py (per position up to 16 moves that give away at least 0.2, the mildest first; the dataset keeps
+#those at or above the threshold, whatever the order):
+#   worst_moves    move ids, (positions, slots), NO_MOVE past the labelled moves and for a position not labelled
+#   worst_losses   the expected score each gives away (0 = as good as the best move)
+BLUNDER_THRESHOLD = 0.2
+WORST_FILES = {"worst_moves": np.int16, "worst_losses": np.float16}
+
 #the files selfplay.py writes next to <name>_{split}_boards.bin, per position, and their dtypes:
 #   visit_moves    the most visited moves of the search at the root, (positions, top moves), NO_MOVE where there were fewer
 #   visit_shares   each one's share of the visits to those moves, adding up to 1
@@ -48,8 +57,10 @@ class ChessGamesDataset(Dataset):
 
     #positions that are already arrays (load_training_set): the boards, and stockfish's best moves and the score after
     #each, (positions, top moves) the way tools/label_with_stockfish.py writes them, the best move first. They can be
-    #memory mapped and far too many for a python list: the tensors share the arrays' memory, nothing is copied
-    def __init__(self, boards: np.ndarray, stockfish_moves: np.ndarray, stockfish_evals: np.ndarray, target_temperature: float):
+    #memory mapped and far too many for a python list: the tensors share the arrays' memory, nothing is copied.
+    #worst_moves and worst_losses (WORST_FILES) are the optional blunder labels, both (positions, slots)
+    def __init__(self, boards: np.ndarray, stockfish_moves: np.ndarray, stockfish_evals: np.ndarray, target_temperature: float,
+                 worst_moves: np.ndarray | None = None, worst_losses: np.ndarray | None = None):
         if target_temperature <= 0:
             raise ValueError(f"the target temperature must be above 0, got {target_temperature}")
         if stockfish_moves.shape != stockfish_evals.shape or len(stockfish_moves) != len(boards):
@@ -58,15 +69,32 @@ class ChessGamesDataset(Dataset):
         unlabelled = int((stockfish_moves[:, 0] == NO_MOVE).sum())
         if unlabelled:
             raise ValueError(f"{unlabelled:,} of {len(boards):,} positions are not labelled yet, tools.label_with_stockfish finishes them")
+        if (worst_moves is None) != (worst_losses is None):
+            raise ValueError("blunder labels need both worst moves and worst losses")
+        if worst_moves is not None and (worst_moves.shape != worst_losses.shape or len(worst_moves) != len(boards)):
+            raise ValueError(f"worst moves {worst_moves.shape} and losses {worst_losses.shape} for {len(boards)} positions")
 
         self.boards = shared_tensor(boards)
         self.stockfish_moves = shared_tensor(stockfish_moves)
         self.stockfish_evals = shared_tensor(stockfish_evals)
         self.target_temperature = target_temperature
+        self.worst_moves = shared_tensor(worst_moves) if worst_moves is not None else None
+        self.worst_losses = shared_tensor(worst_losses) if worst_losses is not None else None
 
     #everything the set reads from disk
     def tensors(self) -> tuple[torch.Tensor, ...]:
-        return self.boards, self.stockfish_moves, self.stockfish_evals
+        blunder_labels = (self.worst_moves, self.worst_losses) if self.worst_moves is not None else ()
+        return self.boards, self.stockfish_moves, self.stockfish_evals, *blunder_labels
+
+    #the blunders of rows: the labelled moves that give away at least BLUNDER_THRESHOLD, NO_MOVE in the other places.
+    #A set without blunder labels has one place per position, always NO_MOVE
+    def blunders_of(self, index: int | list[int]) -> torch.Tensor:
+        if self.worst_moves is None:
+            return torch.full_like(self.stockfish_moves[index][..., :1], NO_MOVE, dtype=torch.long)
+        moves = self.worst_moves[index].long()
+        #compared in the labels' own precision: float16 stores 0.2 as 0.19995, which is still meant to be at the threshold
+        threshold = torch.tensor(BLUNDER_THRESHOLD, dtype=self.worst_losses.dtype)
+        return moves.masked_fill(self.worst_losses[index] < threshold, NO_MOVE)
 
     #the value head's target for rows: stockfish's eval of the position (the first column of the evals, the score after
     #its best move) as the expected score it stands for, a float from 0 to 1
@@ -89,9 +117,10 @@ class ChessGamesDataset(Dataset):
 
     #index is one position, or a list of positions that come back as one batch (see datasets_to_dataloaders)
     #boards, the policy target (moves and their probabilities, see policy_target), the value target (see value_target_of)
-    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    #and the blunders (see blunders_of)
+    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_moves, target_probabilities = self.policy_target(index)
-        return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index)
+        return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index), self.blunders_of(index)
 
 
 #the positions of selfplay.py's games with what the search found at each (SELF_PLAY_FILES), in the same four tensors as
@@ -133,9 +162,11 @@ class SelfPlayDataset(Dataset):
             shares = sharpened(shares, self.visit_temperature)
         return moves.masked_fill(no_move, 0), shares
 
-    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    #the same five tensors as ChessGamesDataset; self play has no blunder labels
+    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_moves, target_probabilities = self.policy_target(index)
-        return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index)
+        no_blunders = torch.full_like(self.visit_moves[index][..., :1], NO_MOVE, dtype=torch.long)
+        return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index), no_blunders
 
 
 #visit shares raised to 1 / temperature and made to add up to 1, divided by the largest first so that a low temperature does
@@ -171,13 +202,15 @@ class MixedLoader:
             yield concatenate_batches(main_batch, mix_batch)
 
 #two batches as one. The sets may keep a different number of target moves: the narrower one is padded with move 0 at
-#probability 0, which adds nothing to the loss
+#probability 0, which adds nothing to the loss. Blunders are padded with NO_MOVE, which is no blunder
 def concatenate_batches(first: tuple[torch.Tensor, ...], second: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-    boards, moves, probabilities, values = zip(first, second)
+    boards, moves, probabilities, values, blunders = zip(first, second)
     width = max(part.shape[1] for part in moves)
     moves = [torch.nn.functional.pad(part, (0, width - part.shape[1])) for part in moves]
     probabilities = [torch.nn.functional.pad(part, (0, width - part.shape[1])) for part in probabilities]
-    return torch.cat(boards), torch.cat(moves), torch.cat(probabilities), torch.cat(values)
+    blunder_width = max(part.shape[1] for part in blunders)
+    blunders = [torch.nn.functional.pad(part, (0, blunder_width - part.shape[1]), value=NO_MOVE) for part in blunders]
+    return torch.cat(boards), torch.cat(moves), torch.cat(probabilities), torch.cat(values), torch.cat(blunders)
 
 
 #the samplers hand the dataset a whole batch of indices at once (batch_size=None turns the loader's own
@@ -239,6 +272,12 @@ def load_training_set(name: str, target_temperature: float, result_weight: float
         stockfish_evals = np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_stockfish_evals.bin", dtype=np.int16, mode="r")
         if len(stockfish_moves) == 0 or len(stockfish_moves) % len(boards) != 0:
             raise ValueError(f"{len(stockfish_moves):,} stockfish moves cannot be shared between {len(boards):,} positions")
-        datasets.append(ChessGamesDataset(boards, stockfish_moves.reshape(len(boards), -1), stockfish_evals.reshape(len(boards), -1), target_temperature))
+        #the blunder labels, when the set has them (WORST_FILES)
+        worst = {}
+        if (PROCESSED_DATA_DIR / f"{name}_{split}_worst_moves.bin").exists():
+            worst = {kind: np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin", dtype=dtype, mode="r").reshape(len(boards), -1)
+                     for kind, dtype in WORST_FILES.items()}
+        datasets.append(ChessGamesDataset(boards, stockfish_moves.reshape(len(boards), -1), stockfish_evals.reshape(len(boards), -1), target_temperature,
+                                          worst.get("worst_moves"), worst.get("worst_losses")))
 
     return datasets[0], datasets[1]

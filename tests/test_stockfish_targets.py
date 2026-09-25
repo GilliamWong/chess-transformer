@@ -41,7 +41,7 @@ def test_stockfish_targets_share_the_probability_by_their_evals(tmp_path, monkey
     write_labelled_set(tmp_path, "labelled")
 
     train_dataset, _ = load_training_set("labelled", TEMPERATURE)
-    _, target_moves, target_probabilities, _ = train_dataset[[0, 1, 2]]
+    _, target_moves, target_probabilities, _, _ = train_dataset[[0, 1, 2]]
 
     #places without a move become move 0 at probability 0, so they can be looked up in the logits and add nothing
     assert target_moves.tolist() == [[5, 9, 2], [7, 0, 0], [1, 3, 0]]

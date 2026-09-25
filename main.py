@@ -22,11 +22,13 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from tools.budget import Budget
 from tools.checkpoint import RUNS_DIR, load_checkpoint, save_checkpoint
+from tools.label_with_stockfish import NO_MOVE
 from model import ChessTransformer
 
 #the model, each of these has a command line flag (python main.py --help)
 D_MODEL = 128
-NUM_LAYERS = 4
+#6, not 4: at the same training compute a d128 with 6 layers reached val loss 1.904 against 1.937 with 4 (and 1.901 with 8)
+NUM_LAYERS = 6
 N_HEADS = 4
 POSITION_TEMPLATES = 8
 
@@ -60,6 +62,13 @@ SEED = 42 #of the model's first weights and of the order of the training positio
 
 #the value head learns stockfish's eval of the position, as the expected score it stands for (see value_target_of in data.py)
 VALUE_LOSS_WEIGHT = 1.0
+
+#weight of blunder_loss, the push off the moves that give away at least data.BLUNDER_THRESHOLD against stockfish's best.
+#Measured on a d128 (8M positions, 800 games against stockfish 1700 per run, two seeds): +27 Elo at 4 against 0, while the
+#move loss got worse (the policy no longer matches stockfish's top moves as exactly). 8 was no better than 4 in Elo and
+#cost 1.1 points of accuracy; only the 4 worst moves at weight 1 did little (the policy already gives them almost nothing).
+#A set without blunder labels (data.WORST_FILES) trains as if this were 0
+BLUNDER_WEIGHT = 4.0
 
 #the policy learns stockfish's best moves, which tools/label_with_stockfish.py has written next to every position.
 #How they share the probability is TARGET_TEMPERATURE, in expected score (0 lost to 1 won): a move that gives up this
@@ -111,6 +120,15 @@ def policy_loss(logits: torch.Tensor, target_moves: torch.Tensor, target_probabi
 def value_loss(value_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return F.binary_cross_entropy_with_logits(value_logits.squeeze(-1).float(), targets)
 
+#unlikelihood: -log(1 - the probability the policy gives a position's blunders together), 0 for a position without any.
+#Cross entropy already pushes every move but the targets down in proportion to its probability; this pushes the
+#blunders down on top of that, the ones the policy likes the most the hardest. blunder_moves is (B, places), NO_MOVE
+#where there is none
+def blunder_loss(logits: torch.Tensor, blunder_moves: torch.Tensor) -> torch.Tensor:
+    blunders = blunder_moves != NO_MOVE
+    probabilities = torch.softmax(logits.float(), dim=-1).gather(1, blunder_moves.clamp(min=0)) * blunders
+    return -torch.log1p(-probabilities.sum(dim=-1).clamp(max=1 - 1e-6)).mean()
+
 #how many positions the value head gets right: the side to move ahead or not (score above a half)
 def value_correct(value_logits: torch.Tensor, targets: torch.Tensor) -> int:
     return int(((value_logits.squeeze(-1) > 0) == (targets > 0.5)).sum().item())
@@ -128,7 +146,8 @@ def train(
     budget: Budget,
     writer: SummaryWriter,
     value_loss_weight: float = VALUE_LOSS_WEIGHT,
-    eval_every: int = EVAL_EVERY) -> None:
+    eval_every: int = EVAL_EVERY,
+    blunder_weight: float = BLUNDER_WEIGHT) -> None:
 
     #kept on the device: adding to it does not make the cpu wait for the gpu the way loss.item() does
     loss_total = torch.zeros((), device=device)
@@ -143,11 +162,14 @@ def train(
 
     #target_moves and target_probabilities are the policy target: stockfish's best few moves (policy_loss)
     #values is the value head's target: stockfish's eval as an expected score (value_loss)
-    for batch, target_moves, target_probabilities, values in batches_on_device(endless_batches(train_data_loader), device):
+    #blunders are the moves the policy is pushed off (blunder_loss)
+    for batch, target_moves, target_probabilities, values, blunders in batches_on_device(endless_batches(train_data_loader), device):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             logits, eval_logits = model(batch)
 
             loss = policy_loss(logits, target_moves, target_probabilities) + value_loss_weight * value_loss(eval_logits, values)
+            if blunder_weight:
+                loss = loss + blunder_weight * blunder_loss(logits, blunders)
 
         for optimizer in optimizers:
             optimizer.zero_grad()
@@ -228,7 +250,8 @@ def evaluate_model(
         #processes evaluate at once (multi_gpu/train_ddp.py), one bar is enough
         progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False, dynamic_ncols=True, disable=not show_progress)
 
-        for batch, target_moves, target_probabilities, values in progress:
+        #the blunders are left out: the val numbers stay the move loss alone, comparable with every earlier run
+        for batch, target_moves, target_probabilities, values, _ in progress:
             target_moves = target_moves.to(device)
             target_probabilities = target_probabilities.to(device)
             values = values.to(device)
@@ -371,7 +394,8 @@ def main(
     visit_temperature: float = VISIT_TEMPERATURE,
     eval_every: int = EVAL_EVERY,
     compile_mode: str = "default",
-    loops: int = 1):
+    loops: int = 1,
+    blunder_weight: float = BLUNDER_WEIGHT):
 
     #fine-tuning starts from a checkpoint's weights, and the model is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -463,6 +487,9 @@ def main(
         "schedule": schedule,
         "seed": seed,
         "value_loss_weight": value_loss_weight,
+        #the blunder push only acts on a set with blunder labels: whether this one has them is recorded next to the weight
+        "blunder_weight": blunder_weight,
+        "blunder_labels": getattr(train_data_loader.dataset, "worst_moves", None) is not None,
         "budget": budget.describe(),
         "batch_size": batch_size,
         "training_set": training_set,
@@ -485,7 +512,7 @@ def main(
         save_checkpoint(model, model_settings, run_dir / "model.pt")
 
     train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, optimizers, schedulers, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight,
-          eval_every=eval_every)
+          eval_every=eval_every, blunder_weight=blunder_weight)
 
     #the final weights as well: model.pt is the best evaluation's, which is usually but not always the last one
     save_checkpoint(model, model_settings, run_dir / "final.pt")
@@ -545,6 +572,8 @@ if __name__ == "__main__":
     parser.add_argument("--templates", type=int, default=POSITION_TEMPLATES, help="attention bias templates the blocks mix, default %(default)s")
     parser.add_argument("--training-set", default=TRAINING_SET, help="name of a training set in processed_data/ that tools.label_with_stockfish has labelled. Default %(default)s")
     parser.add_argument("--value-weight", type=float, default=VALUE_LOSS_WEIGHT, help="weight of the value head's loss next to the move loss, default %(default)s")
+    parser.add_argument("--blunder-weight", type=float, default=BLUNDER_WEIGHT, help="weight of the push off labelled blunders (blunder_loss), 0 for none. "
+                                                                                     "Only a set with blunder labels has any. Default %(default)s")
     parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="what the learning rate does after the warmup, see SCHEDULE in main.py. Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="runs that differ only in this show how much of a difference between two runs is chance. Default %(default)s")
     parser.add_argument("--mlp-ratio", type=float, help="hidden size of the swiglu mlp in every block as a multiple of d-model, default 8/3")
@@ -571,4 +600,5 @@ if __name__ == "__main__":
     main(arguments.positions, arguments.minutes, arguments.name, arguments.note, arguments.d_model, arguments.layers, arguments.heads, arguments.lr, arguments.templates, arguments.training_set, arguments.value_weight, arguments.schedule, arguments.seed, arguments.mlp_ratio, arguments.target_temperature, arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio, arguments.kv_heads, arguments.batch_size,
          init_checkpoint=arguments.init_checkpoint, mix_set=arguments.mix_set, mix_share=arguments.mix_share, result_weight=arguments.result_weight,
          visit_temperature=arguments.visit_temperature,
-         eval_every=arguments.eval_every, compile_mode=arguments.compile_mode, loops=arguments.loops)
+         eval_every=arguments.eval_every, compile_mode=arguments.compile_mode, loops=arguments.loops,
+         blunder_weight=arguments.blunder_weight)

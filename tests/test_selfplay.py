@@ -72,7 +72,7 @@ def test_a_self_play_set_is_read_back_for_training(tmp_path, monkeypatch):
     train, val = load_training_set("played", 0.02, result_weight=0.5)
 
     assert isinstance(train, SelfPlayDataset) and len(train) == len(val) == 2
-    _, moves, shares, values = val[[0, 1]]
+    _, moves, shares, values, _ = val[[0, 1]]
     assert moves[:, :2].tolist() == [[5, 9], [7, 3]] and moves[:, 2:].eq(0).all()
     assert shares.tolist()[0][:2] == [0.75, 0.25]
     #white won game 0: white to move gets (1 + 0.6) / 2, black to move (0 + 0.3) / 2
@@ -90,7 +90,7 @@ def test_the_visit_temperature_sharpens_the_policy_target(tmp_path, monkeypatch)
 
     for temperature, expected in ((1.0, [0.75, 0.25]), (0.5, [0.9, 0.1]), (0.0, [1.0, 0.0])):
         _, val = load_training_set("played", 0.02, visit_temperature=temperature)
-        _, moves, shares, _ = val[[0, 1]]
+        _, moves, shares, _, _ = val[[0, 1]]
         assert shares[0, :2].tolist() == pytest.approx(expected) and shares[1, :2].tolist() == pytest.approx([1.0, 0.0])
         assert shares.sum(dim=1).tolist() == pytest.approx([1.0, 1.0])
         assert moves[:, :2].tolist() == [[5, 9], [7, 3]]

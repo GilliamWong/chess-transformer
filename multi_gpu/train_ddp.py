@@ -127,7 +127,7 @@ def log_validation(writer, metrics, step, final=False):
 
 
 def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
-          value_weight, eval_every, writer=None, save_best=None):
+          value_weight, eval_every, writer=None, save_best=None, blunder_weight=single.BLUNDER_WEIGHT):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     best_val_loss = float("inf")  #the best trained checkpoint, even if the first update regresses
     loss_total = torch.zeros((), device=device)
@@ -143,6 +143,8 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 logits, value_logits = model(batch[0])
                 loss = single.policy_loss(logits, batch[1], batch[2]) + value_weight * single.value_loss(value_logits, batch[3])
+                if blunder_weight:
+                    loss = loss + blunder_weight * single.blunder_loss(logits, batch[4])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             #every rank has the same averaged gradients after backward, so each steps all of the weights itself, Muon's too
@@ -246,7 +248,8 @@ def run(args, device: torch.device):
             settings = dict(
                 model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
                 peak_learn_rate=args.lr, schedule=args.schedule, seed=args.seed,
-                value_loss_weight=args.value_weight,
+                value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight,
+                blunder_labels=getattr(train_dataset, "worst_moves", None) is not None,
                 budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=sampler.batch_size,
                 training_set=args.training_set, target_temperature=args.target_temperature,
                 note=args.note, commit=single.current_commit(), trainer="ddp", world_size=world_size,
@@ -267,7 +270,7 @@ def run(args, device: torch.device):
             save_checkpoint(raw_model, model_settings, run_dir / "model.pt")
 
         train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
-              args.value_weight, args.eval_every, writer, save_best if rank == 0 else None)
+              args.value_weight, args.eval_every, writer, save_best if rank == 0 else None, args.blunder_weight)
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
@@ -318,6 +321,8 @@ def parse_args(argv=None):
     parser.add_argument("--training-set", default=single.TRAINING_SET)
     parser.add_argument("--target-temperature", type=float, default=single.TARGET_TEMPERATURE)
     parser.add_argument("--value-weight", type=float, default=single.VALUE_LOSS_WEIGHT)
+    parser.add_argument("--blunder-weight", type=float, default=single.BLUNDER_WEIGHT,
+                        help="weight of the push off labelled blunders (main.blunder_loss), 0 for none; only sets with blunder labels have any")
     return parser.parse_args(argv)
 
 

@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import data
-from data import EXPECTED_SCORE_PER_CENTIPAWN, ChessGamesDataset, MixedLoader, SelfPlayDataset, datasets_to_dataloaders, load_training_set
+from data import BLUNDER_THRESHOLD, EXPECTED_SCORE_PER_CENTIPAWN, ChessGamesDataset, MixedLoader, SelfPlayDataset, datasets_to_dataloaders, load_training_set
 from encoding import TOKENS_PER_BOARD
 from tools.label_with_stockfish import NO_EVAL, NO_MOVE
 
@@ -34,14 +34,14 @@ def tiny(tmp_path, monkeypatch) -> tuple[ChessGamesDataset, ChessGamesDataset]:
 
 def loader_moves(loader: DataLoader) -> list[int]:
     """every position the loader yields in one epoch, in the order it yields them"""
-    return [move for _, moves, _, _ in loader for move in moves[:, 0].tolist()]
+    return [move for _, moves, _, _, _ in loader for move in moves[:, 0].tolist()]
 
 
 def test_training_set_is_loaded_from_raw_arrays(tiny):
     train_dataset, val_dataset = tiny
 
     assert len(train_dataset) == 300 and len(val_dataset) == 20
-    boards, moves, _, values = train_dataset[[299, 0]]
+    boards, moves, _, values, _ = train_dataset[[299, 0]]
     assert boards.tolist() == [[5] * TOKENS_PER_BOARD] * 2
     assert moves[:, 0].tolist() == [299, 0]  #large enough that reading the int16 moves as bytes would give something else
     #the value target is stockfish's eval of the position as the expected score it stands for
@@ -49,7 +49,7 @@ def test_training_set_is_loaded_from_raw_arrays(tiny):
 
 
 def test_items_have_the_dtype_and_shape_the_model_needs(tiny):
-    board, target_moves, target_probabilities, value = tiny[0][0]
+    board, target_moves, target_probabilities, value, blunders = tiny[0][0]
 
     #embedding lookups and the gather in policy_loss both require int64
     assert board.dtype == torch.long and board.shape == (TOKENS_PER_BOARD,)
@@ -57,10 +57,12 @@ def test_items_have_the_dtype_and_shape_the_model_needs(tiny):
     assert target_moves.dtype == torch.long and target_moves.shape == (2,)
     assert target_probabilities.tolist() == [1.0, 0.0]  #the second place has no move
     assert value.dtype == torch.float and value.shape == ()
+    #a set without blunder labels: one place, no blunder
+    assert blunders.dtype == torch.long and blunders.tolist() == [NO_MOVE]
 
 
 def test_a_list_of_indices_comes_back_as_one_batch(tiny):
-    boards, moves, _, _ = tiny[0][[2, 0]]
+    boards, moves, _, _, _ = tiny[0][[2, 0]]
 
     assert boards.shape == (2, TOKENS_PER_BOARD)
     assert moves[:, 0].tolist() == [2, 0]
@@ -69,8 +71,8 @@ def test_a_list_of_indices_comes_back_as_one_batch(tiny):
 def test_dataloaders_use_their_own_batch_sizes(tiny):
     train_loader, val_loader = datasets_to_dataloaders(*tiny, train_batch_size=16, val_batch_size=5)
 
-    train_boards, train_moves, _, _ = next(iter(train_loader))
-    val_boards, val_moves, _, _ = next(iter(val_loader))
+    train_boards, train_moves, _, _, _ = next(iter(train_loader))
+    val_boards, val_moves, _, _, _ = next(iter(val_loader))
 
     assert train_boards.shape == (16, TOKENS_PER_BOARD) and train_moves.shape == (16, 2)
     assert val_boards.shape == (5, TOKENS_PER_BOARD) and val_moves.shape == (5, 2)
@@ -149,8 +151,45 @@ def test_mixed_batches_take_a_fixed_share_from_each_set(tiny):
     batches = list(MixedLoader(self_play_loader, stockfish_loader))
 
     assert len(batches) == 6
-    for boards, moves, probabilities, values in batches:
+    for boards, moves, probabilities, values, blunders in batches:
         assert boards.shape == (16, TOKENS_PER_BOARD) and moves.shape == probabilities.shape == (16, 8)
         assert probabilities.sum(dim=1).tolist() == pytest.approx([1.0] * 16)
         assert moves[12:, 2:].eq(0).all() and probabilities[12:, 2:].eq(0).all()
         assert values[:12].tolist() == pytest.approx([0.5] * 12)
+        assert blunders.shape == (16, 1) and blunders.eq(NO_MOVE).all()
+
+
+#blunder labels next to a set, 3 places per position worst first: the first position has a blunder, a move at exactly the
+#threshold and a harmless move; the second nothing labelled
+def write_blunder_labels(folder, name, positions):
+    moves = np.full((positions, 3), NO_MOVE, dtype=np.int16)
+    losses = np.zeros((positions, 3), dtype=np.float16)
+    moves[0], losses[0] = [700, 701, 702], [0.6, BLUNDER_THRESHOLD, 0.05]
+    (folder / f"{name}_train_worst_moves.bin").write_bytes(moves.tobytes())
+    (folder / f"{name}_train_worst_losses.bin").write_bytes(losses.tobytes())
+
+
+def test_blunders_are_the_labelled_moves_that_give_away_enough(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    write_training_set(tmp_path, "blunders", {"train": 4, "val": 2})
+    write_blunder_labels(tmp_path, "blunders", 4)
+
+    train_dataset, val_dataset = load_training_set("blunders", TEMPERATURE)
+
+    blunders = train_dataset[[0, 1]][4]
+    assert blunders.tolist() == [[700, 701, NO_MOVE], [NO_MOVE] * 3]
+    #the labels are read with the rest of the set, so warming the file cache covers them
+    assert len(train_dataset.tensors()) == 5
+    #val has no blunder labels of its own
+    assert val_dataset[[0, 1]][4].tolist() == [[NO_MOVE], [NO_MOVE]]
+
+
+def test_blunder_labels_must_come_in_pairs_of_the_same_shape():
+    boards = np.zeros((2, TOKENS_PER_BOARD), dtype=np.uint8)
+    labels = np.zeros((2, 2), dtype=np.int16)
+
+    with pytest.raises(ValueError):
+        ChessGamesDataset(boards, labels, labels, TEMPERATURE, worst_moves=np.zeros((2, 3), dtype=np.int16))
+    with pytest.raises(ValueError):
+        ChessGamesDataset(boards, labels, labels, TEMPERATURE, np.zeros((2, 3), dtype=np.int16), np.zeros((2, 2), dtype=np.float16))
+
