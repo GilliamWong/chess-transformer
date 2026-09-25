@@ -371,16 +371,10 @@ fn softmax(logits: Vec<f32>) -> Vec<f32> {
     priors
 }
 
-#[pyfunction]
-fn sigmoid(logit: f32) -> f32 {
-    search::sigmoid(logit)
-}
-
 #[pymodule]
 fn selfplay_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SelfPlayGames>()?;
     module.add_class::<Searches>()?;
     module.add_function(wrap_pyfunction!(softmax, module)?)?;
-    module.add_function(wrap_pyfunction!(sigmoid, module)?)?;
     Ok(())
 }

@@ -45,7 +45,8 @@ that made them are in `artifacts/processed_data/scripts_used/`.
 
 The policy learns a softmax over Stockfish's top moves by the expected score after each, at `--target-temperature`
 (0.02: a move that gives up 2% of the expected score gets 1/e of the best move's share). The eval head learns the
-position's score as an expected score.
+position's score as a distribution over `--value-bins` equal bins of the expected score (HL-Gauss: the target is a
+narrow gaussian around the score), read out as its mean; `--value-bins 1` is the older single logit.
 
 ```
 uv run python -m tools.label_with_stockfish        label the first games of a set (stoppable, carries on)
@@ -77,6 +78,9 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
 
 - The model sees only the current board; its value head learns Stockfish's eval; 8 position templates, SwiGLU, no
   dropout, no board-wide input embedding (template maps only helped shallow models).
+- The eval head predicts a distribution over 128 bins of the expected score at `--value-weight 0.5`: value error
+  0.044 against 0.054 for a single logit on a d128, the policy unchanged (at weight 1 it lost 0.02 val loss), and
+  about +40 Elo in both a policy and a 64-simulation match, each inside its 200-game margin.
 - Muon for the weight matrices inside the blocks, AdamW for the rest, one learning rate: d128 val loss 1.9414 against
   1.9929 with AdamW alone.
 - The blunder penalty, `--blunder-weight 4`: +27 Elo on a d128. It needs blunder labels next to the set

@@ -91,14 +91,14 @@ class BoardModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return boards.float() @ self.weights / 100, PIECE_VALUES[boards[:, :64].long()].sum(dim=1, keepdim=True)
 
-#mcts.evaluate_many with rust's softmax and sigmoid, whose last bits differ from numpy's and torch's
+#mcts.evaluate_many with rust's softmax, whose last bits differ from numpy's
 def evaluate_many_in_rust_numbers(model: nn.Module, boards: list[chess.Board], device: torch.device) -> list[tuple[dict[chess.Move, float], float]]:
     answers = cpu_batches(model).evaluate_boards(np.array([encode_board(board) for board in boards], dtype=np.uint8))
     evaluations = []
     for board, answer in zip(boards, answers):
         moves = list(board.legal_moves)
         priors = selfplay_rs.softmax(answer[[encode_move_to_id(move, board.turn) for move in moves]].tolist())
-        evaluations.append((dict(zip(moves, priors)), selfplay_rs.sigmoid(float(answer[-1]))))
+        evaluations.append((dict(zip(moves, priors)), float(answer[-1])))
     return evaluations
 
 def assert_same_games(python_games, rust_games) -> None:
@@ -190,7 +190,6 @@ def test_the_rust_numbers_are_numpys():
     logits = np.random.default_rng(0).normal(0, 4, 40).astype(np.float32)
     weights = np.exp(logits - logits.max())
     assert np.allclose(selfplay_rs.softmax(logits.tolist()), weights / weights.sum(), rtol=1e-5, atol=1e-7)
-    assert np.allclose([selfplay_rs.sigmoid(logit) for logit in logits.tolist()], torch.sigmoid(torch.from_numpy(logits)).numpy(), rtol=1e-6)
 
 
 def uniform(boards: np.ndarray) -> np.ndarray:

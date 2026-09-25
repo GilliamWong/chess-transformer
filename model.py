@@ -6,6 +6,23 @@ from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, MOVE_FROM_SQUARES, MOVE
 
 VALUE_TOKEN_DIM = 16
 
+#the eval head's output is a distribution over this many equal bins of the expected score (HL-Gauss, Farebrother et
+#al. 2024); 1 is the older head, one logit of the score
+VALUE_BINS = 128
+
+#the bins' boundaries from 0 to 1
+def value_bin_edges(bins: int, device: torch.device | None = None) -> torch.Tensor:
+    return torch.linspace(0, 1, bins + 1, device=device)
+
+#the eval head's output as the expected score, 0 to 1: one logit is the score's logit, more are the bins' logits
+def expected_score(value_logits: torch.Tensor) -> torch.Tensor:
+    bins = value_logits.shape[-1]
+    if bins == 1:
+        return torch.sigmoid(value_logits[..., 0].float())
+    edges = value_bin_edges(bins, value_logits.device)
+    centres = (edges[:-1] + edges[1:]) / 2
+    return torch.softmax(value_logits.float(), dim=-1) @ centres
+
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_hidden: int):
         super().__init__()
@@ -108,7 +125,7 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_ratio: float | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, loops: int = 1):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_ratio: float | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, loops: int = 1, value_bins: int = VALUE_BINS):
         super().__init__()
         #the input is B x 70 board tokens, torch.long
         self.d_model = d_model
@@ -116,6 +133,8 @@ class ChessTransformer(nn.Module):
         if loops < 1:
             raise ValueError(f"loops is how many times the blocks run, at least 1, got {loops}")
         self.loops = loops
+        if value_bins < 1:
+            raise ValueError(f"value_bins is the eval head's bins over the expected score, at least 1, got {value_bins}")
 
         self.embed = nn.Embedding(BOARD_VOCAB_SIZE, self.d_model)
 
@@ -137,11 +156,11 @@ class ChessTransformer(nn.Module):
             nn.GELU()
         )
 
-        #the logit of the board's expected score
+        #the board's expected score, see expected_score
         self.eval_head = nn.Sequential(
             nn.Linear(TOKENS_PER_BOARD * VALUE_TOKEN_DIM, self.d_model),
             nn.GELU(),
-            nn.Linear(self.d_model, 1)
+            nn.Linear(self.d_model, value_bins)
         )
 
         self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
@@ -188,6 +207,6 @@ class ChessTransformer(nn.Module):
 
             compressed_board = self.board_down_project(model_output.float()).reshape(B, -1) #B T * VALUE_TOKEN_DIM
 
-            board_eval_logits = self.eval_head(compressed_board) #B 1
+            board_eval_logits = self.eval_head(compressed_board) #B value_bins
 
         return combined_logits, board_eval_logits

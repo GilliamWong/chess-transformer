@@ -52,6 +52,7 @@ def evaluate(model: nn.Module, board: chess.Board, device: torch.device) -> tupl
 
 def evaluate_many(model: nn.Module, boards: list[chess.Board], device: torch.device) -> list[tuple[dict[chess.Move, float], float]]:
     import torch
+    from model import expected_score
     legal_moves = [list(board.legal_moves) for board in boards]
     for board, moves in zip(boards, legal_moves):
         if len(moves) == 0:
@@ -61,7 +62,7 @@ def evaluate_many(model: nn.Module, boards: list[chess.Board], device: torch.dev
     with torch.no_grad():
         move_logits, value_logits = model(encoded)
     move_logits = move_logits.float().cpu().numpy()
-    values = torch.sigmoid(value_logits[:, 0].float()).cpu().tolist()
+    values = expected_score(value_logits).cpu().tolist()
 
     evaluations = []
     for board, moves, logits, value in zip(boards, legal_moves, move_logits, values):

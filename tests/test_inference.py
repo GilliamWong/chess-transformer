@@ -4,8 +4,8 @@ import pytest
 import torch
 
 from encoding import encode_board
-from inference import GraphedBatches
-from model import ChessTransformer
+from inference import GraphedBatches, answer_rows
+from model import ChessTransformer, expected_score
 from tools.play.player import CudaGraphModel
 
 
@@ -20,7 +20,7 @@ def test_graphs_answer_like_the_model():
         boards.append(encode_board(board))
     boards = np.array(boards, dtype=np.uint8)
     with torch.no_grad():
-        expected = torch.cat(model(torch.from_numpy(boards).long().cuda()), dim=1).float().cpu().numpy()
+        expected = answer_rows(model(torch.from_numpy(boards).long().cuda())).cpu().numpy()
 
     graphs = GraphedBatches(model, 4)
     answers = graphs.collect(graphs.launch(boards))
@@ -28,4 +28,18 @@ def test_graphs_answer_like_the_model():
     torch.cuda.synchronize()
 
     assert np.allclose(answers, expected, atol=1e-3)
-    assert np.allclose(torch.cat([logits, value], dim=1).numpy(), expected[:1], atol=1e-3)
+    assert np.allclose(answer_rows((logits, value)).numpy(), expected[:1], atol=1e-3)
+
+
+#the last number of a row is the score, not a logit: the search backs it up as it is
+def test_an_answer_row_ends_with_the_expected_score():
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval()
+    boards = torch.from_numpy(np.array([encode_board(chess.Board())], dtype=np.uint8)).long()
+    with torch.no_grad():
+        logits, value_logits = model(boards)
+        rows = answer_rows((logits, value_logits))
+
+    assert rows.shape == (1, logits.shape[1] + 1)
+    assert 0 < rows[0, -1] < 1
+    assert torch.equal(rows[0, -1], expected_score(value_logits)[0])

@@ -12,7 +12,7 @@ from tools.play.player import choose_move, load_model
 CPU = torch.device("cpu")
 
 #not the default size, so loading only works if the settings really come from the file
-SETTINGS = {"d_model": 48, "num_layers": 3, "n_heads": 6, "qk_ratio": [0.5, 0.25, 1.0], "kv_heads": 3, "loops": 2}
+SETTINGS = {"d_model": 48, "num_layers": 3, "n_heads": 6, "qk_ratio": [0.5, 0.25, 1.0], "kv_heads": 3, "loops": 2, "value_bins": 16}
 
 
 def test_model_of_any_size_comes_back_with_the_same_weights(tmp_path):

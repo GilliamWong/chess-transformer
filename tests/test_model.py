@@ -5,7 +5,8 @@ import torch
 from torch import nn
 
 from encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD, encode_board, encode_move_to_id
-from model import ChessTransformer
+from main import value_loss
+from model import VALUE_BINS, ChessTransformer
 
 BATCH_SIZE = 16
 
@@ -36,7 +37,7 @@ def test_one_set_of_move_logits_per_board(batch):
     #not (batch, TOKENS_PER_BOARD, NUM_MOVE_IDS): the tokens have to be pooled into one answer per board
     assert boards.shape == (BATCH_SIZE, TOKENS_PER_BOARD)
     assert logits.shape == (BATCH_SIZE, NUM_MOVE_IDS)
-    assert value_logits.shape == (BATCH_SIZE, 1)  #the logit of the expected score
+    assert value_logits.shape == (BATCH_SIZE, VALUE_BINS)  #a distribution over bins of the expected score
 
 
 #without the positional embedding the model sees which pieces exist but not where they are
@@ -104,7 +105,7 @@ def test_every_parameter_gets_a_gradient(batch):
     #both heads have to be in the loss, or the one left out gets no gradient
     logits, value_logits = model(boards)
     values = torch.full((len(boards),), 0.7)
-    (nn.CrossEntropyLoss()(logits, moves) + nn.functional.binary_cross_entropy_with_logits(value_logits.squeeze(-1), values)).backward()
+    (nn.CrossEntropyLoss()(logits, moves) + value_loss(value_logits, values)).backward()
 
     for name, parameter in model.named_parameters():
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name

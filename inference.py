@@ -11,8 +11,14 @@ import numpy as np
 import torch
 from torch import nn
 from encoding import TOKENS_PER_BOARD, encode_board
+from model import expected_score
 from selfplay import ANSWER_WIDTH, set_priority, slot_arrays
 from tools.play.player import load_model
+
+#a row of ANSWER_WIDTH numbers per board: the move logits, then the expected score
+def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    move_logits, value_logits = outputs
+    return torch.cat([move_logits.float(), expected_score(value_logits).unsqueeze(1)], dim=1)
 
 CPU = torch.device("cpu")
 
@@ -75,7 +81,7 @@ class GraphedBatches:
         for size in reversed(self.sizes):
             self.graphs[size] = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graphs[size], pool=pool), torch.no_grad():
-                self.answers[size] = torch.cat(model(self.boards[:size]), dim=1).float()
+                self.answers[size] = answer_rows(model(self.boards[:size]))
 
     def launch(self, boards: np.ndarray) -> tuple[torch.cuda.Event, torch.Tensor]:
         count = len(boards)
@@ -120,7 +126,7 @@ class Bf16(nn.Module):
 def cpu_batches(model: nn.Module) -> ImmediateBatches:
     def evaluate_boards(boards: np.ndarray) -> np.ndarray:
         with torch.no_grad():
-            return torch.cat(model(torch.from_numpy(boards).long()), dim=1).float().numpy()
+            return answer_rows(model(torch.from_numpy(boards).long())).numpy()
     return ImmediateBatches(evaluate_boards)
 
 #ready is set once the graphs are recorded

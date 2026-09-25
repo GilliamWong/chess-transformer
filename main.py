@@ -21,7 +21,7 @@ from tools.checkpoint import RUNS_DIR, load_checkpoint, save_checkpoint
 from tools.compare_runs import write_progress_page
 from tools.label_with_stockfish import NO_MOVE
 from tools.tensorboard_server import start_tensorboard
-from model import ChessTransformer
+from model import ChessTransformer, expected_score, value_bin_edges
 
 #the model, each of these has a command line flag (python main.py --help)
 D_MODEL = 128
@@ -29,6 +29,10 @@ D_MODEL = 128
 NUM_LAYERS = 6
 N_HEADS = 4
 POSITION_TEMPLATES = 8
+#the eval head's bins over the expected score, 1 for the older single logit
+VALUE_BINS = 128
+#the target over the bins is a gaussian around the score this many bin widths wide
+VALUE_TARGET_SPREAD = 0.75
 
 PEAK_LEARN_RATE = 6e-3
 #the peak for a fine-tune (--init-checkpoint): at PEAK_LEARN_RATE the warmup undid much of what the start model knew
@@ -53,7 +57,8 @@ POSTFIX_EVERY = 20 #reading the loss for the progress bar makes the cpu wait for
 EVAL_BATCHES = 20 #val batches per look; the whole val set is used at the end
 SEED = 42 #of the first weights and of the training order
 
-VALUE_LOSS_WEIGHT = 1.0
+#at 1 the 128-bin eval head cost the policy 0.02 val loss on a d128, at 0.5 nothing, for the same value error
+VALUE_LOSS_WEIGHT = 0.5
 
 #weight of blunder_loss: +27 Elo at 4 against 0 on a d128 (8 was no better). A set without blunder labels trains as if 0
 BLUNDER_WEIGHT = 4.0
@@ -95,9 +100,21 @@ def policy_loss(logits: torch.Tensor, target_moves: torch.Tensor, target_probabi
     log_probabilities = torch.log_softmax(logits, dim=-1).gather(1, target_moves)
     return -(target_probabilities * log_probabilities).sum(dim=-1).mean()
 
-#the target is an expected score from 0 to 1 and the head outputs its logit
+#the share of each bin under a gaussian around every target score, (B, bins) adding up to 1: the part of the
+#gaussian outside 0 to 1 is left out
+def value_target_bins(targets: torch.Tensor, bins: int) -> torch.Tensor:
+    edges = value_bin_edges(bins, targets.device)
+    spread = VALUE_TARGET_SPREAD / bins
+    cumulative = 0.5 * (1 + torch.erf((edges - targets.unsqueeze(-1)) / (spread * math.sqrt(2))))
+    return (cumulative[:, 1:] - cumulative[:, :-1]) / (cumulative[:, -1:] - cumulative[:, :1])
+
+#the target is an expected score from 0 to 1: one logit learns its logit, bins learn the gaussian around it
 def value_loss(value_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    return F.binary_cross_entropy_with_logits(value_logits.squeeze(-1).float(), targets)
+    value_logits = value_logits.float()
+    bins = value_logits.shape[-1]
+    if bins == 1:
+        return F.binary_cross_entropy_with_logits(value_logits.squeeze(-1), targets)
+    return -(value_target_bins(targets, bins) * torch.log_softmax(value_logits, dim=-1)).sum(dim=-1).mean()
 
 #unlikelihood: -log(1 - the probability given to a position's blunders together), 0 without any.
 #blunder_moves is (B, places), NO_MOVE where there is none
@@ -108,7 +125,11 @@ def blunder_loss(logits: torch.Tensor, blunder_moves: torch.Tensor) -> torch.Ten
 
 #positions where the value head gets whether the side to move is ahead (score above a half)
 def value_correct(value_logits: torch.Tensor, targets: torch.Tensor) -> int:
-    return int(((value_logits.squeeze(-1) > 0) == (targets > 0.5)).sum().item())
+    return int(((expected_score(value_logits) > 0.5) == (targets > 0.5)).sum().item())
+
+#how far the head's score is from the target, added up: comparable between heads, which their losses are not
+def value_error(value_logits: torch.Tensor, targets: torch.Tensor) -> float:
+    return (expected_score(value_logits) - targets).abs().sum().item()
 
 
 def train(
@@ -170,10 +191,10 @@ def train(
         if step % eval_every == 0 or budget.finished():
             train_loss = loss_total.item() / total_examples #waits for the gpu, so the pause starts when the steps are done
             budget.pause() #evaluating doesn't count towards a budget in minutes
-            val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(model, val_data_loader, device, max_batches=EVAL_BATCHES)
+            val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_value_error = evaluate_model(model, val_data_loader, device, max_batches=EVAL_BATCHES)
             model.train()
 
-            tqdm.write(f"step {step} ({budget.positions:,} positions, {budget.seconds / 60:.1f} min): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
+            tqdm.write(f"step {step} ({budget.positions:,} positions, {budget.seconds / 60:.1f} min): train loss {train_loss:.3f}, val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}, value error {val_value_error:.4f}")
 
             writer.add_scalar("loss/train", train_loss, step)
             if blunder_weight:
@@ -182,6 +203,7 @@ def train(
             writer.add_scalar("accuracy/val", val_accuracy, step)
             writer.add_scalar("loss/val_value", val_value_loss, step)
             writer.add_scalar("accuracy/val_value", val_value_accuracy, step)
+            writer.add_scalar("error/val_value", val_value_error, step)
             writer.add_scalar("learning_rate", schedulers[0].get_last_lr()[0], step)
 
             if val_loss < best_val_loss:
@@ -199,19 +221,20 @@ def train(
     progress.close()
 
 
-#move loss and accuracy, then value loss and accuracy, over the val loader or its first max_batches.
+#move loss and accuracy, then value loss, accuracy and mean error, over the val loader or its first max_batches.
 #the val loader isn't shuffled, so these are the same positions every time
 def evaluate_model(
     model: nn.Module,
     test_data_loader: DataLoader,
     device: torch.device,
     max_batches: int | None = None,
-    show_progress: bool = True) -> tuple[float, float, float, float]:
+    show_progress: bool = True) -> tuple[float, float, float, float, float]:
 
     epoch_loss_total = 0.0
     total_correct_preds = 0
     value_loss_total = 0.0
     value_correct_preds = 0
+    value_error_total = 0.0
     total_examples = 0
 
     model.eval()
@@ -242,6 +265,7 @@ def evaluate_model(
             total_correct_preds += (model_preds == target_moves[:, 0]).sum().item()
             value_loss_total += batch_value_loss.item() * len(batch)
             value_correct_preds += value_correct(value_logits, values)
+            value_error_total += value_error(value_logits, values)
             total_examples += len(batch)
 
             progress.set_postfix(
@@ -249,7 +273,7 @@ def evaluate_model(
                 accuracy=f"{total_correct_preds / total_examples:.1%}"
             )
 
-    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples)
+    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples), (value_error_total / total_examples)
 
 
 def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE,
@@ -355,7 +379,8 @@ def main(
     eval_every: int = EVAL_EVERY,
     compile_mode: str = "default",
     loops: int = 1,
-    blunder_weight: float = BLUNDER_WEIGHT):
+    blunder_weight: float = BLUNDER_WEIGHT,
+    value_bins: int = VALUE_BINS):
 
     #a fine-tune is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -363,7 +388,7 @@ def main(
         initial_model, model_settings = load_checkpoint(init_checkpoint, torch.device("cpu"))
     else:
         #saved in the checkpoint so the model can be rebuilt when loading
-        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads, "loops": loops}
+        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads, "loops": loops, "value_bins": value_bins}
     if mix_set is not None and not 0 < mix_share < 1:
         raise ValueError(f"--mix-share is the share of every batch from {mix_set}, between 0 and 1, got {mix_share}")
     if peak_learn_rate is None:
@@ -424,8 +449,8 @@ def main(
         compile_muon_step(optimizers)
 
     #untrained: loss about ln(1968) = 7.6, value loss ln(2) = 0.69 and half right. Anything else means broken data or metrics
-    val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, device, max_batches=EVAL_BATCHES)
-    print(f"{'starting point' if init_checkpoint is not None else 'untrained'}: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
+    val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_value_error = evaluate_model(compiled_model, val_data_loader, device, max_batches=EVAL_BATCHES)
+    print(f"{'starting point' if init_checkpoint is not None else 'untrained'}: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}, value error {val_value_error:.4f}")
 
     print(f"budget: {budget.describe()}, batches of {batch_size} positions, evaluating every {eval_every} steps")
     run_dir = RUNS_DIR / run_name
@@ -471,22 +496,24 @@ def main(
     save_checkpoint(model, model_settings, run_dir / "final.pt")
 
     #the number to quote: the final weights on the whole val set
-    val_loss, val_accuracy, val_value_loss, val_value_accuracy = evaluate_model(compiled_model, val_data_loader, device)
-    print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}")
+    val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_value_error = evaluate_model(compiled_model, val_data_loader, device)
+    print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}, value error {val_value_error:.4f}")
 
     writer.add_scalar("final/val_loss", val_loss, budget.steps)
     writer.add_scalar("final/val_accuracy", val_accuracy, budget.steps)
     writer.add_scalar("final/val_value_loss", val_value_loss, budget.steps)
     writer.add_scalar("final/val_value_accuracy", val_value_accuracy, budget.steps)
+    writer.add_scalar("final/val_value_error", val_value_error, budget.steps)
 
     #how much of the mix set the model still knows
     if mix_val_loader is not None:
-        mix_val_loss, mix_val_accuracy, mix_val_value_loss, mix_val_value_accuracy = evaluate_model(compiled_model, mix_val_loader, device)
-        print(f"final, on all {len(mix_val_loader.dataset):,} val positions of {mix_set}: val loss {mix_val_loss:.3f}, val accuracy {mix_val_accuracy:.1%}, value loss {mix_val_value_loss:.3f}, value accuracy {mix_val_value_accuracy:.1%}")
+        mix_val_loss, mix_val_accuracy, mix_val_value_loss, mix_val_value_accuracy, mix_val_value_error = evaluate_model(compiled_model, mix_val_loader, device)
+        print(f"final, on all {len(mix_val_loader.dataset):,} val positions of {mix_set}: val loss {mix_val_loss:.3f}, val accuracy {mix_val_accuracy:.1%}, value loss {mix_val_value_loss:.3f}, value accuracy {mix_val_value_accuracy:.1%}, value error {mix_val_value_error:.4f}")
         writer.add_scalar("final/mix_val_loss", mix_val_loss, budget.steps)
         writer.add_scalar("final/mix_val_accuracy", mix_val_accuracy, budget.steps)
         run_settings.update(final_mix_val_loss=mix_val_loss, final_mix_val_accuracy=mix_val_accuracy,
-                            final_mix_val_value_loss=mix_val_value_loss, final_mix_val_value_accuracy=mix_val_value_accuracy)
+                            final_mix_val_value_loss=mix_val_value_loss, final_mix_val_value_accuracy=mix_val_value_accuracy,
+                            final_mix_val_value_error=mix_val_value_error)
     writer.close()
 
     run_settings.update(
@@ -494,6 +521,7 @@ def main(
         final_val_accuracy=val_accuracy,
         final_val_value_loss=val_value_loss,
         final_val_value_accuracy=val_value_accuracy,
+        final_val_value_error=val_value_error,
         train_seconds=budget.seconds,
         positions_seen=budget.positions,
         finished_at=datetime.now().isoformat(timespec="seconds")
@@ -531,6 +559,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="positions per step, for train and val. Default %(default)s")
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention). Default one per head")
     parser.add_argument("--loops", type=int, default=1, help="how many times the whole stack of blocks runs with the same weights. Default %(default)s")
+    parser.add_argument("--value-bins", type=int, default=VALUE_BINS, help="bins of the expected score the eval head predicts a distribution over, 1 for a single logit. Default %(default)s")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="query/key width as a multiple of the values', one for every block or one per block, e.g. 0.25 0.5 0.5 0.75. Default 1")
     parser.add_argument("--init-checkpoint", type=Path, help="fine-tune from this model.pt; the model is the checkpoint's size and the size flags are ignored")
     parser.add_argument("--mix-set", help="a second training set that fills --mix-share of every batch, e.g. full_sf8_30M_mix when fine-tuning on self play")
@@ -570,4 +599,5 @@ if __name__ == "__main__":
          eval_every=arguments.eval_every,
          compile_mode=arguments.compile_mode,
          loops=arguments.loops,
-         blunder_weight=arguments.blunder_weight)
+         blunder_weight=arguments.blunder_weight,
+         value_bins=arguments.value_bins)

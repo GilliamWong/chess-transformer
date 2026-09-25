@@ -67,11 +67,6 @@ pub fn softmax(logits: &mut [f32]) {
     }
 }
 
-//the eval head's logit as a score, as evaluate_many's torch.sigmoid
-pub fn sigmoid(logit: f32) -> f32 {
-    1.0 / (1.0 + (-logit).exp())
-}
-
 pub struct Tree {
     pub board: Chess,   //the root's position
     pub keys: Vec<u64>, //the position_key of every position of the game, the root's last
@@ -159,7 +154,7 @@ impl Tree {
         }
     }
 
-    //mcts.finish for the waiting leaf; answer is the move logits, then the eval logit
+    //mcts.finish for the waiting leaf; answer is the move logits, then the expected score
     pub fn finish_leaf(&mut self, answer: impl Fn(usize) -> f32, answer_width: usize, move_ids: &MoveIds) {
         self.logits.clear();
         self.logits.extend(self.leaf_moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, self.leaf_turn))));
@@ -171,7 +166,7 @@ impl Tree {
         for (&chess_move, &prior) in self.leaf_moves.iter().zip(&self.logits) {
             self.nodes.push(Node::new(Some(chess_move), f64::from(prior)));
         }
-        self.backup(f64::from(sigmoid(answer(answer_width - 1))));
+        self.backup(f64::from(answer(answer_width - 1)));
     }
 
     //mcts.backup along the path

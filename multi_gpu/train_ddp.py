@@ -105,22 +105,22 @@ def evaluate(model, loader, device, max_batches=None):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     count = len(loader) if max_batches is None else min(max_batches, len(loader))
     own_batches = [indices for number, indices in enumerate(islice(loader.sampler, count)) if number % world_size == rank]
-    #loss, accuracy, value loss and value accuracy, each times the positions measured, then the positions
-    totals = torch.zeros(5, dtype=torch.float64, device=device)
+    #loss, accuracy, value loss, value accuracy and value error, each times the positions measured, then the positions
+    totals = torch.zeros(6, dtype=torch.float64, device=device)
     if own_batches:
         positions = sum(len(indices) for indices in own_batches)
         own_loader = DataLoader(loader.dataset, sampler=own_batches, batch_size=None)
         averages = single.evaluate_model(model, own_loader, device, show_progress=rank == 0)
         totals.copy_(torch.tensor([average * positions for average in averages] + [positions], dtype=torch.float64))
     dist.all_reduce(totals)
-    return (totals[:4] / totals[4]).tolist()
+    return (totals[:5] / totals[5]).tolist()
 
 
-METRIC_NAMES = ("val_loss", "val_accuracy", "val_value_loss", "val_value_accuracy")
+METRIC_NAMES = ("val_loss", "val_accuracy", "val_value_loss", "val_value_accuracy", "val_value_error")
 
 
 def log_validation(writer, metrics, step, final=False):
-    tags = ("loss/val", "accuracy/val", "loss/val_value", "accuracy/val_value")
+    tags = ("loss/val", "accuracy/val", "loss/val_value", "accuracy/val_value", "error/val_value")
     for name, tag, value in zip(METRIC_NAMES, tags, metrics):
         writer.add_scalar(f"final/{name}" if final else tag, value, step)
 
@@ -254,7 +254,7 @@ def run(args, device: torch.device):
     model_settings = dict(d_model=args.d_model, num_layers=args.layers, n_heads=args.heads,
                           position_templates=args.templates, mlp_ratio=args.mlp_ratio,
                           qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads,
-                          loops=args.loops)
+                          loops=args.loops, value_bins=args.value_bins)
     raw_model = ChessTransformer(**model_settings).to(device)
     if resumed is not None:
         raw_model.load_state_dict(resumed["model"])
@@ -376,6 +376,7 @@ def parse_args(argv=None):
     parser.add_argument("--mlp-ratio", type=float)
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention)")
     parser.add_argument("--loops", type=int, default=1, help="how many times the whole stack of blocks runs with the same weights")
+    parser.add_argument("--value-bins", type=int, default=single.VALUE_BINS, help="bins of the expected score the eval head predicts a distribution over, 1 for a single logit")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="query/key width as a multiple of the values', one for every block or one per block")
     parser.add_argument("--lr", type=float, default=single.PEAK_LEARN_RATE)
     parser.add_argument("--schedule", choices=("cosine", "hold", "constant"), default=single.SCHEDULE)
