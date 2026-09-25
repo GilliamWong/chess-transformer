@@ -28,8 +28,7 @@ def test_model_of_any_size_comes_back_with_the_same_weights(tmp_path):
         assert torch.equal(loaded_output, output)
 
 
-#checkpoints from before the template embedding came out name template_maps, 0 in all the recipe runs (the d512 among
-#them): those still load, the setting dropped
+#the recipe runs (the d512 among them) saved template_maps=0: they still load, the setting dropped
 def test_checkpoint_without_template_maps_still_loads(tmp_path):
     torch.manual_seed(0)
     model = ChessTransformer(**SETTINGS).eval()

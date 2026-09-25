@@ -1,7 +1,7 @@
 [project]
 name = "chess-transformer"
 version = "0.1.0"
-description = "A transformer that learns to play chess by imitating Magnus Carlsen's games"
+description = "A transformer that plays chess, trained on Stockfish's moves and evals, with MCTS and self-play"
 requires-python = ">=3.10"
 dependencies = [
     "chess>=1.11",
@@ -10,24 +10,22 @@ dependencies = [
     "tensorboard>=2.15",
     "torch>=2.9",
     "tqdm>=4.66",
-    # torch.compile needs triton. The Linux wheel of torch brings its own, Windows has only this community build.
+    # torch.compile needs triton; on Windows only this community build exists
     "triton-windows>=3.5; sys_platform == 'win32'",
-    "zstandard>=0.25.0",
+    "zstandard>=0.25.0", # tools/puzzles.py
 ]
 
 [dependency-groups]
 dev = ["pytest>=8"]
-# selfplay.py's games, compiled from selfplay_rs/ with Rust (https://rustup.rs) whenever its source changes. A machine
-# that only trains can leave it out: uv sync --no-group selfplay
+# selfplay_rs/, needs Rust (https://rustup.rs). A training-only machine can skip it: uv sync --no-group selfplay
 selfplay = ["selfplay-rs"]
 
-# The project is a set of scripts run from the repository root, not an installable package.
+# scripts run from the repository root, not an installable package
 [tool.uv]
 package = false
 default-groups = ["dev", "selfplay"]
 
-# PyPI's Windows wheel of torch is CPU only, so torch comes from PyTorch's own CUDA 13.0 index on
-# Windows and Linux. RTX 50 series cards need CUDA 12.8 or newer. macOS has no CUDA and uses PyPI.
+# PyPI's Windows torch is CPU only, so torch comes from PyTorch's CUDA 13.0 index (RTX 50 needs CUDA 12.8+)
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
 selfplay-rs = { path = "selfplay_rs" }
@@ -38,6 +36,5 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.pytest.ini_options]
-# main.py lives at the repository root rather than in an installed package.
 pythonpath = ["."]
 testpaths = ["tests"]

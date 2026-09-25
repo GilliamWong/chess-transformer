@@ -1,22 +1,8 @@
-#self play for expert iteration: the model plays itself with mcts.py's search, and every position is saved with what the
-#search found there, as a training set main.py can fine-tune on (SelfPlayDataset in data.py):
-#   policy target  each move's share of the search's visits, for the TOP_MOVES most visited
-#   value target   the game's result and the search's mean score at the root, which data.py blends (RESULT_WEIGHT)
-#
+#self play for expert iteration: every position is saved with what mcts found there, as a training set for main.py.
 #   python selfplay.py artifacts/runs/rl_start_d128_4min/model.pt --name selfplay_r1 --positions 1_000_000 --tablebase
 #   python main.py --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix
-#
-#it can be stopped (ctrl+c) and started again with the same flags: every finished game is kept, and a larger --positions
-#carries on where it stopped.
-#
-#for the games to differ, every search mixes noise into its root's priors (mcts.py), and the first SAMPLED_PLIES plies
-#are drawn from the visit counts instead of taking the most visited move. A game ends by the rules (a draw that could be
-#claimed counts), with --tablebase once the tables know the result (5 pieces, and the result is then exact), or as a draw
-#after MAX_PLIES
-#
-#the games are played in rust (selfplay_rs/, RustSelfPlayBatch), SelfPlayBatch's search and rules move for move at a
-#fraction of the cpu (tests/test_selfplay_rs.py holds the two to each other): a change to mcts.py's search or to the
-#rules here has to be made in selfplay_rs/src too. The network runs in one inference process on the gpu (inference.py)
+#the games run in rust (selfplay_rs/): mirror any change to mcts.py's search or the rules there, tests/test_selfplay_rs.py
+#holds it to the python reference in tests/reference_selfplay.py
 from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterable, Iterator
@@ -33,9 +19,8 @@ import subprocess
 import sys
 import time
 import traceback
-from typing import TYPE_CHECKING
 try:
-    import msvcrt #reads single key presses, for + and - while self play runs
+    import msvcrt #single key presses, for + and -
 except ImportError:
     msvcrt = None
 import chess
@@ -43,40 +28,28 @@ import numpy as np
 from tqdm import tqdm
 import mcts
 import selfplay_rs
-from encoding import MOVE_IDS_BY_SQUARES, NUM_MOVE_IDS, TOKENS_PER_BOARD, encode_board, encode_move_to_id
+from encoding import MOVE_IDS_BY_SQUARES, NUM_MOVE_IDS, TOKENS_PER_BOARD
 from tools.label_with_stockfish import NO_MOVE
-from tools.tablebase import SYZYGY_DIR, TABLEBASE_PIECES, covers, open_tablebase, wdl_score
-#every worker imports this file (a spawned process runs it again), so nothing at the top imports torch: data.py,
-#tools.checkpoint and inference.py do, and the main process imports them where it uses them
-if TYPE_CHECKING:
-    import torch
-    from torch import nn
+from tools.tablebase import SYZYGY_DIR, TABLEBASE_PIECES, open_tablebase
+#every worker imports this file, so nothing at the top may import torch (data.py, tools.checkpoint and inference.py do)
 
-SIMULATIONS = 64 #+390 elo over the policy alone in the ladder of artifacts/mcts_ladder_2026-09-23.md
+SIMULATIONS = 64 #+390 elo over the policy alone (artifacts/mcts_ladder_2026-09-23.md)
 TOP_MOVES = 8
 SAMPLED_PLIES = 30
-#the move played keeps its subtree, and its visits count towards the next search's SIMULATIONS. Measured on 394 self play
-#positions against an 800 simulation search: the targets are as good (visit shares 0.226 from the reference's either way,
-#the most visited move the reference's 77.7% against 75.6%, root score off by 0.0194 against 0.0195), and a move needs
-#37.9 new simulations instead of 64
+#the move played keeps its subtree: the same target quality for 38 new simulations a move instead of 64
 TREE_REUSE = True
 MAX_PLIES = 600 #the fifty move rule ends nearly every game long before
 VAL_EVERY = 50 #every 50th game goes to val
-#the workers play on the cpu in rust, many games each, and one inference process runs the network on the gpu for all of
-#them: every round it takes the boards of all the workers that are waiting in one batch. Measured with the d128 (compiled,
-#bf16), in network evaluations a second: 1 worker x 256 games 96,600, 2 x 256 138,000-144,000 (the gpu's limit, with 10%
-#of the cpu busy), 3 x 256 134,000, 4 x 256 132,000, 2 x 512 134,000. The python search made 83,900 with 28 workers x 64
-#games and every cpu thread busy. + and - change the number while it runs; every slot adds batch sizes the inference
-#process records a graph for, and a larger model needs fewer workers (the d640's gpu limit is about 4,700 a second)
+#rust workers of GAMES_PER_PROCESS games each: with the d128, 2 already keep the gpu busy (~140k evaluations a second)
 PROCESSES = 2
 MAX_PROCESSES = 8
 GAMES_PER_PROCESS = 256
-LOG_EVERY_GAMES = 50 #between two points of the tensorboard charts
+LOG_EVERY_GAMES = 50
 SEED = 42
-RECORD_ATTEMPTS = 20 #about 10 seconds of trying to write the record
+RECORD_ATTEMPTS = 20 #about 10 seconds of retrying the record's move
 
 
-#one game: every position before a move with what the search found there, and the result from white's side
+#every position before a move with what the search found there, and the result from white's side
 @dataclass
 class Game:
     number: int
@@ -92,171 +65,21 @@ class Game:
         return np.where(self.white_to_move, self.white_score, 1 - self.white_score).astype(np.float32)
 
 
-#white's result if the game is over, None while it goes on
-def final_result(board: chess.Board, max_plies: int = MAX_PLIES) -> float | None:
-    outcome = board.outcome(claim_draw=True)
-    if outcome is not None:
-        return 0.5 if outcome.winner is None else 1.0 if outcome.winner == chess.WHITE else 0.0
-    if mcts.tablebase is not None and covers(board):
-        score = wdl_score(mcts.tablebase.probe_wdl(board))
-        return score if board.turn == chess.WHITE else 1 - score
-    if len(board.move_stack) >= max_plies:
-        return 0.5
-    return None
-
-#one game being played: its board, its random numbers (from the seed and its number alone, so a game can be played
-#again), the search of its current move, and what it has recorded so far
-class GameInProgress:
-    def __init__(self, number: int, seed: int, board: chess.Board, tree_reuse: bool):
-        self.number = number
-        self.random = np.random.default_rng([seed, number])
-        self.board = board.copy()
-        self.tree_reuse = tree_reuse
-        self.boards, self.visit_moves, self.visit_shares, self.root_scores, self.white_to_move = [], [], [], [], []
-        self.new_search(mcts.Node(prior=1.0))
-
-    #the search of the next move starts at root: a new node, or with tree reuse the node of the move just played, whose
-    #visits from the last search count towards this one's
-    def new_search(self, root: mcts.Node) -> None:
-        self.root = root
-        #the search walks down on the game's own board and is taken back to here after every simulation
-        self.root_plies = len(self.board.move_stack)
-        self.noised = False
-        self.add_noise_once_expanded()
-
-    #the root noise goes in as soon as the root has children, before any of them is chosen: at once for a reused root that
-    #has them, after the first simulation otherwise (as in search())
-    def add_noise_once_expanded(self) -> None:
-        if not self.noised and self.root.children:
-            mcts.add_root_noise(self.root, self.random)
-            self.noised = True
-
-    #the search of this move is done: record the position with what the search found, and play a move
-    def play_move(self, sampled_plies: int) -> None:
-        moves = list(self.root.children)
-        visits = np.array([self.root.children[move].visit_count for move in moves], dtype=np.float64)
-
-        most_visited = [index for index in np.argsort(-visits, kind="stable")[:TOP_MOVES] if visits[index] > 0]
-        position_moves = np.full(TOP_MOVES, NO_MOVE, dtype=np.int16)
-        position_shares = np.zeros(TOP_MOVES, dtype=np.float32)
-        position_moves[:len(most_visited)] = [encode_move_to_id(moves[index], self.board.turn) for index in most_visited]
-        position_shares[:len(most_visited)] = visits[most_visited] / visits[most_visited].sum()
-
-        self.boards.append(encode_board(self.board))
-        self.visit_moves.append(position_moves)
-        self.visit_shares.append(position_shares)
-        #the root keeps its score for the side that moved into it, the opponent of the side to move here (see Node)
-        self.root_scores.append(1 - self.root.value_sum / self.root.visit_count)
-        self.white_to_move.append(self.board.turn == chess.WHITE)
-
-        if len(self.board.move_stack) < sampled_plies:
-            move = moves[self.random.choice(len(moves), p=visits / visits.sum())]
-        else:
-            move = mcts.most_visited_move(self.root)
-        next_root = self.root.children[move] if self.tree_reuse else mcts.Node(prior=1.0)
-        self.board.push(move)
-        self.new_search(next_root)
-
-    def to_game(self, white_score: float) -> Game:
-        return Game(self.number, np.array(self.boards, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD),
-                    np.array(self.visit_moves, dtype=np.int16).reshape(-1, TOP_MOVES), np.array(self.visit_shares, dtype=np.float32).reshape(-1, TOP_MOVES),
-                    np.array(self.root_scores, dtype=np.float32), np.array(self.white_to_move, dtype=bool), white_score)
-
-
-#plays up to `size` games at once, one simulation of every game's search per round: each walks down its tree, the leaves
-#that need the network go through it together in one call, and each backs its score up. The search is mcts.py's, with the
-#root noise as in search(); a move is played once its root has `simulations` visits, and a game that ends makes room for
-#the next number. The workers play RustSelfPlayBatch's games instead: these are what the rust is tested against
-class SelfPlayBatch:
-    def __init__(self, model: nn.Module, device: torch.device, simulations: int, numbers: Iterator[int], size: int, seed: int,
-                 board: chess.Board, sampled_plies: int, max_plies: int, tree_reuse: bool):
-        self.model, self.device, self.simulations = model, device, simulations
-        self.numbers, self.seed, self.start_board = numbers, seed, board
-        self.sampled_plies, self.max_plies, self.tree_reuse = sampled_plies, max_plies, tree_reuse
-        self.games: list[GameInProgress] = []
-        self.finished: list[Game] = []
-        for _ in range(size):
-            self.start_next_game()
-
-    def start_next_game(self) -> None:
-        for number in self.numbers:
-            game = GameInProgress(number, self.seed, self.start_board, self.tree_reuse)
-            white_score = final_result(game.board, self.max_plies)
-            if white_score is None:
-                self.games.append(game)
-                return
-            self.finished.append(game.to_game(white_score)) #over before it began: a game without positions
-
-    def playing(self) -> bool:
-        return bool(self.games or self.finished)
-
-    #one round, returning the games it finished
-    def step(self) -> list[Game]:
-        waiting = []
-        for game in self.games:
-            leaf = mcts.descend(game.root, game.board)
-            if leaf.value is None:
-                waiting.append((game, leaf))
-            else:
-                mcts.finish(leaf, None, leaf.value)
-        if waiting:
-            #every waiting game's board is still at its leaf
-            evaluations = mcts.evaluate_many(self.model, [game.board for game, _ in waiting], self.device)
-            for (game, leaf), (priors, value) in zip(waiting, evaluations):
-                mcts.finish(leaf, priors, value)
-
-        playing = []
-        for game in self.games:
-            while len(game.board.move_stack) > game.root_plies:
-                game.board.pop()
-            game.add_noise_once_expanded()
-            if game.root.visit_count >= self.simulations:
-                game.play_move(self.sampled_plies)
-                white_score = final_result(game.board, self.max_plies)
-                if white_score is not None:
-                    self.finished.append(game.to_game(white_score))
-                    continue
-            playing.append(game)
-
-        replacements = len(self.games) - len(playing)
-        self.games = playing
-        for _ in range(replacements):
-            self.start_next_game()
-        finished, self.finished = self.finished, []
-        return finished
-
-#the games with these numbers, `size` at a time, each yielded as it ends
-def play_games(model: nn.Module, device: torch.device, simulations: int, numbers: Iterable[int], size: int, seed: int = SEED,
-               board: chess.Board | None = None, sampled_plies: int = SAMPLED_PLIES, max_plies: int = MAX_PLIES,
-               tree_reuse: bool = TREE_REUSE) -> Iterator[Game]:
-    batch = SelfPlayBatch(model, device, simulations, iter(numbers), size, seed, board if board is not None else chess.Board(), sampled_plies,
-                          max_plies, tree_reuse)
-    while batch.playing():
-        yield from batch.step()
-
-#game number `number` of a run on its own
-def play_game(model: nn.Module, device: torch.device, simulations: int, number: int, seed: int = SEED, board: chess.Board | None = None,
-              sampled_plies: int = SAMPLED_PLIES, max_plies: int = MAX_PLIES, tree_reuse: bool = TREE_REUSE) -> Game:
-    return next(play_games(model, device, simulations, [number], 1, seed, board, sampled_plies, max_plies, tree_reuse))
-
-
-#encoding.py's move ids for the rust games, by from square, to square and promotion (0 for none, python-chess's piece
-#type otherwise), -1 where there is no such move
+#encoding.py's move ids by from square, to square and promotion (0 for none, else python-chess's piece type), -1 for no move
 def move_id_table() -> np.ndarray:
     table = np.full((64, 64, 7), -1, dtype=np.int16)
     for (from_square, to_square, promotion), move_id in MOVE_IDS_BY_SQUARES.items():
         table[from_square, to_square, promotion or 0] = move_id
     return table
 
-#what every search in rust is built with (selfplay_rs.SelfPlayGames and Searches): the move ids, mcts.py's constants read
-#now (a test can change them), and the tablebase
+#mcts.py's constants are read at call time, so a test can change them
 def rust_search_settings(use_tablebase: bool) -> dict:
     return dict(move_id_table=move_id_table().ravel().tolist(), answer_width=ANSWER_WIDTH, c_puct=mcts.C_PUCT, c_puct_factor=mcts.C_PUCT_FACTOR,
                 c_puct_base=mcts.C_PUCT_BASE, fpu_reduction=mcts.FPU_REDUCTION, draw=mcts.DRAW, repetitions_for_a_draw=mcts.REPETITIONS_FOR_A_DRAW,
                 tablebase_folder=str(SYZYGY_DIR) if use_tablebase else None, tablebase_pieces=TABLEBASE_PIECES)
 
-#SelfPlayBatch's games played in rust (selfplay_rs): the same games with the random numbers of rust's generator instead of
-#numpy's. network takes the boards of the leaves and gives back ANSWER_WIDTH numbers for each, as the inference process does
+#up to `size` games at once in rust, one simulation of each per round. network takes the leaves' boards and gives back
+#ANSWER_WIDTH numbers for each, as the inference process does
 class RustSelfPlayBatch:
     def __init__(self, network: Callable[[np.ndarray], np.ndarray], simulations: int, numbers: Iterator[int], size: int, seed: int,
                  board: chess.Board, sampled_plies: int, max_plies: int, tree_reuse: bool, use_tablebase: bool):
@@ -287,7 +110,7 @@ class RustSelfPlayBatch:
                      np.frombuffer(root_scores, dtype=np.float32), np.frombuffer(white_to_move, dtype=bool), white_score)
                 for number, boards, visit_moves, visit_shares, root_scores, white_to_move, white_score in self.games.take_finished()]
 
-#play_games in rust
+#the games with these numbers, `size` at a time, each yielded as it ends
 def play_games_in_rust(network: Callable[[np.ndarray], np.ndarray], simulations: int, numbers: Iterable[int], size: int, seed: int = SEED,
                        board: chess.Board | None = None, sampled_plies: int = SAMPLED_PLIES, max_plies: int = MAX_PLIES,
                        tree_reuse: bool = TREE_REUSE, use_tablebase: bool = False) -> Iterator[Game]:
@@ -297,10 +120,8 @@ def play_games_in_rust(network: Callable[[np.ndarray], np.ndarray], simulations:
         yield from batch.step()
 
 
-#the files of a self play set, on disk: every finished game is added to its split's files, and then the record of what
-#has been written, first as <name>_selfplay.json.part and then moved over <name>_selfplay.json. Opening the set again
-#takes the fuller of the two records that the files hold all of (the move can fail after the files and the .part are
-#written), and cuts off whatever was written after it, the part of a game that an interruption left behind
+#a self play set on disk: each game is appended to its split's files, then the record goes to a .part moved over
+#<name>_selfplay.json. Reopening takes the fuller record the files hold, and cuts off whatever was written after it
 class SelfPlaySet:
     def __init__(self, folder: Path, name: str, settings: dict):
         self.folder = folder
@@ -310,7 +131,7 @@ class SelfPlaySet:
 
         records = [record for record in map(self.read_record, (self.record_path, self.partial_record_path)) if record is not None]
         for record in records:
-            #sets played before tree reuse existed were played without it
+            #sets from before tree reuse were played without it
             played, asked = {"tree_reuse": False, **record["settings"]}, {"tree_reuse": False, **settings}
             if played != asked:
                 reuse = " (it was played without tree reuse: --no-tree-reuse carries on with it)" if played["tree_reuse"] != asked["tree_reuse"] else ""
@@ -333,7 +154,7 @@ class SelfPlaySet:
                     with open(path, "r+b") as file:
                         file.truncate(positions * bytes_per_position)
 
-    #None when there is none, or only half of one (the .part of an interrupted write)
+    #None when missing or half written
     @staticmethod
     def read_record(path: Path) -> dict | None:
         try:
@@ -341,7 +162,6 @@ class SelfPlaySet:
         except (FileNotFoundError, json.JSONDecodeError):
             return None
 
-    #whether every file holds at least the positions the record counts
     def files_hold(self, record: dict) -> bool:
         return all((path.stat().st_size if path.exists() else 0) >= record["positions"][split] * bytes_per_position
                    for split in ("train", "val") for path, bytes_per_position in self.files(split).values())
@@ -356,7 +176,7 @@ class SelfPlaySet:
     def positions(self) -> int:
         return self.record["positions"]["train"] + self.record["positions"]["val"]
 
-    #False when the record could not be moved into place this time (see write_record)
+    #False when the record could not be moved into place this time
     def add(self, game: Game, seconds: float) -> bool:
         split = "val" if game.number % VAL_EVERY == 0 else "train"
         arrays = {"boards": game.boards, "visit_moves": game.visit_moves, "visit_shares": game.visit_shares, "outcomes": game.outcomes(), "root_scores": game.root_scores}
@@ -371,9 +191,7 @@ class SelfPlaySet:
         self.record["seconds"] += seconds
         return self.write_record()
 
-    #written whole under another name first, so an interruption never leaves half a record. Windows refuses the move while
-    #another program has the file open for a moment (a virus scanner, an indexer, an editor): it is tried again, and if it
-    #keeps failing the game is still safe, since the .part holds its record and the next game tries again
+    #windows refuses the move while another program has the file open for a moment: retried, and the .part keeps the game safe
     def write_record(self) -> bool:
         for attempt in range(RECORD_ATTEMPTS):
             try:
@@ -385,12 +203,11 @@ class SelfPlaySet:
         return False
 
 
-#the network's answer for one position as the inference process sends it back: the move logits, then the eval logit
+#the move logits, then the eval logit
 ANSWER_WIDTH = NUM_MOVE_IDS + 1
 
-#one worker's place at the inference process: shared memory for the boards it sends (their tokens, one byte each) and for
-#the answers it gets back, and a pipe for "this many boards are ready" and "the answers are in". Made by the main process,
-#so a worker that is added later finds its place ready
+#a worker's place at the inference process: shared memory for its boards (a byte a token) and answers, and a pipe.
+#made by the main process, so a worker added later finds it ready
 class Slot:
     def __init__(self, games_per_process: int):
         self.boards = shared_memory.SharedMemory(create=True, size=games_per_process * TOKENS_PER_BOARD)
@@ -402,7 +219,6 @@ class Slot:
             memory.close()
             memory.unlink()
 
-#a slot's shared memory as arrays, in whichever process attaches to it
 def slot_arrays(boards_name: str, answers_name: str, games_per_process: int) -> tuple[list, np.ndarray, np.ndarray]:
     memories = [shared_memory.SharedMemory(name=boards_name), shared_memory.SharedMemory(name=answers_name)]
     boards = np.ndarray((games_per_process, TOKENS_PER_BOARD), dtype=np.uint8, buffer=memories[0].buf)
@@ -410,8 +226,7 @@ def slot_arrays(boards_name: str, answers_name: str, games_per_process: int) -> 
     return memories, boards, answers
 
 
-#the network as a worker sees it: the boards go to the inference process through its slot, and the answers come back the
-#same way. They stay good until the next call
+#the network as a worker sees it, through its slot. The answers stay valid until the next call
 class RemoteNetwork:
     def __init__(self, boards_name: str, answers_name: str, connection, games_per_process: int):
         self.memories, self.boards, self.answers = slot_arrays(boards_name, answers_name, games_per_process)
@@ -425,10 +240,8 @@ class RemoteNetwork:
         return self.answers[:count]
 
 
-#one self play process, on the cpu only: games_per_process games at a time in rust, their numbers from the shared counter
-#next_number, their leaves evaluated by the inference process through its slot, each game sent back through results as
-#(worker_id, game) as it ends. Once its stop is set it starts no new game, finishes the ones it has and sends
-#(worker_id, None). A failure is sent back as its traceback
+#one cpu-only self play process: sends (worker_id, game) as games end, (worker_id, None) once stopped and finished,
+#or its traceback on failure
 def worker(worker_id: int, slot_names: tuple[str, str], connection_, simulations: int, games_per_process: int, seed: int, use_tablebase: bool,
            tree_reuse: bool, next_number, stop, results) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -449,10 +262,8 @@ def worker(worker_id: int, slot_names: tuple[str, str], connection_, simulations
         results.put((worker_id, traceback.format_exc()))
 
 
-#the processes of a run: the inference process, and the self play workers, which can grow and shrink while it runs. Each
-#worker takes the next game number from a shared counter, so no two play the same game, and one asked to stop finishes the
-#games it has before it goes. Every worker has a slot at the inference process; the slot of one that finished cleanly is
-#given to the next, the slot of one that failed is not (its last request may still be answered into it)
+#the inference process and the workers, which can grow and shrink while it runs. A finished worker's slot is reused,
+#a failed one's is not (its last request may still be answered into it)
 class Workers:
     def __init__(self, context, first_number: int, checkpoint_path: str, compile_model: bool, precision: str, games_per_process: int, worker_arguments: tuple):
         self.context = context
@@ -475,7 +286,6 @@ class Workers:
                                                self.inference_ready, self.inference_stop, self.served_calls, self.served_positions))
         self.inference.start()
 
-    #waits until the inference process has its graphs recorded
     def wait_for_inference(self) -> None:
         while not self.inference_ready.wait(timeout=1):
             if not self.inference.is_alive():
@@ -490,12 +300,10 @@ class Workers:
                                                                self.next_number, self.stops[worker_id], self.results))
         self.processes[worker_id].start()
 
-    #a worker that finished its games: its slot is free again
     def finished(self, worker_id: int) -> None:
         self.done.add(worker_id)
         self.free_slots.append(self.slot_of[worker_id])
 
-    #a worker that failed: its slot is not used again
     def failed(self, worker_id: int) -> None:
         self.done.add(worker_id)
 
@@ -503,11 +311,10 @@ class Workers:
     def playing(self) -> list[int]:
         return [worker_id for worker_id in self.processes if worker_id not in self.done and not self.stops[worker_id].is_set()]
 
-    #how many more can be started: one per free slot
     def can_start(self) -> bool:
         return bool(self.free_slots)
 
-    #the newest one playing finishes its games and goes
+    #the newest one finishes its games and goes
     def stop_one(self) -> None:
         self.stops[self.playing()[-1]].set()
 
@@ -518,14 +325,14 @@ class Workers:
     def all_done(self) -> bool:
         return len(self.done) == len(self.processes)
 
-    #the ones that ended without saying so (killed from outside), now counted as failed
+    #the ones killed from outside, now counted as failed
     def dead(self) -> list[int]:
         dead = [worker_id for worker_id, process in self.processes.items() if worker_id not in self.done and not process.is_alive()]
         for worker_id in dead:
             self.failed(worker_id)
         return dead
 
-    #only after a second ctrl+c or a failure are games still being played: they are lost
+    #games still being played are lost
     def terminate(self) -> None:
         for process in self.processes.values():
             process.terminate()
@@ -539,7 +346,7 @@ class Workers:
             slot.close()
 
 
-#keys pressed in the console since the last look, none where there is no console to read (msvcrt is windows only)
+#keys pressed since the last look; none without a windows console
 def pressed_keys() -> list[str]:
     keys = []
     try:
@@ -550,8 +357,7 @@ def pressed_keys() -> list[str]:
     return keys
 
 
-#sets this process's priority class (windows only): main lowers itself to below normal, which the workers inherit, so the rest
-#of the computer stays responsive for the hours this takes
+#windows only; child processes inherit it
 def set_priority(priority_class: int) -> None:
     if sys.platform != "win32":
         return
@@ -577,7 +383,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
         print(f"{name} already has {games.positions():,} positions")
         return
     if use_tablebase:
-        open_tablebase().close() #fails here, not in every worker, when the tables are missing
+        open_tablebase().close() #fails here rather than in every worker
     set_priority(subprocess.BELOW_NORMAL_PRIORITY_CLASS if sys.platform == "win32" else 0)
 
     workers = Workers(multiprocessing.get_context("spawn"), games.record["next_game"], str(checkpoint_path), compile_model, precision, games_per_process,
@@ -593,12 +399,12 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
     print(f"{len(workers.playing())} processes playing {games_per_process} games each: the first games end together after a few minutes.\n"
           f"+ or - adds or removes a process (up to {MAX_PROCESSES}), ctrl+c finishes the games being played and saves them, a second ctrl+c stops at once")
 
-    #charts of the run in tensorboard, next to the training runs: imported here, it is slow to import
+    #imported here, it is slow to import
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(log_dir=str(RUNS_DIR / "selfplay" / name))
     progress = tqdm(total=positions, initial=games.positions(), unit="pos", smoothing=0.05, dynamic_ncols=True, desc=name)
 
-    #once finishing, every process finishes the games it has and starts no more, so every game begun is saved
+    #once finishing, every process finishes its games and starts no more, so every game begun is saved
     finishing = False
     def finish() -> None:
         nonlocal finishing
@@ -606,7 +412,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
         workers.stop_all()
         progress.set_description(f"{name}, finishing the games being played")
 
-    #the first ctrl+c only asks for the finish. An exception here could land in the middle of writing a game
+    #the first ctrl+c only asks for the finish: an exception could land in the middle of writing a game
     def interrupt(signal_number, frame) -> None:
         if finishing:
             raise KeyboardInterrupt
@@ -638,7 +444,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
                     raise RuntimeError("every self play process has stopped")
                 continue
             except InterruptedError:
-                #on windows a ctrl+c breaks off the wait after interrupt has run, and python does not wait again itself
+                #on windows a ctrl+c breaks off the wait after interrupt has run, and python does not retry it
                 continue
             if message is None:
                 workers.finished(worker_id)
@@ -693,9 +499,9 @@ if __name__ == "__main__":
     parser.add_argument("--simulations", type=int, default=SIMULATIONS, help="per move, default %(default)s")
     parser.add_argument("--tablebase", action="store_true", help="end a game once it has at most 5 pieces, with the syzygy tables' result")
     parser.add_argument("--processes", type=int, default=PROCESSES, help=f"at the start, + and - change it while it runs (up to {MAX_PROCESSES}). Default %(default)s")
-    parser.add_argument("--games-per-process", type=int, default=GAMES_PER_PROCESS, help="games each process plays at once, their leaves evaluated in one call. Default %(default)s")
+    parser.add_argument("--games-per-process", type=int, default=GAMES_PER_PROCESS, help="games each process plays at once. Default %(default)s")
     parser.add_argument("--no-tree-reuse", action="store_true", help="start every search from a new root (see TREE_REUSE)")
-    parser.add_argument("--no-compile", action="store_true", help="skip torch.compile in the inference process (it takes 10-30 s at the start, and makes the gpu 40%% faster)")
+    parser.add_argument("--no-compile", action="store_true", help="skip torch.compile in the inference process (10-30 s at the start, 40%% faster gpu)")
     parser.add_argument("--precision", choices=["bf16", "tf32"], default="bf16", help="of the network in the inference process (see Bf16). Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
     arguments = parser.parse_args()

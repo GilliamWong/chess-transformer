@@ -6,7 +6,6 @@ from tools.play import elo_log
 from tools.play.elo_log import elo_margin, lineage, log_result, read_results
 
 
-#a run fine-tuned from a run fine-tuned from a run trained from scratch is round 2 of the first one's lineage
 def test_the_round_is_counted_along_the_init_checkpoints(tmp_path, monkeypatch):
     monkeypatch.setattr(elo_log, "ARTIFACTS_DIR", tmp_path / "artifacts")
     runs = tmp_path / "artifacts" / "runs"
@@ -32,6 +31,5 @@ def test_a_result_is_logged_with_its_elo(tmp_path, monkeypatch):
     assert list((tmp_path / "elo").iterdir()) #the tensorboard chart was written
 
 
-#the interval shrinks with more games of the same score
 def test_the_margin_shrinks_with_more_games():
     assert elo_margin(400, 400, 200) < elo_margin(40, 40, 20)

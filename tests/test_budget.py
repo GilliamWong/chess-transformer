@@ -4,9 +4,9 @@ from tools import budget as budget_module
 from tools.budget import Budget
 
 
+#a clock the test moves by hand: clock.now += seconds
 @pytest.fixture
 def clock(monkeypatch):
-    """a clock the test moves by hand: clock.now += seconds"""
     class Clock:
         now = 1000.0
     monkeypatch.setattr(budget_module.time, "perf_counter", lambda: Clock.now)

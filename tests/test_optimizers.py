@@ -19,8 +19,7 @@ def names_in(optimizer: torch.optim.Optimizer, model: ChessTransformer) -> set[s
     return {names[id(parameter)] for group in optimizer.param_groups for parameter in group["params"]}
 
 
-#the linear layers inside the blocks go to Muon; the embeddings, the template bank, the heads, the biases and the
-#layer norms to AdamW, and every parameter to exactly one of the two
+#every parameter goes to exactly one of the two
 def test_muon_takes_the_weight_matrices_inside_the_blocks_and_adamw_the_rest():
     model = small_model()
 
@@ -37,7 +36,7 @@ def test_muon_takes_the_weight_matrices_inside_the_blocks_and_adamw_the_rest():
     assert muon.param_groups[0]["lr"].item() == pytest.approx(adamw.param_groups[0]["lr"])
 
 
-#Muon's learning rate is a tensor (the compiled step reads it); the schedule has to move it just like AdamW's float
+#Muon's learning rate is a tensor; the schedule has to move it just like AdamW's float
 def test_the_schedule_moves_both_learning_rates_alike():
     model = small_model()
     optimizers = make_optimizers(model, 1e-3, CPU)
@@ -57,7 +56,7 @@ def test_the_schedule_moves_both_learning_rates_alike():
         assert muon_lr.item() == pytest.approx(adamw_lr)
 
 
-#both optimizers really step their weights: the model learns a fixed batch
+#both optimizers really step their weights
 def test_training_with_muon_learns_a_batch():
     model = small_model()
     boards = torch.randint(0, 13, (16, 70))

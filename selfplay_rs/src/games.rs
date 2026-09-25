@@ -1,5 +1,4 @@
-//selfplay.SelfPlayBatch's games, each with its search tree (search.rs), so that without its random numbers a game is the
-//python's move for move
+//the games of tests/reference_selfplay.py's SelfPlayBatch: without the random numbers, the python's move for move
 use crate::rules::{MoveIds, Tables, encode_board, final_result};
 use crate::search::{SearchSettings, Tree};
 use rand::{RngExt, SeedableRng};
@@ -20,7 +19,7 @@ pub struct GameSettings {
     pub root_noise_share: f64,
 }
 
-//what a game has recorded: every position before a move with what the search found there (selfplay.Game)
+//selfplay.Game: every position before a move with what the search found there
 #[derive(Default)]
 pub struct Record {
     pub boards: Vec<u8>,
@@ -36,7 +35,7 @@ pub struct FinishedGame {
     pub white_score: f64,
 }
 
-//selfplay.GameInProgress
+//reference_selfplay.GameInProgress
 pub struct Game {
     number: u64,
     random: ChaCha8Rng,
@@ -77,7 +76,7 @@ impl Game {
         }
     }
 
-    //GameInProgress.play_move: records the position with what the search found, and plays a move
+    //GameInProgress.play_move
     pub fn play_move(&mut self, settings: &GameSettings, move_ids: &MoveIds) {
         let root = *self.tree.root();
         let turn = self.tree.board.turn();

@@ -53,7 +53,7 @@ def test_moving_a_piece_changes_the_output(batch):
     assert difference > 1e-4
 
 
-#without batch_first=True attention runs across the boards of a batch instead of the tokens of a board
+#a board's output must not depend on the other boards of its batch
 def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
     model = small_model().eval()
     boards, _ = batch
@@ -62,8 +62,8 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
         assert torch.allclose(alone, in_a_batch[:1], atol=1e-5)
 
 
-#something added to every move changes no probability but can grow without limit, and did: training in bf16
-#collapsed once that constant passed 256. The promotion term may only reach the promotions
+#a term added to every move can drift without limit (bf16 training collapsed once it passed 256), so the promotion
+#term may only reach the promotions
 def test_promotion_term_only_changes_promotion_logits(batch):
     model = small_model().eval()
     boards, _ = batch
@@ -97,8 +97,7 @@ def test_every_parameter_gets_a_gradient(batch):
     model = small_model()
     boards, moves = batch
 
-    #the bias is template_mix times templates, so while the templates are zero template_mix cannot get a gradient.
-    #In training they leave zero on the first step
+    #while the templates are zero template_mix gets no gradient; in training they leave zero on the first step
     with torch.no_grad():
         model.templates.normal_(std=0.1)
 

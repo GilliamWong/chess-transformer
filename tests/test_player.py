@@ -9,10 +9,10 @@ import torch
 from torch import nn
 
 from data import EXPECTED_SCORE_PER_CENTIPAWN
-from encoding import NUM_MOVE_IDS, encode_board, encode_move_to_id
+from encoding import NUM_MOVE_IDS, encode_move_to_id
 from tools.play.evaluate_elo import annotate_searches, elo_difference, model_engine, parse_score
 from model import ChessTransformer
-from tools.play.player import AHEAD_SCORE, CudaGraphModel, choose_move, score_to_centipawns, search_move
+from tools.play.player import AHEAD_SCORE, choose_move, score_to_centipawns, search_move
 from tools.play.uci import parse_position
 
 CPU = torch.device("cpu")
@@ -24,7 +24,7 @@ def untrained_model() -> ChessTransformer:
     return ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval()
 
 
-#an untrained model's favourite move is illegal almost every time, so only the mask can make this pass
+#an untrained model's favourite move is almost always illegal, so only the mask makes this pass
 def test_chosen_move_is_always_legal(untrained_model, carlsen_games):
     for game in carlsen_games:
         board = game.board()
@@ -36,7 +36,6 @@ def test_chosen_move_is_always_legal(untrained_model, carlsen_games):
 @pytest.mark.parametrize(
     "fen, only_move",
     [
-        #the king is in check along the back rank and the g file is covered, so one square is left
         pytest.param("6rk/8/8/8/8/8/8/r6K w - - 0 1", "h1h2", id="white-king-has-one-square"),
         pytest.param("R6k/8/8/8/8/8/8/6RK b - - 0 1", "h8h7", id="black-king-has-one-square"),
     ],
@@ -49,7 +48,7 @@ def test_the_only_legal_move_is_chosen(untrained_model, fen, only_move):
 
 
 def test_promotion_moves_can_be_chosen(untrained_model):
-    #every legal move here is a promotion, so the promotion ids have to survive the mask
+    #every legal move is a promotion
     board = chess.Board("1n2k3/P7/8/8/8/8/8/8 w - - 0 1")
 
     assert choose_move(untrained_model, board, CPU).promotion is not None
@@ -62,7 +61,7 @@ def test_no_move_to_choose_when_the_game_is_over(untrained_model):
         choose_move(untrained_model, checkmate, CPU)
 
 
-#a search of one or two simulations visits at most the policy's favourite move, so it has to play what argmax plays
+#one or two simulations visit at most the policy's favourite
 @pytest.mark.parametrize("simulations", [1, 2])
 def test_a_search_without_room_to_search_plays_the_argmax_move(untrained_model, carlsen_games, simulations):
     board = carlsen_games[0].board()
@@ -71,25 +70,6 @@ def test_a_search_without_room_to_search_plays_the_argmax_move(untrained_model, 
         board.push(played_move)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a gpu")
-def test_the_cuda_graph_gives_the_models_outputs(carlsen_games):
-    torch.manual_seed(0)
-    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval().cuda()
-    graphed = CudaGraphModel(model)
-
-    board = carlsen_games[1].board()
-    for played_move in list(carlsen_games[1].mainline_moves())[:20]:
-        boards = torch.tensor(encode_board(board), dtype=torch.long).unsqueeze(0)
-        with torch.no_grad():
-            expected_moves, expected_eval = model(boards.cuda())
-        graphed_moves, graphed_eval = graphed(boards)
-        assert graphed_moves.device.type == "cpu"
-        assert torch.allclose(graphed_moves, expected_moves.cpu(), atol=1e-5)
-        assert torch.allclose(graphed_eval, expected_eval.cpu(), atol=1e-5)
-        board.push(played_move)
-
-
-#the scores a search reports have to be on the same scale as the centipawns the training data turned into expected scores
 def test_reported_centipawns_invert_the_training_curve():
     assert score_to_centipawns(0.5) == 0
     assert score_to_centipawns(1 / (1 + math.exp(-EXPECTED_SCORE_PER_CENTIPAWN * 300))) == 300
@@ -111,7 +91,7 @@ def test_a_search_reports_the_line_of_the_move_it_plays(untrained_model, carlsen
         line_board.push(line_move)
 
 
-#a score is logged for the side that moved, but viewers plot [%eval] from white's side: black's good move is negative
+#scores are logged for the mover, [%eval] is from white's side: black's good move is negative
 def test_searches_are_written_next_to_their_moves_from_whites_side(tmp_path):
     pgn_path = tmp_path / "match.pgn"
     pgn_path.write_text('[Event "?"]\n\n1. e4 e5 2. Nf3 *\n')
@@ -128,7 +108,7 @@ def test_searches_are_written_next_to_their_moves_from_whites_side(tmp_path):
     assert "expects 1...e5 2. Nf3" in e5.comment and "searched e5 50, c5 10 of 64" in e5.comment
 
 
-#a searching model with a clock of 0.1 s a move would lose on time: only it gets an infinite one
+#a searching model would lose on time at 0.1 s a move
 def test_only_a_searching_model_plays_without_a_clock():
     assert "tc=inf" in model_engine(Path("model.pt"), searches=True)
     assert "tc=inf" not in model_engine(Path("model.pt"))
@@ -147,7 +127,7 @@ def test_position_from_a_fen_with_and_without_moves():
     fen = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"
 
     assert parse_position(["fen", *fen.split()]).fen() == fen
-    #castling arrives as the king's move in uci
+    #castling arrives as the king's move
     castled = parse_position(["fen", *fen.split(), "moves", "e1g1"])
     assert castled.piece_at(chess.F1) == chess.Piece(chess.ROOK, chess.WHITE)
 
@@ -157,7 +137,6 @@ def test_unknown_position_is_rejected():
         parse_position(["kiwipete"])
 
 
-#known points of the elo curve: even score is no difference, 10 to 1 odds is 400 points
 def test_elo_difference():
     assert elo_difference(0.5) == 0
     assert elo_difference(10 / 11) == pytest.approx(400)
@@ -175,28 +154,7 @@ Elo difference: -288.1 +/- 80.2, LOS: 0.0 %, DrawRatio: 8.0 %
     assert parse_score(output) == (12, 80, 8)
 
 
-#a graph recorded for a batch takes fewer boards too (self play, when some games need no network this round)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a gpu")
-def test_a_cuda_graph_for_a_batch_takes_fewer_boards(carlsen_games):
-    torch.manual_seed(0)
-    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval().cuda()
-    graphed = CudaGraphModel(model, batch_size=4)
-    board = carlsen_games[1].board()
-    positions = []
-    for played_move in list(carlsen_games[1].mainline_moves())[:3]:
-        board.push(played_move)
-        positions.append(encode_board(board))
-    boards = torch.tensor(positions, dtype=torch.long)
-
-    graphed_moves, graphed_eval = graphed(boards)
-
-    with torch.no_grad():
-        expected_moves, expected_eval = model(boards.cuda())
-    assert graphed_moves.shape == (3, expected_moves.shape[1])
-    assert torch.allclose(graphed_moves, expected_moves.cpu(), atol=1e-5) and torch.allclose(graphed_eval, expected_eval.cpu(), atol=1e-5)
-
-
-#a model that always gives the same answer: the logits of the given moves (every other move far below) and a value
+#the logits of the given moves (every other far below) and a fixed value
 class FixedModel(nn.Module):
     def __init__(self, board: chess.Board, move_logits: dict[str, float], expected_score: float):
         super().__init__()
@@ -209,8 +167,7 @@ class FixedModel(nn.Module):
         return self.move_logits, self.value_logits
 
 
-#lichess game dwCvJZkh after 116...Rc8+: the rook endgame is a draw, Kf7 brings back the position after 115. Re1 and the
-#only other legal move, Re8, hangs the rook
+#lichess game dwCvJZkh: a drawn rook ending where Kf7 repeats and the only other move, Re8, hangs the rook
 def rook_ending_before_the_repetition() -> chess.Board:
     board = chess.Board("2r5/5K2/4RP1k/8/8/8/8/8 w - - 0 1")
     for uci in ("e6e1", "c8c7", "f7g8", "c7c8"):
@@ -225,7 +182,6 @@ def test_a_repetition_is_kept_in_a_level_position():
     assert board.san(choose_move(model, board, CPU, "avoid-repetition")) == "Kf7"
 
 
-#the loss of dwCvJZkh: clearly ahead by the value head, but the only move that does not repeat is one the policy rejects
 def test_a_repetition_is_kept_rather_than_a_move_the_policy_rejects():
     board = rook_ending_before_the_repetition()
     model = FixedModel(board, {"Kf7": 4.0, "Re8": 0.0}, expected_score=0.9)

@@ -1,5 +1,4 @@
-//mcts.py's search over one root position, in the same order of operations and the same arithmetic, so that it visits the
-//same nodes as the python's. Self play (games.rs) and matches (Searches in lib.rs) both run it
+//mcts.py's search with the same order of operations and arithmetic, so that it visits the same nodes
 use crate::rules::{MoveIds, Tables, encode_board, game_result, legal_moves_in_python_order, position_key};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Gamma};
@@ -17,7 +16,7 @@ pub struct SearchSettings {
     pub repetitions_for_a_draw: usize,
 }
 
-//mcts.Node. A tree keeps its nodes in one vector, the root first and every node's children next to each other
+//mcts.Node, in one vector per tree: the root first, every node's children contiguous
 #[derive(Clone, Copy)]
 pub struct Node {
     pub chess_move: Option<Move>, //the move into this node, None for a root
@@ -42,7 +41,7 @@ impl Node {
     }
 }
 
-//python's sum() of floats (3.12 and later): neumaier's compensated sum, not a plain loop, and it differs in the last bits
+//python's sum() of floats (3.12+) is neumaier's compensated sum, which differs from a plain loop in the last bits
 fn python_sum(values: impl Iterator<Item = f64>) -> f64 {
     let mut values = values;
     let Some(mut total) = values.next() else { return 0.0 };
@@ -123,8 +122,7 @@ impl Tree {
         parent.first_child as usize + best
     }
 
-    //mcts.descend for one simulation, and its leaf's score when that needs no network (mcts.finish at once). Otherwise
-    //the leaf's board is added to boards and the tree waits for finish_leaf
+    //mcts.descend, and mcts.finish at once when the leaf needs no network. True when its board was added to boards
     pub fn descend(&mut self, settings: &SearchSettings, tables: Option<&Tables>, boards: &mut Vec<u8>) -> Result<bool, SyzygyError> {
         let mut board = self.board.clone();
         let root_keys = self.keys.len();
@@ -140,7 +138,7 @@ impl Tree {
 
         let legal_moves = board.legal_moves();
         let mut value = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, tables)?;
-        //a position already on the path from the root is the draw its loop heads for
+        //a repeat inside the search is a draw
         let (leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
         if value.is_none() && path_keys.contains(leaf_key) {
             value = Some(settings.draw);
@@ -161,8 +159,7 @@ impl Tree {
         }
     }
 
-    //mcts.finish for the leaf descend left waiting: expanded with the priors of the network's answer, which is the
-    //move logits and then the eval logit
+    //mcts.finish for the waiting leaf; answer is the move logits, then the eval logit
     pub fn finish_leaf(&mut self, answer: impl Fn(usize) -> f32, answer_width: usize, move_ids: &MoveIds) {
         self.logits.clear();
         self.logits.extend(self.leaf_moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, self.leaf_turn))));
@@ -199,8 +196,7 @@ impl Tree {
         }
     }
 
-    //mcts.most_visited_move among node's children: the most visited, ties to the better mean score and then the prior,
-    //then the first
+    //mcts.most_visited_move: ties to the better mean score, then the prior, then the first
     pub fn most_visited_child(&self, node: usize) -> usize {
         let preference = |node: &Node| {
             let mean_score = if node.visit_count > 0 { node.mean_score() } else { 0.0 };
@@ -216,7 +212,7 @@ impl Tree {
         best
     }
 
-    //mcts.principal_variation: the most visited child, then its most visited child, for as long as they were visited
+    //mcts.principal_variation
     pub fn principal_variation(&self) -> Vec<usize> {
         let (mut line, mut node) = (Vec::new(), 0);
         while self.nodes[node].child_count > 0 {

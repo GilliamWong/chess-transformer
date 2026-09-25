@@ -5,19 +5,12 @@ import torch
 from torch import nn
 
 from encoding import MOVE_TO_ID, NUM_MOVE_IDS, NUM_SQUARES
+from fake_models import PIECE_VALUES, UniformModel
 from mcts import DRAW, Node, evaluate, evaluate_many, game_result, most_visited_move, search
 from model import ChessTransformer
 
 CPU = torch.device("cpu")
 
-#material in pawns by board token: the side to move's pieces count for it, the other side's against (see encode_board)
-PIECE_VALUES = torch.tensor([0, 1, 3, 3, 5, 9, 0, -1, -3, -3, -5, -9, 0], dtype=torch.float)
-
-
-#every move equally likely and every position even, so whatever the search finds, it found by searching
-class UniformModel(nn.Module):
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.zeros(len(boards), NUM_MOVE_IDS), torch.zeros(len(boards), 1)
 
 #every move equally likely, and a position scored by its material for the side to move: a pawn up is a logit of 1
 class MaterialModel(nn.Module):
@@ -25,7 +18,7 @@ class MaterialModel(nn.Module):
         material = PIECE_VALUES[boards[:, :NUM_SQUARES]].sum(dim=1, keepdim=True)
         return torch.zeros(len(boards), NUM_MOVE_IDS), material
 
-#puts nearly all of the policy on the given move ids, shared out among those that are legal
+#nearly all of the policy on the given move ids, shared among those that are legal
 class FavouriteMoveModel(nn.Module):
     def __init__(self, *move_ids: int):
         super().__init__()
@@ -37,7 +30,7 @@ class FavouriteMoveModel(nn.Module):
         return logits, torch.zeros(len(boards), 1)
 
 
-#black's moves reach the model mirrored, as if black were white: its e7e5 is the model's e2e4
+#black's moves reach the model mirrored: its e7e5 is the model's e2e4
 def test_black_moves_get_the_priors_of_their_mirrored_ids():
     board = chess.Board()
     board.push_san("e4")
@@ -77,8 +70,7 @@ def node_after(root: Node, *moves: str) -> Node:
         node = node.children[chess.Move.from_uci(move)]
     return node
 
-#the policy walks a knight out and back for each side, bringing the root position round again. Seen only twice, it is still
-#a draw, so it is visited without ever being expanded
+#the knights go out and back: the root position seen a second time inside the search is a draw, never expanded
 def test_a_position_repeated_inside_the_search_is_a_draw():
     model = FavouriteMoveModel(MOVE_TO_ID[chess.Move.from_uci("g1f3")], MOVE_TO_ID[chess.Move.from_uci("f3g1")])
 
@@ -88,8 +80,7 @@ def test_a_position_repeated_inside_the_search_is_a_draw():
     assert repeated.visit_count > 0
     assert repeated.children == {}
 
-#the position after Nf3 Nf6 comes round once more inside the search, but its first time was in the game before the root,
-#not in a loop the search chose, so it is evaluated like any other position
+#its first occurrence was in the game before the root, not in a loop the search chose, so it is evaluated as usual
 def test_a_single_repeat_of_the_game_before_the_root_is_not_a_draw():
     board = chess.Board()
     for san in ("Nf3", "Nf6", "Nc3", "Nc6"):
@@ -102,7 +93,7 @@ def test_a_single_repeat_of_the_game_before_the_root_is_not_a_draw():
     assert repeated.children != {}
 
 
-#expanding a finished position would give a node without children, which looks like one that was never expanded
+#an expanded finished position would have no children and look unexpanded
 def test_a_finished_game_is_neither_evaluated_nor_searched():
     checkmate = chess.Board("R5k1/5ppp/8/8/8/8/5PPP/6K1 b - - 1 30")
 
@@ -112,7 +103,7 @@ def test_a_finished_game_is_neither_evaluated_nor_searched():
         search(UniformModel(), checkmate, CPU)
 
 
-#one simulation only evaluates the root, so no move has a visit: the tie goes to the policy's favourite, not the first legal move
+#one simulation visits no move: the tie goes to the policy's favourite, not the first legal move
 def test_a_search_too_short_to_visit_anything_plays_the_policys_move():
     favourite = chess.Move.from_uci("g1f3")
 
@@ -133,7 +124,7 @@ def mates_on_the_spot(board: chess.Board, move: chess.Move) -> bool:
     board.pop()
     return mated
 
-#one move mates and nothing tells the search which: it has to find it, and see that a mate wins for the side playing it
+#nothing tells the search which move mates: it has to find it, and score the mate as a win for the side playing it
 @pytest.mark.parametrize(
     "fen, mate",
     [
@@ -153,9 +144,7 @@ def test_finds_mate_in_one(fen, mate):
     assert child.value_sum / child.visit_count == pytest.approx(1.0)
 
 
-#scored by material, taking the queen is only the best move once the score after it (black to move, a queen down) is
-#turned into white's score, and the replies deeper down are turned back again. A search with a sign wrong spreads its
-#visits about evenly and can still pick the capture by luck, so most of them have to go there
+#catches a sign error between levels; with one, the visits spread about evenly and the capture wins only by luck
 def test_takes_a_hanging_queen():
     board = chess.Board("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1")
     simulations = 200
@@ -165,7 +154,6 @@ def test_takes_a_hanging_queen():
     assert root.children[chess.Move.from_uci("d1d5")].visit_count > simulations / 2
 
 
-#self play's noise moves the root's priors but keeps them a distribution, and the same random numbers give the same search
 def test_root_noise_moves_the_priors_the_same_way_for_the_same_seed():
     roots = [search(UniformModel(), chess.Board(), CPU, 2, root_noise=np.random.default_rng(seed)) for seed in (7, 7, 8)]
     priors = [[child.prior for child in root.children.values()] for root in roots]
@@ -175,7 +163,6 @@ def test_root_noise_moves_the_priors_the_same_way_for_the_same_seed():
     assert max(priors[0]) > 1 / 20 + 0.01 #20 moves at the start, equally likely without the noise
 
 
-#self play evaluates many leaves in one call: each has to get what it would have got on its own
 def test_positions_evaluated_together_get_what_they_get_alone(carlsen_games):
     torch.manual_seed(0)
     model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval()

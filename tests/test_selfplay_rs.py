@@ -1,5 +1,4 @@
-#the rust games (selfplay_rs) against the python they stand in for: the same rules, and without random numbers the same
-#games, move for move and number for number
+#the rust games (selfplay_rs) against the python reference: the same rules, and without random numbers the same games
 import random
 
 import chess
@@ -11,14 +10,16 @@ from torch import nn
 import mcts
 import selfplay_rs
 from encoding import NUM_MOVE_IDS, encode_board, encode_move_to_id
+from fake_models import PIECE_VALUES, UniformModel
 from inference import cpu_batches
-from selfplay import ANSWER_WIDTH, MAX_PLIES, RustSelfPlayBatch, final_result, play_game, play_games_in_rust, rust_search_settings
+from reference_selfplay import final_result, play_game
+from selfplay import ANSWER_WIDTH, MAX_PLIES, RustSelfPlayBatch, play_games_in_rust, rust_search_settings
 from tools.tablebase import SYZYGY_DIR, TABLES_PER_FOLDER, open_tablebase
 
 CPU = torch.device("cpu")
 
-#positions that bring out the rules' corners: castling both ways, en passant (and one the pin makes illegal), promotions,
-#check, the fifty move rule, bishops on one colour, and a start that already has moves played
+#castling both ways, en passant (and one a pin makes illegal), promotions, check, the fifty move rule, same-coloured
+#bishops, and a start that already has moves played
 STARTS = [
     chess.STARTING_FEN,
     "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 4 9",
@@ -38,7 +39,6 @@ def start_board(fen: str) -> chess.Board:
             board.push_san(san)
     return board
 
-#the rust rules for positions reached from board
 def rust_rules(board: chess.Board, use_tablebase: bool = False) -> selfplay_rs.SelfPlayGames:
     return RustSelfPlayBatch(lambda boards: boards, 1, iter(()), 0, 0, board, 0, MAX_PLIES, True, use_tablebase).games
 
@@ -55,8 +55,8 @@ def playout(board: chess.Board, plies: int, random_numbers: random.Random) -> li
         boards.append(board.copy())
     return boards
 
-#every position of the playouts and every position one move on from them: the encoding, the legal moves in python-chess's
-#order (the order of a node's children), the search's game_result and the game's final_result
+#every playout position and every position one move on: the encoding, the legal moves in python-chess's order (a
+#node's children's order), the search's game_result and the game's final_result
 def test_the_rust_rules_are_the_pythons():
     random_numbers = random.Random(0)
     checked = {"positions": 0, "over in the search": 0, "over in the game": 0}
@@ -77,16 +77,12 @@ def test_the_rust_rules_are_the_pythons():
                     checked["positions"] += 1
                     checked["over in the search"] += in_search is not None
                     checked["over in the game"] += over is not None
-    #the corners were reached, not only positions where the game goes on
 
+    #the corners were reached, not only positions where the game goes on
     assert checked["positions"] > 10000 and checked["over in the search"] > 200 and checked["over in the game"] > 400, checked
 
 
-#material in pawns by board token, the side to move's pieces for it and the other side's against (see encode_board)
-PIECE_VALUES = torch.tensor([0, 1, 3, 3, 5, 9, 0, -1, -3, -3, -5, -9, 0], dtype=torch.float)
-
-#priors of the board's own, and a position scored by its material for the side to move: the searches take what they can,
-#and some games are won
+#priors of the board's own, and a position scored by its material, so that some games are won
 class BoardModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -95,13 +91,7 @@ class BoardModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return boards.float() @ self.weights / 100, PIECE_VALUES[boards[:, :64].long()].sum(dim=1, keepdim=True)
 
-#every move equally likely and every position even
-class UniformModel(nn.Module):
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.zeros(len(boards), NUM_MOVE_IDS), torch.zeros(len(boards), 1)
-
-#mcts.evaluate_many with the rust games' softmax and sigmoid, whose last bits differ from numpy's and torch's: the python
-#games then get exactly the priors and scores the rust games get (test_the_rust_numbers_are_numpys checks those)
+#mcts.evaluate_many with rust's softmax and sigmoid, whose last bits differ from numpy's and torch's
 def evaluate_many_in_rust_numbers(model: nn.Module, boards: list[chess.Board], device: torch.device) -> list[tuple[dict[chess.Move, float], float]]:
     answers = cpu_batches(model).evaluate_boards(np.array([encode_board(board) for board in boards], dtype=np.uint8))
     evaluations = []
@@ -120,9 +110,8 @@ def assert_same_games(python_games, rust_games) -> None:
         assert np.array_equal(python.root_scores, rust.root_scores)
         assert np.array_equal(python.white_to_move, rust.white_to_move)
 
-#without the root noise and the sampled plies nothing is random: every search visits the same nodes in the same order,
-#and every recorded number is the same to the last bit. The uniform model's searches are nothing but ties, which go to
-#the first child in python-chess's order
+#without root noise and sampled plies nothing is random: every number must match to the last bit. The uniform model's
+#searches are all ties, which go to the first child in python-chess's order
 @pytest.mark.parametrize("tree_reuse", [True, False])
 @pytest.mark.parametrize("model", ["board", "uniform"])
 def test_rust_games_are_the_python_games(monkeypatch, tree_reuse, model):
@@ -159,9 +148,8 @@ def test_rust_games_end_where_the_tablebase_knows_the_result(monkeypatch):
     assert len(rust[0].boards) == 0
 
 
-#a match's searches (selfplay_rs.Searches, tools/play/search_match.py) are mcts.search: from positions of carlsen's games,
-#with the moves before them for the repetitions, the same visits for every root move in the same order, the same line and
-#the same score. The network sees one position a call, as mcts.search asks it, so that no bit depends on the batch
+#a match's searches (selfplay_rs.Searches) are mcts.search, with the game's moves for the repetitions. One position per
+#network call, as mcts.search asks, so that no bit depends on the batch
 @pytest.mark.parametrize("model", ["board", "uniform"])
 def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
     monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
@@ -198,7 +186,6 @@ def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
         searches.start(0, "R5k1/5ppp/8/8/8/8/5PPP/6K1 b - - 1 30", [], 40) #mated: nothing to search
 
 
-#the numbers finish_leaf turns the network's answer into, against numpy's softmax and torch's sigmoid
 def test_the_rust_numbers_are_numpys():
     logits = np.random.default_rng(0).normal(0, 4, 40).astype(np.float32)
     weights = np.exp(logits - logits.max())
@@ -209,7 +196,7 @@ def test_the_rust_numbers_are_numpys():
 def uniform(boards: np.ndarray) -> np.ndarray:
     return cpu_batches(UniformModel()).evaluate_boards(boards)
 
-#black mates at once: the only position of the game is black's, it is black's win, and black's move is stored mirrored
+#black mates at once: black's win, and black's move stored mirrored
 def test_a_rust_game_is_recorded_for_the_side_to_move():
     board = chess.Board("7r/8/8/8/8/1k6/8/K7 b - - 0 1")
 
@@ -222,8 +209,7 @@ def test_a_rust_game_is_recorded_for_the_side_to_move():
     assert game.visit_shares[0].sum() == pytest.approx(1.0)
 
 
-#with the noise and the sampled plies back, a game's random numbers come from the seed and its number alone: games
-#played together, their leaves in shared calls, are each the game played alone, and two numbers give two games
+#with noise and sampled plies, a game's random numbers depend on the seed and its number alone
 def test_rust_games_played_together_are_the_games_played_alone():
     alone = [game for number in range(5) for game in play_games_in_rust(uniform, 8, [number], 1, max_plies=40)]
 
@@ -235,7 +221,6 @@ def test_rust_games_played_together_are_the_games_played_alone():
     assert not np.array_equal(alone[0].boards, other_seed.boards)
 
 
-#the move played keeps its subtree, so the next search already has visits and needs fewer evaluations for the same 64
 def test_rust_tree_reuse_needs_fewer_evaluations_for_the_same_visits():
     evaluated = {True: 0, False: 0}
     for tree_reuse in evaluated:

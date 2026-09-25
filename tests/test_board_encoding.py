@@ -56,7 +56,6 @@ AFTER_E4_ENCODING = (
     + [17]
 )
 
-#token ids written out by hand, like the start position above
 BLACK_TO_MOVE, WHITE_TO_MOVE = 13, 14
 NO_CASTLING_RIGHT, CASTLING_RIGHT = 15, 16
 NO_EN_PASSANT = 17  #en passant square s is token 17 + s
@@ -74,8 +73,8 @@ def board_after(*san_moves: str) -> chess.Board:
     return board
 
 
+#1 for a castling right, 0 for none, anything else for any other token
 def castling_flags(encoding) -> tuple[int, int, int, int]:
-    """1 for a castling right and 0 for none. Any other token comes out as neither"""
     return (
         encoding[WHITE_KINGSIDE_INDEX] - NO_CASTLING_RIGHT,
         encoding[WHITE_QUEENSIDE_INDEX] - NO_CASTLING_RIGHT,
@@ -86,9 +85,8 @@ def castling_flags(encoding) -> tuple[int, int, int, int]:
 
 def assert_round_trip(board: chess.Board) -> None:
     decoded = decode_board(encode_board(board))
-    #EPD is placement, turn, castling and en passant: exactly what the encoding carries.
-    #The move counters are not encoded, so Board.__eq__ would be too strict here.
-    #epd() only writes the en passant square when a capture is legal, matching encode_board.
+    #epd is exactly what the encoding carries (no move counters), and like encode_board it only writes a
+    #capturable en passant square
     assert decoded.epd() == board.epd()
 
 
@@ -190,10 +188,10 @@ def test_decoded_board_can_still_castle():
 @pytest.mark.parametrize(
     "san_moves, expected_ep_square",
     [
-        #the side to move captures up the board, so the square is always on rank 6 and 0 (a1) is a safe "none" value
+        #the side to move captures up the board, so the square is on rank 6 and 0 (a1) is a safe "none"
         pytest.param(["h3", "b5", "h4", "b4", "a4"], chess.A6, id="a3-mirrored-for-black"),
         pytest.param(["g4", "a6", "g5", "h5"], chess.H6, id="h6-highest-square"),
-        #a double push that no enemy pawn can capture leaves the position playing the same, so it encodes as none
+        #a double push no enemy pawn can capture encodes as none
         pytest.param(["e4"], 0, id="no-capture-available"),
         #the capturing pawn is pinned to its king, so the capture is not legal
         pytest.param(["e4", "e5", "d4", "exd4", "e5", "Qe7", "a3", "d5"], 0, id="capturing-pawn-pinned"),
@@ -273,15 +271,14 @@ def test_round_trip_every_position_of_real_games(carlsen_games):
             assert_round_trip(board)
 
 
-#counted on paper rather than taken from the table: 1456 queen-line pairs + 336 knight jumps,
-#plus 44 promoting (from, to) pairs * 4 promotion pieces
+#counted on paper: 1456 queen-line pairs + 336 knight jumps, plus 44 promoting (from, to) pairs * 4 pieces
 def test_move_vocabulary_size():
     assert NUM_MOVE_IDS == 1792 + 176
     assert len(ALL_POSSIBLE_MOVES) == NUM_MOVE_IDS
     assert len(set(ALL_POSSIBLE_MOVES)) == NUM_MOVE_IDS  #a duplicate would make two ids decode to one move
 
 
-#the order of the table is the vocabulary. Changing it invalidates any saved ids or trained model.
+#the order of the table is the vocabulary: changing it invalidates every saved id and trained model
 @pytest.mark.parametrize(
     "uci, turn, expected_id",
     [
@@ -344,8 +341,7 @@ def test_every_legal_move_of_real_games_has_an_id(carlsen_games):
             board.push(played_move)
 
 
-
-#the reason the offsets exist: a token never means two things. Blocks written out by hand
+#a token never means two things. Blocks written out by hand
 def test_every_slot_stays_inside_its_token_block(carlsen_games):
     assert BOARD_VOCAB_SIZE == 81
 
@@ -361,8 +357,7 @@ def test_every_slot_stays_inside_its_token_block(carlsen_games):
             assert NO_EN_PASSANT <= encoding[EN_PASSANT_INDEX] < BOARD_VOCAB_SIZE
 
 
-
-#a policy head looks moves up by these instead of by id, so they have to describe the same move
+#the policy head looks moves up by these instead of by id, so they have to describe the same move
 def test_move_parts_describe_the_move_with_that_id():
     assert len(MOVE_FROM_SQUARES) == len(MOVE_TO_SQUARES) == NUM_MOVE_IDS
 
@@ -380,7 +375,7 @@ def test_every_promotion_shares_its_squares_with_a_plain_move():
     assert set(promotion_pairs) <= plain_pairs
 
 
-#a policy head adds something to exactly these ids, picked by landing square and piece
+#the policy head adds something to exactly these ids, picked by landing square and piece
 def test_promotion_tables_describe_every_promotion_and_nothing_else():
     assert len(PROMOTION_MOVE_IDS) == len(PROMOTION_TO_SQUARES) == len(PROMOTION_PIECES) == 176
     assert set(PROMOTION_MOVE_IDS) == {move_id for move_id, move in enumerate(ALL_POSSIBLE_MOVES) if move.promotion is not None}
@@ -392,9 +387,7 @@ def test_promotion_tables_describe_every_promotion_and_nothing_else():
         assert move.promotion == pieces[piece]
 
 
-
-#the encoding as it was first written: mirror the board with python-chess, then read it square by square. Kept as the
-#reference the faster encode_board and encode_move_to_id have to match exactly
+#the slow, obvious encoding (board.mirror(), then square by square): the reference the fast one must match exactly
 def reference_encode_board(board: chess.Board) -> list[int]:
     turn = board.turn
     if turn == chess.BLACK:

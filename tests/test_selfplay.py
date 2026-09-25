@@ -5,7 +5,6 @@ import sys
 import threading
 from types import SimpleNamespace
 
-import chess
 import numpy as np
 import pytest
 import torch
@@ -14,43 +13,12 @@ from torch import nn
 import data
 import selfplay
 from data import SelfPlayDataset, load_training_set
-from encoding import NUM_MOVE_IDS, encode_move_to_id
+from encoding import NUM_MOVE_IDS
 from inference import cpu_batches, serve
-from selfplay import TOP_MOVES, Game, RemoteNetwork, SelfPlaySet, Slot, play_game, play_games, play_games_in_rust, slot_arrays
+from selfplay import TOP_MOVES, Game, RemoteNetwork, SelfPlaySet, Slot, play_games_in_rust, slot_arrays
 from tools.label_with_stockfish import NO_MOVE
 
-CPU = torch.device("cpu")
 SETTINGS = {"simulations": 16}
-
-
-#every move equally likely and every position even: whatever the search finds, it found by searching
-class UniformModel(nn.Module):
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.zeros(len(boards), NUM_MOVE_IDS), torch.zeros(len(boards), 1)
-
-
-#black mates at once: the only position of the game is black's, and it is black's win, whatever the colour of the board
-def test_a_game_is_recorded_for_the_side_to_move():
-    board = chess.Board("7r/8/8/8/8/1k6/8/K7 b - - 0 1")
-
-    game = play_game(UniformModel(), CPU, 800, number=0, board=board, sampled_plies=0)
-
-    assert game.white_score == 0.0 and len(game.boards) == 1
-    assert game.outcomes().tolist() == [1.0]
-    assert game.root_scores[0] > 0.5
-    #black's moves are stored in the mirrored frame the model sees them in
-    assert game.visit_moves[0, 0] == encode_move_to_id(chess.Move.from_uci("h8h1"), chess.BLACK)
-    assert game.visit_shares[0].sum() == pytest.approx(1.0)
-
-
-#a game's random numbers come from the seed and its number alone, so the same game can be played again and two
-#games of a run differ
-def test_a_game_is_the_same_for_the_same_number():
-    first, again, other = (play_game(UniformModel(), CPU, 16, number, max_plies=8) for number in (3, 3, 4))
-
-    assert np.array_equal(first.boards, again.boards) and np.array_equal(first.visit_shares, again.visit_shares)
-    assert not np.array_equal(first.boards, other.boards)
-    assert first.outcomes().tolist() == [0.5] * 8 #cut off after 8 plies: a draw for both sides
 
 
 def two_games() -> list[Game]:
@@ -62,7 +30,7 @@ def two_games() -> list[Game]:
     return [Game(0, boards, visit_moves, visit_shares, np.array([0.6, 0.3], dtype=np.float32), np.array([True, False]), 1.0),
             Game(1, boards, visit_moves, visit_shares, np.array([0.8, 0.1], dtype=np.float32), np.array([True, False]), 0.5)]
 
-#game 0 goes to val, game 1 to train, and training reads them back with the value target blended half and half
+#game 0 goes to val, game 1 to train, read back with the value target blended half and half
 def test_a_self_play_set_is_read_back_for_training(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
     games = SelfPlaySet(tmp_path, "played", SETTINGS)
@@ -80,8 +48,7 @@ def test_a_self_play_set_is_read_back_for_training(tmp_path, monkeypatch):
     assert train.value_target_of([0, 1]).tolist() == pytest.approx([0.65, 0.3]) #game 1 was a draw
 
 
-#a lower visit temperature sharpens the policy target and keeps it a distribution: shares of 0.75 and 0.25 are 0.9 and 0.1
-#at 0.5 (squared, 9 to 1), and the most visited move alone at 0. A position with one visited move keeps it whole
+#0.75/0.25 becomes 0.9/0.1 at 0.5 and 1/0 at 0; a single visited move stays whole
 def test_the_visit_temperature_sharpens_the_policy_target(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
     games = SelfPlaySet(tmp_path, "played", SETTINGS)
@@ -96,7 +63,7 @@ def test_the_visit_temperature_sharpens_the_policy_target(tmp_path, monkeypatch)
         assert moves[:, :2].tolist() == [[5, 9], [7, 3]]
 
 
-#an interruption can leave part of a game in the files after the last record: opening the set again cuts it off
+#part of a game written after the last record is cut off on reopening
 def test_a_self_play_set_continues_after_an_interruption(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
     games = SelfPlaySet(tmp_path, "played", SETTINGS)
@@ -114,22 +81,7 @@ def test_a_self_play_set_continues_after_an_interruption(tmp_path, monkeypatch):
         SelfPlaySet(tmp_path, "played", {"simulations": 64})
 
 
-#games played together in one batch, their leaves evaluated in shared calls and finished games replaced by the next
-#number, come out exactly as each game played on its own: nothing of one game leaks into another
-def test_games_played_together_are_the_games_played_alone():
-    alone = [play_game(UniformModel(), CPU, 8, number, max_plies=12) for number in range(5)]
-
-    together = sorted(play_games(UniformModel(), CPU, 8, range(5), size=3, max_plies=12), key=lambda game: game.number)
-
-    assert [game.number for game in together] == list(range(5))
-    for single, batched in zip(alone, together):
-        assert np.array_equal(single.boards, batched.boards)
-        assert np.array_equal(single.visit_moves, batched.visit_moves)
-        assert np.array_equal(single.visit_shares, batched.visit_shares)
-        assert np.array_equal(single.root_scores, batched.root_scores)
-
-
-#another program holding the record open makes windows refuse the move for a moment: the write is tried again
+#windows refuses the move for a moment while another program holds the record open
 def test_a_record_write_that_fails_for_a_moment_is_tried_again(tmp_path, monkeypatch):
     games = SelfPlaySet(tmp_path, "played", SETTINGS)
     replace = Path.replace
@@ -144,8 +96,7 @@ def test_a_record_write_that_fails_for_a_moment_is_tried_again(tmp_path, monkeyp
     assert SelfPlaySet.read_record(tmp_path / "played_selfplay.json")["games"] == 1
 
 
-#the move of the record kept failing (what stopped a run on 2026-09-23): the game's positions and its record in the .part
-#are both written, so opening the set again keeps that game instead of cutting it off
+#what stopped a run on 2026-09-23: the .part record keeps the game instead of it being cut off
 def test_a_game_whose_record_could_not_be_moved_into_place_is_kept(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
     first, second = two_games()
@@ -166,29 +117,6 @@ def test_a_game_whose_record_could_not_be_moved_into_place_is_kept(tmp_path, mon
     assert len(train) == len(val) == 2
 
 
-#counts the positions it evaluates, every move equally likely and every position even
-class CountingModel(UniformModel):
-    def __init__(self):
-        super().__init__()
-        self.positions = 0
-
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        self.positions += len(boards)
-        return super().forward(boards)
-
-#the move played keeps its subtree, so the next search already has visits and needs fewer evaluations for the same 64
-def test_tree_reuse_needs_fewer_evaluations_for_the_same_visits():
-    fresh, reused = CountingModel(), CountingModel()
-
-    fresh_game = play_game(fresh, CPU, 64, 0, max_plies=10, tree_reuse=False)
-    reused_game = play_game(reused, CPU, 64, 0, max_plies=10, tree_reuse=True)
-
-    assert len(fresh_game.boards) == len(reused_game.boards) == 10
-    assert reused.positions < fresh.positions
-    assert np.allclose(reused_game.visit_shares.sum(axis=1), 1.0)
-
-
-#a set played before tree reuse existed has no such setting: it counts as played without, and only carries on without
 def test_a_set_from_before_tree_reuse_carries_on_without_it(tmp_path):
     SelfPlaySet(tmp_path, "played", SETTINGS).add(two_games()[0], 1.0)
 
@@ -197,7 +125,7 @@ def test_a_set_from_before_tree_reuse_carries_on_without_it(tmp_path):
     assert SelfPlaySet(tmp_path, "played", {**SETTINGS, "tree_reuse": False}).positions() == 2
 
 
-#an answer that depends on the board, so answers handed to the wrong worker, or games crossed between slots, show
+#answers that depend on the board, so answers handed to the wrong worker show
 class BoardModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -208,7 +136,7 @@ class BoardModel(nn.Module):
         return tokens @ self.weights / 100, tokens.sum(dim=1, keepdim=True) / 1000
 
 
-#the inference process's loop in a thread, serving the given slots with evaluate_boards
+#the inference process's loop in a thread
 @contextmanager
 def serving(slots: list[Slot], evaluate_boards, games_per_process: int):
     stop = threading.Event()
@@ -229,7 +157,7 @@ def serving(slots: list[Slot], evaluate_boards, games_per_process: int):
             slot.close()
 
 
-#two workers asking at the same moment are served in one batch, and each gets back the answers to its own boards
+#two workers asking at once are served in one batch, each getting the answers to its own boards
 def test_every_worker_gets_the_answers_to_its_own_boards():
     slots = [Slot(8), Slot(8)]
     network = BoardModel()
@@ -254,7 +182,6 @@ def test_every_worker_gets_the_answers_to_its_own_boards():
                 memory.close()
 
 
-#games whose leaves go through the inference process are the games played with the network in the same process
 def test_games_through_the_inference_process_are_the_games_played_directly():
     network = cpu_batches(BoardModel())
     alone = sorted(play_games_in_rust(network.evaluate_boards, 8, range(4), size=2, max_plies=10), key=lambda game: game.number)
@@ -271,7 +198,7 @@ def test_games_through_the_inference_process_are_the_games_played_directly():
         assert np.allclose(direct.root_scores, through.root_scores)
 
 
-#every worker imports selfplay.py, and torch would take about half a gigabyte in each
+#torch would cost every worker about half a gigabyte
 def test_a_worker_does_not_import_torch():
     imported = subprocess.run([sys.executable, "-c", "import sys, selfplay; print('torch' in sys.modules)"], capture_output=True, text=True,
                               check=True, cwd=Path(selfplay.__file__).parent)

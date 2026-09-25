@@ -1,4 +1,3 @@
-#the networks on the gpu through cuda graphs (inference.GraphedBatches, player.CudaGraphModel)
 import chess
 import numpy as np
 import pytest
@@ -10,7 +9,7 @@ from model import ChessTransformer
 from tools.play.player import CudaGraphModel
 
 
-#the graphs answer what the model itself answers, for a batch smaller than the graph and for one board
+#for a batch smaller than the graph and for one board; graphs recorded on zero boards once hit a device-side assert
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_graphs_answer_like_the_model():
     torch.manual_seed(0)

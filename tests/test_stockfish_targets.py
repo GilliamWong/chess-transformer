@@ -17,7 +17,7 @@ from tools.play.download_engines import STOCKFISH
 
 TEMPERATURE = 0.02
 
-#three positions: two good moves and a blunder, a position with a single legal move, a mate next to a good move
+#two good moves and a blunder; a single legal move; a mate next to a good move
 STOCKFISH_MOVES = [[5, 9, 2], [7, NO_MOVE, NO_MOVE], [1, 3, NO_MOVE]]
 STOCKFISH_EVALS = [[50, 50, -300], [-120, NO_EVAL, NO_EVAL], [MATE_EVAL, 200, NO_EVAL]]
 
@@ -30,8 +30,8 @@ def write_labelled_set(folder, name, stockfish_moves=STOCKFISH_MOVES, stockfish_
         (folder / f"{name}_{split}_stockfish_evals.bin").write_bytes(np.array(stockfish_evals, dtype=np.int16).tobytes())
 
 
+#the softmax written out with math instead of torch
 def expected_probabilities(evals: list[int]) -> list[float]:
-    """the softmax written out with math instead of torch"""
     weights = [math.exp(1 / (1 + math.exp(-EXPECTED_SCORE_PER_CENTIPAWN * centipawns)) / TEMPERATURE) for centipawns in evals]
     return [weight / sum(weights) for weight in weights]
 
@@ -43,7 +43,7 @@ def test_stockfish_targets_share_the_probability_by_their_evals(tmp_path, monkey
     train_dataset, _ = load_training_set("labelled", TEMPERATURE)
     _, target_moves, target_probabilities, _, _ = train_dataset[[0, 1, 2]]
 
-    #places without a move become move 0 at probability 0, so they can be looked up in the logits and add nothing
+    #places without a move are move 0 at probability 0
     assert target_moves.tolist() == [[5, 9, 2], [7, 0, 0], [1, 3, 0]]
     assert target_probabilities[0].tolist() == pytest.approx(expected_probabilities([50, 50, -300]))
     assert target_probabilities[0, 2] < 0.001  #the blunder
@@ -52,7 +52,7 @@ def test_stockfish_targets_share_the_probability_by_their_evals(tmp_path, monkey
     assert target_probabilities[2, 0] > 0.99  #a mate against two pawns up
 
 
-#a position stockfish has not reached yet is filled with NO_MOVE, which would otherwise train as "play move 0"
+#an unlabelled position (NO_MOVE) would otherwise train as "play move 0"
 def test_a_set_that_is_not_labelled_to_the_end_is_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
     write_labelled_set(tmp_path, "unfinished", STOCKFISH_MOVES[:2] + [[NO_MOVE] * 3], STOCKFISH_EVALS[:2] + [[NO_EVAL] * 3])
@@ -93,8 +93,7 @@ def test_a_copied_set_ends_at_the_end_of_a_game():
     assert whole_games_prefix(plies, 100) == 9
 
 
-#a self play set has no plies to cut at: its boards are copied, each position once where it first comes, and the first
-#num_positions of those
+#self play has no plies to cut at: each distinct board once, in first-seen order
 def test_a_self_play_set_is_copied_as_its_distinct_boards(tmp_path):
     boards = np.repeat(np.array([[1], [2], [1], [3]], dtype=np.uint8), TOKENS_PER_BOARD, axis=1)
     boards.tofile(tmp_path / "played_train_boards.bin")
@@ -110,12 +109,12 @@ def test_a_self_play_set_is_copied_as_its_distinct_boards(tmp_path):
 
 def test_scores_are_stored_like_the_fishtest_evals():
     assert score_to_eval(chess.engine.Cp(-37)) == -37
-    assert score_to_eval(chess.engine.Cp(31000)) == MATE_EVAL - 1  #a score is never mistaken for a mate
+    assert score_to_eval(chess.engine.Cp(31000)) == MATE_EVAL - 1  #never mistaken for a mate
     assert score_to_eval(chess.engine.Mate(3)) == MATE_EVAL
     assert score_to_eval(chess.engine.Mate(-1)) == -MATE_EVAL
 
 
-#black to move, so this also catches a move or a score that is not turned to the side to move
+#black to move: catches a move or score not turned to the side to move
 @pytest.mark.skipif(not STOCKFISH.exists(), reason="stockfish is not downloaded (python -m tools.play.download_engines)")
 def test_stockfish_finds_the_mate_for_black_and_scores_it_as_a_win():
     board = chess.Board()

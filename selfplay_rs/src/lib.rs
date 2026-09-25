@@ -1,7 +1,5 @@
-//mcts.py's search in rust, for many searches at once, while python feeds the network: selfplay.py's games
-//(SelfPlayGames, selfplay.RustSelfPlayBatch) and the matches against stockfish (Searches, tools/play/search_match.py).
-//A round is descend (every tree walks down to a leaf and the leaves that need the network come back as boards), then
-//finish with the network's answers for them
+//mcts.py's search for many trees at once while python runs the network: self play games (SelfPlayGames) and match
+//searches (Searches). A round is descend (the leaves that need the network come back as boards), then finish
 mod games;
 mod rules;
 mod search;
@@ -33,7 +31,7 @@ fn open_tables(folder: Option<&str>, pieces: usize) -> PyResult<Option<Tables>> 
     folder.map(|folder| Tables::open(folder, pieces).map_err(|error| PyRuntimeError::new_err(format!("{folder}: {error}")))).transpose()
 }
 
-//a board from its fen, and the keys of its position and of the positions of the moves played from it
+//a board from its fen and moves, with the key of every position along the way
 fn play_out(fen: &str, moves: &[String]) -> PyResult<(Chess, Vec<u64>)> {
     let fen: Fen = fen.parse().map_err(|error| PyValueError::new_err(format!("{fen}: {error}")))?;
     let mut board: Chess = fen.into_position(CastlingMode::Standard).map_err(|error| PyValueError::new_err(format!("{error}")))?;
@@ -52,8 +50,7 @@ fn play_moves(board: &mut Chess, keys: &mut Vec<u64>, moves: &[String]) -> PyRes
     Ok(())
 }
 
-//the first half of a round for every tree: the boards of the leaves that need the network, TOKENS_PER_BOARD bytes each,
-//and in waiting the trees they belong to
+//the boards of the leaves that need the network (TOKENS_PER_BOARD bytes each); their trees go in waiting
 fn descend_all<'a>(
     trees: impl Iterator<Item = &'a mut Tree>,
     settings: &SearchSettings,
@@ -72,7 +69,7 @@ fn descend_all<'a>(
     Ok(boards)
 }
 
-//the network's answers (float32, answer_width a board) for the boards descend gave it
+//the network's answers, answer_width float32s for each board descend gave it
 fn answers_for<'a>(py: Python<'a>, answers: &'a PyBuffer<f32>, boards: usize, answer_width: usize) -> PyResult<&'a [ReadOnlyCell<f32>]> {
     let answers = answers.as_slice(py).ok_or_else(|| PyValueError::new_err("the answers must be one contiguous array"))?;
     if answers.len() != boards * answer_width {
@@ -92,12 +89,12 @@ struct SelfPlayGames {
     answer_width: usize,
     tables: Option<Tables>,
     seed: u64,
-    //every game starts from here: the board, the keys of the positions played to reach it, and how many
+    //every game starts here, with the keys of the positions played to reach it
     start: Chess,
     start_keys: Vec<u64>,
     start_plies: usize,
     games: Vec<Game>,
-    waiting: Vec<usize>, //the games whose leaf the network is evaluating, in the order of their boards
+    waiting: Vec<usize>, //games whose leaf the network is evaluating, in board order
     finished: Vec<FinishedGame>,
 }
 
@@ -157,8 +154,7 @@ impl SelfPlayGames {
         })
     }
 
-    //starts game number `number`: True while it is played, False when it was over before it began (it is then among
-    //the finished, without positions)
+    //false when the game was over before it began (it is then finished, without positions)
     fn start_game(&mut self, number: u64) -> PyResult<bool> {
         let game = Game::new(number, self.seed, &self.start, &self.start_keys, self.start_plies);
         match game.final_result(self.settings.max_plies, self.tables.as_ref()).map_err(tablebase_error)? {
@@ -173,15 +169,14 @@ impl SelfPlayGames {
         }
     }
 
-    //the first half of a round: the boards of the leaves that need the network
+    //the boards of the leaves that need the network
     fn descend<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let trees = self.games.iter_mut().map(|game| &mut game.tree);
         let boards = descend_all(trees, &self.settings.search, self.tables.as_ref(), &mut self.waiting)?;
         Ok(PyBytes::new(py, &boards))
     }
 
-    //the second half: the network's answers for descend's boards finish their simulations, and every game whose root
-    //has its simulations plays a move. Returns how many games ended
+    //finishes the waiting simulations; every game whose root has its simulations plays a move. Returns how many ended
     fn finish(&mut self, py: Python<'_>, answers: PyBuffer<f32>) -> PyResult<usize> {
         let answers = answers_for(py, &answers, self.waiting.len(), self.answer_width)?;
         for (row, &index) in self.waiting.iter().enumerate() {
@@ -240,8 +235,7 @@ impl SelfPlayGames {
         !self.games.is_empty() || !self.finished.is_empty()
     }
 
-    //what the rules here say about the position after `moves` from the start board, for the tests to hold against the
-    //python: its encoding, its legal moves' ids in their order, mcts.game_result and selfplay.final_result
+    //for the parity tests: the position after `moves`' encoding, legal move ids in order, game_result and final_result
     #[allow(clippy::type_complexity)]
     fn inspect<'py>(&self, py: Python<'py>, moves: Vec<String>) -> PyResult<(Bound<'py, PyBytes>, Vec<usize>, Option<f64>, Option<f64>)> {
         let (mut board, mut keys) = (self.start.clone(), self.start_keys.clone());
@@ -259,15 +253,14 @@ impl SelfPlayGames {
     }
 }
 
-//one search of a match: mcts.search from a position of a game, without noise
+//one search of a match: mcts.search, without noise
 struct Search {
     id: u64,
     simulations: u32,
     tree: Tree,
 }
 
-//what a search found, as player.search_move reports it: the line it expects (its move first) as uci moves, the mean score
-//of that move for the side to move, and every root move with its visits, the most visited first
+//as player.search_move reports it: (id, expected line in uci, the chosen move's mean score, root moves by visits)
 type SearchReport = (u64, Vec<String>, f64, Vec<(String, u32)>);
 
 #[pyclass(unsendable)]
@@ -277,7 +270,7 @@ struct Searches {
     answer_width: usize,
     tables: Option<Tables>,
     searches: Vec<Search>,
-    waiting: Vec<usize>, //the searches whose leaf the network is evaluating, in the order of their boards
+    waiting: Vec<usize>, //searches whose leaf the network is evaluating, in board order
 }
 
 #[pymethods]
@@ -308,8 +301,7 @@ impl Searches {
         })
     }
 
-    //starts a search of `simulations` from the position after `moves` from `fen`, the game's moves so that the search
-    //sees its repetitions. Like mcts.search it refuses a position whose game is over or that the tablebase knows
+    //the game's moves let the search see repetitions. Like mcts.search it refuses a finished or tablebase position
     fn start(&mut self, id: u64, fen: &str, moves: Vec<String>, simulations: u32) -> PyResult<()> {
         if simulations == 0 {
             return Err(PyValueError::new_err("a search needs at least one simulation"));
@@ -327,15 +319,14 @@ impl Searches {
         Ok(())
     }
 
-    //the first half of a round: the boards of the leaves that need the network
+    //the boards of the leaves that need the network
     fn descend<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let trees = self.searches.iter_mut().map(|search| &mut search.tree);
         let boards = descend_all(trees, &self.settings, self.tables.as_ref(), &mut self.waiting)?;
         Ok(PyBytes::new(py, &boards))
     }
 
-    //the second half: the network's answers for descend's boards finish their simulations. Returns what every search that
-    //now has all its simulations found, as (id, line, score, root moves)
+    //finishes the waiting simulations and returns the reports of the searches that are done
     fn finish(&mut self, py: Python<'_>, answers: PyBuffer<f32>) -> PyResult<Vec<SearchReport>> {
         let answers = answers_for(py, &answers, self.waiting.len(), self.answer_width)?;
         for (row, &index) in self.waiting.iter().enumerate() {
@@ -352,7 +343,7 @@ impl Searches {
             }
             let line = tree.principal_variation();
             let chosen = &tree.nodes[line[0]];
-            //the chosen move's mean score, or when it was never visited (one simulation) the root's own for its side to move
+            //one simulation visits no child: then the root's score for its side to move
             let score = if chosen.visit_count > 0 { chosen.mean_score() } else { 1.0 - tree.root().mean_score() };
             let moves =
                 |nodes: &[usize]| -> Vec<String> { nodes.iter().map(|&node| uci(tree.nodes[node].chess_move.expect("a child"))).collect() };
@@ -372,7 +363,7 @@ impl Searches {
     }
 }
 
-//the numbers of finish_leaf's priors and score, for the tests' python search to use the same
+//finish_leaf's arithmetic, for the tests' python search to use
 #[pyfunction]
 fn softmax(logits: Vec<f32>) -> Vec<f32> {
     let mut priors = logits;

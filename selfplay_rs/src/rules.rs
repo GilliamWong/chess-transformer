@@ -1,5 +1,5 @@
-//the rules as the python has them: python-chess, encoding.py, mcts.game_result and selfplay.final_result. The games
-//played here have to be the games the python plays, move for move (tests/test_selfplay_rs.py plays both)
+//the rules exactly as the python has them: python-chess, encoding.py, mcts.game_result and final_result in
+//tests/reference_selfplay.py (tests/test_selfplay_rs.py holds the two together)
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{Bitboard, Board, CastlingSide, Chess, Color, EnPassantMode, Move, MoveList, Position, Role, Square};
 use shakmaty_syzygy::{SyzygyError, Tablebase, Wdl};
@@ -10,11 +10,10 @@ const TURN_TOKEN_OFFSET: u8 = 13;
 const CASTLING_TOKEN_OFFSET: u8 = 15;
 const EN_PASSANT_TOKEN_OFFSET: u8 = 17;
 const PIECE_TYPES: u8 = 6;
-//the number of times a position occurs before a draw can be claimed, in the rules (mcts.py's search has its own)
+//the rules' threefold repetition (mcts.py's search has its own)
 const THREEFOLD: usize = 3;
 
-//python-chess's _transposition_key as a zobrist hash: the pieces, the side to move, the castling rights, and the en
-//passant square only when the capture is legal
+//python-chess's _transposition_key as a zobrist hash: en passant only counts when the capture is legal
 pub fn position_key(board: &Chess) -> u64 {
     board.zobrist_hash::<Zobrist64>(EnPassantMode::Legal).0
 }
@@ -45,8 +44,7 @@ pub fn encode_board(board: &Chess, tokens: &mut Vec<u8>) {
     encoding[69] = EN_PASSANT_TOKEN_OFFSET + board.ep_square(EnPassantMode::Legal).map_or(0, |square| (square.to_usize() ^ flip) as u8);
 }
 
-//encoding.py's move ids by the move's squares from the side to move and its promotion, as selfplay.move_id_table lays
-//them out: 64 from squares x 64 to squares x 7 (no promotion, then python-chess's piece types), -1 for no move
+//selfplay.move_id_table: 64 from squares x 64 to squares x 7 (no promotion, then python-chess's piece types), -1 for none
 pub struct MoveIds(Vec<i16>);
 
 pub const MOVE_ID_TABLE_LENGTH: usize = 64 * 64 * 7;
@@ -81,8 +79,7 @@ fn python_chess_squares(chess_move: Move) -> (usize, usize, usize) {
     }
 }
 
-//the legal moves in the order python-chess generates them (Board.generate_legal_moves), which is the order of a node's
-//children in mcts.py: of equal children, the first is the one searched and played
+//python-chess's generation order, which is mcts.py's children order: of equal children the first is searched and played
 pub fn legal_moves_in_python_order(board: &Chess) -> MoveList {
     let mut moves = board.legal_moves();
     let in_check = board.is_check();
@@ -120,7 +117,7 @@ fn promotion_order(promotion: Option<Role>) -> u32 {
     }
 }
 
-//Board.is_insufficient_material: neither side can mate, bishops judged by the colour of their squares
+//Board.is_insufficient_material
 pub fn is_insufficient_material(board: &Board) -> bool {
     has_insufficient_material(board, Color::White) && has_insufficient_material(board, Color::Black)
 }
@@ -141,8 +138,7 @@ fn has_insufficient_material(board: &Board, color: Color) -> bool {
     true
 }
 
-//how many times the last of keys (a game's positions, oldest first) has occurred, looking back over the positions since
-//the last capture or pawn move: none before it can come round again
+//occurrences of the last key (positions oldest first), counting back to the last capture or pawn move
 pub fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
     let (current, earlier) = keys.split_last().expect("the position itself");
     let since_zeroing = &earlier[earlier.len() - earlier.len().min(halfmoves as usize)..];
@@ -167,7 +163,7 @@ impl Tables {
         board.board().occupied().count() <= self.pieces && board.castles().castling_rights().is_empty()
     }
 
-    //tools.tablebase.wdl_score for the side to move: a win or a loss that the fifty move rule turns into a draw is a draw
+    //tools.tablebase.wdl_score: a win or loss the fifty move rule turns into a draw is a draw
     fn score(&self, board: &Chess) -> Result<f64, SyzygyError> {
         Ok(match self.tablebase.probe_wdl_after_zeroing(board)? {
             Wdl::Win => 1.0,
@@ -177,8 +173,7 @@ impl Tables {
     }
 }
 
-//mcts.game_result: the score of the side to move if the game is over here or the tablebase knows how it ends. keys end
-//with the board's own, legal_moves are its moves
+//mcts.game_result; keys end with the board's own
 pub fn game_result(
     board: &Chess,
     keys: &[u64],
@@ -202,8 +197,7 @@ pub fn game_result(
     Ok(None)
 }
 
-//selfplay.final_result: white's result once the game is over by the rules (Board.outcome(claim_draw=True)), known to
-//the tablebase, or at max_plies. keys end with the board's own
+//reference_selfplay.final_result (outcome(claim_draw=True), the tablebase, max_plies); keys end with the board's own
 pub fn final_result(
     board: &Chess,
     keys: &[u64],

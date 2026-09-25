@@ -11,22 +11,20 @@ BLACK_KINGSIDE_INDEX = 67
 BLACK_QUEENSIDE_INDEX = 68
 EN_PASSANT_INDEX = 69
 
-TOKENS_PER_BOARD = 70 #length of an encoded board, each token is one of BOARD_VOCAB_SIZE values
+TOKENS_PER_BOARD = 70
 
-#the same raw value means different things in different slots (1 is a white pawn on a square,
-#white to move in the turn slot, a castling right, or square b1 in the en passant slot).
-#each kind of value gets its own block of token ids so they never share an embedding row.
-#encode_board adds the offsets, so an encoded board is already a list of token ids
+#each slot kind gets its own block of token ids, so a raw value never shares an embedding row across slots.
+#encode_board adds the offsets
 NUM_PIECE_CODES = 1 + 2 * NUM_PIECE_TYPES #13, empty + 6 white + 6 black
-NUM_FLAG_VALUES = 2 #0 or 1
-NUM_EN_PASSANT_VALUES = NUM_SQUARES #0 for no en passant square, otherwise the square itself
+NUM_FLAG_VALUES = 2
+NUM_EN_PASSANT_VALUES = NUM_SQUARES #0 for none, otherwise the square
 
 PIECE_TOKEN_OFFSET = 0
 TURN_TOKEN_OFFSET = PIECE_TOKEN_OFFSET + NUM_PIECE_CODES #13
 CASTLING_TOKEN_OFFSET = TURN_TOKEN_OFFSET + NUM_FLAG_VALUES #15, shared by all four castling slots
 EN_PASSANT_TOKEN_OFFSET = CASTLING_TOKEN_OFFSET + NUM_FLAG_VALUES #17
 
-BOARD_VOCAB_SIZE = EN_PASSANT_TOKEN_OFFSET + NUM_EN_PASSANT_VALUES #81, the size of the board vocabulary
+BOARD_VOCAB_SIZE = EN_PASSANT_TOKEN_OFFSET + NUM_EN_PASSANT_VALUES #81
 
 def _build_all_possible_moves() -> tuple[chess.Move, ...]:
     board = chess.Board.empty()
@@ -59,9 +57,9 @@ def _build_all_possible_moves() -> tuple[chess.Move, ...]:
 
 
     return tuple(moves)
-            
+
 ALL_POSSIBLE_MOVES = _build_all_possible_moves()
-NUM_MOVE_IDS = len(ALL_POSSIBLE_MOVES) #1968, the size of the move vocabulary
+NUM_MOVE_IDS = len(ALL_POSSIBLE_MOVES) #1968
 
 def _build_move_dict() -> dict[chess.Move, int]:
     output = {}
@@ -71,38 +69,29 @@ def _build_move_dict() -> dict[chess.Move, int]:
     return output
 
 MOVE_TO_ID = _build_move_dict()
-#the same ids by the move's squares and promotion, for encode_move_to_id
+#the same ids keyed by (from, to, promotion), for encode_move_to_id
 MOVE_IDS_BY_SQUARES = {(move.from_square, move.to_square, move.promotion): move_id for move, move_id in MOVE_TO_ID.items()}
 
-#move from and to are both length 1968, store the starting and ending squares of every possible move
 MOVE_FROM_SQUARES = tuple(move.from_square for move in ALL_POSSIBLE_MOVES)
 MOVE_TO_SQUARES = tuple(move.to_square for move in ALL_POSSIBLE_MOVES)
 
-#the 176 promotions on their own, all three the same length: the move id, the square the pawn lands on,
-#and the piece as 0 knight, 1 bishop, 2 rook, 3 queen
+#the 176 promotions: move id, landing square, and piece as 0 knight, 1 bishop, 2 rook, 3 queen
 PROMOTION_MOVE_IDS = tuple(move_id for move_id, move in enumerate(ALL_POSSIBLE_MOVES) if move.promotion is not None)
 PROMOTION_TO_SQUARES = tuple(ALL_POSSIBLE_MOVES[move_id].to_square for move_id in PROMOTION_MOVE_IDS)
 PROMOTION_PIECES = tuple(ALL_POSSIBLE_MOVES[move_id].promotion - chess.KNIGHT for move_id in PROMOTION_MOVE_IDS)
 
 
-#need to encode a board state into a tensor of some sort
-#we have 6 unique pieces, so 12 per side. 
-#we also need to encode castling and en passant somehow along with whose turn it is
-#
-#the board is always encoded from the side to move: with black to move it is mirrored first (ranks flipped,
-#colours swapped), so "white" below means the side to move and its pieces always start at the bottom.
-#the turn token keeps the real colour, which is how decode_board knows to mirror back
-#
-#the mirror is done square by square (square ^ 56 flips the rank) rather than with board.mirror(), which copies the board
-#and every move played so far: the search encodes thousands of boards a second
+#the board is encoded from the side to move: with black to move it is mirrored (ranks flipped, colours swapped),
+#so "white" means the side to move. The turn token keeps the real colour so decode_board can mirror back.
+#square ^ 56 flips the rank; board.mirror() would copy the whole move stack, too slow for the search
 def encode_board(board: chess.Board) -> list[int]:
     turn = board.turn
     opponent = not turn
     flip = 0 if turn == chess.WHITE else 56
 
-    encoding = [0 for _ in range(NUM_SQUARES)] #we use 0 to denote an empty square
+    encoding = [0 for _ in range(NUM_SQUARES)] #0 is an empty square
 
-    #the side to move's pieces are 1-6 and the other side's 7-12, read straight from the board's bitboards
+    #the side to move's pieces are 1-6, the other side's 7-12
     for piece_type in chess.PIECE_TYPES:
         for square in chess.scan_forward(board.pieces_mask(piece_type, turn)):
             encoding[square ^ flip] = piece_type
@@ -121,7 +110,7 @@ def encode_board(board: chess.Board) -> list[int]:
     return encoding
 
 def decode_board(encoding: list[int]) -> chess.Board:
-    board = chess.Board.empty() #white to move, which is how every board is encoded
+    board = chess.Board.empty() #white to move, as every board is encoded
 
     ep_square = encoding[EN_PASSANT_INDEX] - EN_PASSANT_TOKEN_OFFSET
     board.ep_square = (None if ep_square == 0 else ep_square)
@@ -144,12 +133,10 @@ def decode_board(encoding: list[int]) -> chess.Board:
 
     return board
 
-#the same move on a mirrored board
 def mirror_move(move: chess.Move) -> chess.Move:
     return chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square), promotion=move.promotion)
 
-#turn is the side playing the move. Black's moves are mirrored, to match the board encode_board gives: square ^ 56 is the
-#square on the mirrored board, and looking three numbers up is faster than building the mirrored move
+#turn is the side playing the move: black's moves are mirrored to match encode_board
 def encode_move_to_id(move: chess.Move, turn: chess.Color) -> int:
     flip = 0 if turn == chess.WHITE else 56
     return MOVE_IDS_BY_SQUARES[move.from_square ^ flip, move.to_square ^ flip, move.promotion]
@@ -159,25 +146,9 @@ def decode_id_to_move(move_id: int, turn: chess.Color) -> chess.Move:
     move = ALL_POSSIBLE_MOVES[move_id]
     return mirror_move(move) if turn == chess.BLACK else move
 
-# 1  # pawn white
-# 2  # knight white
-# 3  # bishop white
-# 4  # rook white
-# 5  # queen white
-# 6  # king white
 def integer_to_piece(piece: int) -> chess.Piece | None:
     if piece == 0: return None
     if piece <= NUM_PIECE_TYPES:
         return chess.Piece(piece, chess.WHITE)
     else:
         return chess.Piece(piece - NUM_PIECE_TYPES, chess.BLACK)
-
-def piece_to_integer(piece: chess.Piece | None) -> int:
-    if piece is None: return 0
-    output_piece = 0
-    if piece.color == chess.WHITE:
-        output_piece += piece.piece_type
-    else:
-        output_piece += piece.piece_type + NUM_PIECE_TYPES
-
-    return output_piece

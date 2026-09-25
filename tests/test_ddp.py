@@ -1,4 +1,4 @@
-"""Real two- and four-process Gloo tests; no GPUs or repository training data required."""
+#real two- and four-process gloo tests: no gpu or training data needed
 
 import copy
 import json
@@ -87,7 +87,7 @@ def compare_update(rank, compiled=False):
 
 
 def check_shared_clock(rank):
-    #the shared budget takes rank zero's clock every CLOCK_EVERY steps and keeps it in between, on every rank alike
+    #every rank takes rank zero's clock every CLOCK_EVERY steps and keeps it in between
     budget = Budget(16, minutes=1)
     clock = Budget(16, minutes=1) if rank == 0 else None
     optimizer = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.1)
@@ -115,7 +115,7 @@ def check_shared_clock(rank):
 
 
 def check_shared_evaluation():
-    #the ranks' shares of the val batches add up to main.py's numbers on the same batches, also when some ranks get none
+    #the ranks' shares add up to main.py's numbers, also when some ranks get no batch
     rows = np.random.default_rng(5)
     size = 11
     val_dataset = data.ChessGamesDataset(
@@ -153,8 +153,7 @@ def distributed_worker(rank, folder, world_size):
         single.WARMUP_STEPS = 1
         check_shared_clock(rank)
 
-        #Exercise the actual production entry point, with only data/output locations
-        #and the warmup/evaluation intervals reduced for this tiny integration run.
+        #the real entry point, with only the folders and the warmup/eval intervals made small
         data.PROCESSED_DATA_DIR = folder
         train_ddp.RUNS_DIR = folder / "runs"
         import tools.compare_runs as reports
@@ -194,8 +193,9 @@ def write_varied_set(folder, name):
             (folder / f"{name}_{split}_{field}.bin").write_bytes(array.tobytes())
 
 
+#a job killed between two steps, as a preempted slurm job stops
 class Preempted(Exception):
-    """a job killed between two steps, the way a preempted or time-limited slurm job stops"""
+    pass
 
 
 def resume_worker(rank, folder, world_size):
@@ -234,8 +234,7 @@ def resume_worker(rank, folder, world_size):
 
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
 def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopped(tmp_path):
-    #catches anything the saved state misses: the optimizers' moments (Muon's and AdamW's), the schedule, the position
-    #in the epoch's order, or the best evaluation that picks model.pt
+    #catches anything the saved state misses: optimizer moments, schedule, position in the epoch, best evaluation
     write_varied_set(tmp_path, "b")
     mp.spawn(resume_worker, args=(str(tmp_path), 2), nprocs=2)
     runs = tmp_path / "runs"

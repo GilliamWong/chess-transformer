@@ -12,9 +12,8 @@ EVAL = 120  #stockfish's score of every position the tests write, in centipawns
 TEMPERATURE = 0.02
 
 
+#raw arrays as in processed_data/, two label places per position (the second empty); the best move is the row number
 def write_training_set(folder, name, positions_per_split) -> None:
-    """raw arrays the way processed_data/ holds them, no header: uint8 boards, and int16 stockfish moves and evals with
-    two places per position, the second empty. Stockfish's best move says which position a row is"""
     for split, num_positions in positions_per_split.items():
         boards = np.full((num_positions, TOKENS_PER_BOARD), 5, dtype=np.uint8)
         stockfish_moves = np.stack([np.arange(num_positions, dtype=np.int16), np.full(num_positions, NO_MOVE, dtype=np.int16)], axis=1)
@@ -24,16 +23,16 @@ def write_training_set(folder, name, positions_per_split) -> None:
         (folder / f"{name}_{split}_stockfish_evals.bin").write_bytes(stockfish_evals.tobytes())
 
 
+#300 train and 20 val positions
 @pytest.fixture
 def tiny(tmp_path, monkeypatch) -> tuple[ChessGamesDataset, ChessGamesDataset]:
-    """300 train and 20 val positions"""
     monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
     write_training_set(tmp_path, "tiny", {"train": 300, "val": 20})
     return load_training_set("tiny", TEMPERATURE)
 
 
+#one epoch's positions in the order the loader yields them
 def loader_moves(loader: DataLoader) -> list[int]:
-    """every position the loader yields in one epoch, in the order it yields them"""
     return [move for _, moves, _, _, _ in loader for move in moves[:, 0].tolist()]
 
 
@@ -53,7 +52,7 @@ def test_items_have_the_dtype_and_shape_the_model_needs(tiny):
 
     #embedding lookups and the gather in policy_loss both require int64
     assert board.dtype == torch.long and board.shape == (TOKENS_PER_BOARD,)
-    #the policy target is a list of moves with a probability each, one per place stockfish's labels have
+    #one target move and probability per place of stockfish's labels
     assert target_moves.dtype == torch.long and target_moves.shape == (2,)
     assert target_probabilities.tolist() == [1.0, 0.0]  #the second place has no move
     assert value.dtype == torch.float and value.shape == ()
@@ -91,7 +90,7 @@ def test_train_loader_reshuffles_and_val_loader_does_not(tiny):
 
 
 def test_train_order_depends_on_the_seed_alone(tiny):
-    #building a model draws random numbers, a different amount for every architecture, which used to change the order
+    #building a model draws a different amount of random numbers for every architecture
     def first_batches(seed: int, draws_before: int) -> list[list[int]]:
         torch.manual_seed(0)
         torch.randn(draws_before)
@@ -137,8 +136,8 @@ def test_dataset_rejects_mismatched_lengths():
         ChessGamesDataset(np.zeros((3, TOKENS_PER_BOARD), dtype=np.uint8), labels, labels, TEMPERATURE)
 
 
-#self play keeps 8 target moves and these stockfish sets 2: the mix pads the narrower part with move 0 at probability 0,
-#and starts the smaller set over when it runs out (72 self play positions take 6 batches, 24 of the 20 stockfish ones)
+#8 self play target moves against 2 stockfish ones: the narrower part is padded, and the smaller set starts over
+#when it runs out (6 batches take 24 of the 20 stockfish positions)
 def test_mixed_batches_take_a_fixed_share_from_each_set(tiny):
     _, stockfish = tiny
     positions = 72
@@ -159,8 +158,7 @@ def test_mixed_batches_take_a_fixed_share_from_each_set(tiny):
         assert blunders.shape == (16, 1) and blunders.eq(NO_MOVE).all()
 
 
-#blunder labels next to a set, 3 places per position worst first: the first position has a blunder, a move at exactly the
-#threshold and a harmless move; the second nothing labelled
+#position 0: a blunder, a move exactly at the threshold and a harmless move; the others nothing labelled
 def write_blunder_labels(folder, name, positions):
     moves = np.full((positions, 3), NO_MOVE, dtype=np.int16)
     losses = np.zeros((positions, 3), dtype=np.float16)

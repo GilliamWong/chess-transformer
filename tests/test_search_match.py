@@ -1,20 +1,13 @@
-#the match against stockfish in one process (tools/play/search_match.py), with random movers standing in for stockfish
+#tools/play/search_match.py's match, with random movers standing in for stockfish
 import random
 
 import chess
 import pytest
-import torch
-from torch import nn
 
-from encoding import NUM_MOVE_IDS
+from fake_models import UniformModel
 from inference import cpu_batches
 from tools.play.search_match import OUR_NAME, play_match, result
 
-
-#every move equally likely and every position even
-class UniformModel(nn.Module):
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.zeros(len(boards), NUM_MOVE_IDS), torch.zeros(len(boards), 1)
 
 class RandomMover:
     def __init__(self, seed: int):
@@ -31,8 +24,7 @@ def opening(*sans: str) -> chess.Board:
     return board
 
 
-#two openings, each played with either colour by two opponents at once: every game is played out from its opening to
-#the end the rules give it, and each of our moves after the opening carries what its search found
+#each opening played with both colours, every game played out, and each of our moves annotated with its search
 def test_every_game_is_played_out_with_the_colours_swapped():
     openings = [opening("e4", "e5"), opening("d4", "d5")]
 
