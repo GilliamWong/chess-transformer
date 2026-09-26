@@ -55,11 +55,12 @@ def graph_sizes(max_batch: int) -> list[int]:
         sizes.append(sizes[-1] + (64 if sizes[-1] < 1024 else 128 if sizes[-1] < 2048 else 256))
     return sizes
 
-#a cuda graph for every one of graph_sizes, sharing one memory pool; a batch runs through the smallest that holds it.
-#launch returns at once and collect waits. Two pinned buffers each way let the next batch fill while the last one runs
+#a cuda graph for every batch size in sizes (ascending), sharing one memory pool; a batch runs through the smallest that
+#holds it. launch returns at once and collect waits. Two pinned buffers each way let the next batch fill while the last
+#one runs, so at most two batches may be launched and not yet collected
 class GraphedBatches:
-    def __init__(self, model: nn.Module, max_batch: int):
-        self.sizes = graph_sizes(max_batch)
+    def __init__(self, model: nn.Module, sizes: list[int]):
+        self.sizes = sizes
         largest = self.sizes[-1]
         #recorded on real boards: zero boards once hit a device-side assert
         self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
@@ -147,7 +148,7 @@ def inference_process(checkpoint_path: str, compile_model: bool, precision: str,
             model = Bf16(model)
         if compile_model:
             model = torch.compile(model, dynamic=True)
-        network = GraphedBatches(model, len(slot_names) * games_per_process)
+        network = GraphedBatches(model, graph_sizes(len(slot_names) * games_per_process))
     else:
         network = cpu_batches(load_model(Path(checkpoint_path), CPU))
     ready.set()

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from encoding import encode_board
-from inference import GraphedBatches, answer_rows
+from inference import GraphedBatches, answer_rows, graph_sizes
 from model import ChessTransformer, expected_score
 from tools.play.player import CudaGraphModel
 
@@ -22,7 +22,7 @@ def test_graphs_answer_like_the_model():
     with torch.no_grad():
         expected = answer_rows(model(torch.from_numpy(boards).long().cuda())).cpu().numpy()
 
-    graphs = GraphedBatches(model, 4)
+    graphs = GraphedBatches(model, graph_sizes(4))
     answers = graphs.collect(graphs.launch(boards))
     logits, value = CudaGraphModel(model)(torch.from_numpy(boards[:1]).long())
     torch.cuda.synchronize()

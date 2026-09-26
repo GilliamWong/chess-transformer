@@ -9,8 +9,8 @@ from torch import nn
 
 import mcts
 import selfplay_rs
-from encoding import NUM_MOVE_IDS, encode_board, encode_move_to_id
-from fake_models import PIECE_VALUES, UniformModel
+from encoding import encode_board, encode_move_to_id
+from fake_models import BoardModel, UniformModel
 from inference import cpu_batches
 from reference_selfplay import final_result, play_game
 from selfplay import ANSWER_WIDTH, MAX_PLIES, RustSelfPlayBatch, play_games_in_rust, rust_search_settings
@@ -81,15 +81,6 @@ def test_the_rust_rules_are_the_pythons():
     #the corners were reached, not only positions where the game goes on
     assert checked["positions"] > 10000 and checked["over in the search"] > 200 and checked["over in the game"] > 400, checked
 
-
-#priors of the board's own, and a position scored by its material, so that some games are won
-class BoardModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weights = torch.randn(70, NUM_MOVE_IDS, generator=torch.Generator().manual_seed(0))
-
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return boards.float() @ self.weights / 100, PIECE_VALUES[boards[:, :64].long()].sum(dim=1, keepdim=True)
 
 #mcts.evaluate_many with rust's softmax, whose last bits differ from numpy's
 def evaluate_many_in_rust_numbers(model: nn.Module, boards: list[chess.Board], device: torch.device) -> list[tuple[dict[chess.Move, float], float]]:
@@ -170,8 +161,8 @@ def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
     while len(searches):
         leaves = np.frombuffer(searches.descend(), dtype=np.uint8).reshape(-1, 70)
         answers = np.concatenate([evaluate(leaves[row:row + 1]) for row in range(len(leaves))]) if len(leaves) else np.zeros((0, ANSWER_WIDTH), np.float32)
-        for number, line, score, root_moves in searches.finish(answers):
-            found[number] = (line, score, root_moves)
+        for number, line, score, root_moves, visits in searches.finish(answers):
+            found[number] = (line, score, root_moves, visits)
 
     assert len(positions) > 20 and sorted(found) == list(range(len(positions)))
     for number, board in enumerate(positions):
@@ -180,7 +171,8 @@ def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
         chosen = root.children[line[0]]
         score = chosen.value_sum / chosen.visit_count if chosen.visit_count > 0 else 1 - root.value_sum / root.visit_count
         by_visits = sorted(root.children.items(), key=lambda item: item[1].visit_count, reverse=True)
-        assert found[number] == ([move.uci() for move in line], score, [(move.uci(), child.visit_count) for move, child in by_visits]), board.fen()
+        assert found[number] == ([move.uci() for move in line], score, [(move.uci(), child.visit_count) for move, child in by_visits],
+                                 root.visit_count), board.fen()
 
     with pytest.raises(ValueError):
         searches.start(0, "R5k1/5ppp/8/8/8/8/5PPP/6K1 b - - 1 30", [], 40) #mated: nothing to search

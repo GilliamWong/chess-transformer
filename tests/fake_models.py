@@ -12,3 +12,12 @@ PIECE_VALUES = torch.tensor([0, 1, 3, 3, 5, 9, 0, -1, -3, -3, -5, -9, 0], dtype=
 class UniformModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.zeros(len(boards), NUM_MOVE_IDS), torch.zeros(len(boards), 1)
+
+#priors of the board's own, and a position scored by its material, so that some games are won
+class BoardModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weights = torch.randn(70, NUM_MOVE_IDS, generator=torch.Generator().manual_seed(0))
+
+    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return boards.float() @ self.weights / 100, PIECE_VALUES[boards[:, :64].long()].sum(dim=1, keepdim=True)
