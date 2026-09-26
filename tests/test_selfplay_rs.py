@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 import mcts
+import selfplay
 import selfplay_rs
 from encoding import encode_board, encode_move_to_id
 from fake_models import BoardModel, UniformModel
@@ -102,12 +103,17 @@ def assert_same_games(python_games, rust_games) -> None:
         assert np.array_equal(python.white_to_move, rust.white_to_move)
 
 #without root noise and sampled plies nothing is random: every number must match to the last bit. The uniform model's
-#searches are all ties, which go to the first child in python-chess's order
+#searches are all ties, which go to the first child in python-chess's order. With the cache (and the rounds of several
+#simulations it allows) the games are the same, from fewer network calls
+@pytest.mark.parametrize("cache", [True, False])
 @pytest.mark.parametrize("tree_reuse", [True, False])
 @pytest.mark.parametrize("model", ["board", "uniform"])
-def test_rust_games_are_the_python_games(monkeypatch, tree_reuse, model):
+def test_rust_games_are_the_python_games(monkeypatch, tree_reuse, model, cache):
     monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
     monkeypatch.setattr(mcts, "ROOT_NOISE_SHARE", 0.0)
+    if not cache:
+        monkeypatch.setattr(selfplay, "CACHE_POSITIONS", 0)
+        monkeypatch.setattr(selfplay, "SIMULATIONS_PER_LEAF", 1)
     model = BoardModel() if model == "board" else UniformModel()
 
     results = []
@@ -210,6 +216,36 @@ def test_rust_games_played_together_are_the_games_played_alone():
     assert not np.array_equal(alone[0].boards, alone[1].boards)
     other_seed, = play_games_in_rust(uniform, 8, [0], 1, seed=7, max_plies=40)
     assert not np.array_equal(alone[0].boards, other_seed.boards)
+
+
+#with root noise and sampled plies too, the cache changes no game: the noise still comes right after the root's
+#expansion, before a second simulation. Without tree reuse every move's root is new, and the cache often knows it
+def test_the_cache_changes_no_game_with_noise(monkeypatch):
+    board_model = cpu_batches(BoardModel()).evaluate_boards
+    cached = list(play_games_in_rust(board_model, 32, range(3), 3, max_plies=30, tree_reuse=False))
+    monkeypatch.setattr(selfplay, "CACHE_POSITIONS", 0)
+    monkeypatch.setattr(selfplay, "SIMULATIONS_PER_LEAF", 1)
+    uncached = list(play_games_in_rust(board_model, 32, range(3), 3, max_plies=30, tree_reuse=False))
+
+    key = lambda game: game.number
+    assert_same_games(sorted(uncached, key=key), sorted(cached, key=key))
+
+
+#the cache answers the positions games reach again, the openings above all: 8 games' first plies take fewer network calls
+def test_the_cache_saves_network_calls(monkeypatch):
+    evaluated = {}
+    for cache in (True, False):
+        if not cache:
+            monkeypatch.setattr(selfplay, "CACHE_POSITIONS", 0)
+            monkeypatch.setattr(selfplay, "SIMULATIONS_PER_LEAF", 1)
+        evaluated[cache] = 0
+        def counting(boards: np.ndarray) -> np.ndarray:
+            evaluated[cache] += len(boards)
+            return uniform(boards)
+        games = list(play_games_in_rust(counting, 64, range(8), 8, max_plies=4))
+        assert len(games) == 8
+
+    assert evaluated[True] < 0.85 * evaluated[False]
 
 
 def test_rust_tree_reuse_needs_fewer_evaluations_for_the_same_visits():

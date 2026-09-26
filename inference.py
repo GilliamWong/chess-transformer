@@ -48,6 +48,13 @@ def serve(network, boards: list[np.ndarray], answers: list[np.ndarray], connecti
             hand_out(*in_flight)
         in_flight = started
 
+#graph sizes for batches from one up to max_batch, a few percent apart (one search's rounds, a match's few games)
+def small_graph_sizes(max_batch: int) -> list[int]:
+    sizes = [1, 2, 4, 8, 16]
+    while sizes[-1] < max_batch:
+        sizes.append(sizes[-1] + 16)
+    return sizes
+
 #every 64 up to 1024, then every 128, then every 256: padding wastes a few percent at most
 def graph_sizes(max_batch: int) -> list[int]:
     sizes = [64]
@@ -114,6 +121,15 @@ class ImmediateBatches:
     def collect(self, launched: np.ndarray) -> np.ndarray:
         return launched
 
+#the network in fp16 with fp16 accumulation, the heads in fp32: on a geforce card faster than bf16 (d512 18.4k
+#positions/s at batch 64 against 13.6k; on data centre gpus fp16 accumulation is no faster) and nearer fp32's priors
+#(total variation 0.0012 against 0.0049). It sets torch's matmul flags for the whole process
+def fp16_model(checkpoint_path: Path) -> nn.Module:
+    torch.backends.cuda.matmul.allow_fp16_accumulation = True
+    #the heads' fp32 matmuls
+    torch.backends.cuda.matmul.allow_tf32 = True
+    return load_model(checkpoint_path, torch.device("cuda")).half_except_heads(torch.float16)
+
 #bf16 autocast, as main.py trains: targets as good as tf32's, and ~150k positions/s instead of 110k (d128, compiled)
 class Bf16(nn.Module):
     def __init__(self, model: nn.Module):
@@ -143,9 +159,12 @@ def inference_process(checkpoint_path: str, compile_model: bool, precision: str,
     if torch.cuda.is_available():
         #the cpu only copies: torch's threads spun on every core for large batches (60% of a 16 core cpu)
         torch.set_num_threads(1)
-        model = load_model(Path(checkpoint_path), torch.device("cuda"))
-        if precision == "bf16":
-            model = Bf16(model)
+        if precision == "fp16":
+            model = fp16_model(Path(checkpoint_path))
+        else:
+            model = load_model(Path(checkpoint_path), torch.device("cuda"))
+            if precision == "bf16":
+                model = Bf16(model)
         if compile_model:
             model = torch.compile(model, dynamic=True)
         network = GraphedBatches(model, graph_sizes(len(slot_names) * games_per_process))

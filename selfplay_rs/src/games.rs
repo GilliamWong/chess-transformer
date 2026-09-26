@@ -68,6 +68,11 @@ impl Game {
         FinishedGame { number: self.number, record: self.record, white_score }
     }
 
+    //the root's noise is still to come: it comes once the root is expanded, before the next simulation
+    pub fn awaits_noise(&self) -> bool {
+        !self.noised
+    }
+
     //GameInProgress.add_noise_once_expanded
     pub fn add_noise_once_expanded(&mut self, settings: &GameSettings) {
         if !self.noised && !self.tree.root().children().is_empty() {

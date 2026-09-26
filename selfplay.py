@@ -46,6 +46,12 @@ MAX_PROCESSES = 8
 GAMES_PER_PROCESS = 256
 LOG_EVERY_GAMES = 50
 SEED = 42
+#the network's answers kept by position for transpositions (selfplay_rs' Cache, one a process), about 200 bytes each: a
+#third of a d512 search's evaluations repeat a position, and self play's games share their openings
+CACHE_POSITIONS = 500_000
+#a round's simulations for each leaf it sends to the network: those the cache or the game's end answer at once do not
+#wait for it. One leaf a round is still mcts.py's search, in fewer rounds
+SIMULATIONS_PER_LEAF = 3
 RECORD_ATTEMPTS = 20 #about 10 seconds of retrying the record's move
 
 
@@ -87,7 +93,8 @@ class RustSelfPlayBatch:
         self.games = selfplay_rs.SelfPlayGames(
             **rust_search_settings(use_tablebase), start_fen=board.root().fen(), start_moves=[move.uci() for move in board.move_stack], seed=seed,
             simulations=simulations, sampled_plies=sampled_plies, max_plies=max_plies, tree_reuse=tree_reuse, top_moves=TOP_MOVES,
-            no_move=NO_MOVE, root_noise_alpha=mcts.ROOT_NOISE_ALPHA, root_noise_share=mcts.ROOT_NOISE_SHARE)
+            no_move=NO_MOVE, root_noise_alpha=mcts.ROOT_NOISE_ALPHA, root_noise_share=mcts.ROOT_NOISE_SHARE, cache_positions=CACHE_POSITIONS,
+            simulations_per_round=SIMULATIONS_PER_LEAF)
         for _ in range(size):
             self.start_next_game()
 
@@ -502,7 +509,8 @@ if __name__ == "__main__":
     parser.add_argument("--games-per-process", type=int, default=GAMES_PER_PROCESS, help="games each process plays at once. Default %(default)s")
     parser.add_argument("--no-tree-reuse", action="store_true", help="start every search from a new root (see TREE_REUSE)")
     parser.add_argument("--no-compile", action="store_true", help="skip torch.compile in the inference process (10-30 s at the start, 40%% faster gpu)")
-    parser.add_argument("--precision", choices=["bf16", "tf32"], default="bf16", help="of the network in the inference process (see Bf16). Default %(default)s")
+    parser.add_argument("--precision", choices=["fp16", "bf16", "tf32"], default="fp16",
+                        help="of the network in the inference process (see inference.fp16_model and Bf16). Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
     arguments = parser.parse_args()
 

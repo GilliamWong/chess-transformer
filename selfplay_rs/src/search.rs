@@ -121,9 +121,6 @@ pub struct Round {
     pub visit_limit: u32, //the search's simulations, those already done and waiting included
 }
 
-//one simulation a round, mcts.py's search
-pub const ONE_LEAF: Round = Round { leaves: 1, simulations: 1, collisions: 0, visit_limit: u32::MAX };
-
 pub struct Tree {
     pub board: Chess,   //the root's position
     pub keys: Vec<u64>, //the position_key of every position of the game, the root's last
@@ -144,6 +141,19 @@ impl Tree {
     //simulations waiting for the network
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    //the visits of the root's two most visited moves, 0 for a move it does not have
+    pub fn two_most_visits(&self) -> (u32, u32) {
+        let (mut most, mut second) = (0, 0);
+        for child in &self.nodes[self.root().children()] {
+            if child.visit_count > most {
+                (most, second) = (child.visit_count, most);
+            } else if child.visit_count > second {
+                second = child.visit_count;
+            }
+        }
+        (most, second)
     }
 
     //mcts.select_child, with the simulations under a child that wait for the network counted in its visits for the
@@ -246,11 +256,6 @@ impl Tree {
             }
         }
         Ok(gathered)
-    }
-
-    //mcts.descend, and mcts.finish at once when the leaf needs no network. True when its board was added to boards
-    pub fn descend(&mut self, settings: &SearchSettings, tables: Option<&Tables>, boards: &mut Vec<u8>) -> Result<bool, SyzygyError> {
-        Ok(self.gather(&ONE_LEAF, settings, tables, None, boards)? == 1)
     }
 
     //mcts.finish for the oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it

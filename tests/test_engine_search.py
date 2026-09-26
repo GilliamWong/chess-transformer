@@ -1,5 +1,5 @@
 #the uci engine's search (tools/play/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
-#deadline and node limit, the tree kept for the next move, and uci.py's go limits
+#deadline and node limit, smart pruning, the tree kept for the next move, and uci.py's go limits and clock
 import subprocess
 import sys
 import time
@@ -18,7 +18,7 @@ from model import ChessTransformer
 from selfplay import rust_search_settings
 from tools.checkpoint import save_checkpoint
 from tools.play.engine_search import EngineSearch
-from tools.play.uci import MOVE_OVERHEAD_SECONDS, search_limits, seconds_for_move
+from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
 
@@ -101,14 +101,16 @@ def test_one_leaf_a_round_is_the_exact_search_at_every_move(carlsen_games):
         board.push(report.line[0])
 
 
-#with leaves out on the network, rounds stop at the search's simulations
+#with leaves out on the network, rounds stop at the search's simulations (without smart pruning, which stops sooner)
 @pytest.mark.parametrize("simulations", [1, 37, 300])
 def test_a_search_of_many_leaves_a_round_stops_at_its_simulations(carlsen_games, simulations):
     board = carlsen_games[1].board()
     for move in list(carlsen_games[1].mainline_moves())[:10]:
         board.push(move)
+    search = EngineSearch(cpu_batches(BoardModel()), 16)
+    search.smart_pruning = False
 
-    report = EngineSearch(cpu_batches(BoardModel()), 16).search(board, simulations=simulations)
+    report = search.search(board, simulations=simulations)
 
     assert report.simulations == simulations and report.line[0] in board.legal_moves
 
@@ -141,6 +143,7 @@ def test_a_timed_search_ends_by_its_deadline():
 def test_the_next_search_carries_on_the_last_tree():
     network = CountingNetwork(BoardModel())
     search = EngineSearch(network, 16)
+    search.smart_pruning = False
     board = chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1")
     first = search.search(board, simulations=400)
 
@@ -162,14 +165,69 @@ def test_the_next_search_carries_on_the_last_tree():
 
 #the side to move's clock, milliseconds as seconds, and --simulations when go sets no limit (go infinite)
 def test_go_limits():
-    assert search_limits("movetime 1000".split(), chess.WHITE, 800) == (None, pytest.approx(1 - MOVE_OVERHEAD_SECONDS))
-    assert search_limits("movetime 500 nodes 100".split(), chess.WHITE, 800) == (100, pytest.approx(0.5 - MOVE_OVERHEAD_SECONDS))
-    assert search_limits("nodes 5000".split(), chess.BLACK, 800) == (5000, None)
-    assert search_limits(["infinite"], chess.BLACK, 800) == (800, None)
+    clock = Clock()
+    assert clock.limits("movetime 1000".split(), chess.WHITE, 800) == (None, pytest.approx(1 - MOVE_OVERHEAD_SECONDS))
+    assert clock.limits("movetime 500 nodes 100".split(), chess.WHITE, 800) == (100, pytest.approx(0.5 - MOVE_OVERHEAD_SECONDS))
+    assert clock.limits("nodes 5000".split(), chess.BLACK, 800) == (5000, None)
+    assert clock.limits(["infinite"], chess.BLACK, 800) == (800, None)
 
-    nodes, seconds = search_limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), chess.BLACK, 800)
-    assert nodes is None and seconds == pytest.approx(seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None))
-    assert 0.5 < seconds < 30 / 5
+    nodes, seconds = clock.limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), chess.BLACK, 800)
+    assert nodes is None and seconds == pytest.approx(clock.seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None))
+    assert 0.5 < seconds < 30 * MOST_OF_THE_TIME_LEFT
+
+
+#a search stopped early (smart pruning) leaves time on the clock, and the next moves get it; a movetime search is not
+#on the clock
+def test_time_saved_goes_to_later_moves():
+    clock = Clock()
+    _, first = clock.limits("wtime 60000 btime 60000".split(), chess.WHITE, 800)
+    clock.searched(first / 2)
+    _, later = clock.limits("wtime 59000 btime 60000".split(), chess.WHITE, 800)
+    _, without_saving = Clock().limits("wtime 59000 btime 60000".split(), chess.WHITE, 800)
+    assert later > 1.05 * without_saving
+
+    clock.searched(later / 4)
+    _, after_more_saving = clock.limits("wtime 58000 btime 60000".split(), chess.WHITE, 800)
+    assert after_more_saving > later
+    clock.limits("movetime 1000".split(), chess.WHITE, 800)
+    clock.searched(0.1)
+    assert clock.limits("wtime 58000 btime 60000".split(), chess.WHITE, 800)[1] == pytest.approx(after_more_saving)
+    for _ in range(50):
+        clock.searched(0.0)
+    assert clock.limits("wtime 3000 btime 60000".split(), chess.WHITE, 800)[1] <= 3 * MOST_OF_THE_TIME_LEFT
+
+
+#smart pruning stops once the simulations left could not change the most visited move: a mate in one is decided when
+#it has about half the budget, and at the stop its lead is more than the simulations left; the start with a flat
+#eval is never decided
+def test_a_decided_search_stops_early():
+    mate = EngineSearch(cpu_batches(UniformModel()), 16).search(chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1"), simulations=4000)
+    (best, most), (_, second) = mate.root_moves[:2]
+    assert best.uci() == "e1e8" and mate.simulations < 2200 and most - second > 4000 - mate.simulations
+
+    start = EngineSearch(cpu_batches(UniformModel()), 16).search(chess.Board(), simulations=400)
+    assert start.simulations == 400
+
+
+#with a number of simulations, the pruned search plays the move of the whole search (both from a new tree and cache)
+def test_pruning_never_changes_the_move(carlsen_games):
+    positions = []
+    for game in carlsen_games:
+        board = game.board()
+        for ply, move in enumerate(game.mainline_moves()):
+            board.push(move)
+            if ply % 9 == 6 and not board.is_game_over():
+                positions.append(chess.Board(board.fen()))
+
+    stopped_early = 0
+    for board in positions:
+        pruned = EngineSearch(cpu_batches(BoardModel()), 16).search(board, simulations=300)
+        whole_search = EngineSearch(cpu_batches(BoardModel()), 16)
+        whole_search.smart_pruning = False
+        whole = whole_search.search(board, simulations=300)
+        assert pruned.line[0] == whole.line[0] and whole.simulations == 300, board.fen()
+        stopped_early += pruned.simulations < 300
+    assert len(positions) > 20 and stopped_early > 5
 
 
 #the engine as a gui drives it: a move within go movetime, and go nodes' simulations (in a new game: a kept tree's

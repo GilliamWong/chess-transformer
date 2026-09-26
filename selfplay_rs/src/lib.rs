@@ -51,25 +51,6 @@ fn play_moves(board: &mut Chess, keys: &mut Vec<u64>, moves: &[String]) -> PyRes
     Ok(())
 }
 
-//the boards of the leaves that need the network (TOKENS_PER_BOARD bytes each); their trees go in waiting
-fn descend_all<'a>(
-    trees: impl Iterator<Item = &'a mut Tree>,
-    settings: &SearchSettings,
-    tables: Option<&Tables>,
-    waiting: &mut Vec<usize>,
-) -> PyResult<Vec<u8>> {
-    if !waiting.is_empty() {
-        return Err(PyRuntimeError::new_err("the last leaves are still waiting for finish"));
-    }
-    let mut boards = Vec::new();
-    for (index, tree) in trees.enumerate() {
-        if tree.descend(settings, tables, &mut boards).map_err(tablebase_error)? {
-            waiting.push(index);
-        }
-    }
-    Ok(boards)
-}
-
 //the network's answers, answer_width float32s for each board descend gave it
 fn answers_for<'a>(py: Python<'a>, answers: &'a PyBuffer<f32>, boards: usize, answer_width: usize) -> PyResult<&'a [ReadOnlyCell<f32>]> {
     let answers = answers.as_slice(py).ok_or_else(|| PyValueError::new_err("the answers must be one contiguous array"))?;
@@ -97,14 +78,19 @@ struct SelfPlayGames {
     games: Vec<Game>,
     waiting: Vec<usize>, //games whose leaf the network is evaluating, in board order
     finished: Vec<FinishedGame>,
+    cache: Option<Cache>, //shared by the games: the network answers a position the same in every game
+    simulations_per_round: u32,
 }
 
 #[pymethods]
 impl SelfPlayGames {
+    //cache_positions is the size of the cache of network answers by position (search.rs Cache), 0 for none.
+    //simulations_per_round: a game's round may do this many simulations, all but the last answered at once (by the
+    //cache or the game's end); the games are the same, in fewer rounds
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, start_fen, start_moves, seed, simulations, sampled_plies, max_plies, tree_reuse,
                         top_moves, no_move, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
-                        root_noise_alpha, root_noise_share, tablebase_folder, tablebase_pieces))]
+                        root_noise_alpha, root_noise_share, tablebase_folder, tablebase_pieces, cache_positions=0, simulations_per_round=1))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -128,7 +114,12 @@ impl SelfPlayGames {
         root_noise_share: f64,
         tablebase_folder: Option<&str>,
         tablebase_pieces: usize,
+        cache_positions: usize,
+        simulations_per_round: u32,
     ) -> PyResult<SelfPlayGames> {
+        if simulations_per_round == 0 {
+            return Err(PyValueError::new_err("a round needs at least one simulation"));
+        }
         let (start, start_keys) = play_out(start_fen, &start_moves)?;
         Ok(SelfPlayGames {
             settings: GameSettings {
@@ -152,6 +143,8 @@ impl SelfPlayGames {
             games: Vec::new(),
             waiting: Vec::new(),
             finished: Vec::new(),
+            cache: (cache_positions > 0).then(|| Cache::new(cache_positions)),
+            simulations_per_round,
         })
     }
 
@@ -170,10 +163,30 @@ impl SelfPlayGames {
         }
     }
 
-    //the boards of the leaves that need the network
+    //the boards of the leaves that need the network, at most one a game (TOKENS_PER_BOARD bytes each). As in
+    //reference_selfplay a move gets at least one simulation, and the move is played once the root has its simulations
+    //(so a round stops there); until the root's noise is in, a round is one simulation
     fn descend<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let trees = self.games.iter_mut().map(|game| &mut game.tree);
-        let boards = descend_all(trees, &self.settings.search, self.tables.as_ref(), &mut self.waiting)?;
+        if !self.waiting.is_empty() {
+            return Err(PyRuntimeError::new_err("the last leaves are still waiting for finish"));
+        }
+        let mut boards = Vec::new();
+        for (index, game) in self.games.iter_mut().enumerate() {
+            let round = Round {
+                leaves: 1,
+                simulations: if game.awaits_noise() { 1 } else { self.simulations_per_round },
+                collisions: 0,
+                visit_limit: self.settings.simulations.max(game.tree.root().visit_count + 1),
+            };
+            if game
+                .tree
+                .gather(&round, &self.settings.search, self.tables.as_ref(), self.cache.as_ref(), &mut boards)
+                .map_err(tablebase_error)?
+                > 0
+            {
+                self.waiting.push(index);
+            }
+        }
         Ok(PyBytes::new(py, &boards))
     }
 
@@ -182,7 +195,7 @@ impl SelfPlayGames {
         let answers = answers_for(py, &answers, self.waiting.len(), self.answer_width)?;
         for (row, &index) in self.waiting.iter().enumerate() {
             let answer = &answers[row * self.answer_width..(row + 1) * self.answer_width];
-            self.games[index].tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, None);
+            self.games[index].tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, self.cache.as_mut());
         }
         self.waiting.clear();
 
@@ -444,6 +457,14 @@ impl Searches {
         }
         search.stopped = true;
         Ok(self.take_reports().into_iter().next())
+    }
+
+    //(the root's visits, the visits of its two most visited moves) of a running search, for smart pruning: the most
+    //visited move is decided once the simulations left cannot close the gap
+    fn root_visits(&self, id: u64) -> PyResult<(u32, u32, u32)> {
+        let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+        let (most, second) = search.tree.two_most_visits();
+        Ok((search.tree.root().visit_count, most, second))
     }
 
     //the searches still running

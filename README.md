@@ -111,6 +111,9 @@ uv run python -m tools.play.analyze_match                    judge the last matc
 The policy plays `avoid-repetition` by default (argmax, but no draw by repetition when clearly ahead). A search match
 against Stockfish runs every game in one process (`tools/play/search_match.py`): the searches in Rust, their leaves
 through the network together on the GPU; other matches run under cutechess-cli with `tools/play/uci.py` as the engine.
+Since 2026-09-26 the search match's network runs in fp16 (tf32 before, so its numbers differ a little from results
+logged earlier) and a cache answers positions reached again; the search is still `mcts.py`'s, 4.5x faster for the
+d512 at 32 games.
 Games are saved to `artifacts/match.pgn` (with the search's scores as `[%eval]`), and results against Stockfish are
 logged to `artifacts/elo_results.jsonl` and the `elo` chart in TensorBoard.
 
@@ -123,9 +126,11 @@ uv run python -m tools.play.uci artifacts/runs/<run>/model.pt --select mcts --gp
 The search (`tools/play/engine_search.py`) runs in Rust and gathers 64 leaves for each network call, as lc0 does, with
 the next round gathered while one is on the GPU; the network runs in fp16 as CUDA graphs, a cache answers positions
 reached again by another order of moves, and the tree is kept for the next move. The d512 does ~27k simulations a
-second on the 5070 Ti in one search, lc0 with BT4 ~6k nodes. `--leaves 1` is `mcts.py`'s search. The first start after
-an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to answer
-`isready`, so start the engine once by hand before a match.
+second on the 5070 Ti in one search, lc0 with BT4 ~6k nodes. Smart pruning stops a search once the simulations left
+cannot change its move (at 1 s a move 3 searches in 4 stop early, a quarter of the time saved), and on a clock the
+time saved goes to the moves that are not decided. `--leaves 1` is `mcts.py`'s search, without pruning. The first start
+after an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to
+answer `isready`, so start the engine once by hand before a match.
 
 ## Self-play (expert iteration)
 
@@ -138,7 +143,9 @@ uv run python -m tools.play.evaluate_elo --checkpoint artifacts/runs/rl_r1/model
 `selfplay.py` plays the model against itself with 64 simulations a move (root noise, the first 30 plies sampled from
 the visits, tree reuse) and saves every position with the search's visit shares, the game's result and the root's
 score. Worker processes play the games in Rust (`selfplay_rs/`); one inference process runs the network for all of them
-on the GPU. `+` and `-` add or remove a worker while it runs; ctrl+c finishes the games being played, a second ctrl+c
+on the GPU, in fp16 since 2026-09-26 (bf16 before: `--precision bf16`), and each worker keeps a cache of the network's
+answers by position. The games are the same search either way; for the d512 at 64 simulations 423 positions/s instead
+of 249. `+` and `-` add or remove a worker while it runs; ctrl+c finishes the games being played, a second ctrl+c
 stops at once, and running it again with the same flags carries on.
 
 The Rust search and rules must match `mcts.py` and the Python reference games in `tests/reference_selfplay.py`
