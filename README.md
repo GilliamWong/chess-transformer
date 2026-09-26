@@ -153,6 +153,6 @@ uv run pytest
 | `selfplay.py`, `inference.py` | Self-play: the worker processes and the GPU inference process |
 | `multi_gpu/` | The DDP trainer |
 | `selfplay_rs/` | The search and self-play games in Rust |
-| `tools/` | Checkpoints, run comparison, labelling, puzzles, and `play/` (UCI engine, matches, Elo log) |
-| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games) |
+| `tools/` | Checkpoints, run comparison, labelling, puzzles, the scaling grid's figure, and `play/` (UCI engine, matches, Elo log) |
+| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games) and `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget) |
 | `tests/` | `uv run pytest` |
