@@ -19,7 +19,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import main as single
-from model import ChessTransformer
+from data import concatenate_batches
+from model import ChessTransformer, mlp_hidden_width
 from tools.budget import Budget
 from tools.checkpoint import RUNS_DIR, save_checkpoint
 from tools.compare_runs import write_progress_page
@@ -62,6 +63,17 @@ def endless_batches(loader: DataLoader):
     while True:
         yield from loader
         loader.sampler.epoch += 1
+
+
+#the training set's batches, with a mix set each joined with the mix set's next one (main.py's MixedLoader); each set
+#starts its next epoch when it runs out
+def training_batches(loader: DataLoader, mix_loader: DataLoader | None):
+    if mix_loader is None:
+        yield from endless_batches(loader)
+        return
+    mix_batches = endless_batches(mix_loader)
+    for batch in endless_batches(loader):
+        yield concatenate_batches(batch, next(mix_batches))
 
 
 def make_budget(args) -> Budget:
@@ -125,11 +137,11 @@ def log_validation(writer, metrics, step, final=False):
         writer.add_scalar(f"final/{name}" if final else tag, value, step)
 
 
-#best_val_loss is the best evaluation so far (a resumed run's). save_resume(best_val_loss) is rank zero's, called every
-#resume_every_seconds of its wall clock
-def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
+#model is master_weights' compute model under DDP. best_val_loss is the best evaluation so far (a resumed run's).
+#save_resume(best_val_loss) is rank zero's, called every resume_every_seconds of its wall clock
+def train(model, master_weights, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
           value_weight, eval_every, writer=None, save_best=None, blunder_weight=single.BLUNDER_WEIGHT,
-          best_val_loss=float("inf"), save_resume=None, resume_every_seconds=None):
+          best_val_loss=float("inf"), save_resume=None, resume_every_seconds=None, mix_loader=None):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     #summed on the device over an eval interval: policy + value loss, the unweighted blunder penalty, and the gradient
     #norm before clipping
@@ -140,18 +152,18 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
                     disable=rank != 0, unit="s" if budget.timed else "it")
     model.train()
     try:
-        for batch in single.batches_on_device(endless_batches(train_loader), device):
-            for optimizer in optimizers:
-                optimizer.zero_grad()
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                logits, value_logits = model(batch[0])
-                loss = single.policy_loss(logits, batch[1], batch[2]) + value_weight * single.value_loss(value_logits, batch[3])
-                penalty = single.blunder_loss(logits, batch[4]) if blunder_weight else torch.zeros((), device=device)
+        for batch in single.batches_on_device(training_batches(train_loader, mix_loader), device):
+            master_weights.zero_grad()
+            logits, value_logits = model(batch[0])
+            loss = single.policy_loss(logits, batch[1], batch[2]) + value_weight * single.value_loss(value_logits, batch[3])
+            penalty = single.blunder_loss(logits, batch[4]) if blunder_weight else torch.zeros((), device=device)
             (loss + blunder_weight * penalty).backward()
-            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            master_weights.gradients_to_master()
+            gradient_norm = torch.nn.utils.clip_grad_norm_(master_weights.parameters, 1.0)
             #the gradients are averaged after backward, so every rank steps all of the weights itself, Muon's too
             for optimizer in optimizers:
                 optimizer.step()
+            master_weights.weights_to_compute()
 
             before = budget.seconds
             step_budget(budget, clock, device)
@@ -168,7 +180,7 @@ def train(model, raw_model, train_loader, val_loader, optimizers, schedulers, bu
                 train_loss, train_penalty, gradient_norm = (totals / (interval_steps * world_size)).tolist()
                 if rank == 0:
                     clock.pause()
-                metrics = evaluate(raw_model, val_loader, device, single.EVAL_BATCHES)
+                metrics = evaluate(master_weights.model, val_loader, device, single.EVAL_BATCHES)
                 if rank == 0:
                     tqdm.write(f"step {budget.steps} ({budget.positions:,} positions, {clock.seconds / 60:.1f} min): "
                                f"train loss {train_loss:.3f}, val loss {metrics[0]:.3f}, val accuracy {metrics[1]:.1%}")
@@ -236,23 +248,42 @@ def run(args, device: torch.device):
             resumed = torch.load(resume_path, map_location=device, weights_only=True)
     torch.manual_seed(args.seed)
 
+    #a mix set fills --mix-share of every global batch (a fine-tune on self play with stockfish positions), rounded so
+    #both parts divide between the processes
+    mix_batch_size = 0
+    if args.mix_set is not None:
+        if not 0 < args.mix_share < 1:
+            raise ValueError(f"--mix-share is the share of every batch from {args.mix_set}, between 0 and 1, got {args.mix_share}")
+        mix_batch_size = round(args.batch_size * args.mix_share / world_size) * world_size
+        if not 0 < mix_batch_size < args.batch_size:
+            raise ValueError(f"a mix share of {args.mix_share} leaves no whole batch of {world_size} processes on one side of {args.batch_size}")
+
     #one process per host warms the file cache; read-only mappings share the cached pages
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    train_dataset, val_dataset = single.load_training_set(args.training_set, args.target_temperature, blunder_threshold=args.blunder_threshold)
+    def load(name):
+        return single.load_training_set(name, args.target_temperature, args.result_weight, args.visit_temperature, args.blunder_threshold)
+    train_dataset, val_dataset = load(args.training_set)
+    mix_train_dataset, mix_val_dataset = load(args.mix_set) if args.mix_set is not None else (None, None)
     if local_rank == 0:
-        single.warm_file_cache(train_dataset, val_dataset)
-    val_loader = DataLoader(val_dataset, batch_size=None, sampler=BatchSampler(
-        SequentialSampler(val_dataset), single.BATCH_SIZE, drop_last=False))
+        single.warm_file_cache(*(dataset for dataset in (train_dataset, val_dataset, mix_train_dataset, mix_val_dataset) if dataset is not None))
+    def val_loader_of(dataset):
+        return DataLoader(dataset, batch_size=None, sampler=BatchSampler(SequentialSampler(dataset), single.BATCH_SIZE, drop_last=False))
+    val_loader = val_loader_of(val_dataset)
     dist.barrier()
     if not len(val_loader.dataset):
         raise ValueError("validation needs at least one position")
-    sampler = TrainingSampler(train_dataset, args.batch_size, rank, world_size, args.seed)
+    sampler = TrainingSampler(train_dataset, args.batch_size - mix_batch_size, rank, world_size, args.seed)
     #not pinned here: batches_on_device pins them in its thread
     train_loader = DataLoader(train_dataset, batch_size=None, sampler=sampler,
                               generator=torch.Generator().manual_seed(args.seed + rank))
+    mix_sampler = mix_loader = None
+    if args.mix_set is not None:
+        #its own order: the same seed would draw the same rows of both sets
+        mix_sampler = TrainingSampler(mix_train_dataset, mix_batch_size, rank, world_size, args.seed + 1)
+        mix_loader = DataLoader(mix_train_dataset, batch_size=None, sampler=mix_sampler)
 
     model_settings = dict(d_model=args.d_model, num_layers=args.layers, n_heads=args.heads,
-                          position_templates=args.templates, mlp_ratio=args.mlp_ratio,
+                          position_templates=args.templates, mlp_hidden=mlp_hidden_width(args.d_model, args.mlp_ratio),
                           qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads,
                           loops=args.loops, value_bins=args.value_bins)
     raw_model = ChessTransformer(**model_settings).to(device)
@@ -261,7 +292,9 @@ def run(args, device: torch.device):
     elif args.init_from is not None:
         #weights only: optimizer and schedule start afresh
         raw_model.load_state_dict(torch.load(args.init_from, map_location=device)["state_dict"])
-    model = DDP(raw_model, device_ids=[device.index] if device.type == "cuda" else None)
+    master_weights = single.MasterWeights(raw_model)
+    #DDP averages the compute model's gradients in bf16, as its bf16_compress_hook would
+    model = DDP(master_weights.compute_model, device_ids=[device.index] if device.type == "cuda" else None)
     if not args.no_compile:
         model = torch.compile(model) if args.compile_mode == "default" else torch.compile(model, mode=args.compile_mode)
     optimizers = single.make_optimizers(raw_model, args.lr, device, args.weight_decay, args.muon_momentum)
@@ -276,8 +309,10 @@ def run(args, device: torch.device):
         budget.steps = resumed["steps"]
         if clock is not None:
             clock.steps, clock.seconds = resumed["steps"], resumed["seconds"]
-        #one batch a step, so the step says where in which epoch's order the run was
+        #one batch of each set a step, so the step says where in which epoch's order the run was
         sampler.epoch, sampler.skip = divmod(resumed["steps"], len(sampler))
+        if mix_sampler is not None:
+            mix_sampler.epoch, mix_sampler.skip = divmod(resumed["steps"], len(mix_sampler))
         best_val_loss = resumed["best_val_loss"]
     if device.type == "cuda" and not args.no_compile:
         single.compile_muon_step(optimizers)  #after loading: the graph captures the learning rate tensor it finds
@@ -306,17 +341,21 @@ def run(args, device: torch.device):
                     value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight, blunder_threshold=args.blunder_threshold,
                     weight_decay=args.weight_decay, muon_momentum=args.muon_momentum,
                     blunder_labels=getattr(train_dataset, "worst_moves", None) is not None,
-                    budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=sampler.batch_size,
+                    budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=args.batch_size // world_size,
                     training_set=args.training_set, target_temperature=args.target_temperature,
+                    result_weight=args.result_weight, visit_temperature=args.visit_temperature,
+                    mix_set=args.mix_set, mix_share=mix_batch_size / args.batch_size if args.mix_set is not None else None,
+                    mix_blunder_labels=getattr(mix_train_dataset, "worst_moves", None) is not None if args.mix_set is not None else None,
                     note=args.note, commit=single.current_commit(), trainer="ddp", world_size=world_size,
                     init_from=str(args.init_from) if args.init_from is not None else None,
                     device=device.type, backend=dist.get_backend(), compile=not args.no_compile,
                     compile_mode=args.compile_mode, eval_every=args.eval_every, optimizer="muon",
                 )
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
-            print(f"DDP: {world_size} processes on {device.type}, global batch {args.batch_size}, "
-                  f"local batch {sampler.batch_size}; " + (f"resumed at step {budget.steps:,}, val loss {metrics[0]:.3f}"
-                                                           if resumed is not None else f"untrained val loss {metrics[0]:.3f}"))
+            print(f"DDP: {world_size} processes on {device.type}, global batch {args.batch_size}"
+                  + (f" ({mix_batch_size} of it from {args.mix_set})" if args.mix_set is not None else "")
+                  + f", local batch {args.batch_size // world_size}; " + (f"resumed at step {budget.steps:,}, val loss {metrics[0]:.3f}"
+                                                           if resumed is not None else f"{'starting point' if args.init_from is not None else 'untrained'} val loss {metrics[0]:.3f}"))
             print(f"logging to {run_dir}")
             if not args.no_tensorboard:
                 start_tensorboard()
@@ -327,15 +366,21 @@ def run(args, device: torch.device):
         def save_resume(best_val_loss):
             save_resume_state(run_dir / RESUME_FILE, raw_model, optimizers, schedulers, budget, clock, best_val_loss)
 
-        train(model, raw_model, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
+        train(model, master_weights, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
               args.value_weight, args.eval_every, writer, save_best if rank == 0 else None, args.blunder_weight,
-              best_val_loss, save_resume if rank == 0 and args.resume else None, args.checkpoint_minutes * 60)
+              best_val_loss, save_resume if rank == 0 and args.resume else None, args.checkpoint_minutes * 60, mix_loader)
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
+        #the mix set's whole val too: what a fine-tune still knows of it, and a number a run on it alone also has
+        mix_metrics = evaluate(raw_model, val_loader_of(mix_val_dataset), device) if args.mix_set is not None else None
         if rank == 0:
             log_validation(writer, metrics, budget.steps, final=True)
             settings.update({f"final_{name}": value for name, value in zip(METRIC_NAMES, metrics)})
+            if mix_metrics is not None:
+                for name, value in zip(METRIC_NAMES, mix_metrics):
+                    writer.add_scalar(f"final/mix_{name}", value, budget.steps)
+                settings.update({f"final_mix_{name}": value for name, value in zip(METRIC_NAMES, mix_metrics)})
             settings.update(train_seconds=clock.seconds, positions_seen=budget.positions,
                             gpu_seconds=clock.seconds * world_size if device.type == "cuda" else 0,
                             finished_at=datetime.now().isoformat(timespec="seconds"))
@@ -383,6 +428,12 @@ def parse_args(argv=None):
     parser.add_argument("--schedule", choices=("cosine", "hold", "constant"), default=single.SCHEDULE)
     parser.add_argument("--seed", type=int, default=single.SEED)
     parser.add_argument("--training-set", default=single.TRAINING_SET)
+    parser.add_argument("--mix-set", help="a second training set that fills --mix-share of every batch, e.g. full_sf8_20260922 while fine-tuning on self play")
+    parser.add_argument("--mix-share", type=float, default=single.MIX_SHARE, help="share of every batch from --mix-set, default %(default)s")
+    parser.add_argument("--result-weight", type=float, default=single.RESULT_WEIGHT,
+                        help="self play sets: share of the value target from the game's result, the rest the search's score. Default %(default)s")
+    parser.add_argument("--visit-temperature", type=float, default=single.VISIT_TEMPERATURE,
+                        help="self play sets: sharpens the visit shares the policy learns, 0 = the most visited move. Default %(default)s")
     parser.add_argument("--target-temperature", type=float, default=single.TARGET_TEMPERATURE)
     parser.add_argument("--value-weight", type=float, default=single.VALUE_LOSS_WEIGHT)
     parser.add_argument("--blunder-weight", type=float, default=single.BLUNDER_WEIGHT,

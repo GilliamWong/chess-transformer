@@ -12,7 +12,7 @@ from tools.play.player import choose_move, load_model
 CPU = torch.device("cpu")
 
 #not the default size, so loading only works if the settings really come from the file
-SETTINGS = {"d_model": 48, "num_layers": 3, "n_heads": 6, "qk_ratio": [0.5, 0.25, 1.0], "kv_heads": 3, "loops": 2, "value_bins": 16}
+SETTINGS = {"d_model": 48, "num_layers": 3, "n_heads": 6, "mlp_hidden": 96, "qk_ratio": [0.5, 0.25, 1.0], "kv_heads": 3, "loops": 2, "value_bins": 16}
 
 
 def test_model_of_any_size_comes_back_with_the_same_weights(tmp_path):
@@ -40,6 +40,19 @@ def test_checkpoint_without_template_maps_still_loads(tmp_path):
     assert loaded_settings == SETTINGS
     for loaded_output, output in zip(loaded.eval()(boards), model(boards)):
         assert torch.equal(loaded_output, output)
+
+
+#checkpoints from before mlp_hidden name mlp_ratio: they load at the width they trained at, where the rounding now in
+#model.py would give 320, 672 and 672
+@pytest.mark.parametrize("d_model, mlp_ratio, width", [(128, None, 344), (256, None, 688), (512, 1.333, 680)])
+def test_a_checkpoint_from_before_mlp_hidden_loads_at_its_old_width(tmp_path, d_model, mlp_ratio, width):
+    old = ChessTransformer(d_model=d_model, num_layers=1, n_heads=4, mlp_hidden=width)
+    save_checkpoint(old, {"d_model": d_model, "num_layers": 1, "n_heads": 4, "mlp_ratio": mlp_ratio, "value_bins": 128}, tmp_path / "model.pt")
+
+    loaded, loaded_settings = load_checkpoint(tmp_path / "model.pt", CPU)
+
+    assert loaded_settings["mlp_hidden"] == width and "mlp_ratio" not in loaded_settings
+    assert loaded.encoder[0].mlp.up_projection.out_features == width
 
 
 def test_checkpoint_with_template_maps_points_to_the_commit_that_has_them(tmp_path):

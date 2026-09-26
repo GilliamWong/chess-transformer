@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import queue
 import re
@@ -21,7 +22,7 @@ from tools.checkpoint import RUNS_DIR, load_checkpoint, save_checkpoint
 from tools.compare_runs import write_progress_page
 from tools.label_with_stockfish import NO_MOVE
 from tools.tensorboard_server import start_tensorboard
-from model import ChessTransformer, expected_score, value_bin_edges
+from model import ChessTransformer, expected_score, mlp_hidden_width, value_bin_edges
 
 #the model, each of these has a command line flag (python main.py --help)
 D_MODEL = 128
@@ -134,8 +135,10 @@ def value_error(value_logits: torch.Tensor, targets: torch.Tensor) -> float:
     return (expected_score(value_logits) - targets).abs().sum().item()
 
 
+#model is master_weights' compute model, maybe compiled
 def train(
     model: nn.Module,
+    master_weights: "MasterWeights",
     save_best_checkpoint: Callable[[], None],
     train_data_loader: DataLoader | MixedLoader,
     val_data_loader: DataLoader,
@@ -162,21 +165,21 @@ def train(
                     bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}{postfix}]")
 
     for batch, target_moves, target_probabilities, values, blunders in batches_on_device(endless_batches(train_data_loader), device):
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits, eval_logits = model(batch)
+        logits, eval_logits = model(batch)
 
-            loss = policy_loss(logits, target_moves, target_probabilities) + value_loss_weight * value_loss(eval_logits, values)
-            penalty = blunder_loss(logits, blunders) if blunder_weight else torch.zeros((), device=device)
+        loss = policy_loss(logits, target_moves, target_probabilities) + value_loss_weight * value_loss(eval_logits, values)
+        penalty = blunder_loss(logits, blunders) if blunder_weight else torch.zeros((), device=device)
 
-        for optimizer in optimizers:
-            optimizer.zero_grad()
+        master_weights.zero_grad()
 
         (loss + blunder_weight * penalty).backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        master_weights.gradients_to_master()
+        torch.nn.utils.clip_grad_norm_(master_weights.parameters, 1.0)
 
         for optimizer in optimizers:
             optimizer.step()
+        master_weights.weights_to_compute()
         progress.update(budget.step_done())
         for scheduler in schedulers:
             scheduler.step()
@@ -341,6 +344,30 @@ def compile_muon_step(optimizers: list[torch.optim.Optimizer]) -> None:
         if isinstance(optimizer, torch.optim.Muon):
             optimizer.step = torch.compile(optimizer.step, mode="reduce-overhead") #type: ignore[method-assign]
 
+#a bf16 copy of the model trains (a d512 step 6% faster than autocast) while the optimizers step the fp32 model, which
+#keeps the updates too small for a bf16 weight (bf16 weights alone: +0.020 val loss on a d128). Checkpoints save model
+class MasterWeights:
+    def __init__(self, model: ChessTransformer):
+        self.model = model
+        self.compute_model = copy.deepcopy(model).bf16_except_heads()
+        self.parameters = list(model.parameters())
+        self.compute_parameters = list(self.compute_model.parameters())
+        #allocated once, every step copies into them
+        for parameter in self.parameters:
+            parameter.grad = torch.zeros_like(parameter)
+
+    def zero_grad(self) -> None:
+        self.compute_model.zero_grad()
+
+    #after backward, before clipping and the optimizers' step
+    def gradients_to_master(self) -> None:
+        torch._foreach_copy_([parameter.grad for parameter in self.parameters], [parameter.grad for parameter in self.compute_parameters]) #type: ignore
+
+    #after the optimizers' step
+    @torch.no_grad()
+    def weights_to_compute(self) -> None:
+        torch._foreach_copy_(self.compute_parameters, self.parameters) #type: ignore
+
 
 #the commit, with a + when there were uncommitted changes
 def current_commit() -> str:
@@ -395,7 +422,7 @@ def main(
         initial_model, model_settings = load_checkpoint(init_checkpoint, torch.device("cpu"))
     else:
         #saved in the checkpoint so the model can be rebuilt when loading
-        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_ratio": mlp_ratio, "qk_ratio": qk_ratio, "kv_heads": kv_heads, "loops": loops, "value_bins": value_bins}
+        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_hidden": mlp_hidden_width(d_model, mlp_ratio), "qk_ratio": qk_ratio, "kv_heads": kv_heads, "loops": loops, "value_bins": value_bins}
     if mix_set is not None and not 0 < mix_share < 1:
         raise ValueError(f"--mix-share is the share of every batch from {mix_set}, between 0 and 1, got {mix_share}")
     if peak_learn_rate is None:
@@ -439,7 +466,9 @@ def main(
     num_parameters = sum(parameter.numel() for parameter in model.parameters())
     print(f"model: {model_settings}, {num_parameters:,} parameters")
 
-    compiled_model = torch.compile(model) if compile_mode == "default" else torch.compile(model, mode=compile_mode)
+    master_weights = MasterWeights(model)
+    compute_model = master_weights.compute_model
+    compiled_model = torch.compile(compute_model) if compile_mode == "default" else torch.compile(compute_model, mode=compile_mode)
     optimizers = make_optimizers(model, peak_learn_rate, device, weight_decay, muon_momentum)
 
     #the schedule runs over the part of the budget left when the warmup ends
@@ -499,7 +528,7 @@ def main(
     def save_best_checkpoint() -> None:
         save_checkpoint(model, model_settings, run_dir / "model.pt")
 
-    train(compiled_model, save_best_checkpoint, train_data_loader, val_data_loader, optimizers, schedulers, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight,
+    train(compiled_model, master_weights, save_best_checkpoint, train_data_loader, val_data_loader, optimizers, schedulers, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight,
           eval_every=eval_every, blunder_weight=blunder_weight)
 
     #model.pt is the best evaluation's, usually but not always the last
@@ -567,7 +596,7 @@ if __name__ == "__main__":
     parser.add_argument("--muon-momentum", type=float, default=MUON_MOMENTUM, help="default %(default)s")
     parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="the learning rate after the warmup, see SCHEDULE. Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
-    parser.add_argument("--mlp-ratio", type=float, help="hidden size of the swiglu mlp as a multiple of d-model, default 8/3")
+    parser.add_argument("--mlp-ratio", type=float, help="hidden size of the swiglu mlp as a multiple of d-model, rounded down to a multiple of 32. Default 8/3")
     parser.add_argument("--target-temperature", type=float, default=TARGET_TEMPERATURE, help="how stockfish's moves share the target, see TARGET_TEMPERATURE. Default %(default)s")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="positions per step, for train and val. Default %(default)s")
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention). Default one per head")

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from main import WEIGHT_DECAY, blunder_loss, make_optimizers, policy_loss
+from main import WEIGHT_DECAY, MasterWeights, blunder_loss, make_optimizers, policy_loss, value_loss
 from tools.label_with_stockfish import NO_MOVE
 from model import ChessTransformer
 
@@ -83,6 +83,35 @@ def test_training_with_muon_learns_a_batch():
     assert losses[-1] < losses[0] / 2
     for name in ["encoder.0.Q.weight", "encoder.1.mlp.down_projection.weight", "embed.weight", "from_projection.weight"]:
         assert not torch.equal(dict(model.named_parameters())[name], weights_before[name]), name
+
+
+#a step of main.train's: the bf16 copy's gradients reach the fp32 weights whole, and the copy then has the stepped
+#weights. A copy that kept its own weights, or optimizers stepping it directly, would train in bf16 alone
+def test_master_weights_step_the_fp32_model_and_the_bf16_copy_follows():
+    model = small_model()
+    master_weights = MasterWeights(model)
+    compute_model = master_weights.compute_model
+    assert compute_model.encoder[0].Q.weight.dtype == torch.bfloat16 and compute_model.eval_head[0].weight.dtype == torch.float32
+    #from the start too: a resumed run starts from a new copy, whose heads must not be rounded to bf16
+    for parameter, compute_parameter in zip(model.parameters(), compute_model.parameters()):
+        assert torch.equal(compute_parameter, parameter.to(compute_parameter.dtype))
+    optimizers = make_optimizers(model, 3e-3, CPU)
+    query_weights_before = model.encoder[0].Q.weight.detach().clone()
+
+    master_weights.zero_grad()
+    logits, value_logits = compute_model(torch.randint(0, 13, (16, 70)))
+    (policy_loss(logits, torch.randint(0, 1968, (16, 1)), torch.ones(16, 1)) + value_loss(value_logits, torch.rand(16))).backward()
+    master_weights.gradients_to_master()
+    for parameter, compute_parameter in zip(model.parameters(), compute_model.parameters()):
+        assert parameter.grad.dtype == torch.float32 and torch.equal(parameter.grad, compute_parameter.grad.float())
+    for optimizer in optimizers:
+        optimizer.step()
+    master_weights.weights_to_compute()
+
+    assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
+    assert not torch.equal(model.encoder[0].Q.weight, query_weights_before)
+    for parameter, compute_parameter in zip(model.parameters(), compute_model.parameters()):
+        assert torch.equal(compute_parameter, parameter.to(compute_parameter.dtype))
 
 
 def test_the_blunder_loss_is_minus_log_of_the_probability_left_to_other_moves():

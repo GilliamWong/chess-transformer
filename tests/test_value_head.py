@@ -55,7 +55,8 @@ def test_the_expected_score_is_the_head_output_as_a_score():
 #every checkpoint saved before the bins has one logit and no value_bins setting
 def test_a_checkpoint_from_before_the_bins_loads_with_one_logit(tmp_path):
     settings = {"d_model": 32, "num_layers": 1, "n_heads": 2}
-    old = ChessTransformer(**settings, value_bins=1)
+    #its mlp is the width of before mlp_hidden too
+    old = ChessTransformer(**settings, value_bins=1, mlp_hidden=88)
     save_checkpoint(old, settings, tmp_path / "model.pt")
 
     loaded, loaded_settings = load_checkpoint(tmp_path / "model.pt", CPU)
@@ -65,7 +66,7 @@ def test_a_checkpoint_from_before_the_bins_loads_with_one_logit(tmp_path):
 
 
 def test_the_bins_are_a_stored_setting(tmp_path):
-    settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "value_bins": 8}
+    settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": 8}
     save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
 
     loaded, _ = load_checkpoint(tmp_path / "model.pt", CPU)

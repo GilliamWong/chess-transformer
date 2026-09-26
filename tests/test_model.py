@@ -6,7 +6,7 @@ from torch import nn
 
 from encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD, encode_board, encode_move_to_id
 from main import value_loss
-from model import VALUE_BINS, ChessTransformer
+from model import VALUE_BINS, ChessTransformer, mlp_hidden_width
 
 BATCH_SIZE = 16
 
@@ -172,6 +172,14 @@ def test_a_qk_ratio_per_block_gives_each_block_its_own_width(batch):
     assert model(boards)[0].shape == (BATCH_SIZE, NUM_MOVE_IDS)
     with pytest.raises(ValueError): #a list that does not match the blocks would otherwise quietly miss some
         ChessTransformer(d_model=32, num_layers=2, n_heads=2, qk_ratio=[0.25, 0.5, 1.0])
+
+
+#widths the tensor cores take whole: the d512 recipe's ratio 1.333 is 672 wide, the default 8/3 of a d128 320
+def test_the_mlp_width_is_rounded_down_to_a_multiple_of_32():
+    assert mlp_hidden_width(512, 1.333) == 672
+    assert mlp_hidden_width(128) == 320
+    assert mlp_hidden_width(16) == 32
+    assert ChessTransformer(d_model=128, num_layers=1).encoder[0].mlp.up_projection.out_features == 320
 
 
 def test_grouped_query_attention_is_heads_sharing_their_keys_and_values(batch):

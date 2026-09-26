@@ -188,6 +188,28 @@ def test_blunders_are_the_labelled_moves_that_give_away_enough(tmp_path, monkeyp
     assert lenient[[0]][4].tolist() == [[700, 701, 702]]
 
 
+#self play sets take blunder labels the same way (tools.label_blunders labels any boards file): a set whose labels
+#were ignored would train without the penalty and say nothing
+def test_self_play_sets_take_blunder_labels_too(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    for split, positions in (("train", 4), ("val", 2)):
+        (tmp_path / f"selfplay_{split}_boards.bin").write_bytes(np.full((positions, TOKENS_PER_BOARD), 3, dtype=np.uint8).tobytes())
+        (tmp_path / f"selfplay_{split}_visit_moves.bin").write_bytes(np.tile(np.arange(2, dtype=np.int16), (positions, 1)).tobytes())
+        (tmp_path / f"selfplay_{split}_visit_shares.bin").write_bytes(np.full((positions, 2), 0.5, dtype=np.float32).tobytes())
+        (tmp_path / f"selfplay_{split}_outcomes.bin").write_bytes(np.ones(positions, dtype=np.float32).tobytes())
+        (tmp_path / f"selfplay_{split}_root_scores.bin").write_bytes(np.full(positions, 0.5, dtype=np.float32).tobytes())
+    write_blunder_labels(tmp_path, "selfplay", 4)
+
+    train_dataset, val_dataset = load_training_set("selfplay", TEMPERATURE)
+
+    assert isinstance(train_dataset, SelfPlayDataset)
+    assert train_dataset[[0, 1]][4].tolist() == [[700, 701, NO_MOVE], [NO_MOVE] * 3]
+    assert len(train_dataset.tensors()) == 7
+    assert val_dataset[[0, 1]][4].tolist() == [[NO_MOVE], [NO_MOVE]]
+    strict, _ = load_training_set("selfplay", TEMPERATURE, blunder_threshold=0.5)
+    assert strict[[0]][4].tolist() == [[700, NO_MOVE, NO_MOVE]]
+
+
 def test_blunder_labels_must_come_in_pairs_of_the_same_shape():
     boards = np.zeros((2, TOKENS_PER_BOARD), dtype=np.uint8)
     labels = np.zeros((2, 2), dtype=np.int16)

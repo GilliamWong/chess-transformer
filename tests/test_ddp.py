@@ -1,6 +1,7 @@
 #real two- and four-process gloo tests: no gpu or training data needed
 
 import copy
+from itertools import islice
 import json
 import time
 from datetime import timedelta
@@ -178,9 +179,9 @@ def distributed_worker(rank, folder, world_size):
         dist.destroy_process_group()
 
 
-def write_varied_set(folder, name):
+def write_varied_set(folder, name, seed=11):
     #different rows and blunder labels, so a resumed run that trained on the wrong batches ends with different weights
-    rows = np.random.default_rng(11)
+    rows = np.random.default_rng(seed)
     for split, size in (("train", 32), ("val", 10)):
         arrays = dict(
             boards=rows.integers(0, BOARD_VOCAB_SIZE, (size, TOKENS_PER_BOARD)).astype(np.uint8),
@@ -198,7 +199,7 @@ class Preempted(Exception):
     pass
 
 
-def resume_worker(rank, folder, world_size):
+def resume_worker(rank, folder, world_size, mix):
     torch.set_num_threads(1)
     folder = Path(folder)
     dist.init_process_group("gloo", init_method=(folder / "rendezvous").as_uri(),
@@ -215,6 +216,9 @@ def resume_worker(rank, folder, world_size):
         flags = ["--device", "cpu", "--no-compile", "--no-tensorboard", "--positions", "320", "--batch-size", "16",
                  "--d-model", "16", "--layers", "1", "--heads", "2", "--templates", "2", "--training-set", "b",
                  "--eval-every", "3", "--resume", "--checkpoint-minutes", "0"]
+        #with a mix set, 4 of the 16 come from c: 8 batches an epoch there, so the stop is in c's first epoch and the
+        #resumed run has to carry on into its second
+        flags += ["--mix-set", "c", "--mix-share", "0.25"] if mix else []
         train_ddp.run(train_ddp.parse_args(flags + ["--name", "whole"]), torch.device("cpu"))
 
         batches_on_device = single.batches_on_device
@@ -233,10 +237,13 @@ def resume_worker(rank, folder, world_size):
 
 
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
-def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopped(tmp_path):
-    #catches anything the saved state misses: optimizer moments, schedule, position in the epoch, best evaluation
+@pytest.mark.parametrize("mix", [False, True])
+def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopped(tmp_path, mix):
+    #catches anything the saved state misses: optimizer moments, schedule, position in the epoch (in both sets with a
+    #mix set), best evaluation
     write_varied_set(tmp_path, "b")
-    mp.spawn(resume_worker, args=(str(tmp_path), 2), nprocs=2)
+    write_varied_set(tmp_path, "c", seed=12)
+    mp.spawn(resume_worker, args=(str(tmp_path), 2, mix), nprocs=2)
     runs = tmp_path / "runs"
     for checkpoint in ("final.pt", "model.pt"):
         whole = torch.load(runs / "whole" / checkpoint)["state_dict"]
@@ -247,6 +254,30 @@ def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopp
     assert [entry["step"] for entry in settings["resumed"]] == [7]
     assert settings["positions_seen"] == 320 and settings["blunder_labels"]
     assert not (runs / "stopped" / train_ddp.RESUME_FILE).exists()
+    if mix:
+        assert settings["mix_set"] == "c" and settings["mix_share"] == 0.25 and settings["mix_blunder_labels"]
+        assert settings["final_mix_val_loss"] > 0 and settings["final_mix_val_loss"] != settings["final_val_loss"]
+
+
+#every mixed batch is the training set's local batch and then the mix set's, and each set moves on to its next epoch
+#when it runs out: a mix set whose rows never reached training, or came in the wrong share, would pass silently
+def test_mixed_training_batches_are_the_training_sets_rows_then_the_mix_sets():
+    def dataset(token, positions):
+        rows = np.random.default_rng(token)
+        return data.ChessGamesDataset(np.full((positions, TOKENS_PER_BOARD), token, dtype=np.uint8), rows.integers(0, 1968, (positions, 2)).astype(np.int16),
+                                      rows.integers(-300, 300, (positions, 2)).astype(np.int16), single.TARGET_TEMPERATURE)
+    main_sampler = train_ddp.TrainingSampler(dataset(3, 10), 3, 0, 1, 0)
+    mix_sampler = train_ddp.TrainingSampler(dataset(7, 6), 2, 0, 1, 1)
+    main_loader = torch.utils.data.DataLoader(main_sampler.dataset, batch_size=None, sampler=main_sampler)
+    mix_loader = torch.utils.data.DataLoader(mix_sampler.dataset, batch_size=None, sampler=mix_sampler)
+
+    batches = list(islice(train_ddp.training_batches(main_loader, mix_loader), 7))
+
+    for boards, *_ in batches:
+        assert boards.shape == (5, TOKENS_PER_BOARD)
+        assert boards[:3].eq(3).all() and boards[3:].eq(7).all()
+    #3 batches an epoch in each: the seventh is the third epoch's first
+    assert main_sampler.epoch == mix_sampler.epoch == 2
 
 
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")

@@ -10,6 +10,14 @@ VALUE_TOKEN_DIM = 16
 #al. 2024); 1 is the older head, one logit of the score
 VALUE_BINS = 128
 
+#the swiglu mlp's hidden width is mlp_ratio (default 8/3) times d_model, rounded down to a multiple of this: whole
+#tensor core tiles, 680 -> 672 made a d512 step 7% faster (a multiple of 16 is not enough)
+MLP_WIDTH_MULTIPLE = 32
+
+def mlp_hidden_width(d_model: int, mlp_ratio: float | None = None) -> int:
+    ratio = 8 / 3 if mlp_ratio is None else mlp_ratio
+    return max(MLP_WIDTH_MULTIPLE, int(ratio * d_model) // MLP_WIDTH_MULTIPLE * MLP_WIDTH_MULTIPLE)
+
 #the bins' boundaries from 0 to 1
 def value_bin_edges(bins: int, device: torch.device | None = None) -> torch.Tensor:
     return torch.linspace(0, 1, bins + 1, device=device)
@@ -43,7 +51,7 @@ class SwiGLU(nn.Module):
         return output
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, position_templates: int, mlp_ratio: float | None = None, qk_ratio: float = 1.0, kv_heads: int | None = None):
+    def __init__(self, d_model: int, n_heads: int, position_templates: int, mlp_hidden: int, qk_ratio: float = 1.0, kv_heads: int | None = None):
         super().__init__()
         #prenorm encoder block, no causal mask:
         #x = x + attention(ln1(x)), then x = x + mlp(ln2(x))
@@ -69,12 +77,7 @@ class TransformerBlock(nn.Module):
 
         self.combine_heads = nn.Linear(self.d_model, self.d_model)
 
-        if mlp_ratio is None:
-            d_hidden = 8 * math.ceil(self.d_model / 3)
-        else:
-            d_hidden = max(8, 8 * round(mlp_ratio * self.d_model / 8))
-
-        self.mlp = SwiGLU(self.d_model, d_hidden)
+        self.mlp = SwiGLU(self.d_model, mlp_hidden)
 
         self.template_mix = nn.Linear(self.d_model, position_templates * self.n_heads)
 
@@ -125,7 +128,8 @@ class TransformerBlock(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_ratio: float | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, loops: int = 1, value_bins: int = VALUE_BINS):
+    #mlp_hidden None is mlp_hidden_width(d_model)
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_hidden: int | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, loops: int = 1, value_bins: int = VALUE_BINS):
         super().__init__()
         #the input is B x 70 board tokens, torch.long
         self.d_model = d_model
@@ -148,8 +152,11 @@ class ChessTransformer(nn.Module):
         if len(qk_ratios) != num_layers:
             raise ValueError(f"{len(qk_ratios)} qk ratios for {num_layers} blocks, give one or one per block")
 
+        if mlp_hidden is None:
+            mlp_hidden = mlp_hidden_width(d_model)
+
         #a ModuleList since every block also needs the templates
-        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, mlp_ratio, qk_ratios[layer], kv_heads) for layer in range(num_layers)])
+        self.encoder = nn.ModuleList([TransformerBlock(self.d_model, n_heads, position_templates, mlp_hidden, qk_ratios[layer], kv_heads) for layer in range(num_layers)])
 
         self.board_down_project = nn.Sequential(
             nn.Linear(self.d_model, VALUE_TOKEN_DIM),
@@ -176,6 +183,17 @@ class ChessTransformer(nn.Module):
         self.promotion_projection = nn.Linear(self.d_model, 4) #one per piece a pawn can become
 
         self.ln = nn.LayerNorm(self.d_model)
+
+    #bf16 weights for all but the heads, which forward runs in fp32 on fp32 inputs. The heads are left alone rather than
+    #converted back, which would round their weights to bf16's precision
+    def bf16_except_heads(self) -> "ChessTransformer":
+        heads = {id(head) for head in (self.from_projection, self.to_projection, self.promotion_projection, self.board_down_project, self.eval_head)}
+        for child in self.children():
+            if id(child) not in heads:
+                child.to(torch.bfloat16)
+        for name, parameter in list(self.named_parameters(recurse=False)):
+            setattr(self, name, nn.Parameter(parameter.detach().to(torch.bfloat16)))
+        return self
 
     def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         #B x TOKENS_PER_BOARD
