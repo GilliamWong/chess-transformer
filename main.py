@@ -349,7 +349,7 @@ def compile_muon_step(optimizers: list[torch.optim.Optimizer]) -> None:
 class MasterWeights:
     def __init__(self, model: ChessTransformer):
         self.model = model
-        self.compute_model = copy.deepcopy(model).bf16_except_heads()
+        self.compute_model = copy.deepcopy(model).half_except_heads()
         self.parameters = list(model.parameters())
         self.compute_parameters = list(self.compute_model.parameters())
         #allocated once, every step copies into them

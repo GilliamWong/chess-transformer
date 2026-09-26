@@ -184,15 +184,15 @@ class ChessTransformer(nn.Module):
 
         self.ln = nn.LayerNorm(self.d_model)
 
-    #bf16 weights for all but the heads, which forward runs in fp32 on fp32 inputs. The heads are left alone rather than
-    #converted back, which would round their weights to bf16's precision
-    def bf16_except_heads(self) -> "ChessTransformer":
+    #bf16 (or fp16) weights for all but the heads, which forward runs in fp32 on fp32 inputs. The heads are left alone
+    #rather than converted back, which would round their weights to the half precision
+    def half_except_heads(self, dtype: torch.dtype = torch.bfloat16) -> "ChessTransformer":
         heads = {id(head) for head in (self.from_projection, self.to_projection, self.promotion_projection, self.board_down_project, self.eval_head)}
         for child in self.children():
             if id(child) not in heads:
-                child.to(torch.bfloat16)
+                child.to(dtype)
         for name, parameter in list(self.named_parameters(recurse=False)):
-            setattr(self, name, nn.Parameter(parameter.detach().to(torch.bfloat16)))
+            setattr(self, name, nn.Parameter(parameter.detach().to(dtype)))
         return self
 
     def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

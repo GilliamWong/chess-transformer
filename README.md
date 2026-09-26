@@ -114,6 +114,19 @@ through the network together on the GPU; other matches run under cutechess-cli w
 Games are saved to `artifacts/match.pgn` (with the search's scores as `[%eval]`), and results against Stockfish are
 logged to `artifacts/elo_results.jsonl` and the `elo` chart in TensorBoard.
 
+As a UCI engine with a clock (`go movetime`, `nodes`, `wtime`/`btime`), for timed matches against lc0 and others:
+
+```
+uv run python -m tools.play.uci artifacts/runs/<run>/model.pt --select mcts --gpu
+```
+
+The search (`tools/play/engine_search.py`) runs in Rust and gathers 64 leaves for each network call, as lc0 does, with
+the next round gathered while one is on the GPU; the network runs in fp16 as CUDA graphs, a cache answers positions
+reached again by another order of moves, and the tree is kept for the next move. The d512 does ~27k simulations a
+second on the 5070 Ti in one search, lc0 with BT4 ~6k nodes. `--leaves 1` is `mcts.py`'s search. The first start after
+an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to answer
+`isready`, so start the engine once by hand before a match.
+
 ## Self-play (expert iteration)
 
 ```
