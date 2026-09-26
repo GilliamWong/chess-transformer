@@ -94,6 +94,27 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
 - At scale, train with `train_ddp.py` at a global batch of about 4096 (the gradient noise scale of a d640 is 2.5k-7k
   positions) and stay within about 4 passes over the data (`full_sf8_20260922` has 290M positions).
 
+## Where it stands
+
+September 2026, details in `artifacts/selfplay_and_leela_2026-09-26.md` and `artifacts/scaling_grid_20260925/`:
+
+- The d512 with this recipe (22M parameters, 360M positions, about 3e18 training FLOPs) ties the d640 L20 against
+  Stockfish (65.6% against UCI_Elo 2500) at about a quarter of its compute. Without search it loses to Leela's BT4 by
+  383 Elo and to T1-512 by 189.
+- Its policy is capped by its labels: judged by deeper Stockfish, depth 8's move is only slightly better than ours
+  and worse than BT4's policy, while depth 10 and 12 labels are better than BT4's.
+- Self-play at 800 simulations gives targets about 40% better than the depth-8 labels, but fine-tuning the d512 on
+  19.8M such positions gained only +20 head-to-head and nothing against Stockfish: the net can fit the search's moves
+  on positions it trained on, yet only about a tenth of those corrections transfer to new positions, with 500k or 19M
+  positions alike.
+- At equal training compute the bigger model won every comparison of the scaling grid, around 5-15 positions per
+  parameter.
+- With search, against lc0 with BT4 at a fixed number of nodes a move: -418 Elo at equal nodes, -255 with 5 times
+  Leela's nodes (about her compute per move), -79 with 20 times. The engine search below does ~27k nodes/s on the
+  5070 Ti against lc0's ~6k with BT4; a timed match has not been played yet.
+- Depth-12 labels of every position (`full_sf12_20260926`, `selfplay_d512m_800_sf12` and `full_sf12_30M_mix`, the
+  30M set's rows) were made on Hyak on 2026-09-26; they share the depth-8 sets' boards and blunder labels.
+
 ## Play against it and measure its strength
 
 Windows only. Fetch Stockfish, Cute Chess and Leela once, then run a match:
@@ -174,5 +195,5 @@ uv run pytest
 | `multi_gpu/` | The DDP trainer |
 | `selfplay_rs/` | The search and self-play games in Rust |
 | `tools/` | Checkpoints, run comparison, labelling, puzzles, the scaling grid's figure, and `play/` (UCI engine, matches, Elo log) |
-| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games) and `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget) |
+| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games), `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget) and `selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish) |
 | `tests/` | `uv run pytest` |
