@@ -132,6 +132,7 @@ class ChessTransformer(nn.Module):
     def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_hidden: int | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, loops: int = 1, value_bins: int = VALUE_BINS):
         super().__init__()
         #the input is B x 70 board tokens, torch.long
+        #the 6 metadata tokens are also attention's scratch space (registers): a 64 token board without them plays worse
         self.d_model = d_model
         #looped depth: the whole stack runs this many times with the same weights
         if loops < 1:
