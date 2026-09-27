@@ -93,6 +93,21 @@ def test_attention_bias_starts_at_zero(batch):
     assert torch.equal(model(boards)[0], before)
 
 
+#the sink lets a head do nothing: with its score far above every real score the attention reads no token, and the block
+#adds only combine_heads' bias before its mlp
+def test_a_head_whose_sink_score_dominates_reads_nothing(batch):
+    boards, _ = batch
+    model = small_model().eval()
+    block = model.encoder[0]
+    x = model.embed(boards) + model.position_embed
+
+    with torch.no_grad():
+        block.sinks.fill_(1e4)
+        after_attention = x + block.combine_heads.bias
+        expected = after_attention + block.mlp(block.ln2(after_attention))
+        assert torch.allclose(block(x, model.templates), expected, atol=1e-5)
+
+
 #a layer that forward never uses gets no gradient and would silently never train
 def test_every_parameter_gets_a_gradient(batch):
     model = small_model()

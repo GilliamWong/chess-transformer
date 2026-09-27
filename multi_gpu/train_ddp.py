@@ -22,7 +22,7 @@ import main as single
 from data import concatenate_batches
 from model import ChessTransformer, mlp_hidden_width
 from tools.budget import Budget
-from tools.checkpoint import RUNS_DIR, save_checkpoint
+from tools.checkpoint import RUNS_DIR, save_checkpoint, warm_start
 from tools.compare_runs import write_progress_page
 from tools.tensorboard_server import start_tensorboard
 
@@ -138,10 +138,12 @@ def log_validation(writer, metrics, step, final=False):
 
 
 #model is master_weights' compute model under DDP. best_val_loss is the best evaluation so far (a resumed run's).
-#save_resume(best_val_loss) is rank zero's, called every resume_every_seconds of its wall clock
+#save_resume(best_val_loss) is rank zero's, called every resume_every_seconds of its wall clock; save_snapshot too,
+#every snapshot_every steps
 def train(model, master_weights, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
           value_weight, eval_every, writer=None, save_best=None, blunder_weight=single.BLUNDER_WEIGHT,
-          best_val_loss=float("inf"), save_resume=None, resume_every_seconds=None, mix_loader=None):
+          best_val_loss=float("inf"), save_resume=None, resume_every_seconds=None, mix_loader=None,
+          save_snapshot=None, snapshot_every=0):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     #summed on the device over an eval interval: policy + value loss, the unweighted blunder penalty, and the gradient
     #norm before clipping
@@ -201,6 +203,8 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
                 dist.barrier()  #checkpoint/logging time is excluded on every process
                 if rank == 0 and not finished:
                     clock.resume()
+            if save_snapshot is not None and budget.steps % snapshot_every == 0:
+                save_snapshot()
             if finished:
                 break
             if save_resume is not None and time.monotonic() - last_resume_save >= resume_every_seconds:
@@ -286,12 +290,13 @@ def run(args, device: torch.device):
                           position_templates=args.templates, mlp_hidden=mlp_hidden_width(args.d_model, args.mlp_ratio),
                           qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads,
                           loops=args.loops, value_bins=args.value_bins)
-    raw_model = ChessTransformer(**model_settings).to(device)
+    if args.init_from is not None:
+        #weights only: optimizer and schedule start afresh. The size is the checkpoint's, whatever the size flags say
+        raw_model, model_settings = warm_start(args.init_from, device, args.value_bins)
+    else:
+        raw_model = ChessTransformer(**model_settings).to(device)
     if resumed is not None:
         raw_model.load_state_dict(resumed["model"])
-    elif args.init_from is not None:
-        #weights only: optimizer and schedule start afresh
-        raw_model.load_state_dict(torch.load(args.init_from, map_location=device)["state_dict"])
     master_weights = single.MasterWeights(raw_model)
     #DDP averages the compute model's gradients in bf16, as its bf16_compress_hook would
     model = DDP(master_weights.compute_model, device_ids=[device.index] if device.type == "cuda" else None)
@@ -350,6 +355,7 @@ def run(args, device: torch.device):
                     init_from=str(args.init_from) if args.init_from is not None else None,
                     device=device.type, backend=dist.get_backend(), compile=not args.no_compile,
                     compile_mode=args.compile_mode, eval_every=args.eval_every, optimizer="muon",
+                    snapshot_every=args.snapshot_every,
                 )
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
             print(f"DDP: {world_size} processes on {device.type}, global batch {args.batch_size}"
@@ -366,9 +372,13 @@ def run(args, device: torch.device):
         def save_resume(best_val_loss):
             save_resume_state(run_dir / RESUME_FILE, raw_model, optimizers, schedulers, budget, clock, best_val_loss)
 
+        def save_snapshot():
+            save_checkpoint(raw_model, model_settings, run_dir / f"snapshot_{budget.positions:_}.pt")
+
         train(model, master_weights, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
               args.value_weight, args.eval_every, writer, save_best if rank == 0 else None, args.blunder_weight,
-              best_val_loss, save_resume if rank == 0 and args.resume else None, args.checkpoint_minutes * 60, mix_loader)
+              best_val_loss, save_resume if rank == 0 and args.resume else None, args.checkpoint_minutes * 60, mix_loader,
+              save_snapshot if rank == 0 and args.snapshot_every else None, args.snapshot_every)
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
@@ -406,7 +416,9 @@ def parse_args(argv=None):
                         help="carry on the --name run from its last saved state, or start it. Needs --positions")
     parser.add_argument("--checkpoint-minutes", type=float, default=10,
                         help="with --resume: wall minutes between two saved states. Default %(default)s")
-    parser.add_argument("--init-from", type=Path, help="model.pt to start the weights from (same architecture flags); optimizer and schedule start afresh")
+    parser.add_argument("--snapshot-every", type=int, default=0,
+                        help="steps between two copies of the weights kept in the run folder (snapshot_<positions>.pt), 0 for none")
+    parser.add_argument("--init-from", type=Path, help="model.pt to start from, at its size whatever the size flags say; with other --value-bins its eval head's last layer starts afresh. Optimizer and schedule start afresh")
     parser.add_argument("--note", default="")
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument("--no-compile", action="store_true", help="use eager execution for debugging")

@@ -81,6 +81,9 @@ class TransformerBlock(nn.Module):
 
         self.template_mix = nn.Linear(self.d_model, position_templates * self.n_heads)
 
+        #a learned score per head for attending to nothing; zeros draw no random numbers, so the other weights start the same
+        self.sinks = nn.Parameter(torch.zeros(self.n_heads))
+
 
     def forward(self, x: torch.Tensor, templates: torch.Tensor) -> torch.Tensor:
         #x is B T d_model, templates is position_templates 64 64 and shared by every block
@@ -111,7 +114,12 @@ class TransformerBlock(nn.Module):
         bias = F.pad(bias, (0, metadata_tokens, 0, metadata_tokens))
         attention = attention + bias
 
-        softmax_attention = torch.softmax(attention, dim=-1)
+        sink = self.sinks.view(1, -1, 1, 1).expand(B, -1, T, 1) #B n_heads T 1
+
+        attention = torch.cat([attention, sink], dim=-1) #the sink as an extra last column, B n_heads T T+1
+
+        #the sink column is dropped after the softmax: what a head puts there reads nothing
+        softmax_attention = torch.softmax(attention, dim=-1)[:, :, :, :-1]
 
         attention_weights = softmax_attention @ V_heads #B n_heads T d_head
 

@@ -215,7 +215,7 @@ def resume_worker(rank, folder, world_size, mix):
         #20 steps of 2 batches an epoch: the stop after step 7 is in the middle of the fourth epoch
         flags = ["--device", "cpu", "--no-compile", "--no-tensorboard", "--positions", "320", "--batch-size", "16",
                  "--d-model", "16", "--layers", "1", "--heads", "2", "--templates", "2", "--training-set", "b",
-                 "--eval-every", "3", "--resume", "--checkpoint-minutes", "0"]
+                 "--eval-every", "3", "--resume", "--checkpoint-minutes", "0", "--snapshot-every", "5"]
         #with a mix set, 4 of the 16 come from c: 8 batches an epoch there, so the stop is in c's first epoch and the
         #resumed run has to carry on into its second
         flags += ["--mix-set", "c", "--mix-share", "0.25"] if mix else []
@@ -240,12 +240,15 @@ def resume_worker(rank, folder, world_size, mix):
 @pytest.mark.parametrize("mix", [False, True])
 def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopped(tmp_path, mix):
     #catches anything the saved state misses: optimizer moments, schedule, position in the epoch (in both sets with a
-    #mix set), best evaluation
+    #mix set), best evaluation, and snapshots from before the stop and after it
     write_varied_set(tmp_path, "b")
     write_varied_set(tmp_path, "c", seed=12)
     mp.spawn(resume_worker, args=(str(tmp_path), 2, mix), nprocs=2)
     runs = tmp_path / "runs"
-    for checkpoint in ("final.pt", "model.pt"):
+    snapshots = ["snapshot_80.pt", "snapshot_160.pt", "snapshot_240.pt", "snapshot_320.pt"]  #every 5 of the 20 steps
+    for run in ("whole", "stopped"):
+        assert sorted(path.name for path in (runs / run).glob("snapshot_*.pt")) == sorted(snapshots)
+    for checkpoint in ("final.pt", "model.pt", *snapshots):
         whole = torch.load(runs / "whole" / checkpoint)["state_dict"]
         stopped = torch.load(runs / "stopped" / checkpoint)["state_dict"]
         assert whole.keys() == stopped.keys()

@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from tools import checkpoint
-from tools.checkpoint import load_checkpoint, save_checkpoint
+from tools.checkpoint import load_checkpoint, save_checkpoint, warm_start
 from model import ChessTransformer
 from tools.play.player import choose_move, load_model
 
@@ -53,6 +53,27 @@ def test_a_checkpoint_from_before_mlp_hidden_loads_at_its_old_width(tmp_path, d_
 
     assert loaded_settings["mlp_hidden"] == width and "mlp_ratio" not in loaded_settings
     assert loaded.encoder[0].mlp.up_projection.out_features == width
+
+
+#the warm start of the long d512 runs: a 1-bin checkpoint of an old width goes on with 128 bins. Everything but the
+#eval head's last layer has to carry over, and the size has to come from the file
+def test_a_warm_start_with_other_bins_renews_only_the_last_layer_of_the_eval_head(tmp_path):
+    torch.manual_seed(0)
+    old_settings = {"d_model": 32, "num_layers": 2, "n_heads": 2, "mlp_hidden": 40, "value_bins": 1}
+    old = ChessTransformer(**old_settings)
+    save_checkpoint(old, old_settings, tmp_path / "model.pt")
+
+    model, settings = warm_start(tmp_path / "model.pt", CPU, value_bins=16)
+
+    assert settings == {**old_settings, "value_bins": 16}
+    new_weights, old_weights = model.state_dict(), old.state_dict()
+    assert new_weights.keys() == old_weights.keys()
+    changed = {name for name in new_weights if new_weights[name].shape != old_weights[name].shape or not torch.equal(new_weights[name], old_weights[name])}
+    assert changed == {"eval_head.2.weight", "eval_head.2.bias"}
+    assert model.eval_head[-1].out_features == 16
+    #the same bins: the checkpoint as it is
+    same, _ = warm_start(tmp_path / "model.pt", CPU, value_bins=1)
+    assert all(torch.equal(tensor, old_weights[name]) for name, tensor in same.state_dict().items())
 
 
 def test_checkpoint_with_template_maps_points_to_the_commit_that_has_them(tmp_path):

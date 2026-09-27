@@ -150,12 +150,16 @@ def train(
     writer: SummaryWriter,
     value_loss_weight: float = VALUE_LOSS_WEIGHT,
     eval_every: int = EVAL_EVERY,
-    blunder_weight: float = BLUNDER_WEIGHT) -> None:
+    blunder_weight: float = BLUNDER_WEIGHT,
+    save_snapshot: Callable[[], None] | None = None,
+    snapshot_every: int = 0) -> None:
 
     #kept on the device: adding to it doesn't make the cpu wait for the gpu the way loss.item() does
     loss_total = torch.zeros((), device=device)
     penalty_total = torch.zeros((), device=device)
+    gradient_norm_total = torch.zeros((), device=device)
     total_examples = 0
+    interval_steps = 0
 
     model.train()
 
@@ -175,7 +179,9 @@ def train(
         (loss + blunder_weight * penalty).backward()
 
         master_weights.gradients_to_master()
-        torch.nn.utils.clip_grad_norm_(master_weights.parameters, 1.0)
+        #before clipping: a runaway (an attention head collapsing, say) shows here first
+        gradient_norm_total += torch.nn.utils.clip_grad_norm_(master_weights.parameters, 1.0)
+        interval_steps += 1
 
         for optimizer in optimizers:
             optimizer.step()
@@ -210,6 +216,7 @@ def train(
             writer.add_scalar("accuracy/val_value", val_value_accuracy, step)
             writer.add_scalar("error/val_value", val_value_error, step)
             writer.add_scalar("learning_rate", schedulers[0].get_last_lr()[0], step)
+            writer.add_scalar("gradient_norm/train", gradient_norm_total.item() / interval_steps, step)
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -217,8 +224,13 @@ def train(
 
             loss_total.zero_()
             penalty_total.zero_()
+            gradient_norm_total.zero_()
             total_examples = 0
+            interval_steps = 0
             budget.resume()
+
+        if save_snapshot is not None and step % snapshot_every == 0:
+            save_snapshot()
 
         if budget.finished():
             break
@@ -414,7 +426,8 @@ def main(
     value_bins: int = VALUE_BINS,
     blunder_threshold: float = BLUNDER_THRESHOLD,
     weight_decay: float = WEIGHT_DECAY,
-    muon_momentum: float = MUON_MOMENTUM):
+    muon_momentum: float = MUON_MOMENTUM,
+    snapshot_every: int = 0):
 
     #a fine-tune is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -518,6 +531,7 @@ def main(
         "visit_temperature": visit_temperature,
         "eval_every": eval_every,
         "compile_mode": compile_mode,
+        "snapshot_every": snapshot_every,
         "optimizer": "muon",
         "note": note,
         "commit": current_commit()
@@ -528,8 +542,11 @@ def main(
     def save_best_checkpoint() -> None:
         save_checkpoint(model, model_settings, run_dir / "model.pt")
 
+    def save_snapshot() -> None:
+        save_checkpoint(model, model_settings, run_dir / f"snapshot_{budget.positions:_}.pt")
+
     train(compiled_model, master_weights, save_best_checkpoint, train_data_loader, val_data_loader, optimizers, schedulers, device, best_val_loss=val_loss, budget=budget, writer=writer, value_loss_weight=value_loss_weight,
-          eval_every=eval_every, blunder_weight=blunder_weight)
+          eval_every=eval_every, blunder_weight=blunder_weight, save_snapshot=save_snapshot if snapshot_every else None, snapshot_every=snapshot_every)
 
     #model.pt is the best evaluation's, usually but not always the last
     save_checkpoint(model, model_settings, run_dir / "final.pt")
@@ -608,6 +625,7 @@ if __name__ == "__main__":
     parser.add_argument("--mix-share", type=float, default=MIX_SHARE, help="share of every batch from --mix-set, default %(default)s")
     parser.add_argument("--result-weight", type=float, default=RESULT_WEIGHT, help="self play sets: share of the value target from the game's result, the rest the search's score. Default %(default)s")
     parser.add_argument("--eval-every", type=int, default=EVAL_EVERY, help="steps between two looks at the val set, default %(default)s")
+    parser.add_argument("--snapshot-every", type=int, default=0, help="steps between two copies of the weights kept in the run folder (snapshot_<positions>.pt), 0 for none")
     parser.add_argument("--compile-mode", choices=["default", "max-autotune-no-cudagraphs"], default="default", help="torch.compile's mode, default %(default)s")
     parser.add_argument("--visit-temperature", type=float, default=VISIT_TEMPERATURE, help="self play sets: sharpens the visit shares, 1 as recorded, 0 the most visited move alone. Default %(default)s")
     arguments = parser.parse_args()
@@ -639,6 +657,7 @@ if __name__ == "__main__":
          result_weight=arguments.result_weight,
          visit_temperature=arguments.visit_temperature,
          eval_every=arguments.eval_every,
+         snapshot_every=arguments.snapshot_every,
          compile_mode=arguments.compile_mode,
          loops=arguments.loops,
          blunder_weight=arguments.blunder_weight,
