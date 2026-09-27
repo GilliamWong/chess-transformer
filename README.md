@@ -82,8 +82,13 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
   0.044 against 0.054 for a single logit on a d128, the policy unchanged (at weight 1 it lost 0.02 val loss), and
   about +40 Elo in both a policy and a 64-simulation match, each inside its 200-game margin.
 - Muon for the weight matrices inside the blocks, AdamW for the rest, one learning rate: d128 val loss 1.9414 against
-  1.9929 with AdamW alone. Weight decay 0.1 for both (`--weight-decay`): 0.007 better val loss than 0.01 on two seeds;
-  learning rates of 4e-3 and 1e-2 and Muon momentum 0.9 all lost to 6e-3 and 0.95 (d128 L6, 10M positions, 2026-09-25).
+  1.9929 with AdamW alone. Learning rates of 4e-3 and 1e-2 and Muon momentum 0.9 all lost to 6e-3 and 0.95 (d128 L6,
+  10M positions, 2026-09-25).
+- Weight decay sized to the run (`--weight-decay`, both optimizers): 1/(lr x wd) should be 15-20% of the steps, so
+  wd ≈ 1 / (0.17 x lr x steps). The default 0.1 won the short d128 sweep (0.007 better val loss than 0.01 on two
+  seeds) but stalled an 850k-step d512, which wants about 0.002 (`artifacts/attention_lookups_20260927/`).
+- Every attention head has a learned sink, a score for attending to nothing (since 76062f9). Checkpoints from before it
+  load from commit 0ef8f7d.
 - The blunder penalty, `--blunder-weight 4`: +27 Elo on a d128. It needs blunder labels next to the set
   (`<set>_{split}_worst_{moves,losses}.bin`); a set without them trains as if the weight were 0. A move counts as a
   blunder from 0.3 expected score lost (`--blunder-threshold`): thresholds 0.1, 0.2 and 0.3 played the same Elo
@@ -114,6 +119,11 @@ September 2026, details in `artifacts/selfplay_and_leela_2026-09-26.md` and `art
   5070 Ti against lc0's ~6k with BT4; a timed match has not been played yet.
 - Depth-12 labels of every position (`full_sf12_20260926`, `selfplay_d512m_800_sf12` and `full_sf12_30M_mix`, the
   30M set's rows) were made on Hyak on 2026-09-26; they share the depth-8 sets' boards and blunder labels.
+- Long runs on them (d512 from scratch and warm-started, and equal-parameter d448 L16 and d384 L22, 1.74B positions
+  each) are under way on Hyak. At low weight decay block 1's attention turns into one-hot lookups with scores past
+  fp16's limit (NaN in the search engine); a learned sink does not prevent it, and Leela's BT4 has no such heads.
+  Across 8 models the heads look up the kings and queens, the neighbouring squares, the first piece along each line
+  and the metadata: `artifacts/attention_lookups_20260927/`.
 
 ## Play against it and measure its strength
 
@@ -194,6 +204,6 @@ uv run pytest
 | `selfplay.py`, `inference.py` | Self-play: the worker processes and the GPU inference process |
 | `multi_gpu/` | The DDP trainer |
 | `selfplay_rs/` | The search and self-play games in Rust |
-| `tools/` | Checkpoints, run comparison, labelling, puzzles, the scaling grid's figure, and `play/` (UCI engine, matches, Elo log) |
-| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games), `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget) and `selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish) |
+| `tools/` | Checkpoints, run comparison, labelling, puzzles, attention probes and maps (`plot_attention.py`, like `plot_templates.py`), the scaling grid's and attention report's figures, and `play/` (UCI engine, matches, Elo log) |
+| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games), `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget), `selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish) and `attention_lookups_20260927/` (weight decay for long runs, the block-1 attention collapse, and what every head looks up, with charts) |
 | `tests/` | `uv run pytest` |
