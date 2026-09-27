@@ -427,8 +427,7 @@ def main(
     blunder_threshold: float = BLUNDER_THRESHOLD,
     weight_decay: float = WEIGHT_DECAY,
     muon_momentum: float = MUON_MOMENTUM,
-    snapshot_every: int = 0,
-    attention_sink: bool = False):
+    snapshot_every: int = 0):
 
     #a fine-tune is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -436,7 +435,7 @@ def main(
         initial_model, model_settings = load_checkpoint(init_checkpoint, torch.device("cpu"))
     else:
         #saved in the checkpoint so the model can be rebuilt when loading
-        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_hidden": mlp_hidden_width(d_model, mlp_ratio), "qk_ratio": qk_ratio, "kv_heads": kv_heads, "loops": loops, "value_bins": value_bins, "attention_sink": attention_sink}
+        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_hidden": mlp_hidden_width(d_model, mlp_ratio), "qk_ratio": qk_ratio, "kv_heads": kv_heads, "loops": loops, "value_bins": value_bins}
     if mix_set is not None and not 0 < mix_share < 1:
         raise ValueError(f"--mix-share is the share of every batch from {mix_set}, between 0 and 1, got {mix_share}")
     if peak_learn_rate is None:
@@ -627,7 +626,6 @@ if __name__ == "__main__":
     parser.add_argument("--result-weight", type=float, default=RESULT_WEIGHT, help="self play sets: share of the value target from the game's result, the rest the search's score. Default %(default)s")
     parser.add_argument("--eval-every", type=int, default=EVAL_EVERY, help="steps between two looks at the val set, default %(default)s")
     parser.add_argument("--snapshot-every", type=int, default=0, help="steps between two copies of the weights kept in the run folder (snapshot_<positions>.pt), 0 for none")
-    parser.add_argument("--attention-sink", action="store_true", help="give every attention head a learned score for attending to nothing")
     parser.add_argument("--compile-mode", choices=["default", "max-autotune-no-cudagraphs"], default="default", help="torch.compile's mode, default %(default)s")
     parser.add_argument("--visit-temperature", type=float, default=VISIT_TEMPERATURE, help="self play sets: sharpens the visit shares, 1 as recorded, 0 the most visited move alone. Default %(default)s")
     arguments = parser.parse_args()
@@ -660,7 +658,6 @@ if __name__ == "__main__":
          visit_temperature=arguments.visit_temperature,
          eval_every=arguments.eval_every,
          snapshot_every=arguments.snapshot_every,
-         attention_sink=arguments.attention_sink,
          compile_mode=arguments.compile_mode,
          loops=arguments.loops,
          blunder_weight=arguments.blunder_weight,

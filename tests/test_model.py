@@ -6,7 +6,8 @@ from torch import nn
 
 from encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD, encode_board, encode_move_to_id
 from main import value_loss
-from model import VALUE_BINS, ChessTransformer, mlp_hidden_width
+from model import ATTENTION_CAP, VALUE_BINS, ChessTransformer, mlp_hidden_width
+from tools.attention_probe import attention_scores
 
 BATCH_SIZE = 16
 
@@ -106,6 +107,50 @@ def test_a_head_whose_sink_score_dominates_reads_nothing(batch):
         after_attention = x + block.combine_heads.bias
         expected = after_attention + block.mlp(block.ln2(after_attention))
         assert torch.allclose(block(x, model.templates), expected, atol=1e-5)
+
+
+#QK-norm: the scores depend on the directions of the queries and keys, not their size, so growing projections change
+#nothing
+def test_the_size_of_the_queries_and_keys_does_not_matter(batch):
+    boards, _ = batch
+    model = small_model().eval()
+    block = model.encoder[0]
+    x = model.embed(boards) + model.position_embed
+
+    with torch.no_grad():
+        before = block(x, model.templates)
+        for projection in (block.Q, block.K):
+            projection.weight *= 100
+            projection.bias *= 100
+        assert torch.allclose(block(x, model.templates), before, atol=1e-4)
+
+
+#however large the template bias and the sink, every score stays inside the cap
+def test_the_attention_scores_stay_inside_the_cap(batch):
+    boards, _ = batch
+    model = small_model().eval()
+    with torch.no_grad():
+        model.templates.fill_(1e4)
+        for block in model.encoder:
+            block.sinks.fill_(-1e4)
+
+    largest = max(scores.abs().max().item() for scores in attention_scores(model, boards))
+    assert 0.99 * ATTENTION_CAP < largest <= ATTENTION_CAP
+
+
+#the search runs the model in fp16, whose largest number is 65,504: queries and keys this big made every score inf and
+#every output NaN
+def test_fp16_stays_finite_with_huge_queries_and_keys(batch):
+    boards, _ = batch
+    model = small_model().eval()
+    with torch.no_grad():
+        for block in model.encoder:
+            block.Q.weight *= 1000
+            block.K.weight *= 1000
+    model.half_except_heads(torch.float16)
+
+    logits, value_logits = model(boards)
+    assert torch.isfinite(logits).all() and torch.isfinite(value_logits).all()
 
 
 #a layer that forward never uses gets no gradient and would silently never train

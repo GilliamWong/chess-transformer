@@ -10,6 +10,9 @@ VALUE_TOKEN_DIM = 16
 #al. 2024); 1 is the older head, one logit of the score
 VALUE_BINS = 128
 
+#every attention score, sink included, is soft-capped to cap * tanh(score / cap): uncapped, block 1's ran past fp16's 65,504
+ATTENTION_CAP = 50.0
+
 #the swiglu mlp's hidden width is mlp_ratio (default 8/3) times d_model, rounded down to a multiple of this: whole
 #tensor core tiles, 680 -> 672 made a d512 step 7% faster (a multiple of 16 is not enough)
 MLP_WIDTH_MULTIPLE = 32
@@ -72,6 +75,10 @@ class TransformerBlock(nn.Module):
         self.K = nn.Linear(self.d_model, self.kv_heads * self.d_qk_head)
         self.V = nn.Linear(self.d_model, self.kv_heads * self.d_head)
 
+        #QK-norm: each head's query and key at unit rms, so the scores cannot grow by the projections growing
+        self.q_norm = nn.RMSNorm(self.d_qk_head, eps=1e-5)
+        self.k_norm = nn.RMSNorm(self.d_qk_head, eps=1e-5)
+
         self.ln1 = nn.LayerNorm(self.d_model)
         self.ln2 = nn.LayerNorm(self.d_model)
 
@@ -95,8 +102,8 @@ class TransformerBlock(nn.Module):
         K = self.K(x_norm) #B T kv_heads * d_qk_head
         V = self.V(x_norm) #B T kv_heads * d_head
 
-        Q_heads = Q.reshape(B, T, self.n_heads, self.d_qk_head).transpose(1, 2) #B n_heads T d_qk_head
-        K_heads = K.reshape(B, T, self.kv_heads, self.d_qk_head).transpose(1, 2)
+        Q_heads = self.q_norm(Q.reshape(B, T, self.n_heads, self.d_qk_head)).transpose(1, 2) #B n_heads T d_qk_head
+        K_heads = self.k_norm(K.reshape(B, T, self.kv_heads, self.d_qk_head)).transpose(1, 2)
         V_heads = V.reshape(B, T, self.kv_heads, self.d_head).transpose(1, 2) #B kv_heads T d_head
 
         #head h reads key/value head h // heads_per_kv
@@ -117,6 +124,7 @@ class TransformerBlock(nn.Module):
         sink = self.sinks.view(1, -1, 1, 1).expand(B, -1, T, 1) #B n_heads T 1
 
         attention = torch.cat([attention, sink], dim=-1) #the sink as an extra last column, B n_heads T T+1
+        attention = ATTENTION_CAP * torch.tanh(attention / ATTENTION_CAP)
 
         #the sink column is dropped after the softmax: what a head puts there reads nothing
         softmax_attention = torch.softmax(attention, dim=-1)[:, :, :, :-1]

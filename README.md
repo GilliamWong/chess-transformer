@@ -87,8 +87,10 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
 - Weight decay sized to the run (`--weight-decay`, both optimizers): 1/(lr x wd) should be 15-20% of the steps, so
   wd ≈ 1 / (0.17 x lr x steps). The default 0.1 won the short d128 sweep (0.007 better val loss than 0.01 on two
   seeds) but stalled an 850k-step d512, which wants about 0.002 (`artifacts/attention_lookups_20260927/`).
-- Every attention head has a learned sink, a score for attending to nothing (since 76062f9). Checkpoints from before it
-  load from commit 0ef8f7d.
+- Every attention head has a learned sink, a score for attending to nothing (since 76062f9). Queries and keys are
+  RMS-normalised per head (QK-norm) and every score is soft-capped at 50, so block 1's scores can no longer run past
+  fp16's range; on a d128 this also trained 0.047 lower train loss by 12k steps. Checkpoints from before the sink load
+  from commit 0ef8f7d, from before QK-norm from 474e5ed.
 - The blunder penalty, `--blunder-weight 4`: +27 Elo on a d128. It needs blunder labels next to the set
   (`<set>_{split}_worst_{moves,losses}.bin`); a set without them trains as if the weight were 0. A move counts as a
   blunder from 0.3 expected score lost (`--blunder-threshold`): thresholds 0.1, 0.2 and 0.3 played the same Elo
