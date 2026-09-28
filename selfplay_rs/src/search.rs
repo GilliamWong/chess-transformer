@@ -1,6 +1,6 @@
 //mcts.py's search with the same order of operations and arithmetic, so that it visits the same nodes. A round may also
 //gather many leaves for one network call (gather), as lc0 does; one leaf a round is mcts.py's search exactly
-use crate::rules::{MoveIds, Tables, encode_board, game_result, legal_moves_in_python_order, position_key};
+use crate::rules::{MoveIds, Tables, encode_board, game_result, position_key, sort_moves_in_python_order};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Gamma};
 use shakmaty::{Chess, Color, Move, MoveList, Position};
@@ -27,13 +27,14 @@ pub struct Node {
     //simulations through this node waiting for the network, and while a round is gathered its collisions
     in_flight: u32,
     pub value_sum: f64,
+    visited_policy_sqrt: f64, //sqrt of the sum of visited children's priors, refreshed when that set or the priors change
     first_child: u32,
     child_count: u32, //0 until the node is expanded
 }
 
 impl Node {
     fn new(chess_move: Option<Move>, prior: f64) -> Node {
-        Node { chess_move, prior, visit_count: 0, in_flight: 0, value_sum: 0.0, first_child: 0, child_count: 0 }
+        Node { chess_move, prior, visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, first_child: 0, child_count: 0 }
     }
 
     pub fn children(&self) -> Range<usize> {
@@ -164,8 +165,7 @@ impl Tree {
             settings.c_puct + settings.c_puct_factor * ((f64::from(parent.visit_count) + settings.c_puct_base) / settings.c_puct_base).ln();
         let children_visits = parent.visit_count.saturating_sub(1).max(1);
         let children = &self.nodes[parent.children()];
-        let visited_policy = python_sum(children.iter().filter(|child| child.visit_count > 0).map(|child| child.prior));
-        let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * visited_policy.sqrt();
+        let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt;
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
         let (mut best, mut best_u) = (0, f64::NEG_INFINITY);
@@ -221,7 +221,7 @@ impl Tree {
                 continue;
             }
 
-            let legal_moves = board.legal_moves();
+            let mut legal_moves = board.legal_moves();
             let mut value = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, tables)?;
             //a repeat inside the search is a draw
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
@@ -235,7 +235,8 @@ impl Tree {
                 self.backup(&path, value, 0);
                 continue;
             }
-            let moves = legal_moves_in_python_order(&board);
+            sort_moves_in_python_order(&board, &mut legal_moves);
+            let moves = legal_moves;
             //a hash collision would give another number of moves
             match cache.and_then(|cache| cache.get(leaf_key)).filter(|answer| answer.priors.len() == moves.len()) {
                 Some(answer) => {
@@ -294,12 +295,22 @@ impl Tree {
     //mcts.backup along the path, for a simulation that had in_flight visits waiting there
     fn backup(&mut self, path: &[usize], value: f64, in_flight: u32) {
         let mut score = 1.0 - value;
-        for &node in path.iter().rev() {
+        for (depth, &node) in path.iter().enumerate().rev() {
             self.nodes[node].visit_count += 1;
             self.nodes[node].in_flight -= in_flight;
             self.nodes[node].value_sum += score;
+            if self.nodes[node].visit_count == 1 && depth > 0 {
+                self.refresh_visited_policy(path[depth - 1]);
+            }
             score = 1.0 - score;
         }
+    }
+
+    fn refresh_visited_policy(&mut self, node: usize) {
+        //Keep Python's summation order and compensation, including after noise on a reused root.
+        self.nodes[node].visited_policy_sqrt =
+            python_sum(self.nodes[self.nodes[node].children()].iter().filter(|child| child.visit_count > 0).map(|child| child.prior))
+                .sqrt();
     }
 
     //mcts.add_root_noise: dirichlet noise as gamma draws scaled to add up to 1
@@ -312,6 +323,7 @@ impl Tree {
             let prior = self.nodes[child].prior;
             self.nodes[child].prior = (1.0 - share) * prior + share * (draw / total);
         }
+        self.refresh_visited_policy(0);
     }
 
     //mcts.most_visited_move: ties to the better mean score, then the prior, then the first

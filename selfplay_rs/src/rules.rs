@@ -82,9 +82,14 @@ fn python_chess_squares(chess_move: Move) -> (usize, usize, usize) {
 //python-chess's generation order, which is mcts.py's children order: of equal children the first is searched and played
 pub fn legal_moves_in_python_order(board: &Chess) -> MoveList {
     let mut moves = board.legal_moves();
-    let in_check = board.is_check();
-    moves.sort_unstable_by_key(|&chess_move| python_order(chess_move, in_check));
+    sort_moves_in_python_order(board, &mut moves);
     moves
+}
+
+pub fn sort_moves_in_python_order(board: &Chess, moves: &mut MoveList) {
+    let in_check = board.is_check();
+    //The key branches on move type: computing it once per move is cheaper than on every comparison.
+    moves.sort_by_cached_key(|&chess_move| python_order(chess_move, in_check));
 }
 
 fn python_order(chess_move: Move, in_check: bool) -> u32 {
