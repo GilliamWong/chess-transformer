@@ -15,7 +15,6 @@ engines/
 match.pgn
 processed_data/
 runs/
-attention_plots/
 artifacts/runs_archive/
 artifacts/progress.html
 artifacts/match_searches/
