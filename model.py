@@ -133,23 +133,29 @@ class TransformerBlock(nn.Module):
 #piece codes on the squares: 0 empty, 1-6 the side to move's pawn, knight, bishop, rook, queen, king, 7-12 the other side's
 PAWN, KNIGHT, QUEEN, KING = 1, 2, 5, 6
 THEIRS = NUM_PIECE_TYPES #added to a piece code for the other side's piece
+EDGE = NUM_PIECE_CODES #the code past every edge of the board
 
 #(file step, rank step); rank +1 is towards the other side, as every board is from the side to move
 DIRECTIONS = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (-1, 1), (1, -1), (-1, -1)]
 KNIGHT_JUMPS = [(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)]
-OFF_BOARD = NUM_SQUARES #one square past every edge, holding a code of its own
 
 #rows of each square feature
-OFFSET_ROWS = 15 * 15 + 1 #where the square is from a piece, or no such piece
-NEIGHBOUR_ROWS = NUM_PIECE_CODES + 1 #a neighbour's code, or off the board
+NO_PIECE = 15 * 15 #the offset feature's row when there is no such piece
+OFFSET_ROWS = NO_PIECE + 1 #where the square is from a piece: (rank step + 7) * 15 + file step + 7
+NEIGHBOUR_ROWS = NUM_PIECE_CODES + 1 #a neighbour's code, or the edge
 LINE_ROWS = 1 + 12 * 7 #none, or the first piece along a line and how far
 KNIGHT_ROWS = 3 * 3 #our and their knights attacking the square, 0, 1 or 2+ each
 PAWN_ROWS = 1 + 2 * 7 #none, or the nearest pawn up or down the file, whose and how far
-NO_PIECE = OFFSET_ROWS - 1
 
 def step(square: int, file_step: int, rank_step: int) -> int:
     file, rank = square % 8 + file_step, square // 8 + rank_step
-    return rank * 8 + file if 0 <= file < 8 and 0 <= rank < 8 else OFF_BOARD
+    return rank * 8 + file if 0 <= file < 8 and 0 <= rank < 8 else NUM_SQUARES #the square past the edge
+
+#codes out along lines (... 7, nearest first): the code where found first holds (0 if it never does) and how far out
+def first_along(along: torch.Tensor, found: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    distance = found.int().argmax(dim=-1, keepdim=True)
+    code = torch.where(found.any(dim=-1, keepdim=True), along.gather(-1, distance), 0)
+    return code.squeeze(-1), distance.squeeze(-1)
 
 class SquareFeatures(nn.Module):
     #per square, what heads otherwise looked up (artifacts/attention_lookups_20260927): kings, queens, neighbours, the
@@ -162,10 +168,9 @@ class SquareFeatures(nn.Module):
         #zeros: a new model is the model without the features, and they draw no random numbers
         self.table = nn.Parameter(torch.zeros(sum(slot_rows), d_model))
 
-        #[square, piece's square]: where the square is from the piece, (rank step + 7) * 15 + file step + 7
+        #[square, piece's square]: where the square is from the piece
         offsets = [[(s // 8 - p // 8 + 7) * 15 + s % 8 - p % 8 + 7 for p in range(NUM_SQUARES)] for s in range(NUM_SQUARES)]
         self.register_buffer("offsets", torch.tensor(offsets), persistent=False)
-        self.register_buffer("neighbours", torch.tensor([[step(s, *d) for d in DIRECTIONS] for s in range(NUM_SQUARES)]), persistent=False)
         #[square, direction, 7]: the squares out along each direction, nearest first
         rays = [[[step(s, d[0] * k, d[1] * k) for k in range(1, 8)] for d in DIRECTIONS] for s in range(NUM_SQUARES)]
         self.register_buffer("rays", torch.tensor(rays), persistent=False)
@@ -173,33 +178,28 @@ class SquareFeatures(nn.Module):
 
     #B 64 23: each square's row within each feature's rows
     def indices(self, board_state: torch.Tensor) -> torch.Tensor:
-        pieces = board_state[:, :NUM_SQUARES]
-        padded = F.pad(pieces, (0, 1), value=NUM_PIECE_CODES) #B 65, the square past the edge last
+        squares = board_state[:, :NUM_SQUARES]
+        padded = F.pad(squares, (0, 1), value=EDGE) #B 65, the square past the edge last
 
         offsets = []
         for code in (KING, KING + THEIRS, QUEEN, QUEEN + THEIRS):
-            present = pieces == code
+            present = squares == code
             square = present.int().argmax(dim=1) #the first one; a second queen is rare
             offsets.append(torch.where(present.any(dim=1, keepdim=True), self.offsets[:, square].T, NO_PIECE))
 
-        neighbours = padded[:, self.neighbours] #B 64 8
-
+        #out along the lines: the neighbours are the first squares, then the first piece and how far
         along = padded[:, self.rays] #B 64 8 7
-        occupied = (along != 0) & (along != NUM_PIECE_CODES)
-        nearest = occupied.int().argmax(dim=-1, keepdim=True) #how far out, 0 for the next square
-        piece = along.gather(-1, nearest).squeeze(-1)
-        lines = torch.where(occupied.any(dim=-1), 1 + (piece - 1) * 7 + nearest.squeeze(-1), 0)
+        first, distance = first_along(along, (along != 0) & (along != EDGE))
+        lines = torch.where(first > 0, 1 + (first - 1) * 7 + distance, 0)
 
         jumps = padded[:, self.knight_jumps]
         knights = (jumps == KNIGHT).sum(dim=-1).clamp(max=2) * 3 + (jumps == KNIGHT + THEIRS).sum(dim=-1).clamp(max=2)
 
         file = along[:, :, :2] #up and down the file
-        pawn = (file == PAWN) | (file == PAWN + THEIRS)
-        nearest_pawn = pawn.int().argmax(dim=-1, keepdim=True)
-        theirs = (file.gather(-1, nearest_pawn).squeeze(-1) == PAWN + THEIRS).long()
-        pawns = torch.where(pawn.any(dim=-1), 1 + theirs * 7 + nearest_pawn.squeeze(-1), 0)
+        pawn, pawn_distance = first_along(file, (file == PAWN) | (file == PAWN + THEIRS))
+        pawns = torch.where(pawn > 0, 1 + (pawn == PAWN + THEIRS).long() * 7 + pawn_distance, 0)
 
-        return torch.cat([torch.stack(offsets, dim=-1), neighbours, lines, knights.unsqueeze(-1), pawns], dim=-1)
+        return torch.cat([torch.stack(offsets, dim=-1), along[..., 0], lines, knights.unsqueeze(-1), pawns], dim=-1)
 
     def forward(self, board_state: torch.Tensor) -> torch.Tensor:
         #B 64 d_model; embedding_bag sums the 23 rows without holding them all

@@ -100,6 +100,10 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
   games) +9 ± 28 Elo at 6 layers. Cost per step: QK-norm +0.6% at d128, +3.4% at d512; the features +5% at d128,
   nothing measurable at d512. The sink, in the model from 76062f9, was taken out again: no gain, and it did not stop
   block 1's scores running away.
+- Gated attention (Qiu et al. 2025, a sigmoid of the query's state on each head's output) was tried on the same bed and
+  left out: one gate per head 1.8686 (nothing), one per channel 1.8509 but with 9% more block parameters, 1.8591 with
+  the MLP narrowed to match them (-0.009, one seed). The gates stayed near 0.46 rather than going sparse as in the
+  paper, and at d512 the per-channel gate would cost about 15% of a block's matrix work.
 - Checkpoints from before the sink load from commit 0ef8f7d, with the sink but before QK-norm from 474e5ed, with the
   sink and QK-norm but before the square features from 6b4d786 (which also soft-caps the scores).
 - The blunder penalty, `--blunder-weight 4`: +27 Elo on a d128. It needs blunder labels next to the set
