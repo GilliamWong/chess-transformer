@@ -343,11 +343,14 @@ def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE) -> float
 def make_optimizers(model: ChessTransformer, learn_rate: float, device: torch.device, weight_decay: float = WEIGHT_DECAY,
                     muon_momentum: float = MUON_MOMENTUM) -> list[torch.optim.Optimizer]:
     block_matrices = [parameter for parameter in model.encoder.parameters() if parameter.ndim == 2]
-    in_muon = {id(parameter) for parameter in block_matrices}
-    rest = [parameter for parameter in model.parameters() if id(parameter) not in in_muon]
+    #QK-norm's gains alone set how sharp attention can be: decayed at 0.1 they fell to 0.3 and the heads went near uniform
+    qk_gains = [norm.weight for block in model.encoder for norm in (block.q_norm, block.k_norm)]
+    elsewhere = {id(parameter) for parameter in block_matrices + qk_gains}
+    rest = [parameter for parameter in model.parameters() if id(parameter) not in elsewhere]
     #a tensor: compile_muon_step's graph would bake a float in and recompile whenever the schedule changes it
     muon = torch.optim.Muon(block_matrices, lr=torch.tensor(learn_rate, device=device), weight_decay=weight_decay, momentum=muon_momentum, adjust_lr_fn="match_rms_adamw") #type: ignore[arg-type]
-    return [torch.optim.AdamW(rest, lr=learn_rate, weight_decay=weight_decay, fused=device.type == "cuda"), muon]
+    groups = [{"params": rest}, {"params": qk_gains, "weight_decay": 0.0}]
+    return [torch.optim.AdamW(groups, lr=learn_rate, weight_decay=weight_decay, fused=device.type == "cuda"), muon]
 
 #Muon's step as one compiled cuda graph: eager 28 ms next to an 80 ms d256 training step, graphed 5 ms.
 #Call after making the schedulers, which wrap optimizer.step and need it to still be a method

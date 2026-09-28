@@ -41,6 +41,16 @@ def test_muon_takes_the_weight_matrices_inside_the_blocks_and_adamw_the_rest():
     assert muon.param_groups[0]["momentum"] == 0.9
 
 
+#QK-norm's gains set how sharp attention can be, so weight decay must not pull them to zero
+def test_the_qk_norm_gains_are_not_decayed():
+    model = small_model()
+    adamw, _ = make_optimizers(model, 1e-3, CPU, weight_decay=0.1)
+
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    undecayed = {names[id(parameter)] for group in adamw.param_groups if group["weight_decay"] == 0 for parameter in group["params"]}
+    assert undecayed == {f"encoder.{block}.{norm}.weight" for block in range(2) for norm in ("q_norm", "k_norm")}
+
+
 #Muon's learning rate is a tensor; the schedule has to move it just like AdamW's float
 def test_the_schedule_moves_both_learning_rates_alike():
     model = small_model()

@@ -18,11 +18,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import data
 import main as single
-from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD
+from encoding import BOARD_VOCAB_SIZE, NUM_PIECE_CODES, NUM_SQUARES, TOKENS_PER_BOARD
 from model import ChessTransformer
 from multi_gpu import train_ddp
 from tools.budget import Budget
 from tools.checkpoint import load_checkpoint
+
+
+#random boards as the data holds them: a piece code on every square (the square features index by it), any token after
+def random_boards(rows: np.random.Generator, size: int) -> np.ndarray:
+    squares = rows.integers(0, NUM_PIECE_CODES, (size, NUM_SQUARES))
+    metadata = rows.integers(0, BOARD_VOCAB_SIZE, (size, TOKENS_PER_BOARD - NUM_SQUARES))
+    return np.concatenate([squares, metadata], axis=1).astype(np.uint8)
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
@@ -63,7 +70,7 @@ def compare_update(rank, compiled=False):
         distributed = torch.compile(distributed, backend="aot_eager")
     generator = torch.Generator().manual_seed(18)
     batch = (
-        torch.randint(BOARD_VOCAB_SIZE, (8, TOKENS_PER_BOARD), generator=generator),
+        torch.from_numpy(random_boards(np.random.default_rng(18), 8)).long(),
         torch.arange(16).reshape(8, 2), torch.tensor([[0.7, 0.3]] * 8),
         torch.rand(8, generator=generator),
     )
@@ -120,7 +127,7 @@ def check_shared_evaluation():
     rows = np.random.default_rng(5)
     size = 11
     val_dataset = data.ChessGamesDataset(
-        rows.integers(0, BOARD_VOCAB_SIZE, (size, TOKENS_PER_BOARD)).astype(np.uint8),
+        random_boards(rows, size),
         rows.integers(0, 1968, (size, 2)).astype(np.int16), rows.integers(-300, 300, (size, 2)).astype(np.int16),
         single.TARGET_TEMPERATURE)
     _, val_loader = data.datasets_to_dataloaders(val_dataset, val_dataset, val_batch_size=4, seed=0)  #batches of 4, 4 and 3
@@ -184,7 +191,7 @@ def write_varied_set(folder, name, seed=11):
     rows = np.random.default_rng(seed)
     for split, size in (("train", 32), ("val", 10)):
         arrays = dict(
-            boards=rows.integers(0, BOARD_VOCAB_SIZE, (size, TOKENS_PER_BOARD)).astype(np.uint8),
+            boards=random_boards(rows, size),
             stockfish_moves=rows.integers(0, 1968, (size, 2)).astype(np.int16),
             stockfish_evals=rows.integers(-300, 300, (size, 2)).astype(np.int16),
             worst_moves=np.where(rows.random((size, 4)) < 0.5, rows.integers(0, 1968, (size, 4)), -1).astype(np.int16),

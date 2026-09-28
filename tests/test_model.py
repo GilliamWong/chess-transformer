@@ -1,13 +1,13 @@
 from itertools import islice
 
+import chess
 import pytest
 import torch
 from torch import nn
 
 from encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD, encode_board, encode_move_to_id
 from main import value_loss
-from model import ATTENTION_CAP, VALUE_BINS, ChessTransformer, mlp_hidden_width
-from tools.attention_probe import attention_scores
+from model import VALUE_BINS, ChessTransformer, mlp_hidden_width
 
 BATCH_SIZE = 16
 
@@ -94,21 +94,6 @@ def test_attention_bias_starts_at_zero(batch):
     assert torch.equal(model(boards)[0], before)
 
 
-#the sink lets a head do nothing: with its score far above every real score the attention reads no token, and the block
-#adds only combine_heads' bias before its mlp
-def test_a_head_whose_sink_score_dominates_reads_nothing(batch):
-    boards, _ = batch
-    model = small_model().eval()
-    block = model.encoder[0]
-    x = model.embed(boards) + model.position_embed
-
-    with torch.no_grad():
-        block.sinks.fill_(1e4)
-        after_attention = x + block.combine_heads.bias
-        expected = after_attention + block.mlp(block.ln2(after_attention))
-        assert torch.allclose(block(x, model.templates), expected, atol=1e-5)
-
-
 #QK-norm: the scores depend on the directions of the queries and keys, not their size, so growing projections change
 #nothing
 def test_the_size_of_the_queries_and_keys_does_not_matter(batch):
@@ -125,19 +110,6 @@ def test_the_size_of_the_queries_and_keys_does_not_matter(batch):
         assert torch.allclose(block(x, model.templates), before, atol=1e-4)
 
 
-#however large the template bias and the sink, every score stays inside the cap
-def test_the_attention_scores_stay_inside_the_cap(batch):
-    boards, _ = batch
-    model = small_model().eval()
-    with torch.no_grad():
-        model.templates.fill_(1e4)
-        for block in model.encoder:
-            block.sinks.fill_(-1e4)
-
-    largest = max(scores.abs().max().item() for scores in attention_scores(model, boards))
-    assert 0.99 * ATTENTION_CAP < largest <= ATTENTION_CAP
-
-
 #the search runs the model in fp16, whose largest number is 65,504: queries and keys this big made every score inf and
 #every output NaN
 def test_fp16_stays_finite_with_huge_queries_and_keys(batch):
@@ -151,6 +123,41 @@ def test_fp16_stays_finite_with_huge_queries_and_keys(batch):
 
     logits, value_logits = model(boards)
     assert torch.isfinite(logits).all() and torch.isfinite(value_logits).all()
+
+
+#white: king e1, rook a1, knight c3, pawn e2; black: king e8, queen d5, pawn d7. White to move, so no mirroring
+def test_the_square_features_of_a_known_position():
+    board = torch.tensor([encode_board(chess.Board("4k3/3p4/8/3q4/8/2N5/4P3/R3K3 w - - 0 1"))])
+    features = small_model().square_features.indices(board)[0]
+    e4, d5, a1 = chess.E4, chess.D5, chess.A1
+
+    #from our king e1 3 ranks up, from their king e8 4 down, no queen of ours, 1 file right and 1 rank down from d5
+    assert features[e4, :4].tolist() == [(3 + 7) * 15 + 7, (-4 + 7) * 15 + 7, 15 * 15, (-1 + 7) * 15 + 1 + 7]
+    #neighbours up, down, right, left, then the diagonals: only d5 (up-left) holds a piece, their queen
+    assert features[e4, 4:12].tolist() == [0, 0, 0, 0, 0, 5 + 6, 0, 0]
+    #first piece up the file their king 4 away, down it our pawn 2 away, up-left their queen next door; nothing else
+    king, pawn, queen = 1 + (6 + 6 - 1) * 7 + 3, 1 + (1 - 1) * 7 + 1, 1 + (5 + 6 - 1) * 7 + 0
+    assert features[e4, 12:20].tolist() == [king, pawn, 0, 0, 0, queen, 0, 0]
+    #our knight on c3 attacks e4, none of theirs: 1 * 3 + 0
+    assert features[e4, 20].item() == 3
+    #no pawn up the e-file; our pawn 2 down it
+    assert features[e4, 21:23].tolist() == [0, 1 + 1]
+    #their pawn on d7, 2 up the d-file from d5
+    assert features[d5, 21].item() == 1 + 7 + 1
+    #left of a1 is off the board, and so is everything along that line
+    assert features[a1, 4 + 3].item() == 13 and features[a1, 12 + 3].item() == 0
+
+
+#the features start at zero, so a new model is the model without them, and a trained table reaches the output
+def test_the_square_features_start_at_zero_and_reach_the_output(batch):
+    boards, _ = batch
+    model = small_model().eval()
+    before, _ = model(boards)
+    assert (model.square_features(boards) == 0).all()
+
+    with torch.no_grad():
+        model.square_features.table.normal_()
+    assert not torch.allclose(model(boards)[0], before)
 
 
 #a layer that forward never uses gets no gradient and would silently never train

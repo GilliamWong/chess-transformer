@@ -2,16 +2,13 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import math
-from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
+from encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, NUM_PIECE_CODES, NUM_PIECE_TYPES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
 
 VALUE_TOKEN_DIM = 16
 
 #the eval head's output is a distribution over this many equal bins of the expected score (HL-Gauss, Farebrother et
 #al. 2024); 1 is the older head, one logit of the score
 VALUE_BINS = 128
-
-#every attention score, sink included, is soft-capped to cap * tanh(score / cap): uncapped, block 1's ran past fp16's 65,504
-ATTENTION_CAP = 50.0
 
 #the swiglu mlp's hidden width is mlp_ratio (default 8/3) times d_model, rounded down to a multiple of this: whole
 #tensor core tiles, 680 -> 672 made a d512 step 7% faster (a multiple of 16 is not enough)
@@ -88,10 +85,6 @@ class TransformerBlock(nn.Module):
 
         self.template_mix = nn.Linear(self.d_model, position_templates * self.n_heads)
 
-        #a learned score per head for attending to nothing; zeros draw no random numbers, so the other weights start the same
-        self.sinks = nn.Parameter(torch.zeros(self.n_heads))
-
-
     def forward(self, x: torch.Tensor, templates: torch.Tensor) -> torch.Tensor:
         #x is B T d_model, templates is position_templates 64 64 and shared by every block
         B, T, d_model = x.shape
@@ -121,13 +114,7 @@ class TransformerBlock(nn.Module):
         bias = F.pad(bias, (0, metadata_tokens, 0, metadata_tokens))
         attention = attention + bias
 
-        sink = self.sinks.view(1, -1, 1, 1).expand(B, -1, T, 1) #B n_heads T 1
-
-        attention = torch.cat([attention, sink], dim=-1) #the sink as an extra last column, B n_heads T T+1
-        attention = ATTENTION_CAP * torch.tanh(attention / ATTENTION_CAP)
-
-        #the sink column is dropped after the softmax: what a head puts there reads nothing
-        softmax_attention = torch.softmax(attention, dim=-1)[:, :, :, :-1]
+        softmax_attention = torch.softmax(attention, dim=-1)
 
         attention_weights = softmax_attention @ V_heads #B n_heads T d_head
 
@@ -141,6 +128,84 @@ class TransformerBlock(nn.Module):
         residual = residual + self.mlp(x_norm2)
 
         return residual
+
+
+#piece codes on the squares: 0 empty, 1-6 the side to move's pawn, knight, bishop, rook, queen, king, 7-12 the other side's
+PAWN, KNIGHT, QUEEN, KING = 1, 2, 5, 6
+THEIRS = NUM_PIECE_TYPES #added to a piece code for the other side's piece
+
+#(file step, rank step); rank +1 is towards the other side, as every board is from the side to move
+DIRECTIONS = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (-1, 1), (1, -1), (-1, -1)]
+KNIGHT_JUMPS = [(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)]
+OFF_BOARD = NUM_SQUARES #one square past every edge, holding a code of its own
+
+#rows of each square feature
+OFFSET_ROWS = 15 * 15 + 1 #where the square is from a piece, or no such piece
+NEIGHBOUR_ROWS = NUM_PIECE_CODES + 1 #a neighbour's code, or off the board
+LINE_ROWS = 1 + 12 * 7 #none, or the first piece along a line and how far
+KNIGHT_ROWS = 3 * 3 #our and their knights attacking the square, 0, 1 or 2+ each
+PAWN_ROWS = 1 + 2 * 7 #none, or the nearest pawn up or down the file, whose and how far
+NO_PIECE = OFFSET_ROWS - 1
+
+def step(square: int, file_step: int, rank_step: int) -> int:
+    file, rank = square % 8 + file_step, square // 8 + rank_step
+    return rank * 8 + file if 0 <= file < 8 and 0 <= rank < 8 else OFF_BOARD
+
+class SquareFeatures(nn.Module):
+    #per square, what heads otherwise looked up (artifacts/attention_lookups_20260927): kings, queens, neighbours, the
+    #first piece along each line, attacking knights, nearest pawns on the file. 23 learned vectors, summed
+    def __init__(self, d_model: int):
+        super().__init__()
+        #the row each of the 23 features starts at, in the order of indices()
+        slot_rows = [OFFSET_ROWS] * 4 + [NEIGHBOUR_ROWS] * 8 + [LINE_ROWS] * 8 + [KNIGHT_ROWS] + [PAWN_ROWS] * 2
+        self.register_buffer("row_offsets", torch.tensor([0] + slot_rows[:-1]).cumsum(0), persistent=False)
+        #zeros: a new model is the model without the features, and they draw no random numbers
+        self.table = nn.Parameter(torch.zeros(sum(slot_rows), d_model))
+
+        #[square, piece's square]: where the square is from the piece, (rank step + 7) * 15 + file step + 7
+        offsets = [[(s // 8 - p // 8 + 7) * 15 + s % 8 - p % 8 + 7 for p in range(NUM_SQUARES)] for s in range(NUM_SQUARES)]
+        self.register_buffer("offsets", torch.tensor(offsets), persistent=False)
+        self.register_buffer("neighbours", torch.tensor([[step(s, *d) for d in DIRECTIONS] for s in range(NUM_SQUARES)]), persistent=False)
+        #[square, direction, 7]: the squares out along each direction, nearest first
+        rays = [[[step(s, d[0] * k, d[1] * k) for k in range(1, 8)] for d in DIRECTIONS] for s in range(NUM_SQUARES)]
+        self.register_buffer("rays", torch.tensor(rays), persistent=False)
+        self.register_buffer("knight_jumps", torch.tensor([[step(s, *j) for j in KNIGHT_JUMPS] for s in range(NUM_SQUARES)]), persistent=False)
+
+    #B 64 23: each square's row within each feature's rows
+    def indices(self, board_state: torch.Tensor) -> torch.Tensor:
+        pieces = board_state[:, :NUM_SQUARES]
+        padded = F.pad(pieces, (0, 1), value=NUM_PIECE_CODES) #B 65, the square past the edge last
+
+        offsets = []
+        for code in (KING, KING + THEIRS, QUEEN, QUEEN + THEIRS):
+            present = pieces == code
+            square = present.int().argmax(dim=1) #the first one; a second queen is rare
+            offsets.append(torch.where(present.any(dim=1, keepdim=True), self.offsets[:, square].T, NO_PIECE))
+
+        neighbours = padded[:, self.neighbours] #B 64 8
+
+        along = padded[:, self.rays] #B 64 8 7
+        occupied = (along != 0) & (along != NUM_PIECE_CODES)
+        nearest = occupied.int().argmax(dim=-1, keepdim=True) #how far out, 0 for the next square
+        piece = along.gather(-1, nearest).squeeze(-1)
+        lines = torch.where(occupied.any(dim=-1), 1 + (piece - 1) * 7 + nearest.squeeze(-1), 0)
+
+        jumps = padded[:, self.knight_jumps]
+        knights = (jumps == KNIGHT).sum(dim=-1).clamp(max=2) * 3 + (jumps == KNIGHT + THEIRS).sum(dim=-1).clamp(max=2)
+
+        file = along[:, :, :2] #up and down the file
+        pawn = (file == PAWN) | (file == PAWN + THEIRS)
+        nearest_pawn = pawn.int().argmax(dim=-1, keepdim=True)
+        theirs = (file.gather(-1, nearest_pawn).squeeze(-1) == PAWN + THEIRS).long()
+        pawns = torch.where(pawn.any(dim=-1), 1 + theirs * 7 + nearest_pawn.squeeze(-1), 0)
+
+        return torch.cat([torch.stack(offsets, dim=-1), neighbours, lines, knights.unsqueeze(-1), pawns], dim=-1)
+
+    def forward(self, board_state: torch.Tensor) -> torch.Tensor:
+        #B 64 d_model; embedding_bag sums the 23 rows without holding them all
+        B = board_state.shape[0]
+        rows = self.indices(board_state) + self.row_offsets
+        return F.embedding_bag(rows.reshape(B * NUM_SQUARES, -1), self.table, mode="sum").reshape(B, NUM_SQUARES, -1)
 
 
 class ChessTransformer(nn.Module):
@@ -160,6 +225,8 @@ class ChessTransformer(nn.Module):
         self.embed = nn.Embedding(BOARD_VOCAB_SIZE, self.d_model)
 
         self.position_embed = nn.Parameter(torch.randn(TOKENS_PER_BOARD, self.d_model))
+
+        self.square_features = SquareFeatures(self.d_model)
 
         #attention bias templates, each 64x64, shared by every block
         self.templates = nn.Parameter(torch.zeros(position_templates, NUM_SQUARES, NUM_SQUARES))
@@ -218,6 +285,8 @@ class ChessTransformer(nn.Module):
 
         embed_state = self.embed(board_state) #B T d_model
         embed_state = embed_state + self.position_embed
+        #the squares' features; the metadata tokens have none
+        embed_state = embed_state + F.pad(self.square_features(board_state), (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
 
         for _ in range(self.loops):
             for block in self.encoder:

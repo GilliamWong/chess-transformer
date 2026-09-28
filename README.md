@@ -87,10 +87,21 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
 - Weight decay sized to the run (`--weight-decay`, both optimizers): 1/(lr x wd) should be 15-20% of the steps, so
   wd ≈ 1 / (0.17 x lr x steps). The default 0.1 won the short d128 sweep (0.007 better val loss than 0.01 on two
   seeds) but stalled an 850k-step d512, which wants about 0.002 (`artifacts/attention_lookups_20260927/`).
-- Every attention head has a learned sink, a score for attending to nothing (since 76062f9). Queries and keys are
-  RMS-normalised per head (QK-norm) and every score is soft-capped at 50, so block 1's scores can no longer run past
-  fp16's range; on a d128 this also trained 0.047 lower train loss by 12k steps. Checkpoints from before the sink load
-  from commit 0ef8f7d, from before QK-norm from 474e5ed.
+- Queries and keys are RMS-normalised per head (QK-norm), so block 1's scores can no longer run past fp16's range by the projections
+  growing. Its gains alone set how sharp attention can be, so they are not weight-decayed: at 0.1 they fell to 0.3 and
+  the heads went nearly uniform.
+- Each square also gets 23 learned feature vectors, summed into its embedding (`SquareFeatures`), for what heads
+  otherwise looked up: its offset from each king and queen, its 8 neighbours, the first piece along each of 8 lines
+  and how far, the knights attacking it, and the nearest pawns up and down its file (`artifacts/attention_lookups_20260927/`).
+- On the 6-minute d128 bed (10M positions, full val), each row adding to the last: old model 1.8840, + a learned
+  attention sink 1.8812, + QK-norm 1.8781, + square features 1.8678 (45.8% against 45.3%). The features' lead shrank
+  from 0.06 early to 0.010 at the end, a fixed head start of about 1,000 steps plus a lasting gain. With 5 layers the
+  features gain 0.022 (1.8752 against 1.8973), matching the 6-layer model without them. Against Stockfish 1700 (1,000
+  games) +9 ± 28 Elo at 6 layers. Cost per step: QK-norm +0.6% at d128, +3.4% at d512; the features +5% at d128,
+  nothing measurable at d512. The sink, in the model from 76062f9, was taken out again: no gain, and it did not stop
+  block 1's scores running away.
+- Checkpoints from before the sink load from commit 0ef8f7d, with the sink but before QK-norm from 474e5ed, with the
+  sink and QK-norm but before the square features from 6b4d786 (which also soft-caps the scores).
 - The blunder penalty, `--blunder-weight 4`: +27 Elo on a d128. It needs blunder labels next to the set
   (`<set>_{split}_worst_{moves,losses}.bin`); a set without them trains as if the weight were 0. A move counts as a
   blunder from 0.3 expected score lost (`--blunder-threshold`): thresholds 0.1, 0.2 and 0.3 played the same Elo
