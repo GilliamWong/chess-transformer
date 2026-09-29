@@ -13,6 +13,7 @@ import pytest
 import torch
 from torch import nn
 
+import mcts
 import selfplay_rs
 from encoding import TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import BoardModel, UniformModel
@@ -412,17 +413,17 @@ def test_certainty_stops_descents_at_proven_nodes():
     assert report.simulations == 6000 and report.score == 1.0
     assert network.boards < 3000
 
-#the uniform model, but for the moves it likes (uci, side), e^logit times more likely than any other
+#the uniform model (or values' scores), but for the moves it likes (uci, side), e^logit times more likely than any other
 class LikesMoves(nn.Module):
-    def __init__(self, moves: list[tuple[str, chess.Color]], logit: float):
+    def __init__(self, moves: list[tuple[str, chess.Color]], logit: float, values: nn.Module | None = None):
         super().__init__()
         self.move_ids = [encode_move_to_id(chess.Move.from_uci(move), side) for move, side in moves]
-        self.logit = logit
+        self.logit, self.values = logit, values or UniformModel()
 
     def forward(self, boards):
-        logits, value = UniformModel()(boards)
+        logits, _ = UniformModel()(boards)
         logits[:, self.move_ids] = self.logit
-        return logits, value
+        return logits, self.values(boards)[1]
 
 #a proven win is played although another move has more visits (lc0 ranks proven wins first): the network likes a king
 #move, the search finds the rook's mate
@@ -553,6 +554,22 @@ def test_the_lower_confidence_bound_picks_the_move(carlsen_games):
         assert lcb_score >= most_visited_score and dict(root_moves)[lcb_line[0]] >= 0.1 * root_moves[0][1]
         different += lcb_line[0] != most_visited_line[0]
     assert different > 0
+
+
+#white's only move (Kd2) leaves its queen to Rxa1, a move the network gives black little chance next to Kc4, which it
+#likes. First play urgency keeps black on Kc4 unless exploration finds Rxa1: with the opponent's c_puct scaled up
+#black finds it and white's score falls; scaled down black never tries it. White's own c_puct is not the one scaled
+@pytest.mark.parametrize("opponent_scale, finds_the_capture", [(4.0, True), (0.05, False)])
+def test_the_opponents_c_puct_scale(opponent_scale, finds_the_capture):
+    board = chess.Board("8/8/8/8/8/1k6/8/Q1K1r3 w - - 0 1")
+    evaluate = cpu_batches(LikesMoves([("b3c4", chess.BLACK)], 4.0, values=BoardModel())).evaluate_boards
+    reports = {}
+    for name, settings in (("opponent", {"opponent_c_puct_scale": opponent_scale}), ("own", {"c_puct": mcts.C_PUCT * opponent_scale})):
+        searches = selfplay_rs.Searches(**{**rust_search_settings(False), **settings})
+        reports[name] = searched(searches, board, 400, evaluate)
+    _, line, score, _, _ = reports["opponent"]
+    assert line[0] == "c1d2" and (line[1] == "e1a1") == finds_the_capture and (score < 0.5) == finds_the_capture
+    assert reports["own"] != reports["opponent"]
 
 
 #TimeUse's budget: the planned time by default, more for changes of the best move and a falling score, less when

@@ -38,6 +38,10 @@ pub struct SearchSettings {
     //katago's lcb). 0 for none: the most visited, as mcts.py
     pub lcb_stdevs: f64,
     pub lcb_least_share: f64,
+    //c_puct and the fpu reduction at nodes where the root's opponent is to move are multiplied by these: below 1 the
+    //search looks at fewer of the opponent's replies, above 1 at more. 1 for none, as mcts.py
+    pub opponent_c_puct_scale: f64,
+    pub opponent_fpu_scale: f64,
 }
 
 impl SearchSettings {
@@ -58,6 +62,8 @@ impl SearchSettings {
             cpuct_stdev_prior_weight: 2.0,
             lcb_stdevs: 0.0,
             lcb_least_share: 0.1,
+            opponent_c_puct_scale: 1.0,
+            opponent_fpu_scale: 1.0,
         }
     }
 }
@@ -305,8 +311,9 @@ impl Tree {
     }
 
     //mcts.select_child, with the simulations under a child that wait for the network counted in its visits for the
-    //exploration term (lc0's n started); an edge without a node is a child without visits. Returns the edge
-    fn select_edge(&self, node: usize, settings: &SearchSettings) -> usize {
+    //exploration term (lc0's n started); an edge without a node is a child without visits. opponent: the root's
+    //opponent is to move at the node. Returns the edge
+    fn select_edge(&self, node: usize, settings: &SearchSettings, opponent: bool) -> usize {
         let parent = &self.nodes[node];
         let mut c_puct =
             settings.c_puct + settings.c_puct_factor * ((f64::from(parent.visit_count) + settings.c_puct_base) / settings.c_puct_base).ln();
@@ -314,9 +321,14 @@ impl Tree {
             let stdev = parent.score_stdev(settings.cpuct_stdev_prior, settings.cpuct_stdev_prior_weight);
             c_puct *= 1.0 + settings.cpuct_stdev_scale * (stdev / settings.cpuct_stdev_prior - 1.0);
         }
+        let mut fpu_reduction = settings.fpu_reduction;
+        if opponent {
+            c_puct *= settings.opponent_c_puct_scale;
+            fpu_reduction *= settings.opponent_fpu_scale;
+        }
         let children_visits = parent.visit_count.saturating_sub(1).max(1);
         let edges = parent.edges();
-        let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt;
+        let first_play_urgency = (1.0 - parent.mean_score()) - fpu_reduction * parent.visited_policy_sqrt;
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
         let (mut best, mut best_u) = (0, f64::NEG_INFINITY);
@@ -371,7 +383,8 @@ impl Tree {
             path.push(0);
             let mut node = 0;
             while self.nodes[node].edge_count > 0 {
-                let edge = self.select_edge(node, settings);
+                //the root's side moves at even depths
+                let edge = self.select_edge(node, settings, path.len() % 2 == 0);
                 board.play_unchecked(self.moves[edge]);
                 //a descent never ends without a visit or a simulation waiting, so the node is needed
                 node = self.child_node(edge);
