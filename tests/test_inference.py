@@ -6,10 +6,21 @@ import pytest
 import torch
 
 from encoding import EN_PASSANT_TOKEN_OFFSET, encode_board
-from inference import GraphedBatches, answer_rows, fp16_model, graph_sizes
+from inference import GraphedBatches, answer_rows, fp16_model, graph_sizes, small_graph_sizes
 from model import VALUE_BINS, ChessTransformer, expected_score
 from tools.checkpoint import save_checkpoint
 from tools.play.player import CudaGraphModel
+
+
+#every batch up to max_batch has a graph, and past 16 boards pads by fewer than 4 boards or a sixteenth: steps of 16
+#cost the engine's rounds of 64 leaves 3% of its nodes/s
+@pytest.mark.parametrize("max_batch", [64, 300])
+def test_small_graph_sizes_pad_little(max_batch):
+    sizes = small_graph_sizes(max_batch)
+    assert sizes == sorted(set(sizes)) and sizes[0] == 1 and sizes[-1] >= max_batch
+    for batch in range(17, max_batch + 1):
+        padded = next(size for size in sizes if size >= batch)
+        assert padded - batch < max(4, padded // 16)
 
 
 #for a batch smaller than the graph and for one board; graphs recorded on zero boards once hit a device-side assert

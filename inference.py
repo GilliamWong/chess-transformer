@@ -48,11 +48,13 @@ def serve(network, boards: list[np.ndarray], answers: list[np.ndarray], connecti
             hand_out(*in_flight)
         in_flight = started
 
-#graph sizes for batches from one up to max_batch, a few percent apart (one search's rounds, a match's few games)
+#graph sizes for batches from one up to max_batch (one search's rounds, a match's few games): past 16, 4 boards or a
+#sixteenth apart. A round of the engine's 64 leaves often sends fewer boards (the cache answers some), and steps of 16
+#rather than 4 cost it 3% of its nodes/s
 def small_graph_sizes(max_batch: int) -> list[int]:
     sizes = [1, 2, 4, 8, 16]
     while sizes[-1] < max_batch:
-        sizes.append(sizes[-1] + 16)
+        sizes.append(sizes[-1] + max(4, sizes[-1] // 16))
     return sizes
 
 #every 64 up to 1024, then every 128, then every 256: padding wastes a few percent at most
