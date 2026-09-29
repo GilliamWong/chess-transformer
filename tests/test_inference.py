@@ -5,9 +5,10 @@ import numpy as np
 import pytest
 import torch
 
-from encoding import EN_PASSANT_TOKEN_OFFSET, encode_board
-from inference import GraphedBatches, answer_rows, fp16_model, graph_sizes, small_graph_sizes
-from model import VALUE_BINS, ChessTransformer, expected_score
+from encoding import EN_PASSANT_TOKEN_OFFSET, TOKENS_PER_BOARD, encode_board, encode_move_to_id
+from inference import GraphedBatches, ImmediateBatches, MirroredBatches, answer_rows, fp16_model, graph_sizes, small_graph_sizes
+from model import VALUE_BINS, ChessTransformer, expected_score, score_spread
+from selfplay import ANSWER_WIDTH
 from tools.checkpoint import save_checkpoint
 from tools.play.player import CudaGraphModel
 
@@ -189,8 +190,10 @@ def test_linear_kernel_accumulating_in_fp32():
     assert torch.allclose(out, x.float() @ weight.float() + bias, atol=1e-4)
 
 
-#the last number of a row is the score, not a logit: the search backs it up as it is
-def test_an_answer_row_ends_with_the_expected_score():
+#a row ends with the spread of the value head's distribution and then the score, not a logit: the search backs it up
+#as it is. The spread is the distribution's standard deviation: 0 with all its mass in one bin, 1/sqrt(12) for the
+#uniform distribution from 0 to 1
+def test_an_answer_row_ends_with_the_spread_and_the_expected_score():
     torch.manual_seed(0)
     model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval()
     boards = torch.from_numpy(np.array([encode_board(chess.Board())], dtype=np.uint8)).long()
@@ -198,6 +201,38 @@ def test_an_answer_row_ends_with_the_expected_score():
         logits, value_logits = model(boards)
         rows = answer_rows((logits, value_logits))
 
-    assert rows.shape == (1, logits.shape[1] + 1)
+    assert rows.shape == (1, logits.shape[1] + 2)
     assert 0 < rows[0, -1] < 1
     assert torch.equal(rows[0, -1], expected_score(value_logits)[0])
+    assert torch.equal(rows[0, -2], score_spread(value_logits)[0])
+    one_bin = torch.full((1, VALUE_BINS), -1e4)
+    one_bin[0, 40] = 0.0
+    assert score_spread(one_bin)[0].item() == pytest.approx(0.0, abs=1e-3)
+    assert score_spread(torch.zeros(1, VALUE_BINS))[0].item() == pytest.approx(12 ** -0.5, rel=1e-3)
+
+
+#MirroredBatches' answer for a board without castling rights is the average of the network's answers for the board and
+#for its mirror image as python-chess makes it (Board.transform(flip_horizontal)), each legal move's logit averaged with
+#its mirrored move's; a board that can still castle passes through unchanged. The network is an arbitrary function of
+#the tokens, so a wrong square, en passant square or move id in the mirroring changes the answer
+def test_mirrored_batches_average_a_board_with_its_mirror_image():
+    weights = np.random.default_rng(0).normal(size=(TOKENS_PER_BOARD, ANSWER_WIDTH))
+    answer = lambda boards: (np.asarray(boards, dtype=np.float64) @ weights / 100).astype(np.float32)
+    boards = [chess.Board("4k3/8/8/8/3pP3/8/8/4K3 b - e3 0 1"), chess.Board("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1"),
+              chess.Board("2r2rk1/pp3ppp/2n1pn2/3p4/3P4/2N1PN2/PP3PPP/2R2RK1 w - - 0 15")]
+    network = MirroredBatches(ImmediateBatches(answer))
+    answers = network.collect(network.launch(np.array([encode_board(board) for board in boards], dtype=np.uint8)))
+
+    for board, answered in zip(boards, answers):
+        plain = answer([encode_board(board)])[0]
+        if board.castling_rights:
+            np.testing.assert_array_equal(answered, plain)
+            continue
+        image = board.transform(chess.flip_horizontal)
+        mirrored = answer([encode_board(image)])[0]
+        for move in board.legal_moves:
+            image_move = chess.Move(move.from_square ^ 7, move.to_square ^ 7, move.promotion)
+            assert image_move in image.legal_moves
+            expected = (plain[encode_move_to_id(move, board.turn)] + mirrored[encode_move_to_id(image_move, image.turn)]) / 2
+            assert answered[encode_move_to_id(move, board.turn)] == pytest.approx(expected, rel=1e-6)
+        assert answered[-1] == pytest.approx((plain[-1] + mirrored[-1]) / 2, rel=1e-6)

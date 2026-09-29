@@ -90,6 +90,48 @@ def test_the_cache_answers_transpositions_as_the_network_would():
     assert evaluated_with_cache < 0.9 * evaluated_without
 
 
+#transposition_visits (a light graph search): a new leaf whose position has a node elsewhere in the tree with enough
+#visits takes that node's priors and searched score, so the search makes fewer network calls; a threshold no node
+#reaches leaves the search exactly as it was without the setting
+def test_a_transposition_takes_its_searched_twins_score():
+    evaluate = cpu_batches(BoardModel()).evaluate_boards
+    found = {}
+    for transposition_visits in (0, 2, 10**6):
+        searches = selfplay_rs.Searches(**engine_search_settings(False, {"transposition_visits": transposition_visits}, own=False))
+        searches.start(0, chess.STARTING_FEN, [], 2000)
+        evaluated, reports = 0, []
+        while not reports:
+            boards = leaf_boards(searches.descend())
+            evaluated += len(boards)
+            reports = searches.finish(evaluate(boards))
+        found[transposition_visits] = (reports[0], evaluated)
+
+    assert found[10**6] == found[0]
+    assert found[2][1] < 0.95 * found[0][1]
+
+
+#uncertainty_scale weights each network score by the value head's spread: spreads that are all the same leave the
+#search's line, moves and visits as they were (the weights cancel in every mean), and spreads that differ move its score
+def test_uncertainty_weights_count_surer_scores_more():
+    plain = cpu_batches(BoardModel()).evaluate_boards
+    #BoardModel's score is 0.5 everywhere, which no weighting moves: scores and spreads from two hashes of the board
+    def with_spreads(spread_of):
+        def evaluate(boards):
+            answers = plain(boards).copy()
+            answers[:, -2] = spread_of(boards)
+            answers[:, -1] = 0.3 + boards.astype(np.int64).sum(axis=1) % 11 / 25
+            return answers
+        return evaluate
+    constant = with_spreads(lambda boards: np.full(len(boards), 0.1, dtype=np.float32))
+    varied = with_spreads(lambda boards: (boards[:, :64].astype(np.int64) * np.arange(64)).sum(axis=1) % 7 / 20)
+    search = lambda settings, evaluate: searched(selfplay_rs.Searches(**engine_search_settings(False, settings, own=False)), chess.Board(), 800, evaluate)
+
+    unweighted, same = search({}, constant), search({"uncertainty_scale": 0.1}, constant)
+    assert (same[1], same[3], same[4]) == (unweighted[1], unweighted[3], unweighted[4])
+    assert same[2] == pytest.approx(unweighted[2], abs=1e-9)
+    assert search({"uncertainty_scale": 0.1}, varied)[2] != pytest.approx(search({}, varied)[2], abs=1e-4)
+
+
 #one leaf a round is mcts.py's search (Searches' defaults, test_selfplay_rs.py) at every move, as evaluate_elo's logged
 #results were played, whatever the engine's own settings: a second round out on the network would change it. From a
 #middlegame, where captures move the material count, so that an answer changes the next choice

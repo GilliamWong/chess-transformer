@@ -26,7 +26,7 @@ def played(changes: tuple[str, str], nodes: int | None = None, clock: tuple[floa
     variants = [Variant(name, variant_settings(change, False)) for name, change in zip("ab", changes)]
     games = [(2 * index + colour, opening, colour == 0, (0, 1)) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
     finished = []
-    play(cpu_batches(BoardModel()), variants, games, 3, 4, nodes, clock, node_rate, None, lambda record, game: finished.append((record, game)))
+    play([cpu_batches(BoardModel())] * 2, variants, games, 3, 4, nodes, clock, node_rate, None, lambda record, game: finished.append((record, game)))
     return finished
 
 
@@ -106,7 +106,7 @@ def test_a_match_stops_when_on_result_says_so():
     variants = [Variant(name, variant_settings("", False)) for name in "ab"]
     games = [(2 * index + colour, opening, colour == 0, (0, 1)) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
     finished = []
-    play(cpu_batches(BoardModel()), variants, games, 3, 4, 20, None, 0.0, None, lambda record, game: finished.append(record) or True)
+    play([cpu_batches(BoardModel())] * 2, variants, games, 3, 4, 20, None, 0.0, None, lambda record, game: finished.append(record) or True)
     assert len(finished) == 1
 
 
@@ -119,7 +119,7 @@ def test_the_variants_play_a_common_opponent():
     opponent = Opponent([sys.executable, "-m", "tools.play.uci", "random"], 1, 3, 2)
     finished = []
     try:
-        play(cpu_batches(BoardModel()), variants, games, 3, 4, 12, None, 0.0, None, lambda record, game: finished.append((record, game)), opponent)
+        play([cpu_batches(BoardModel())] * 2, variants, games, 3, 4, 12, None, 0.0, None, lambda record, game: finished.append((record, game)), opponent)
     finally:
         opponent.close()
 

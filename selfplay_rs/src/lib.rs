@@ -361,7 +361,8 @@ impl Searches {
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, policy_temperature=1.0, certainty=false,
                         fifty_move_horizon=0.0, cpuct_stdev_scale=0.0, cpuct_stdev_prior=0.2, cpuct_stdev_prior_weight=2.0, lcb_stdevs=0.0,
-                        lcb_least_share=0.1, opponent_c_puct_scale=1.0, opponent_fpu_scale=1.0))]
+                        lcb_least_share=0.1, opponent_c_puct_scale=1.0, opponent_fpu_scale=1.0,
+                        transposition_visits=0, uncertainty_scale=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -386,12 +387,17 @@ impl Searches {
         lcb_least_share: f64,
         opponent_c_puct_scale: f64,
         opponent_fpu_scale: f64,
+        transposition_visits: u32,
+        uncertainty_scale: f64,
     ) -> PyResult<Searches> {
         if policy_temperature <= 0.0 {
             return Err(PyValueError::new_err(format!("a policy temperature must be above 0, not {policy_temperature}")));
         }
         if fifty_move_horizon < 0.0 {
             return Err(PyValueError::new_err(format!("a fifty move horizon must be 0 (none) or above, not {fifty_move_horizon}")));
+        }
+        if uncertainty_scale < 0.0 {
+            return Err(PyValueError::new_err(format!("an uncertainty scale must be 0 (none) or above, not {uncertainty_scale}")));
         }
         if cpuct_stdev_prior <= 0.0 || cpuct_stdev_prior_weight < 0.0 {
             return Err(PyValueError::new_err("the stdev prior must be above 0 and its weight at least 0"));
@@ -408,6 +414,8 @@ impl Searches {
                 lcb_least_share,
                 opponent_c_puct_scale,
                 opponent_fpu_scale,
+                transposition_visits,
+                uncertainty_scale,
                 ..SearchSettings::mcts(c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw)
             },
             move_ids: move_ids(move_id_table)?,

@@ -42,6 +42,14 @@ pub struct SearchSettings {
     //search looks at fewer of the opponent's replies, above 1 at more. 1 for none, as mcts.py
     pub opponent_c_puct_scale: f64,
     pub opponent_fpu_scale: f64,
+    //a light graph search: a new leaf whose position already has a node elsewhere in the tree with at least this many
+    //visits (a transposition) takes that node's priors and its searched score instead of the network's answer. 0 for
+    //none, as mcts.py
+    pub transposition_visits: u32,
+    //uncertainty-weighted backups (katago's): a network answer's score counts in its nodes' means with weight
+    //1 / (1 + (spread / uncertainty_scale)^2), spread being the standard deviation of the value head's distribution, so
+    //the scores the network is surest of count most. The visits still count one each. 0 for none, as mcts.py
+    pub uncertainty_scale: f64,
 }
 
 impl SearchSettings {
@@ -64,7 +72,18 @@ impl SearchSettings {
             lcb_least_share: 0.1,
             opponent_c_puct_scale: 1.0,
             opponent_fpu_scale: 1.0,
+            transposition_visits: 0,
+            uncertainty_scale: 0.0,
         }
+    }
+
+    //the weight of a network answer's score in its nodes' means, by its spread (uncertainty_scale's)
+    fn answer_weight(&self, spread: f32) -> f64 {
+        if self.uncertainty_scale == 0.0 {
+            return 1.0;
+        }
+        let relative = f64::from(spread) / self.uncertainty_scale;
+        1.0 / (1.0 + relative * relative)
     }
 }
 
@@ -114,8 +133,9 @@ pub struct Node {
     pub visit_count: u32,
     //simulations through this node waiting for the network, and while a round is gathered its collisions
     in_flight: u32,
-    pub value_sum: f64,
-    value_square_sum: f64, //of the scores' squares, for their spread
+    pub value_sum: f64, //of the scores, each times its weight (SearchSettings' uncertainty_scale; 1 without)
+    value_square_sum: f64, //of the scores' squares, for their spread, each times its weight
+    weight_sum: f64, //of the scores' weights: the visits without uncertainty_scale
     visited_policy_sqrt: f64, //sqrt of the sum of visited children's priors, refreshed when that set or the priors change
     first_edge: u32,
     edge_count: u32, //0 until the node is expanded
@@ -132,6 +152,7 @@ impl Node {
             in_flight: 0,
             value_sum: 0.0,
             value_square_sum: 0.0,
+            weight_sum: 0.0,
             visited_policy_sqrt: 0.0,
             first_edge: 0,
             edge_count: 0,
@@ -145,7 +166,7 @@ impl Node {
     }
 
     pub fn mean_score(&self) -> f64 {
-        self.value_sum / f64::from(self.visit_count)
+        self.value_sum / self.weight_sum
     }
 
     //the standard deviation of the scores backed up through the node, as if `prior` had been seen `weight` times more
@@ -156,7 +177,7 @@ impl Node {
             return prior;
         }
         let mean = self.mean_score();
-        let variance = ((mean * mean + prior * prior) * weight + self.value_square_sum) / (weight + visits - 1.0) - mean * mean;
+        let variance = ((mean * mean + prior * prior) * weight + self.value_square_sum) / (weight + self.weight_sum - 1.0) - mean * mean;
         variance.max(0.0).sqrt()
     }
 }
@@ -199,6 +220,7 @@ struct PendingLeaf {
 //the network's answer for a position: its legal moves' priors in python-chess's order, and its expected score
 struct Answer {
     priors: Box<[f32]>,
+    spread: f32, //the standard deviation of the value head's distribution
     value: f32,
 }
 
@@ -252,6 +274,9 @@ pub struct Tree {
     //taken off a draw's score for the root's side to move and added for the other side (contempt): above 0 the search
     //plays on rather than draw
     pub contempt: f64,
+    //with SearchSettings' transposition_visits: the first node a descent went through for each position, by its
+    //position_key. Emptied when the root moves (the nodes are renumbered) and filled again by the next descents
+    transpositions: HashMap<u64, u32>,
 }
 
 impl Tree {
@@ -266,6 +291,7 @@ impl Tree {
             pending: VecDeque::new(),
             logits: Vec::new(),
             contempt: 0.0,
+            transpositions: HashMap::new(),
         }
     }
 
@@ -350,6 +376,16 @@ impl Tree {
     }
 
     //the edge's node, made if the edge has none yet
+    //another node of the leaf's position with SearchSettings' transposition_visits, expanded with its move count
+    fn transposition(&self, key: u64, leaf: usize, move_count: usize, settings: &SearchSettings) -> Option<Node> {
+        if settings.transposition_visits == 0 {
+            return None;
+        }
+        let twin = *self.transpositions.get(&key)? as usize;
+        let found = self.nodes[twin];
+        (twin != leaf && found.visit_count >= settings.transposition_visits && found.edge_count as usize == move_count).then_some(found)
+    }
+
     fn child_node(&mut self, edge: usize) -> usize {
         if self.children[edge] == NO_NODE {
             self.children[edge] = self.nodes.len() as u32;
@@ -389,7 +425,11 @@ impl Tree {
                 //a descent never ends without a visit or a simulation waiting, so the node is needed
                 node = self.child_node(edge);
                 path.push(node);
-                self.keys.push(position_key(&board));
+                let key = position_key(&board);
+                self.keys.push(key);
+                if settings.transposition_visits > 0 {
+                    self.transpositions.entry(key).or_insert(node as u32);
+                }
                 if self.nodes[node].proof.is_some() {
                     break;
                 }
@@ -399,7 +439,7 @@ impl Tree {
             if let Some(proof) = self.nodes[node].proof {
                 self.keys.truncate(root_keys);
                 simulations += 1;
-                self.backup(&path, 1.0 - proof.value, 0);
+                self.backup(&path, 1.0 - proof.value, 0, 1.0);
                 continue;
             }
 
@@ -440,7 +480,7 @@ impl Tree {
                     };
                     self.prove(&path, Proof { outcome, value: 1.0 - result, plies });
                 }
-                self.backup(&path, value, 0);
+                self.backup(&path, value, 0, 1.0);
                 if settings.certainty {
                     self.propagate_proofs(&path);
                 }
@@ -448,11 +488,21 @@ impl Tree {
             }
             sort_moves_in_python_order(&board, &mut legal_moves);
             let moves = legal_moves;
+            //a transposition searched enough already: its priors (its edges are these moves in the same order) and its
+            //score, which is for the side that moved into it, as this leaf's is. A hash collision would give another
+            //number of moves
+            if let Some(twin) = self.transposition(leaf_key, node, moves.len(), settings) {
+                let priors: Vec<f32> = self.priors[twin.edges()].iter().map(|&prior| prior as f32).collect();
+                self.expand(node, &moves, &priors);
+                self.backup(&path, 1.0 - twin.mean_score(), 0, 1.0);
+                continue;
+            }
             //a hash collision would give another number of moves
             match cache.and_then(|cache| cache.get(leaf_key)).filter(|answer| answer.priors.len() == moves.len()) {
                 Some(answer) => {
                     self.expand(node, &moves, &answer.priors);
-                    self.backup(&path, fifty_move_scaled(f64::from(answer.value), board.halfmoves(), settings), 0);
+                    let weight = settings.answer_weight(answer.spread);
+                    self.backup(&path, fifty_move_scaled(f64::from(answer.value), board.halfmoves(), settings), 0, weight);
                 }
                 None => {
                     encode_board(&board, boards);
@@ -471,7 +521,8 @@ impl Tree {
         Ok(gathered)
     }
 
-    //mcts.finish for the oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it
+    //mcts.finish for the oldest waiting leaf; answer is the move logits, then the spread of the value head's
+    //distribution, then the expected score. The cache keeps it
     pub fn finish_leaf(
         &mut self,
         answer: impl Fn(usize) -> f32,
@@ -489,14 +540,15 @@ impl Tree {
             self.logits.iter_mut().for_each(|logit| *logit /= temperature);
         }
         softmax(&mut self.logits);
-        let value = answer(answer_width - 1);
+        let (spread, value) = (answer(answer_width - 2), answer(answer_width - 1));
 
         let node = *leaf.path.last().expect("the root at least");
         let priors = std::mem::take(&mut self.logits);
         self.expand(node, &leaf.moves, &priors);
-        self.backup(&leaf.path, fifty_move_scaled(f64::from(value), leaf.halfmoves, settings), 1);
+        let weight = settings.answer_weight(spread);
+        self.backup(&leaf.path, fifty_move_scaled(f64::from(value), leaf.halfmoves, settings), 1, weight);
         match cache {
-            Some(cache) => cache.insert(leaf.key, Answer { priors: priors.into_boxed_slice(), value }),
+            Some(cache) => cache.insert(leaf.key, Answer { priors: priors.into_boxed_slice(), spread, value }),
             None => self.logits = priors,
         }
     }
@@ -519,8 +571,9 @@ impl Tree {
         }
     }
 
-    //mcts.backup along the path, for a simulation that had in_flight visits waiting there
-    fn backup(&mut self, path: &[usize], value: f64, in_flight: u32) {
+    //mcts.backup along the path, for a simulation that had in_flight visits waiting there; its score counts `weight`
+    //in the means (1 without SearchSettings' uncertainty_scale, which leaves mcts.py's sums to the last bit)
+    fn backup(&mut self, path: &[usize], value: f64, in_flight: u32, weight: f64) {
         let mut score = 1.0 - value;
         for (depth, &node) in path.iter().enumerate().rev() {
             //from a node proven while the simulation waited for the network, the proven score (lc0's backup does the same)
@@ -529,8 +582,9 @@ impl Tree {
             }
             self.nodes[node].visit_count += 1;
             self.nodes[node].in_flight -= in_flight;
-            self.nodes[node].value_sum += score;
-            self.nodes[node].value_square_sum += score * score;
+            self.nodes[node].value_sum += weight * score;
+            self.nodes[node].value_square_sum += weight * score * score;
+            self.nodes[node].weight_sum += weight;
             if self.nodes[node].visit_count == 1 && depth > 0 {
                 self.refresh_visited_policy(path[depth - 1]);
             }
@@ -543,8 +597,8 @@ impl Tree {
     //alternates, and the squares' change in the parent's is the node's less twice the sums'
     fn prove(&mut self, path: &[usize], proof: Proof) {
         let (&node, ancestors) = path.split_last().expect("a node to prove");
-        let visits = f64::from(self.nodes[node].visit_count);
-        let (proven_sum, proven_squares) = (visits * proof.value, visits * proof.value * proof.value);
+        let weights = self.nodes[node].weight_sum;
+        let (proven_sum, proven_squares) = (weights * proof.value, weights * proof.value * proof.value);
         let change = proven_sum - self.nodes[node].value_sum;
         let square_change = proven_squares - self.nodes[node].value_square_sum;
         (self.nodes[node].value_sum, self.nodes[node].value_square_sum) = (proven_sum, proven_squares);
@@ -700,6 +754,7 @@ impl Tree {
         }
         self.board.play_unchecked(chess_move);
         self.keys.push(position_key(&self.board));
+        self.transpositions.clear();
     }
 
     //the tree under node as a tree of its own, node its root. Its proofs still hold: a proof comes from the game's end
