@@ -8,7 +8,7 @@ use shakmaty_syzygy::SyzygyError;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 
-//mcts.py's constants
+//mcts.py's constants, and the engine's own
 pub struct SearchSettings {
     pub c_puct: f64,
     pub c_puct_factor: f64,
@@ -16,6 +16,51 @@ pub struct SearchSettings {
     pub fpu_reduction: f64,
     pub draw: f64,
     pub repetitions_for_a_draw: usize,
+    //the priors are the softmax of the logits over this (lc0's policy softmax temperature): above 1 flattens them.
+    //mcts.py has none, which is 1
+    pub policy_temperature: f64,
+    //certainty propagation (lc0's sticky endgames): a game's end in the tree (mate, a draw by the rules or by
+    //repetition, the tablebase) is a proven result, and so is a node with a winning move or with every move's result
+    //proven. A proven node's visits all count its result, and the search no longer goes below it. mcts.py has none
+    pub certainty: bool,
+    //the network does not see the fifty move rule's count: its score is drawn towards a draw by halfmoves / this
+    //(stockfish scales its eval so), so that the side ahead makes progress. 0 for none, as mcts.py
+    pub fifty_move_horizon: f64,
+}
+
+//the network's score for the side to move, drawn towards a draw by SearchSettings' fifty_move_horizon
+fn fifty_move_scaled(value: f64, halfmoves: u32, settings: &SearchSettings) -> f64 {
+    if settings.fifty_move_horizon == 0.0 {
+        return value;
+    }
+    let kept = (1.0 - f64::from(halfmoves) / settings.fifty_move_horizon).max(0.0);
+    settings.draw + (value - settings.draw) * kept
+}
+
+//a result the search has proven, for the side that played into the node (as the node's value_sum)
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Outcome {
+    Loss,
+    Draw,
+    Win,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Proof {
+    pub outcome: Outcome,
+    pub value: f64, //the node's score under the proof, a draw's as the tree values draws
+    pub plies: u32, //to the game's end: a quicker win or a slower loss is the better one
+}
+
+//how good a move's proven result is for the side choosing it: a win, the quicker the better, then a draw, then a
+//loss, the slower the better
+fn proof_rank(proof: &Proof) -> (Outcome, i64) {
+    let plies = i64::from(proof.plies);
+    (proof.outcome, match proof.outcome {
+        Outcome::Win => -plies,
+        Outcome::Draw => 0,
+        Outcome::Loss => plies,
+    })
 }
 
 //mcts.Node's numbers, in one vector per tree with the root first. An expanded node's moves (its edges) are contiguous
@@ -30,6 +75,7 @@ pub struct Node {
     visited_policy_sqrt: f64, //sqrt of the sum of visited children's priors, refreshed when that set or the priors change
     first_edge: u32,
     edge_count: u32, //0 until the node is expanded
+    pub proof: Option<Proof>, //only with SearchSettings' certainty, and never at the root
 }
 
 //an edge without a node
@@ -37,7 +83,7 @@ const NO_NODE: u32 = u32::MAX;
 
 impl Node {
     fn new() -> Node {
-        Node { visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, first_edge: 0, edge_count: 0 }
+        Node { visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, first_edge: 0, edge_count: 0, proof: None }
     }
 
     //the node's moves, as indices into the tree's edges
@@ -82,6 +128,7 @@ struct PendingLeaf {
     key: u64,
     moves: MoveList,
     turn: Color,
+    halfmoves: u32, //since the last capture or pawn move
 }
 
 //the network's answer for a position: its legal moves' priors in python-chess's order, and its expected score
@@ -137,6 +184,9 @@ pub struct Tree {
     children: Vec<u32>,
     pending: VecDeque<PendingLeaf>, //oldest first, the order the network's answers come back in
     logits: Vec<f32>,
+    //taken off a draw's score for the root's side to move and added for the other side (contempt): above 0 the search
+    //plays on rather than draw
+    pub contempt: f64,
 }
 
 impl Tree {
@@ -150,7 +200,13 @@ impl Tree {
             children: Vec::new(),
             pending: VecDeque::new(),
             logits: Vec::new(),
+            contempt: 0.0,
         }
+    }
+
+    //a draw's score for the side to move in a position of the tree
+    fn draw_score(&self, turn: Color, settings: &SearchSettings) -> f64 {
+        if turn == self.board.turn() { settings.draw - self.contempt } else { settings.draw + self.contempt }
     }
 
     pub fn root(&self) -> &Node {
@@ -258,6 +314,17 @@ impl Tree {
                 node = self.child_node(edge);
                 path.push(node);
                 self.keys.push(position_key(&board));
+                if self.nodes[node].proof.is_some() {
+                    break;
+                }
+            }
+
+            //a proven result is known without going further
+            if let Some(proof) = self.nodes[node].proof {
+                self.keys.truncate(root_keys);
+                simulations += 1;
+                self.backup(&path, 1.0 - proof.value, 0);
+                continue;
             }
 
             if self.nodes[node].in_flight > 0 {
@@ -271,17 +338,33 @@ impl Tree {
             }
 
             let mut legal_moves = board.legal_moves();
-            let mut value = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, tables)?;
+            let draw = self.draw_score(board.turn(), settings);
+            let mut value = game_result(&board, &self.keys, &legal_moves, draw, settings.repetitions_for_a_draw, tables)?;
             //a repeat inside the search is a draw
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
             if value.is_none() && path_keys.contains(&leaf_key) {
-                value = Some(settings.draw);
+                value = Some(draw);
             }
             self.keys.truncate(root_keys);
 
             simulations += 1;
             if let Some(value) = value {
+                //the root is never proven: start refuses a root whose game is over
+                if settings.certainty && node != 0 {
+                    //the result is for the side to move, the proof for the side that moved here
+                    let outcome = if value == 0.0 {
+                        Outcome::Win
+                    } else if value == 1.0 {
+                        Outcome::Loss
+                    } else {
+                        Outcome::Draw
+                    };
+                    self.prove(&path, Proof { outcome, value: 1.0 - value, plies: 0 });
+                }
                 self.backup(&path, value, 0);
+                if settings.certainty {
+                    self.propagate_proofs(&path);
+                }
                 continue;
             }
             sort_moves_in_python_order(&board, &mut legal_moves);
@@ -290,12 +373,13 @@ impl Tree {
             match cache.and_then(|cache| cache.get(leaf_key)).filter(|answer| answer.priors.len() == moves.len()) {
                 Some(answer) => {
                     self.expand(node, &moves, &answer.priors);
-                    self.backup(&path, f64::from(answer.value), 0);
+                    self.backup(&path, fifty_move_scaled(f64::from(answer.value), board.halfmoves(), settings), 0);
                 }
                 None => {
                     encode_board(&board, boards);
                     self.add_in_flight(&path);
-                    self.pending.push_back(PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() });
+                    let (turn, halfmoves) = (board.turn(), board.halfmoves());
+                    self.pending.push_back(PendingLeaf { path: path.clone(), key: leaf_key, moves, turn, halfmoves });
                     gathered += 1;
                 }
             }
@@ -309,17 +393,29 @@ impl Tree {
     }
 
     //mcts.finish for the oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it
-    pub fn finish_leaf(&mut self, answer: impl Fn(usize) -> f32, answer_width: usize, move_ids: &MoveIds, cache: Option<&mut Cache>) {
+    pub fn finish_leaf(
+        &mut self,
+        answer: impl Fn(usize) -> f32,
+        answer_width: usize,
+        move_ids: &MoveIds,
+        settings: &SearchSettings,
+        cache: Option<&mut Cache>,
+    ) {
         let leaf = self.pending.pop_front().expect("a waiting simulation");
         self.logits.clear();
         self.logits.extend(leaf.moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, leaf.turn))));
+        //at 1 the logits are left alone, so the priors stay mcts.py's to the last bit
+        if settings.policy_temperature != 1.0 {
+            let temperature = settings.policy_temperature as f32;
+            self.logits.iter_mut().for_each(|logit| *logit /= temperature);
+        }
         softmax(&mut self.logits);
         let value = answer(answer_width - 1);
 
         let node = *leaf.path.last().expect("the root at least");
         let priors = std::mem::take(&mut self.logits);
         self.expand(node, &leaf.moves, &priors);
-        self.backup(&leaf.path, f64::from(value), 1);
+        self.backup(&leaf.path, fifty_move_scaled(f64::from(value), leaf.halfmoves, settings), 1);
         match cache {
             Some(cache) => cache.insert(leaf.key, Answer { priors: priors.into_boxed_slice(), value }),
             None => self.logits = priors,
@@ -348,6 +444,10 @@ impl Tree {
     fn backup(&mut self, path: &[usize], value: f64, in_flight: u32) {
         let mut score = 1.0 - value;
         for (depth, &node) in path.iter().enumerate().rev() {
+            //from a node proven while the simulation waited for the network, the proven score (lc0's backup does the same)
+            if let Some(proof) = self.nodes[node].proof {
+                score = proof.value;
+            }
             self.nodes[node].visit_count += 1;
             self.nodes[node].in_flight -= in_flight;
             self.nodes[node].value_sum += score;
@@ -356,6 +456,61 @@ impl Tree {
             }
             score = 1.0 - score;
         }
+    }
+
+    //proves the path's last node: its visits so far count the proven score instead of theirs, in its ancestors too
+    //(lc0's AdjustForTerminal); a visit's score goes to the node and 1 - it to the parent, so the change alternates
+    fn prove(&mut self, path: &[usize], proof: Proof) {
+        let (&node, ancestors) = path.split_last().expect("a node to prove");
+        let proven_sum = f64::from(self.nodes[node].visit_count) * proof.value;
+        let mut change = proven_sum - self.nodes[node].value_sum;
+        self.nodes[node].value_sum = proven_sum;
+        self.nodes[node].proof = Some(proof);
+        for &ancestor in ancestors.iter().rev() {
+            change = -change;
+            self.nodes[ancestor].value_sum += change;
+        }
+    }
+
+    //after the path's last node was proven, its parent may be too, and so on up to the root's children
+    fn propagate_proofs(&mut self, path: &[usize]) {
+        for depth in (1..path.len().saturating_sub(1)).rev() {
+            match self.proof_from_moves(path[depth]) {
+                Some(proof) => self.prove(&path[..=depth], proof),
+                None => break,
+            }
+        }
+    }
+
+    //an expanded node's result from its moves' proofs: it is lost for the side that moved into it if a move wins (the
+    //quickest), and otherwise known once every move's result is, the best of them
+    fn proof_from_moves(&self, node: usize) -> Option<Proof> {
+        let edges = self.nodes[node].edges();
+        if edges.is_empty() {
+            return None;
+        }
+        let mut best: Option<Proof> = None;
+        let mut all_proven = true;
+        for edge in edges {
+            match self.child(edge).and_then(|child| child.proof) {
+                Some(proof) if best.is_none_or(|best| proof_rank(&proof) > proof_rank(&best)) => best = Some(proof),
+                Some(_) => {}
+                None => all_proven = false,
+            }
+        }
+        let best = best?;
+        let outcome = match best.outcome {
+            Outcome::Win => Outcome::Loss,
+            _ if !all_proven => return None,
+            Outcome::Draw => Outcome::Draw,
+            Outcome::Loss => Outcome::Win,
+        };
+        Some(Proof { outcome, value: 1.0 - best.value, plies: best.plies + 1 })
+    }
+
+    //the root's result is proven: a move wins, or every move's result is known, and searching on changes nothing
+    pub fn root_decided(&self) -> bool {
+        self.proof_from_moves(0).is_some()
     }
 
     fn refresh_visited_policy(&mut self, node: usize) {
@@ -377,12 +532,17 @@ impl Tree {
         self.refresh_visited_policy(0);
     }
 
-    //mcts.most_visited_move: ties to the better mean score, then the prior, then the first. Returns the edge
+    //mcts.most_visited_move: ties to the better mean score, then the prior, then the first. Returns the edge. A proven
+    //win comes before every other move (the quickest first) and a proven loss after (the slowest first), as lc0 has it
     pub fn most_visited_edge(&self, node: usize) -> usize {
         let preference = |edge: usize| {
             let visits = self.visits(edge);
             let mean_score = if visits > 0 { self.nodes[self.children[edge] as usize].mean_score() } else { 0.0 };
-            (visits, mean_score, self.priors[edge])
+            let proven = match self.child(edge).and_then(|child| child.proof) {
+                Some(proof) if proof.outcome != Outcome::Draw => proof_rank(&proof),
+                _ => (Outcome::Draw, 0),
+            };
+            (proven, visits, mean_score, self.priors[edge])
         };
         let mut edges = self.nodes[node].edges();
         let mut best = edges.next().expect("a searched node has children");
@@ -433,7 +593,8 @@ impl Tree {
         self.keys.push(position_key(&self.board));
     }
 
-    //the tree under node as a tree of its own, node its root
+    //the tree under node as a tree of its own, node its root. Its proofs go: a draw by a repetition of a position that
+    //is now before the root is no longer one, and the search proves again what still holds as it comes by
     fn keep_subtree(&mut self, node: usize) {
         let mut nodes = vec![self.nodes[node]];
         let (mut moves, mut priors, mut children) = (Vec::new(), Vec::new(), Vec::new());
@@ -441,6 +602,7 @@ impl Tree {
         while index < nodes.len() {
             let edges = nodes[index].edges();
             nodes[index].first_edge = moves.len() as u32;
+            nodes[index].proof = None;
             moves.extend_from_slice(&self.moves[edges.clone()]);
             priors.extend_from_slice(&self.priors[edges.clone()]);
             for edge in edges {

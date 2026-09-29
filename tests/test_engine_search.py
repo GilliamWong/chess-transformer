@@ -1,5 +1,6 @@
 #the uci engine's search (tools/play/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
-#deadline and node limit, smart pruning, the tree kept for the next move, and uci.py's go limits and clock
+#deadline and node limit, smart pruning, the tree kept for the next move, the engine's own settings (policy
+#temperature, certainty propagation, contempt), and uci.py's go limits and clock
 import subprocess
 import sys
 import time
@@ -9,15 +10,16 @@ import chess
 import chess.engine
 import numpy as np
 import pytest
+from torch import nn
 
 import selfplay_rs
-from encoding import TOKENS_PER_BOARD
+from encoding import TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import BoardModel, UniformModel
 from inference import cpu_batches
 from model import ChessTransformer
 from selfplay import rust_search_settings
 from tools.checkpoint import save_checkpoint
-from tools.play.engine_search import EngineSearch
+from tools.play.engine_search import CONTEMPT_FROM_SCORE, EngineSearch
 from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
@@ -286,3 +288,173 @@ def test_the_engine_keeps_to_gos_limits(tmp_path):
     assert timed.move in board.legal_moves and timed.info["nodes"] > 10 and 0.3 < seconds < 0.5 + 0.1
     assert counted.info["nodes"] == 50
     assert first_move < 0.5 and 0.8 < move_40 < 1.3
+
+
+#Searches' search of board to its simulations, one leaf a round; its report (id, line, score, root moves, visits)
+def searched(searches: selfplay_rs.Searches, board: chess.Board, simulations: int, evaluate, search_id: int = 0, contempt: float = 0.0):
+    searches.start(search_id, board.root().fen(), [move.uci() for move in board.move_stack], simulations, contempt)
+    reports = []
+    while not reports:
+        reports = searches.finish(evaluate(leaf_boards(searches.descend())))
+    return reports[0]
+
+#BoardModel with sharper priors, its move logits multiplied by `scale` and divided by `divisor`
+class SharpBoardModel(nn.Module):
+    def __init__(self, scale: float, divisor: float = 1.0):
+        super().__init__()
+        self.model, self.scale, self.divisor = BoardModel(), scale, divisor
+
+    def forward(self, boards):
+        logits, value = self.model(boards)
+        return logits * self.scale / self.divisor, value
+
+#a policy temperature divides the logits before the softmax (lc0's policy softmax temperature): the search with it is
+#the search of a network whose logits are divided, to the last bit, and not the search without it
+def test_the_policy_temperature_divides_the_logits(carlsen_games):
+    board = carlsen_games[2].board()
+    found = {}
+    for ply, move in enumerate(list(carlsen_games[2].mainline_moves())[:40]):
+        board.push(move)
+        if ply % 8 == 7:
+            for name, temperature, model in (("tempered", 1.5, SharpBoardModel(30)), ("divided", 1.0, SharpBoardModel(30, 1.5)),
+                                             ("untempered", 1.0, SharpBoardModel(30))):
+                searches = selfplay_rs.Searches(**rust_search_settings(False), policy_temperature=temperature)
+                found.setdefault(name, []).append(searched(searches, board, 200, cpu_batches(model).evaluate_boards))
+
+    assert found["tempered"] == found["divided"]
+    assert found["tempered"] != found["untempered"]
+
+
+#with tree reuse every game (search id) keeps its own tree: a game's next search carries on its tree although another
+#game searched in between, and needs only the simulations it lacks
+def test_every_game_keeps_its_tree():
+    network = CountingNetwork(BoardModel())
+    searches = selfplay_rs.Searches(**rust_search_settings(False), tree_reuse=True)
+    boards = [chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"), chess.Board()]
+    for search_id, board in enumerate(boards):
+        searched(searches, board, 400, network.launch, search_id)
+
+    for search_id, board in enumerate(boards):
+        network.boards = 0
+        assert searched(searches, board, 600, network.launch, search_id)[4] == 600
+        assert 0 < network.boards <= 200
+
+
+#certainty propagation proves a mate in two (the defender's one reply is mated) and the engine stops once it is
+#proven: the mate's first move, scored as a certain win, long before its budget; without it the win is only likely.
+#The tree kept for the next move loses its proofs, and the search proves the mate in one again
+def test_certainty_proves_a_mate_and_the_search_stops():
+    board = chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1")
+    search = EngineSearch(cpu_batches(UniformModel()), 16, certainty=True)
+    proven = search.search(board, simulations=20_000)
+    assert proven.line[0].uci() == "c6b6" and proven.score == 1.0 and proven.simulations < 5_000
+
+    unproven = EngineSearch(cpu_batches(UniformModel()), 16).search(board, simulations=proven.simulations)
+    assert unproven.score < 1.0
+
+    board.push_uci("c6b6")
+    board.push_uci("a8b8")
+    mate = search.search(board, simulations=20_000)
+    assert mate.line[0].uci() == "h1h8" and mate.score == 1.0 and mate.simulations < 5_000
+
+#the search goes no further than a proven node: with the whole budget searched (no smart pruning), the simulations
+#after the proof take the proven score at once and the network sees few boards
+def test_certainty_stops_descents_at_proven_nodes():
+    network = CountingNetwork(UniformModel())
+    report = EngineSearch(network, 16, smart_pruning=False, certainty=True).search(chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1"), simulations=6000)
+
+    assert report.simulations == 6000 and report.score == 1.0
+    assert network.boards < 3000
+
+#the uniform model, but for the moves it likes (uci, side), e^logit times more likely than any other
+class LikesMoves(nn.Module):
+    def __init__(self, moves: list[tuple[str, chess.Color]], logit: float):
+        super().__init__()
+        self.move_ids = [encode_move_to_id(chess.Move.from_uci(move), side) for move, side in moves]
+        self.logit = logit
+
+    def forward(self, boards):
+        logits, value = UniformModel()(boards)
+        logits[:, self.move_ids] = self.logit
+        return logits, value
+
+#a proven win is played although another move has more visits (lc0 ranks proven wins first): the network likes a king
+#move, the search finds the rook's mate
+def test_certainty_plays_a_proven_win_over_the_most_visited_move():
+    board = chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1")
+    model = LikesMoves([("g1f1", chess.WHITE)], 5.0)
+    report = EngineSearch(cpu_batches(model), 16, certainty=True).search(board, simulations=4000)
+
+    assert report.line[0].uci() == "e1e8" and report.score == 1.0
+    assert report.root_moves[0][0].uci() == "g1f1"
+
+#the position after these moves has white to move and Nh1 draws by a third repetition; two plies before, white to move
+#could head there (Ng3 Ke8 Nh1)
+REPETITION_START = "4k3/7p/8/8/8/8/P7/4K2N b - - 0 1"
+REPETITION_MOVES = "e8d7 h1g3 d7e8 g3h1 e8d7 h1g3 d7e8".split()
+
+#a kept tree's proofs are proven again in the next search: a draw proven with contempt below 0 (worth 0.7 to white)
+#counts at the next search's contempt of 0.2 (worth 0.3), and white no longer plays it although the network likes it
+@pytest.mark.parametrize("contempt, draws", [(-0.2, True), (0.2, False)])
+def test_certainty_proves_a_kept_trees_draws_again(contempt, draws):
+    model = LikesMoves([("h1g3", chess.WHITE), ("g3h1", chess.WHITE), ("e8d7", chess.BLACK), ("d7e8", chess.BLACK)], 3.0)
+    evaluate = cpu_batches(model).evaluate_boards
+    searches = selfplay_rs.Searches(**rust_search_settings(False), tree_reuse=True, certainty=True)
+    board = chess.Board(REPETITION_START)
+    for move in REPETITION_MOVES[:-2]:
+        board.push_uci(move)
+    searched(searches, board, 500, evaluate, contempt=-0.2)
+
+    for move in REPETITION_MOVES[-2:]:
+        board.push_uci(move)
+    _, line, score, _, _ = searched(searches, board, 3000, evaluate, contempt=contempt)
+    assert (line[0] == "g3h1") == draws
+
+
+#white can draw by a third repetition (Nh1). A draw is even for the uniform model, so without contempt the search
+#visits the repetition like any move; contempt makes it worse for white, the root's side, and fewer visits go there;
+#contempt below 0 (a draw worth more to white) sends the search to it
+def test_contempt_steers_the_root_side_away_from_draws():
+    board = chess.Board(REPETITION_START)
+    for move in REPETITION_MOVES:
+        board.push_uci(move)
+    evaluate = cpu_batches(UniformModel()).evaluate_boards
+    visits = {}
+    for contempt in (0.0, 0.1, -0.1):
+        _, line, _, root_moves, _ = searched(selfplay_rs.Searches(**rust_search_settings(False)), board, 600, evaluate, contempt=contempt)
+        visits[contempt] = dict(root_moves)["g3h1"]
+        if contempt < 0:
+            assert line[0] == "g3h1"
+    assert visits[0.1] < visits[0.0] / 2 < visits[-0.1] / 2
+
+    with pytest.raises(ValueError):
+        selfplay_rs.Searches(**rust_search_settings(False)).start(0, board.root().fen(), [], 10, 0.5)
+
+
+#white is a rook ahead 90 halfmoves after the last pawn move. The material count scores every move the same, but with
+#a fifty move horizon a pawn move keeps the whole score and the others are drawn towards a draw: the search moves a
+#pawn. The same search again, all of it from the cache, finds the same
+@pytest.mark.parametrize("horizon, pawn_moves", [(100.0, True), (0.0, False)])
+def test_the_fifty_move_horizon_makes_the_side_ahead_move_a_pawn(horizon, pawn_moves):
+    board = chess.Board("4k3/8/8/8/8/8/P7/R3K3 w - - 90 80")
+    evaluate = cpu_batches(BoardModel()).evaluate_boards
+    searches = selfplay_rs.Searches(**rust_search_settings(False), fifty_move_horizon=horizon, cache_positions=10_000)
+    report = searched(searches, board, 400, evaluate)
+    _, _, _, root_moves, visits = report
+
+    pawn_visits = sum(move_visits for move, move_visits in root_moves if move in ("a2a3", "a2a4"))
+    assert (pawn_visits > visits / 2) == pawn_moves
+    assert searched(searches, board, 400, evaluate) == report
+
+#the engine's contempt applies once its last search of the same game found it ahead
+def test_contempt_starts_once_the_engine_is_ahead():
+    search = EngineSearch(cpu_batches(UniformModel()), 16, contempt=0.05)
+    board = chess.Board()
+    board.push_uci("e2e4")
+    assert search.contempt_for(board, ["e2e4"]) == 0.0
+    search.last_search = (chess.STARTING_FEN, ["e2e4"], CONTEMPT_FROM_SCORE)
+    assert search.contempt_for(board, ["e2e4", "e7e5", "g1f3"]) == 0.05
+    search.last_search = (chess.STARTING_FEN, ["d2d4"], CONTEMPT_FROM_SCORE)
+    assert search.contempt_for(board, ["e2e4", "e7e5", "g1f3"]) == 0.0
+    search.last_search = (chess.STARTING_FEN, ["e2e4"], CONTEMPT_FROM_SCORE - 0.01)
+    assert search.contempt_for(board, ["e2e4", "e7e5", "g1f3"]) == 0.0
