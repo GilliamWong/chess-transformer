@@ -135,6 +135,22 @@ def test_linear_kernel_in_fp16(gated):
     assert torch.allclose(out.float(), expected, atol=0.03, rtol=0.01)
 
 
+#the policy head's from and to projections (fused_blocks.HalfInputLinear): fp16 inputs accumulating in fp32 and
+#giving fp32, as close to the fp32 matmul as fp16's rounding of the weights allows
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_linear_kernel_accumulating_in_fp32():
+    from fused_blocks import linear
+    torch.manual_seed(0)
+    x = torch.randn(3, 64, 512, device="cuda").half()
+    weight = (torch.randn(512, 200, device="cuda") / 512**0.5).half()
+    bias = torch.randn(200, device="cuda")
+
+    out = linear(x, weight, bias, accumulate_fp32=True)
+
+    assert out.dtype == torch.float32
+    assert torch.allclose(out, x.float() @ weight.float() + bias, atol=1e-4)
+
+
 #the last number of a row is the score, not a logit: the search backs it up as it is
 def test_an_answer_row_ends_with_the_expected_score():
     torch.manual_seed(0)

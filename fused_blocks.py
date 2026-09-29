@@ -102,11 +102,12 @@ LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_DEPTH, LINEAR_WARPS, LINEAR_STAGES, GROUP_M 
 
 
 #out = x @ w (w is in_features x out_features), then in the same kernel the bias, silu(gate) * up (gated: w's first
-#half of columns is the gate, the second up) and the residual added. fp16 inputs accumulate in fp16, as cuBLAS does
-#with allow_fp16_accumulation (twice fp32 accumulation's speed on a geforce card); the elementwise work is in fp32
+#half of columns is the gate, the second up) and the residual added. ACC_TYPE is the accumulators' type: fp16 for the
+#blocks, as cuBLAS did with allow_fp16_accumulation (twice fp32 accumulation's speed on a geforce card); the
+#elementwise work is in fp32
 @triton.jit
 def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride_w,
-                  HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr,
+                  HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, ACC_TYPE: tl.constexpr,
                   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
     pid = tl.program_id(0)
     grid_m, grid_n = tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N)
@@ -122,14 +123,13 @@ def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride
     x_ptrs = x_ptr + rows[:, None] * K + depth[None, :]
     w_ptrs = w_ptr + depth[:, None] * stride_w + cols[None, :]
 
-    acc_type: tl.constexpr = tl.float16 if x_ptr.dtype.element_ty == tl.float16 else tl.float32
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_type)
-    up = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_type)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    up = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     for _ in range(0, K, BLOCK_K):
         x = tl.load(x_ptrs, mask=row_ok[:, None], other=0.0)
-        acc = tl.dot(x, tl.load(w_ptrs, mask=col_ok[None, :], other=0.0), acc, out_dtype=acc_type)
+        acc = tl.dot(x, tl.load(w_ptrs, mask=col_ok[None, :], other=0.0), acc, out_dtype=ACC_TYPE)
         if GATED:
-            up = tl.dot(x, tl.load(w_ptrs + N, mask=col_ok[None, :], other=0.0), up, out_dtype=acc_type)
+            up = tl.dot(x, tl.load(w_ptrs + N, mask=col_ok[None, :], other=0.0), up, out_dtype=ACC_TYPE)
         x_ptrs += BLOCK_K
         w_ptrs += BLOCK_K * stride_w
 
@@ -144,16 +144,18 @@ def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride
     tl.store(out_ptr + out_offsets, out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None] & col_ok[None, :])
 
 
-#an opaque op for torch.compile, as template_attention
+#an opaque op for torch.compile, as template_attention. fp16 inputs accumulate in fp16 and give fp16, or with
+#accumulate_fp32 accumulate in fp32 and give fp32; fp32 inputs accumulate in fp32 (tf32 products)
 @torch.library.custom_op("chess::linear", mutates_args=())
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, residual: torch.Tensor | None = None,
-           gated: bool = False) -> torch.Tensor:
+           gated: bool = False, accumulate_fp32: bool = False) -> torch.Tensor:
     K, width = weight.shape
     N = width // 2 if gated else width
     if K % LINEAR_DEPTH != 0:
         raise ValueError(f"linear_kernel reads the {K} inputs {LINEAR_DEPTH} at a time")
     x = x.contiguous()
-    out = x.new_empty(*x.shape[:-1], N)
+    out = x.new_empty(*x.shape[:-1], N, dtype=torch.float32 if accumulate_fp32 else x.dtype)
+    acc_type = tl.float16 if x.dtype == torch.float16 and not accumulate_fp32 else tl.float32
     M = x.numel() // K
     columns = LINEAR_COLUMNS // 2 if gated else LINEAR_COLUMNS
     #the pointers of unused inputs are never read
@@ -161,19 +163,32 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = No
     residual_ = residual.contiguous() if residual is not None else out
     grid = (triton.cdiv(M, LINEAR_ROWS) * triton.cdiv(N, columns),)
     linear_kernel[grid](x, weight, bias_, residual_, out, M, N, K, weight.stride(0), HAS_BIAS=bias is not None, HAS_RESIDUAL=residual is not None,
-                        GATED=gated, BLOCK_M=LINEAR_ROWS, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M, num_warps=LINEAR_WARPS,
+                        GATED=gated, ACC_TYPE=acc_type, BLOCK_M=LINEAR_ROWS, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M, num_warps=LINEAR_WARPS,
                         num_stages=LINEAR_STAGES)
     return out
 
 
 @linear.register_fake
-def _(x, weight, bias=None, residual=None, gated=False):
-    return x.new_empty(*x.shape[:-1], weight.shape[1] // 2 if gated else weight.shape[1])
+def _(x, weight, bias=None, residual=None, gated=False, accumulate_fp32=False):
+    return x.new_empty(*x.shape[:-1], weight.shape[1] // 2 if gated else weight.shape[1], dtype=torch.float32 if accumulate_fp32 else x.dtype)
 
 
 #a linear layer's weight as linear_kernel reads it, in_features x out_features
 def transposed(weight: torch.Tensor) -> nn.Parameter:
     return nn.Parameter(weight.detach().t().contiguous())
+
+
+#a head's fp32 linear layer (from_projection, to_projection) on fp16 inputs and weights accumulating in fp32, giving
+#fp32: its input is the last LayerNorm's fp16 output, and fp16's 10 bit mantissas are tf32's, which the fp32 matmul
+#used, at twice tf32's speed
+class HalfInputLinear(nn.Module):
+    def __init__(self, layer: nn.Linear):
+        super().__init__()
+        self.weight = transposed(layer.weight.half())
+        self.bias = layer.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return linear(x.half(), self.weight, self.bias, accumulate_fp32=True)
 
 
 class FusedBlock(nn.Module):
@@ -245,9 +260,10 @@ class SummedSquareFeatures(nn.Module):
         return feature_sum(self.features.indices(board_state) + self.features.row_offsets, self.features.table)
 
 
-#the model with its blocks swapped for FusedBlocks and its square features summed as above, for inference only;
-#embeddings and heads unchanged
+#the model with its blocks swapped for FusedBlocks, its square features summed and its policy head's from and to
+#projections as above, for inference only; embeddings and the other heads unchanged
 def fuse_blocks(model: nn.Module) -> nn.Module:
     model.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
     model.square_features = SummedSquareFeatures(model.square_features)
+    model.from_projection, model.to_projection = HalfInputLinear(model.from_projection), HalfInputLinear(model.to_projection)
     return model
