@@ -18,7 +18,7 @@ from model import ChessTransformer
 from selfplay import rust_search_settings
 from tools.checkpoint import save_checkpoint
 from tools.play.engine_search import EngineSearch
-from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, Clock
+from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
 
@@ -166,35 +166,54 @@ def test_the_next_search_carries_on_the_last_tree():
 #the side to move's clock, milliseconds as seconds, and --simulations when go sets no limit (go infinite)
 def test_go_limits():
     clock = Clock()
-    assert clock.limits("movetime 1000".split(), chess.WHITE, 800) == (None, pytest.approx(1 - MOVE_OVERHEAD_SECONDS))
-    assert clock.limits("movetime 500 nodes 100".split(), chess.WHITE, 800) == (100, pytest.approx(0.5 - MOVE_OVERHEAD_SECONDS))
-    assert clock.limits("nodes 5000".split(), chess.BLACK, 800) == (5000, None)
-    assert clock.limits(["infinite"], chess.BLACK, 800) == (800, None)
+    white, black = chess.Board(), chess.Board("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+    assert clock.limits("movetime 1000".split(), white, 800) == (None, pytest.approx(1 - MOVE_OVERHEAD_SECONDS))
+    assert clock.limits("movetime 500 nodes 100".split(), white, 800) == (100, pytest.approx(0.5 - MOVE_OVERHEAD_SECONDS))
+    assert clock.limits("nodes 5000".split(), black, 800) == (5000, None)
+    assert clock.limits(["infinite"], black, 800) == (800, None)
 
-    nodes, seconds = clock.limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), chess.BLACK, 800)
-    assert nodes is None and seconds == pytest.approx(clock.seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None))
+    nodes, seconds = clock.limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), black, 800)
+    assert nodes is None and seconds == pytest.approx(clock.seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 1))
     assert 0.5 < seconds < 30 * MOST_OF_THE_TIME_LEFT
 
 
 #a search stopped early (smart pruning) leaves time on the clock, and the next moves get it; a movetime search is not
 #on the clock
 def test_time_saved_goes_to_later_moves():
-    clock = Clock()
-    _, first = clock.limits("wtime 60000 btime 60000".split(), chess.WHITE, 800)
+    clock, board = Clock(), chess.Board()
+    _, first = clock.limits("wtime 60000 btime 60000".split(), board, 800)
     clock.searched(first / 2)
-    _, later = clock.limits("wtime 59000 btime 60000".split(), chess.WHITE, 800)
-    _, without_saving = Clock().limits("wtime 59000 btime 60000".split(), chess.WHITE, 800)
+    _, later = clock.limits("wtime 59000 btime 60000".split(), board, 800)
+    _, without_saving = Clock().limits("wtime 59000 btime 60000".split(), board, 800)
     assert later > 1.05 * without_saving
 
     clock.searched(later / 4)
-    _, after_more_saving = clock.limits("wtime 58000 btime 60000".split(), chess.WHITE, 800)
+    _, after_more_saving = clock.limits("wtime 58000 btime 60000".split(), board, 800)
     assert after_more_saving > later
-    clock.limits("movetime 1000".split(), chess.WHITE, 800)
+    clock.limits("movetime 1000".split(), board, 800)
     clock.searched(0.1)
-    assert clock.limits("wtime 58000 btime 60000".split(), chess.WHITE, 800)[1] == pytest.approx(after_more_saving)
+    assert clock.limits("wtime 58000 btime 60000".split(), board, 800)[1] == pytest.approx(after_more_saving)
     for _ in range(50):
         clock.searched(0.0)
-    assert clock.limits("wtime 3000 btime 60000".split(), chess.WHITE, 800)[1] <= 3 * MOST_OF_THE_TIME_LEFT
+    assert clock.limits("wtime 3000 btime 60000".split(), board, 800)[1] <= 3 * MOST_OF_THE_TIME_LEFT
+
+
+#at 60+0.6 the time is planned to last to about move 50, as lc0 spends its clock, and later moves live on the
+#increment: searches that take all they are given keep the opening's pace through the middle game, have the clock low
+#by move 60 (an even share over 30 more moves still had ~11 s there) and never run it below the reserve
+def test_the_clock_is_spent_by_about_move_50_and_never_runs_out():
+    clock, board, left, spent, low = Clock(), chess.Board(), 60.0, {}, 60.0
+    for move in range(1, 121):
+        board.fullmove_number = move
+        _, seconds = clock.limits(f"wtime {round(left * 1000)} btime 60000 winc 600 binc 600".split(), board, 800)
+        clock.searched(seconds)
+        left += 0.6 - seconds - MOVE_OVERHEAD_SECONDS
+        spent[move], low = seconds, min(low, left)
+        if move == 60:
+            left_at_60 = left
+    opening, middle_game = sum(spent[m] for m in range(1, 11)) / 10, sum(spent[m] for m in range(20, 40)) / 20
+    assert middle_game > 0.9 * opening
+    assert left_at_60 < 5 and low > RESERVE_SECONDS / 2
 
 
 #smart pruning stops once the simulations left could not change the most visited move: a mate in one is decided when
@@ -237,8 +256,8 @@ def test_pruning_never_changes_the_move(carlsen_games):
     assert len(positions) > 20 and stopped_early > 5
 
 
-#the engine as a gui drives it: a move within go movetime, and go nodes' simulations (in a new game: a kept tree's
-#visits count, as lc0 counts them)
+#the engine as a gui drives it: a move within go movetime, go nodes' simulations (in a new game: a kept tree's visits
+#count, as lc0 counts them), and on a clock more time for move 40 than for the first move
 def test_the_engine_keeps_to_gos_limits(tmp_path):
     settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": 16}
     save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
@@ -253,8 +272,17 @@ def test_the_engine_keeps_to_gos_limits(tmp_path):
         seconds = time.perf_counter() - started
         other = chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1")
         counted = engine.play(other, chess.engine.Limit(nodes=50), info=chess.engine.INFO_BASIC)
+        #on a 10+0.1 clock the first move gets ~0.28 s and move 40 ~1 s: the time is planned to last to about move 50
+        clock = chess.engine.Limit(white_clock=10, black_clock=10, white_inc=0.1, black_inc=0.1)
+        started = time.perf_counter()
+        engine.play(board, clock)
+        first_move = time.perf_counter() - started
+        started = time.perf_counter()
+        engine.play(chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 40"), clock)
+        move_40 = time.perf_counter() - started
     finally:
         engine.quit()
 
     assert timed.move in board.legal_moves and timed.info["nodes"] > 10 and 0.3 < seconds < 0.5 + 0.1
     assert counted.info["nodes"] == 50
+    assert first_move < 0.5 and 0.8 < move_40 < 1.3
