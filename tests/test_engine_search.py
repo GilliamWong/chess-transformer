@@ -218,6 +218,16 @@ def test_the_clock_is_spent_by_about_move_50_and_never_runs_out():
     assert left_at_60 < 5 and low > RESERVE_SECONDS / 2
 
 
+#a clock planned to last to an earlier move spends more on the moves before it, and a move's cap is the part of the
+#time left given
+def test_a_clocks_plan_and_cap_can_be_set():
+    board = chess.Board()
+    board.fullmove_number = 10
+    arguments = "wtime 60000 btime 60000 winc 600 binc 600".split()
+    assert Clock(planned_moves=30).limits(arguments, board, 800)[1] > 1.5 * Clock().limits(arguments, board, 800)[1]
+    assert Clock(most_of_the_time_left=0.01).limits(arguments, board, 800)[1] == pytest.approx((60 - MOVE_OVERHEAD_SECONDS) * 0.01)
+
+
 #smart pruning stops once the simulations left could not change the most visited move: a mate in one is decided when
 #it has about half the budget, and at the stop its lead is more than the simulations left; the start with a flat
 #eval is never decided
