@@ -7,9 +7,16 @@ import pytest
 
 from fake_models import BoardModel
 from inference import cpu_batches
+import tools.play.engine_search as engine_search
 from tools.play.variant_match import SPRT_BOUND, Variant, a_points, pair_elo, play, sprt_llr, variant_settings
 
 OPENINGS = ["r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3", "8/5pk1/6p1/8/8/5PK1/6P1/2R5 b - - 0 1"]
+
+
+#the variants here change mcts.py's search, whose constants the expectations were set by
+@pytest.fixture(autouse=True)
+def mcts_constants(monkeypatch):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {})
 
 def played(changes: tuple[str, str], nodes: int | None = None, clock: tuple[float, float] | None = None, node_rate: float = 0.0):
     variants = [Variant(name, variant_settings(change, False)) for name, change in zip("ab", changes)]

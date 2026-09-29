@@ -28,6 +28,13 @@ from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE
 REPOSITORY = Path(__file__).parent.parent
 
 
+#the searches here are mcts.py's, whose constants the expectations were set by; the engine's own changes over them are
+#test_the_engines_settings'
+@pytest.fixture(autouse=True)
+def mcts_constants(monkeypatch):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {})
+
+
 def leaf_boards(leaves: bytes) -> np.ndarray:
     return np.frombuffer(bytearray(leaves), dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
 
