@@ -268,6 +268,20 @@ def test_pruning_never_changes_the_move(carlsen_games):
     assert len(positions) > 20 and stopped_early > 5
 
 
+#uci.py's --search-settings and --contempt reach the search: with certainty a mate in two (Kb6 or Kc7) is proven, and
+#scored as a sure win
+def test_the_engine_takes_search_settings(tmp_path):
+    settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": 16}
+    save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
+    engine = chess.engine.SimpleEngine.popen_uci([sys.executable, "-m", "tools.play.uci", str(tmp_path / "model.pt"), "--select", "mcts",
+                                                  "--search-settings", "certainty=1,policy_temperature=1.2", "--contempt", "0.02"], cwd=REPOSITORY)
+    try:
+        played = engine.play(chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1"), chess.engine.Limit(nodes=20000), info=chess.engine.INFO_SCORE)
+    finally:
+        engine.quit()
+    assert played.move.uci() in ("c6b6", "c6c7") and played.info["score"].relative.score() >= 2400
+
+
 #the engine as a gui drives it: a move within go movetime, go nodes' simulations (in a new game: a kept tree's visits
 #count, as lc0 counts them), and on a clock more time for move 40 than for the first move
 def test_the_engine_keeps_to_gos_limits(tmp_path):
@@ -356,7 +370,7 @@ def test_every_game_keeps_its_tree():
 def test_certainty_proves_a_mate_and_the_search_stops():
     board = chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1")
     network = CountingNetwork(UniformModel())
-    search = EngineSearch(network, 16, certainty=True)
+    search = EngineSearch(network, 16, settings={"certainty": True})
     proven = search.search(board, simulations=20_000)
     assert proven.line[0].uci() == "c6b6" and proven.score == 1.0 and proven.simulations < 5_000
 
@@ -373,7 +387,8 @@ def test_certainty_proves_a_mate_and_the_search_stops():
 #after the proof take the proven score at once and the network sees few boards
 def test_certainty_stops_descents_at_proven_nodes():
     network = CountingNetwork(UniformModel())
-    report = EngineSearch(network, 16, smart_pruning=False, certainty=True).search(chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1"), simulations=6000)
+    search = EngineSearch(network, 16, smart_pruning=False, settings={"certainty": True})
+    report = search.search(chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1"), simulations=6000)
 
     assert report.simulations == 6000 and report.score == 1.0
     assert network.boards < 3000
@@ -395,7 +410,7 @@ class LikesMoves(nn.Module):
 def test_certainty_plays_a_proven_win_over_the_most_visited_move():
     board = chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1")
     model = LikesMoves([("g1f1", chess.WHITE)], 5.0)
-    report = EngineSearch(cpu_batches(model), 16, certainty=True).search(board, simulations=4000)
+    report = EngineSearch(cpu_batches(model), 16, settings={"certainty": True}).search(board, simulations=4000)
 
     assert report.line[0].uci() == "e1e8" and report.score == 1.0
     assert report.root_moves[0][0].uci() == "g1f1"
