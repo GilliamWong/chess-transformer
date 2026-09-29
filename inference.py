@@ -67,6 +67,9 @@ def graph_sizes(max_batch: int) -> list[int]:
 #one runs, so at most two batches may be launched and not yet collected
 class GraphedBatches:
     def __init__(self, model: nn.Module, sizes: list[int]):
+        #the graphs read the model's weights where they were when recorded: freed, their memory went to the next
+        #tensors made and every answer came back wrong
+        self.model = model
         self.sizes = sizes
         largest = self.sizes[-1]
         #recorded on real boards: zero boards once hit a device-side assert

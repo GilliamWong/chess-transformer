@@ -34,6 +34,24 @@ def test_graphs_answer_like_the_model():
     assert np.allclose(answer_rows((logits, value)).numpy(), expected[:1], atol=1e-3)
 
 
+#the graphs read the model's weights in place, so GraphedBatches must keep a model nothing else holds (as
+#engine_network's) alive: freed, its memory went to the next tensors made and every answer came back wrong
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_graphs_keep_their_model_alive():
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    boards = np.array([encode_board(chess.Board())], dtype=np.uint8)
+    with torch.no_grad():
+        expected = answer_rows(model(torch.from_numpy(boards).long().cuda())).cpu().numpy()
+
+    graphs = GraphedBatches(copy.deepcopy(model), graph_sizes(4))
+    #tensors the size of the weights, which take the copy's memory if it was freed
+    garbage = [torch.full_like(weight, 1e4) for weight in model.parameters() for _ in range(4)]
+    answers = graphs.collect(graphs.launch(boards))
+
+    assert np.allclose(answers, expected, atol=1e-3)
+
+
 #the d512_selfplay_sf12_10pass run's residual stream passes fp16's 65,504 on the en-passant token: every board came back
 #NaN and the engine's search put all its visits on one arbitrary move
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
