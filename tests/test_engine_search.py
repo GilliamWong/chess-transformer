@@ -19,7 +19,8 @@ from inference import cpu_batches
 from model import ChessTransformer
 from selfplay import rust_search_settings
 from tools.checkpoint import save_checkpoint
-from tools.play.engine_search import CONTEMPT_FROM_SCORE, EngineSearch
+import tools.play.engine_search as engine_search
+from tools.play.engine_search import CONTEMPT_FROM_SCORE, EngineSearch, engine_search_settings
 from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
@@ -81,9 +82,10 @@ def test_the_cache_answers_transpositions_as_the_network_would():
 
 
 #one leaf a round is mcts.py's search (Searches' defaults, test_selfplay_rs.py) at every move, as evaluate_elo's logged
-#results were played: a second round out on the network would change it. From a middlegame, where captures move the
-#material count, so that an answer changes the next choice
-def test_one_leaf_a_round_is_the_exact_search_at_every_move(carlsen_games):
+#results were played, whatever the engine's own settings: a second round out on the network would change it. From a
+#middlegame, where captures move the material count, so that an answer changes the next choice
+def test_one_leaf_a_round_is_the_exact_search_at_every_move(monkeypatch, carlsen_games):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"c_puct": 0.5, "policy_temperature": 1.3})
     evaluate = cpu_batches(BoardModel()).evaluate_boards
     search = EngineSearch(cpu_batches(BoardModel()), 1)
     board = carlsen_games[0].board()
@@ -101,6 +103,16 @@ def test_one_leaf_a_round_is_the_exact_search_at_every_move(carlsen_games):
         assert ([played.uci() for played in report.line], report.score, report.simulations) == (line, score, visits)
         assert [(played.uci(), move_visits) for played, move_visits in report.root_moves] == root_moves[:len(report.root_moves)]
         board.push(report.line[0])
+
+
+#the engine's settings are mcts.py's with its own changes over them, and a caller's over those
+def test_the_engines_settings(monkeypatch):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"c_puct": 0.5, "certainty": True})
+    assert engine_search_settings(False) == {**rust_search_settings(False), "policy_temperature": 1.0, "certainty": True,
+                                             "fifty_move_horizon": 0.0, "c_puct": 0.5}
+    assert engine_search_settings(False, {"c_puct": 0.7})["c_puct"] == 0.7
+    assert engine_search_settings(False, own=False) == {**rust_search_settings(False), "policy_temperature": 1.0, "certainty": False,
+                                                        "fifty_move_horizon": 0.0}
 
 
 #with leaves out on the network, rounds stop at the search's simulations (without smart pruning, which stops sooner)
