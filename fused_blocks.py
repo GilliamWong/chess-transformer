@@ -3,11 +3,11 @@
 #the template mix are one matmul, the mlp's gate and up another, and attention is one Triton kernel: it RMS-normalises
 #the queries and keys (QK-norm), adds the template bias, takes the softmax and mixes the values without writing the
 #scores, the bias or any transposed copy to memory, and each query head reads its group's key/value head in place
-#instead of a copy (repeat_interleave)
+#instead of a copy (repeat_interleave). The matmuls are a Triton kernel too, with the bias, the mlp's silu(gate) * up
+#and the residual add in the same kernel
 import math
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
@@ -94,31 +94,111 @@ def _(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_c
     return projected.new_empty(B, T, heads * dv)
 
 
+#a tile of the blocks' matmuls is LINEAR_ROWS x LINEAR_COLUMNS, LINEAR_DEPTH deep (a gated matmul's is LINEAR_COLUMNS / 2
+#columns of the gate and the same of up), and GROUP_M row tiles go through the columns together so their rows stay in
+#L2. The fastest on an RTX 4090 at 64 positions of 32 to 128 rows, 64 to 256 columns, 2 to 4 stages and 4 or 8 warps;
+#smaller tiles for smaller batches gained under 1% of a search
+LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_DEPTH, LINEAR_WARPS, LINEAR_STAGES, GROUP_M = 128, 128, 32, 4, 3, 8
+
+
+#out = x @ w (w is in_features x out_features), then in the same kernel the bias, silu(gate) * up (gated: w's first
+#half of columns is the gate, the second up) and the residual added. fp16 inputs accumulate in fp16, as cuBLAS does
+#with allow_fp16_accumulation (twice fp32 accumulation's speed on a geforce card); the elementwise work is in fp32
+@triton.jit
+def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride_w,
+                  HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr,
+                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+    pid = tl.program_id(0)
+    grid_m, grid_n = tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N)
+    in_group = GROUP_M * grid_n
+    first_m = pid // in_group * GROUP_M
+    group_rows = min(grid_m - first_m, GROUP_M)
+    pid_m = first_m + pid % in_group % group_rows
+    pid_n = pid % in_group // group_rows
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    depth = tl.arange(0, BLOCK_K)
+    row_ok, col_ok = rows < M, cols < N
+    x_ptrs = x_ptr + rows[:, None] * K + depth[None, :]
+    w_ptrs = w_ptr + depth[:, None] * stride_w + cols[None, :]
+
+    acc_type: tl.constexpr = tl.float16 if x_ptr.dtype.element_ty == tl.float16 else tl.float32
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_type)
+    up = tl.zeros((BLOCK_M, BLOCK_N), dtype=acc_type)
+    for _ in range(0, K, BLOCK_K):
+        x = tl.load(x_ptrs, mask=row_ok[:, None], other=0.0)
+        acc = tl.dot(x, tl.load(w_ptrs, mask=col_ok[None, :], other=0.0), acc, out_dtype=acc_type)
+        if GATED:
+            up = tl.dot(x, tl.load(w_ptrs + N, mask=col_ok[None, :], other=0.0), up, out_dtype=acc_type)
+        x_ptrs += BLOCK_K
+        w_ptrs += BLOCK_K * stride_w
+
+    out = acc.to(tl.float32)
+    if HAS_BIAS:
+        out += tl.load(bias_ptr + cols, mask=col_ok, other=0.0).to(tl.float32)[None, :]
+    if GATED:
+        out = out * tl.sigmoid(out) * up.to(tl.float32)
+    out_offsets = rows[:, None] * N + cols[None, :]
+    if HAS_RESIDUAL:
+        out += tl.load(residual_ptr + out_offsets, mask=row_ok[:, None] & col_ok[None, :], other=0.0).to(tl.float32)
+    tl.store(out_ptr + out_offsets, out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None] & col_ok[None, :])
+
+
+#an opaque op for torch.compile, as template_attention
+@torch.library.custom_op("chess::linear", mutates_args=())
+def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, residual: torch.Tensor | None = None,
+           gated: bool = False) -> torch.Tensor:
+    K, width = weight.shape
+    N = width // 2 if gated else width
+    if K % LINEAR_DEPTH != 0:
+        raise ValueError(f"linear_kernel reads the {K} inputs {LINEAR_DEPTH} at a time")
+    x = x.contiguous()
+    out = x.new_empty(*x.shape[:-1], N)
+    M = x.numel() // K
+    columns = LINEAR_COLUMNS // 2 if gated else LINEAR_COLUMNS
+    #the pointers of unused inputs are never read
+    bias_ = bias if bias is not None else weight
+    residual_ = residual.contiguous() if residual is not None else out
+    grid = (triton.cdiv(M, LINEAR_ROWS) * triton.cdiv(N, columns),)
+    linear_kernel[grid](x, weight, bias_, residual_, out, M, N, K, weight.stride(0), HAS_BIAS=bias is not None, HAS_RESIDUAL=residual is not None,
+                        GATED=gated, BLOCK_M=LINEAR_ROWS, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M, num_warps=LINEAR_WARPS,
+                        num_stages=LINEAR_STAGES)
+    return out
+
+
+@linear.register_fake
+def _(x, weight, bias=None, residual=None, gated=False):
+    return x.new_empty(*x.shape[:-1], weight.shape[1] // 2 if gated else weight.shape[1])
+
+
+#a linear layer's weight as linear_kernel reads it, in_features x out_features
+def transposed(weight: torch.Tensor) -> nn.Parameter:
+    return nn.Parameter(weight.detach().t().contiguous())
+
+
 class FusedBlock(nn.Module):
-    #takes over a trained block's weights (copied into the joined matmuls, or shared)
+    #takes over a trained block's weights (copied into the joined, transposed matmuls, or shared)
     def __init__(self, block: TransformerBlock):
         super().__init__()
         self.heads, self.kv_heads = block.n_heads, block.kv_heads
         self.dq, self.dv, self.templates_count = block.d_qk_head, block.d_head, block.position_templates
-        self.ln1, self.ln2, self.combine_heads, self.down = block.ln1, block.ln2, block.combine_heads, block.mlp.down_projection
+        self.ln1, self.ln2 = block.ln1, block.ln2
         self.q_gain, self.k_gain = block.q_norm.weight, block.k_norm.weight
         self.eps = block.q_norm.eps if block.q_norm.eps is not None else torch.finfo(torch.float32).eps
-        weight = block.Q.weight
-        with torch.no_grad():
-            projections = (block.Q, block.K, block.V, block.template_mix)
-            self.projection = nn.Linear(block.d_model, sum(p.out_features for p in projections), device=weight.device, dtype=weight.dtype)
-            self.projection.weight.copy_(torch.cat([projection.weight for projection in projections]))
-            self.projection.bias.copy_(torch.cat([projection.bias for projection in projections]))
-            mlp = block.mlp
-            self.gate_up = nn.Linear(block.d_model, 2 * mlp.up_projection.out_features, bias=False, device=weight.device, dtype=weight.dtype)
-            self.gate_up.weight.copy_(torch.cat([mlp.gate_projection.weight, mlp.up_projection.weight]))
+        projections = (block.Q, block.K, block.V, block.template_mix)
+        mlp = block.mlp
+        self.projection = transposed(torch.cat([projection.weight for projection in projections]))
+        self.projection_bias = nn.Parameter(torch.cat([projection.bias for projection in projections]).detach())
+        self.combine_heads = transposed(block.combine_heads.weight)
+        self.combine_heads_bias = block.combine_heads.bias
+        self.gate_up = transposed(torch.cat([mlp.gate_projection.weight, mlp.up_projection.weight]))
+        self.down = transposed(mlp.down_projection.weight)
 
     def forward(self, x: torch.Tensor, templates: torch.Tensor) -> torch.Tensor:
-        attended = template_attention(self.projection(self.ln1(x)), templates, self.q_gain, self.k_gain, self.heads, self.kv_heads, self.dq,
-                                      self.dv, self.templates_count, self.eps)
-        x = x + self.combine_heads(attended)
-        gate, up = self.gate_up(self.ln2(x)).chunk(2, dim=-1)
-        return x + self.down(F.silu(gate) * up)
+        attended = template_attention(linear(self.ln1(x), self.projection, self.projection_bias), templates, self.q_gain, self.k_gain, self.heads,
+                                      self.kv_heads, self.dq, self.dv, self.templates_count, self.eps)
+        x = linear(attended, self.combine_heads, self.combine_heads_bias, residual=x)
+        return linear(linear(self.ln2(x), self.gate_up, gated=True), self.down, residual=x)
 
 
 #the model with its blocks swapped for FusedBlocks, for inference only; embeddings, square features and heads unchanged

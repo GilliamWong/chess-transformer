@@ -109,6 +109,31 @@ def test_fused_blocks_compute_what_the_model_does():
     assert torch.allclose(expected_score(fused_value_logits), expected_score(value_logits), atol=1e-3)
 
 
+#fused_blocks.linear in fp16 as the engine runs it, accumulating in fp16, with the bias and residual added (the
+#attention's output projection) or silu(gate) * up (the mlp), on rows and columns that leave part of a tile empty
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("gated", [False, True])
+def test_linear_kernel_in_fp16(gated):
+    from fused_blocks import linear
+    torch.manual_seed(0)
+    width = 200
+    x = torch.randn(3, 70, 512, device="cuda").half()
+    weight = (torch.randn(512, 2 * width if gated else width, device="cuda") / 512**0.5).half()
+    bias = None if gated else torch.randn(width, device="cuda").half()
+    residual = None if gated else torch.randn(3, 70, width, device="cuda").half()
+
+    out = linear(x, weight, bias, residual, gated)
+
+    projected = x.float() @ weight.float()
+    if gated:
+        gate, up = projected.chunk(2, dim=-1)
+        expected = torch.nn.functional.silu(gate) * up
+    else:
+        expected = projected + bias.float() + residual.float()
+    assert out.dtype == torch.float16 and out.shape == expected.shape
+    assert torch.allclose(out.float(), expected, atol=0.03, rtol=0.01)
+
+
 #the last number of a row is the score, not a logit: the search backs it up as it is
 def test_an_answer_row_ends_with_the_expected_score():
     torch.manual_seed(0)
