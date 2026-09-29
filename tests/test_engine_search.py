@@ -209,6 +209,13 @@ def test_a_decided_search_stops_early():
     assert start.simulations == 400
 
 
+#uci.py --no-smart-pruning, for matches where both engines must spend all of their time: the decided mate in one
+#still gets the whole budget
+def test_a_search_without_smart_pruning_uses_its_whole_budget():
+    mate = EngineSearch(cpu_batches(UniformModel()), 16, smart_pruning=False).search(chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1"), simulations=4000)
+    assert mate.line[0].uci() == "e1e8" and mate.simulations == 4000
+
+
 #with a number of simulations, the pruned search plays the move of the whole search (both from a new tree and cache)
 def test_pruning_never_changes_the_move(carlsen_games):
     positions = []
