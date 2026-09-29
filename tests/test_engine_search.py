@@ -352,10 +352,11 @@ def test_every_game_keeps_its_tree():
 
 #certainty propagation proves a mate in two (the defender's one reply is mated) and the engine stops once it is
 #proven: the mate's first move, scored as a certain win, long before its budget; without it the win is only likely.
-#The tree kept for the next move loses its proofs, and the search proves the mate in one again
+#The tree kept for the next move keeps the proof of the mate in one
 def test_certainty_proves_a_mate_and_the_search_stops():
     board = chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1")
-    search = EngineSearch(cpu_batches(UniformModel()), 16, certainty=True)
+    network = CountingNetwork(UniformModel())
+    search = EngineSearch(network, 16, certainty=True)
     proven = search.search(board, simulations=20_000)
     assert proven.line[0].uci() == "c6b6" and proven.score == 1.0 and proven.simulations < 5_000
 
@@ -364,8 +365,9 @@ def test_certainty_proves_a_mate_and_the_search_stops():
 
     board.push_uci("c6b6")
     board.push_uci("a8b8")
+    network.boards = 0
     mate = search.search(board, simulations=20_000)
-    assert mate.line[0].uci() == "h1h8" and mate.score == 1.0 and mate.simulations < 5_000
+    assert mate.line[0].uci() == "h1h8" and mate.score == 1.0 and network.boards <= 2 * 16
 
 #the search goes no further than a proven node: with the whole budget searched (no smart pruning), the simulations
 #after the proof take the proven score at once and the network sees few boards
@@ -403,10 +405,10 @@ def test_certainty_plays_a_proven_win_over_the_most_visited_move():
 REPETITION_START = "4k3/7p/8/8/8/8/P7/4K2N b - - 0 1"
 REPETITION_MOVES = "e8d7 h1g3 d7e8 g3h1 e8d7 h1g3 d7e8".split()
 
-#a kept tree's proofs are proven again in the next search: a draw proven with contempt below 0 (worth 0.7 to white)
-#counts at the next search's contempt of 0.2 (worth 0.3), and white no longer plays it although the network likes it
+#a tree is kept only for a search with its contempt: a draw proven with contempt below 0 (worth 0.7 to white) counts
+#at the next search's contempt of 0.2 (worth 0.3), and white no longer plays it although the network likes it
 @pytest.mark.parametrize("contempt, draws", [(-0.2, True), (0.2, False)])
-def test_certainty_proves_a_kept_trees_draws_again(contempt, draws):
+def test_a_kept_trees_draws_count_at_the_next_searchs_contempt(contempt, draws):
     model = LikesMoves([("h1g3", chess.WHITE), ("g3h1", chess.WHITE), ("e8d7", chess.BLACK), ("d7e8", chess.BLACK)], 3.0)
     evaluate = cpu_batches(model).evaluate_boards
     searches = selfplay_rs.Searches(**rust_search_settings(False), tree_reuse=True, certainty=True)

@@ -347,9 +347,10 @@ impl Searches {
     }
 
     //the id's kept tree carried on to the position after `moves`, when it is the same game and holds the moves played since
-    fn reused_tree(&mut self, id: u64, fen: &str, moves: &[String]) -> Option<Tree> {
+    //and was searched with the same contempt: its draws' scores and their proofs are that contempt's
+    fn reused_tree(&mut self, id: u64, fen: &str, moves: &[String], contempt: f64) -> Option<Tree> {
         let kept = self.kept.remove(&id)?;
-        if kept.fen != fen || !moves.starts_with(&kept.moves) {
+        if kept.fen != fen || !moves.starts_with(&kept.moves) || kept.tree.contempt != contempt {
             return None;
         }
         let mut tree = kept.tree;
@@ -418,8 +419,9 @@ impl Searches {
     }
 
     //the game's moves let the search see repetitions. Like mcts.search it refuses a finished or tablebase position.
-    //With tree reuse, the tree of this id's last search is kept when it holds the moves played since. contempt is taken
-    //off a draw's score for the side to move here and added for the other side (search.rs Tree), 0 is mcts.py's search
+    //With tree reuse, the tree of this id's last search is kept when it holds the moves played since and had the same
+    //contempt. contempt is taken off a draw's score for the side to move here and added for the other side (search.rs
+    //Tree), 0 is mcts.py's search
     #[pyo3(signature = (id, fen, moves, simulations, contempt=0.0))]
     fn start(&mut self, id: u64, fen: &str, moves: Vec<String>, simulations: u32, contempt: f64) -> PyResult<()> {
         if simulations == 0 {
@@ -441,7 +443,7 @@ impl Searches {
                 "the game is over or the tablebase knows it, there is nothing to search: {fen} {moves:?}"
             )));
         }
-        let mut tree = self.reused_tree(id, fen, &moves).unwrap_or_else(|| Tree::new(board, keys));
+        let mut tree = self.reused_tree(id, fen, &moves, contempt).unwrap_or_else(|| Tree::new(board, keys));
         tree.contempt = contempt;
         self.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
         Ok(())

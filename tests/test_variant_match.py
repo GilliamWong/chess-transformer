@@ -18,9 +18,9 @@ def played(changes: tuple[str, str], nodes: int | None = None, clock: tuple[floa
 
 
 #every opening with a as white and then as black, the variants moving in turn, every game to its end, and each move
-#searched for its nodes (a search with one legal move stops at once)
+#searched for its nodes, a's twice as many (a search with one legal move stops at once)
 def test_every_opening_is_played_out_with_both_colours():
-    finished = played(("smart_pruning=0", "smart_pruning=0,policy_temperature=1.5"), nodes=30)
+    finished = played(("smart_pruning=0,node_scale=2", "smart_pruning=0,policy_temperature=1.5"), nodes=30)
 
     assert sorted(record["game"] for record, _ in finished) == [0, 1, 2, 3]
     for record, game in finished:
@@ -28,7 +28,7 @@ def test_every_opening_is_played_out_with_both_colours():
         board = chess.Board(game.opening)
         for ply in game.plies:
             assert ply["variant"] == (0 if (board.turn == chess.WHITE) == game.a_white else 1)
-            assert ply["nodes"] >= 30 or board.legal_moves.count() == 1
+            assert ply["nodes"] >= 30 * (2 if ply["variant"] == 0 else 1) or board.legal_moves.count() == 1
             board.push_uci(ply["move"])
         assert record["result"] in ("1-0", "0-1", "1/2-1/2") and record["plies"] == len(game.plies)
 

@@ -19,9 +19,10 @@ pub struct SearchSettings {
     //the priors are the softmax of the logits over this (lc0's policy softmax temperature): above 1 flattens them.
     //mcts.py has none, which is 1
     pub policy_temperature: f64,
-    //certainty propagation (lc0's sticky endgames): a game's end in the tree (mate, a draw by the rules or by
-    //repetition, the tablebase) is a proven result, and so is a node with a winning move or with every move's result
-    //proven. A proven node's visits all count its result, and the search no longer goes below it. mcts.py has none
+    //certainty propagation (lc0's sticky endgames): a game's end in the tree (mate, a draw by the rules, the
+    //tablebase) is a proven result, and so is a node with a winning move or with every move's result proven; a
+    //two-fold repetition stays an unproven draw. A proven node's visits all count its result, and the search no longer
+    //goes below it. mcts.py has none
     pub certainty: bool,
     //the network does not see the fifty move rule's count: its score is drawn towards a draw by halfmoves / this
     //(stockfish scales its eval so), so that the side ahead makes progress. 0 for none, as mcts.py
@@ -51,6 +52,9 @@ pub struct Proof {
     pub value: f64, //the node's score under the proof, a draw's as the tree values draws
     pub plies: u32, //to the game's end: a quicker win or a slower loss is the better one
 }
+
+//a tablebase win or loss counts as this many plies from its position, so that a mate comes before it
+const TABLEBASE_PLIES: u32 = 1000;
 
 //how good a move's proven result is for the side choosing it: a win, the quicker the better, then a draw, then a
 //loss, the slower the better
@@ -339,27 +343,30 @@ impl Tree {
 
             let mut legal_moves = board.legal_moves();
             let draw = self.draw_score(board.turn(), settings);
-            let mut value = game_result(&board, &self.keys, &legal_moves, draw, settings.repetitions_for_a_draw, tables)?;
-            //a repeat inside the search is a draw
+            let game_over = game_result(&board, &self.keys, &legal_moves, draw, settings.repetitions_for_a_draw, tables)?;
+            //a repeat inside the search is a draw, but not a proven one: the game need not repeat (lc0 gives two-fold
+            //draws no bounds either)
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
-            if value.is_none() && path_keys.contains(&leaf_key) {
-                value = Some(draw);
-            }
+            let value = game_over.or_else(|| path_keys.contains(&leaf_key).then_some(draw));
             self.keys.truncate(root_keys);
 
             simulations += 1;
             if let Some(value) = value {
                 //the root is never proven: start refuses a root whose game is over
-                if settings.certainty && node != 0 {
-                    //the result is for the side to move, the proof for the side that moved here
-                    let outcome = if value == 0.0 {
-                        Outcome::Win
-                    } else if value == 1.0 {
-                        Outcome::Loss
+                if let Some(result) = game_over
+                    && settings.certainty
+                    && node != 0
+                {
+                    //the result is for the side to move, the proof for the side that moved here. A win or loss with
+                    //moves left is the tablebase's, after any mate
+                    let (outcome, plies) = if result == 0.0 {
+                        (Outcome::Win, if legal_moves.is_empty() { 0 } else { TABLEBASE_PLIES })
+                    } else if result == 1.0 {
+                        (Outcome::Loss, TABLEBASE_PLIES)
                     } else {
-                        Outcome::Draw
+                        (Outcome::Draw, 0)
                     };
-                    self.prove(&path, Proof { outcome, value: 1.0 - value, plies: 0 });
+                    self.prove(&path, Proof { outcome, value: 1.0 - result, plies });
                 }
                 self.backup(&path, value, 0);
                 if settings.certainty {
@@ -593,8 +600,8 @@ impl Tree {
         self.keys.push(position_key(&self.board));
     }
 
-    //the tree under node as a tree of its own, node its root. Its proofs go: a draw by a repetition of a position that
-    //is now before the root is no longer one, and the search proves again what still holds as it comes by
+    //the tree under node as a tree of its own, node its root. Its proofs still hold: a proof comes from the game's end
+    //by its rules or the tablebase, which a new root leaves as it was (a two-fold repetition proves nothing)
     fn keep_subtree(&mut self, node: usize) {
         let mut nodes = vec![self.nodes[node]];
         let (mut moves, mut priors, mut children) = (Vec::new(), Vec::new(), Vec::new());
@@ -602,7 +609,6 @@ impl Tree {
         while index < nodes.len() {
             let edges = nodes[index].edges();
             nodes[index].first_edge = moves.len() as u32;
-            nodes[index].proof = None;
             moves.extend_from_slice(&self.moves[edges.clone()]);
             priors.extend_from_slice(&self.priors[edges.clone()]);
             for edge in edges {
