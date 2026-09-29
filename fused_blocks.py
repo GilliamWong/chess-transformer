@@ -113,10 +113,7 @@ def linear_extra_rows(M: int, column_tiles: int, multiprocessors: int) -> int:
     return min((0, 16, 32, 64), key=cost)
 
 
-#out = x @ w (w is in_features x out_features), then in the same kernel the bias, silu(gate) * up (gated: w's first
-#half of columns is the gate, the second up) and the residual added. ACC_TYPE is the accumulators' type: fp16 for the
-#blocks, as cuBLAS did with allow_fp16_accumulation (twice fp32 accumulation's speed on a geforce card); the
-#elementwise work is in fp32
+#a tile's bias, silu(gate) * up and residual, in fp32, and its store
 @triton.jit
 def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr,
                     HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr):
@@ -132,6 +129,9 @@ def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr,
     tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None] & col_ok[None, :])
 
 
+#out = x @ w (w is in_features x out_features), then in the same kernel the bias, silu(gate) * up (gated: w's first
+#half of columns is the gate, the second up) and the residual added. ACC_TYPE is the accumulators' type: fp16 for the
+#blocks, as cuBLAS did with allow_fp16_accumulation (twice fp32 accumulation's speed on a geforce card)
 @triton.jit
 def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride_w,
                   HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, ACC_TYPE: tl.constexpr,
