@@ -1,11 +1,13 @@
 #tools/play/variant_match.py: two variants of the engine's search play out every opening with both colours, on a
 #number of nodes a move or a clock in nodes, and the elo of their pairs of games
+import math
+
 import chess
 import pytest
 
 from fake_models import BoardModel
 from inference import cpu_batches
-from tools.play.variant_match import Variant, a_points, pair_elo, play, variant_settings
+from tools.play.variant_match import SPRT_BOUND, Variant, a_points, pair_elo, play, sprt_llr, variant_settings
 
 OPENINGS = ["r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3", "8/5pk1/6p1/8/8/5PK1/6P1/2R5 b - - 0 1"]
 
@@ -63,6 +65,38 @@ def test_pair_elo():
 
     elo, low, high, pairs = pair_elo(records[:-1] + [{**records[-1], "result": "1-0"}])
     assert pairs == 20 and low < elo < high and elo == pytest.approx(179.5, abs=0.5)
+
+
+#records whose pairs score these, a as white first
+def records_scoring(pair_points: list[float]) -> list[dict]:
+    results = {1.0: ("1-0", "0-1"), 0.75: ("1-0", "1/2-1/2"), 0.5: ("1/2-1/2", "1/2-1/2"), 0.25: ("0-1", "1/2-1/2"), 0.0: ("0-1", "1-0")}
+    return [{"game": 2 * pair + colour, "a_white": colour == 0, "result": results[points][colour]}
+            for pair, points in enumerate(pair_points) for colour in (0, 1)]
+
+#the SPRT's log likelihood ratio is that of two normal distributions of the pair scores with the pairs' own variance,
+#centred on elo0's and elo1's scores: positive when a scores well above both, negative near elo0's
+def test_sprt_llr():
+    pair_points = [0.75, 0.5, 0.5, 1.0, 0.25, 0.75, 0.5, 0.75] * 8
+    elo0, elo1 = 0.0, 15.0
+    mean = sum(pair_points) / len(pair_points)
+    variance = sum((points - mean) ** 2 for points in pair_points) / len(pair_points)
+    score0, score1 = 1 / (1 + 10 ** (-elo0 / 400)), 1 / (1 + 10 ** (-elo1 / 400))
+    log_density = lambda points, centre: -(points - centre) ** 2 / (2 * variance) - 0.5 * math.log(2 * math.pi * variance)
+    expected = sum(log_density(points, score1) - log_density(points, score0) for points in pair_points)
+
+    assert sprt_llr(records_scoring(pair_points), elo0, elo1) == pytest.approx(expected)
+    assert sprt_llr(records_scoring(pair_points), elo0, elo1) > SPRT_BOUND
+    assert sprt_llr(records_scoring([0.5, 0.25, 0.75, 0.5] * 150), elo0, elo1) < -SPRT_BOUND
+    assert sprt_llr(records_scoring([0.5]), elo0, elo1) == 0.0
+
+
+#on_result returning True stops the match: the first game to end is the only one recorded
+def test_a_match_stops_when_on_result_says_so():
+    variants = [Variant(name, variant_settings("", False)) for name in "ab"]
+    games = [(2 * index + colour, opening, colour == 0) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
+    finished = []
+    play(cpu_batches(BoardModel()), variants, games, 3, 4, 20, None, 0.0, None, lambda record, game: finished.append(record) or True)
+    assert len(finished) == 1
 
 
 def test_variant_settings():
