@@ -15,7 +15,6 @@ from fake_models import BoardModel, UniformModel
 from inference import cpu_batches
 from reference_selfplay import final_result, play_game
 from selfplay import ANSWER_WIDTH, MAX_PLIES, RustSelfPlayBatch, play_games_in_rust, rust_search_settings
-from tools.tablebase import SYZYGY_DIR, TABLES_PER_FOLDER, open_tablebase
 
 CPU = torch.device("cpu")
 
@@ -128,11 +127,10 @@ def test_rust_games_are_the_python_games(monkeypatch, tree_reuse, model, cache):
         assert any(result != 0.5 for result in results) #some were won, not all drawn
 
 
-@pytest.mark.skipif(len(list(SYZYGY_DIR.glob("*.rtb*"))) != 2 * TABLES_PER_FOLDER, reason="the syzygy tables are not downloaded")
-def test_rust_games_end_where_the_tablebase_knows_the_result(monkeypatch):
+def test_rust_games_end_where_the_tablebase_knows_the_result(tablebase, monkeypatch):
     monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
     monkeypatch.setattr(mcts, "ROOT_NOISE_SHARE", 0.0)
-    monkeypatch.setattr(mcts, "tablebase", open_tablebase())
+    monkeypatch.setattr(mcts, "tablebase", tablebase)
     model = BoardModel()
 
     #6 and 7 pieces, then 4: a game the tables know before it begins has no positions

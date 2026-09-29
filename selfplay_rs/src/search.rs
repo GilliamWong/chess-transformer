@@ -242,6 +242,10 @@ impl Tree {
         let (mut simulations, mut gathered) = (0, 0);
         let mut collisions: Vec<Vec<usize>> = Vec::new();
         let mut path = Vec::new();
+        //the tables finish the nodes they cover below the root. Below a root they cover (the engine searches a size it
+        //has no dtz tables for), only those right after a capture or pawn move, as lc0 probes: the network steers the
+        //moves between, and the tables' result, which starts the fifty move count there, is exact
+        let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         while gathered < round.leaves
             && simulations < round.simulations
             && self.root().visit_count as usize + self.pending.len() < round.visit_limit as usize
@@ -271,7 +275,8 @@ impl Tree {
             }
 
             let mut legal_moves = board.legal_moves();
-            let mut value = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, tables)?;
+            let node_tables = tables.filter(|_| node != 0 && (!root_covered || board.halfmoves() == 0));
+            let mut value = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?;
             //a repeat inside the search is a draw
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
             if value.is_none() && path_keys.contains(&leaf_key) {

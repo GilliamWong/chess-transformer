@@ -157,14 +157,17 @@ pub struct Tables {
 }
 
 impl Tables {
-    pub fn open(folder: &str, pieces: usize) -> std::io::Result<Tables> {
+    //folders as a SyzygyPath (tools.tablebase.tablebase_path): ';' between them on windows, ':' elsewhere
+    pub fn open(folders: &str, pieces: usize) -> std::io::Result<Tables> {
         let mut tablebase = Tablebase::new();
-        tablebase.add_directory(folder)?;
+        for folder in std::env::split_paths(folders) {
+            tablebase.add_directory(folder)?;
+        }
         Ok(Tables { tablebase, pieces })
     }
 
     //tools.tablebase.covers
-    fn covers(&self, board: &Chess) -> bool {
+    pub fn covers(&self, board: &Chess) -> bool {
         board.board().occupied().count() <= self.pieces && board.castles().castling_rights().is_empty()
     }
 

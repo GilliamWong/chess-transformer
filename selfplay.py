@@ -30,7 +30,7 @@ import mcts
 import selfplay_rs
 from encoding import MOVE_IDS_BY_SQUARES, NUM_MOVE_IDS, TOKENS_PER_BOARD
 from tools.label_with_stockfish import NO_MOVE
-from tools.tablebase import SYZYGY_DIR, TABLEBASE_PIECES, open_tablebase
+from tools.tablebase import TABLEBASE_PIECES, open_tablebase, tablebase_path
 #every worker imports this file, so nothing at the top may import torch (data.py, tools.checkpoint and inference.py do)
 
 SIMULATIONS = 64 #+390 elo over the policy alone (artifacts/mcts_ladder_2026-09-23.md)
@@ -78,11 +78,12 @@ def move_id_table() -> np.ndarray:
         table[from_square, to_square, promotion or 0] = move_id
     return table
 
-#mcts.py's constants are read at call time, so a test can change them
-def rust_search_settings(use_tablebase: bool) -> dict:
+#mcts.py's constants are read at call time, so a test can change them. tablebase_pieces: the tables' positions of up to
+#that many pieces (tools.tablebase.TABLE_SETS)
+def rust_search_settings(use_tablebase: bool, tablebase_pieces: int = TABLEBASE_PIECES) -> dict:
     return dict(move_id_table=move_id_table().ravel().tolist(), answer_width=ANSWER_WIDTH, c_puct=mcts.C_PUCT, c_puct_factor=mcts.C_PUCT_FACTOR,
                 c_puct_base=mcts.C_PUCT_BASE, fpu_reduction=mcts.FPU_REDUCTION, draw=mcts.DRAW, repetitions_for_a_draw=mcts.REPETITIONS_FOR_A_DRAW,
-                tablebase_folder=str(SYZYGY_DIR) if use_tablebase else None, tablebase_pieces=TABLEBASE_PIECES)
+                tablebase_folder=tablebase_path(tablebase_pieces) if use_tablebase else None, tablebase_pieces=tablebase_pieces)
 
 #up to `size` games at once in rust, one simulation of each per round. network takes the leaves' boards and gives back
 #ANSWER_WIDTH numbers for each, as the inference process does

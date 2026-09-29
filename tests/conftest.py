@@ -2,6 +2,7 @@ import chess.pgn
 import pytest
 
 from tools.play.evaluate_elo import CARLSEN_PGN
+from tools.tablebase import open_tablebase
 
 NUM_PGN_GAMES_TO_REPLAY = 5
 
@@ -16,3 +17,14 @@ def carlsen_games() -> list[chess.pgn.Game]:
 
     assert len(games) == NUM_PGN_GAMES_TO_REPLAY
     return games
+
+
+#the syzygy tables of up to 5 pieces; a test that needs them is skipped without them
+@pytest.fixture(scope="session")
+def tablebase():
+    try:
+        tables = open_tablebase()
+    except FileNotFoundError as error:
+        pytest.skip(str(error))
+    yield tables
+    tables.close()
