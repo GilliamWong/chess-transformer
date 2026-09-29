@@ -279,6 +279,18 @@ class ChessTransformer(nn.Module):
             setattr(self, name, nn.Parameter(parameter.detach().to(dtype)))
         return self
 
+    #every read of the residual stream is a LayerNorm, which ignores its scale (all but eps), so scaling everything
+    #written into it changes no output. fp16 inference shrinks it this way (inference.fp16_model)
+    def scale_residual_stream(self, scale: float) -> "ChessTransformer":
+        with torch.no_grad():
+            for weight in (self.embed.weight, self.position_embed, self.square_features.table):
+                weight *= scale
+            for block in self.encoder:
+                block.combine_heads.weight *= scale
+                block.combine_heads.bias *= scale
+                block.mlp.down_projection.weight *= scale
+        return self
+
     def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         #B x TOKENS_PER_BOARD
         B = board_state.shape[0]

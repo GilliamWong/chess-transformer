@@ -125,6 +125,26 @@ def test_fp16_stays_finite_with_huge_queries_and_keys(batch):
     assert torch.isfinite(logits).all() and torch.isfinite(value_logits).all()
 
 
+#fp16 inference shrinks the residual stream (inference.fp16_model); anything writing into it that the scaling misses
+#would change the moves. The LayerNorms' eps is the one thing that sees the scale, so it is 0 here
+def test_scaling_the_residual_stream_changes_no_output(batch):
+    boards, _ = batch
+    model = small_model().eval()
+    with torch.no_grad():
+        #zeros at init would hide the table being missed
+        model.square_features.table.normal_()
+    for module in model.modules():
+        if isinstance(module, nn.LayerNorm):
+            module.eps = 0.0
+
+    with torch.no_grad():
+        expected = model(boards)
+        scaled = model.scale_residual_stream(1 / 16)(boards)
+
+    for output, expected_output in zip(scaled, expected, strict=True):
+        assert torch.allclose(output, expected_output, atol=1e-4)
+
+
 #white: king e1, rook a1, knight c3, pawn e2; black: king e8, queen d5, pawn d7. White to move, so no mirroring
 def test_the_square_features_of_a_known_position():
     board = torch.tensor([encode_board(chess.Board("4k3/3p4/8/3q4/8/2N5/4P3/R3K3 w - - 0 1"))])

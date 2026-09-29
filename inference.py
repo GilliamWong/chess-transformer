@@ -121,14 +121,22 @@ class ImmediateBatches:
     def collect(self, launched: np.ndarray) -> np.ndarray:
         return launched
 
+#the residual stream shrunk for fp16, whose largest number is 65,504: the d512_selfplay_sf12_10pass run's reaches ~127k
+#on one channel and nearly every board came back NaN. 1/4 to 1/16 all match fp32 as well as fp16 can (policy total
+#variation 0.0012 over 4,000 positions); 1/16 leaves 8x room
+FP16_RESIDUAL_SCALE = 1 / 16
+
 #the network in fp16 with fp16 accumulation, the heads in fp32: on a geforce card faster than bf16 (d512 18.4k
 #positions/s at batch 64 against 13.6k; on data centre gpus fp16 accumulation is no faster) and nearer fp32's priors
 #(total variation 0.0012 against 0.0049). It sets torch's matmul flags for the whole process
 def fp16_model(checkpoint_path: Path) -> nn.Module:
+    #imported here: it needs Triton, which the cpu-only paths do not
+    from fused_blocks import fuse_blocks
     torch.backends.cuda.matmul.allow_fp16_accumulation = True
     #the heads' fp32 matmuls
     torch.backends.cuda.matmul.allow_tf32 = True
-    return load_model(checkpoint_path, torch.device("cuda")).half_except_heads(torch.float16)
+    model = load_model(checkpoint_path, torch.device("cuda")).scale_residual_stream(FP16_RESIDUAL_SCALE)
+    return fuse_blocks(model).half_except_heads(torch.float16)
 
 #bf16 autocast, as main.py trains: targets as good as tf32's, and ~150k positions/s instead of 110k (d128, compiled)
 class Bf16(nn.Module):

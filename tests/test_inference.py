@@ -1,11 +1,14 @@
+import copy
+
 import chess
 import numpy as np
 import pytest
 import torch
 
-from encoding import encode_board
-from inference import GraphedBatches, answer_rows, graph_sizes
-from model import ChessTransformer, expected_score
+from encoding import EN_PASSANT_TOKEN_OFFSET, encode_board
+from inference import GraphedBatches, answer_rows, fp16_model, graph_sizes
+from model import VALUE_BINS, ChessTransformer, expected_score
+from tools.checkpoint import save_checkpoint
 from tools.play.player import CudaGraphModel
 
 
@@ -29,6 +32,63 @@ def test_graphs_answer_like_the_model():
 
     assert np.allclose(answers, expected, atol=1e-3)
     assert np.allclose(answer_rows((logits, value)).numpy(), expected[:1], atol=1e-3)
+
+
+#the d512_selfplay_sf12_10pass run's residual stream passes fp16's 65,504 on the en-passant token: every board came back
+#NaN and the engine's search put all its visits on one arbitrary move
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
+    torch.manual_seed(0)
+    settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": VALUE_BINS}
+    model = ChessTransformer(**settings).eval()
+    with torch.no_grad():
+        #the token of a board without en passant, so on every board
+        model.embed.weight[EN_PASSANT_TOKEN_OFFSET, 0] = 2e5
+    save_checkpoint(model, settings, tmp_path / "model.pt")
+    board, boards = chess.Board(), []
+    for san in ("e4", "c5", "Nf3"):
+        board.push_san(san)
+        boards.append(encode_board(board))
+    boards = torch.tensor(boards).cuda()
+
+    #fp16_model sets these for the whole process
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        with torch.no_grad():
+            logits, value_logits = fp16_model(tmp_path / "model.pt")(boards)
+            expected_logits, expected_value_logits = model.cuda()(boards)
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert torch.isfinite(logits).all() and torch.isfinite(value_logits).all()
+    policy_distance = 0.5 * (torch.softmax(logits.float(), dim=-1) - torch.softmax(expected_logits, dim=-1)).abs().sum(dim=-1)
+    assert policy_distance.max() < 0.01
+    assert torch.allclose(expected_score(value_logits.float()), expected_score(expected_value_logits), atol=0.01)
+
+
+#fused_blocks.FusedBlock must compute what model.TransformerBlock does: with random templates (zeros at init would hide
+#the template bias), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_fused_blocks_compute_what_the_model_does():
+    from fused_blocks import fuse_blocks
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=128, num_layers=3, n_heads=4, kv_heads=2, qk_ratio=[0.25, 0.5, 0.75], value_bins=16).cuda().eval()
+    with torch.no_grad():
+        model.templates.normal_()
+        model.square_features.table.normal_(std=0.1)
+    board, boards = chess.Board(), []
+    for san in "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6 Be3 e5 Nb3 Be6 f3 Be7".split():
+        board.push_san(san)
+        boards.append(encode_board(board))
+    boards = torch.tensor(boards).cuda()
+
+    with torch.no_grad():
+        logits, value_logits = model(boards)
+        fused_logits, fused_value_logits = fuse_blocks(copy.deepcopy(model))(boards)
+
+    assert torch.allclose(fused_logits, logits, atol=1e-2)
+    assert torch.equal(fused_logits.argmax(-1), logits.argmax(-1))
+    assert torch.allclose(expected_score(fused_value_logits), expected_score(value_logits), atol=1e-3)
 
 
 #the last number of a row is the score, not a logit: the search backs it up as it is
