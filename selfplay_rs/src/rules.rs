@@ -171,12 +171,12 @@ impl Tables {
         board.board().occupied().count() <= self.pieces && board.castles().castling_rights().is_empty()
     }
 
-    //tools.tablebase.wdl_score: a win or loss the fifty move rule turns into a draw is a draw
-    fn score(&self, board: &Chess) -> Result<f64, SyzygyError> {
+    //tools.tablebase.wdl_score with a draw scored `draw`: a win or loss the fifty move rule turns into a draw is a draw
+    fn score(&self, board: &Chess, draw: f64) -> Result<f64, SyzygyError> {
         Ok(match self.tablebase.probe_wdl_after_zeroing(board)? {
             Wdl::Win => 1.0,
             Wdl::Loss => 0.0,
-            _ => 0.5,
+            _ => draw,
         })
     }
 }
@@ -200,7 +200,7 @@ pub fn game_result(
     if let Some(tables) = tables
         && tables.covers(board)
     {
-        return Ok(Some(tables.score(board)?));
+        return Ok(Some(tables.score(board, draw)?));
     }
     Ok(None)
 }
@@ -233,7 +233,7 @@ pub fn final_result(
     if let Some(tables) = tables
         && tables.covers(board)
     {
-        return Ok(Some(white_score(tables.score(board)?)));
+        return Ok(Some(white_score(tables.score(board, 0.5)?)));
     }
     if plies >= max_plies {
         return Ok(Some(0.5));

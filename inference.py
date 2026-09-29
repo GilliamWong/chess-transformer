@@ -10,15 +10,16 @@ import chess
 import numpy as np
 import torch
 from torch import nn
-from encoding import TOKENS_PER_BOARD, encode_board
-from model import expected_score
+from encoding import FILE_MIRRORED_MOVE_IDS, NUM_MOVE_IDS, TOKENS_PER_BOARD, encode_board, file_mirrored_boards, without_castling
+from model import expected_score, score_spread
 from selfplay import ANSWER_WIDTH, set_priority, slot_arrays
 from tools.play.player import load_model
 
-#a row of ANSWER_WIDTH numbers per board: the move logits, then the expected score
+#a row of ANSWER_WIDTH numbers per board: the move logits, the spread of the value head's distribution, then the
+#expected score
 def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     move_logits, value_logits = outputs
-    return torch.cat([move_logits.float(), expected_score(value_logits).unsqueeze(1)], dim=1)
+    return torch.cat([move_logits.float(), score_spread(value_logits).unsqueeze(1), expected_score(value_logits).unsqueeze(1)], dim=1)
 
 CPU = torch.device("cpu")
 
@@ -125,6 +126,28 @@ class ImmediateBatches:
 
     def collect(self, launched: np.ndarray) -> np.ndarray:
         return launched
+
+#chess is symmetric under a left-right mirror once neither side can castle, so the network should answer a board and
+#its mirror image alike; it does not exactly, and the average of the two cancels part of its error. Each such board
+#goes through `network` with its mirror image (one launch of up to twice the boards: network's largest batch must hold
+#them) and their answers are averaged: the spreads and expected scores, and the move logits with each mirrored move's
+#logit taken back to its move
+class MirroredBatches:
+    def __init__(self, network):
+        self.network = network
+
+    def launch(self, boards: np.ndarray) -> tuple[object, int, np.ndarray]:
+        mirrorable = np.flatnonzero(without_castling(boards))
+        return self.network.launch(np.concatenate([boards, file_mirrored_boards(boards[mirrorable])])), len(boards), mirrorable
+
+    def collect(self, launched: tuple[object, int, np.ndarray]) -> np.ndarray:
+        inner, count, mirrorable = launched
+        answers = self.network.collect(inner)
+        averaged = answers[:count].copy()
+        mirrored = answers[count:]
+        averaged[mirrorable, :NUM_MOVE_IDS] = (averaged[mirrorable, :NUM_MOVE_IDS] + mirrored[:, FILE_MIRRORED_MOVE_IDS]) / 2
+        averaged[mirrorable, NUM_MOVE_IDS:] = (averaged[mirrorable, NUM_MOVE_IDS:] + mirrored[:, NUM_MOVE_IDS:]) / 2
+        return averaged
 
 #the residual stream shrunk for fp16, whose largest number is 65,504: the d512_selfplay_sf12_10pass run's reaches ~127k
 #on one channel and nearly every board came back NaN. 1/4 to 1/16 all match fp32 as well as fp16 can (policy total

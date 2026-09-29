@@ -211,8 +211,8 @@ class SelfPlaySet:
         return False
 
 
-#the move logits, then the expected score
-ANSWER_WIDTH = NUM_MOVE_IDS + 1
+#the move logits, the spread of the value head's distribution (search.rs uncertainty_scale), then the expected score
+ANSWER_WIDTH = NUM_MOVE_IDS + 2
 
 #a worker's place at the inference process: shared memory for its boards (a byte a token) and answers, and a pipe.
 #made by the main process, so a worker added later finds it ready
