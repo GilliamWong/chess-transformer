@@ -69,6 +69,18 @@ def test_time_use_on_a_clock_in_nodes():
     assert searched[0] / moves[0] < 0.8 * searched[1] / moves[1]
 
 
+#a variant that plays the best lower confidence bound's move is never stopped by its visit gap, as the plain one is:
+#every search with more than one legal move runs its nodes
+def test_visit_gaps_do_not_stop_a_lower_confidence_bound_variant():
+    stopped_early = [0, 0]
+    for _, game in played(("lcb_stdevs=5", ""), nodes=60):
+        board = chess.Board(game.opening)
+        for ply in game.plies:
+            stopped_early[ply["variant"]] += ply["nodes"] < 60 and board.legal_moves.count() > 1
+            board.push_uci(ply["move"])
+    assert stopped_early[0] == 0 and stopped_early[1] > 0
+
+
 #a's points from both colours: 19 pairs of 1.5 of 2 and one of 0.5, a score of 0.7375 or 179 elo within its interval
 def test_pair_elo():
     records = [{"game": game, "a_white": game % 2 == 0, "result": "1-0" if game % 2 == 0 else "1/2-1/2"} for game in range(40)]

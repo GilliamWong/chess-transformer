@@ -1,6 +1,7 @@
 #the uci engine's search (tools/play/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
 #deadline and node limit, smart pruning, the tree kept for the next move, the engine's own settings (policy
 #temperature, certainty propagation, contempt), and uci.py's go limits and clock
+import io
 import subprocess
 import sys
 import time
@@ -15,14 +16,16 @@ from torch import nn
 
 import mcts
 import selfplay_rs
-from encoding import TOKENS_PER_BOARD, encode_move_to_id
+from encoding import NUM_MOVE_IDS, TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import BoardModel, UniformModel
 from inference import cpu_batches
 from model import ChessTransformer
-from selfplay import rust_search_settings
+from selfplay import ANSWER_WIDTH, rust_search_settings
 from tools.checkpoint import save_checkpoint
 import tools.play.engine_search as engine_search
 from tools.play.engine_search import CONTEMPT_FROM_SCORE, MCTS_EXTRAS, EngineSearch, LeaderChanges, TimeUse, engine_search_settings
+from tools.play.player import SearchReport
+import tools.play.uci as uci
 from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
@@ -297,6 +300,22 @@ def test_a_clocks_plan_and_cap_can_be_set():
     assert Clock().limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS) / 10 + 0.6)
 
 
+#ucinewgame starts a fresh clock: searches that used little of their time make the clock give later moves more (the
+#8th move here gets over twice the first's), but the next game's first move gets what the first game's did
+def test_a_new_game_starts_a_fresh_clock(monkeypatch):
+    given = []
+    class Player:
+        def search(self, board, nodes, seconds, most):
+            given.append(seconds)
+            return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
+    go = ["position startpos", "go wtime 60000 btime 60000 winc 600 binc 600"]
+    monkeypatch.setattr(uci, "load_player", lambda *arguments: Player())
+    monkeypatch.setattr(uci, "send", lambda line: None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(["uci", "isready", *go * 8, "ucinewgame", *go, "quit"])))
+    uci.main(Path("unused.pt"), selection="mcts")
+    assert given[7] > 2 * given[0] and given[8] == given[0]
+
+
 #smart pruning stops once the simulations left could not change the most visited move: a mate in one is decided when
 #it has about half the budget, and at the stop its lead is more than the simulations left; the start with a flat
 #eval is never decided
@@ -335,6 +354,28 @@ def test_pruning_never_changes_the_move(carlsen_games):
         assert pruned.line[0] == whole.line[0] and whole.simulations == 300, board.fen()
         stopped_early += pruned.simulations < 300
     assert len(positions) > 20 and stopped_early > 5
+
+
+#priors that favour e2e4 over d2d4 and scores that are a hash of the board
+class HashedScores:
+    def launch(self, boards):
+        answers = np.zeros((len(boards), ANSWER_WIDTH), dtype=np.float32)
+        answers[:, :NUM_MOVE_IDS] = -3.0
+        answers[:, encode_move_to_id(chess.Move.from_uci("e2e4"), chess.WHITE)] = 2.0
+        answers[:, encode_move_to_id(chess.Move.from_uci("d2d4"), chess.WHITE)] = 0.5
+        answers[:, -1] = 0.1 + (boards.astype(np.int64) @ np.arange(1, TOKENS_PER_BOARD + 1) + 7 * 131) % 97 / 120
+        return answers
+
+    def collect(self, launched):
+        return launched
+
+#a search that plays the best lower confidence bound's move is not decided by its visit gap: pruned, it plays the whole
+#search's move (a visit gap once stopped this one at 390 of 600 simulations on e2e4, where the whole search plays d2d4)
+def test_pruning_keeps_to_the_lower_confidence_bound():
+    settings = {"lcb_stdevs": 5.0, "lcb_least_share": 0.15, "c_puct": 0.4}
+    pruned = EngineSearch(HashedScores(), 8, settings=settings).search(chess.Board(), simulations=600)
+    whole = EngineSearch(HashedScores(), 8, settings=settings, smart_pruning=False).search(chess.Board(), simulations=600)
+    assert pruned.line[0] == whole.line[0] == chess.Move.from_uci("d2d4") and pruned.simulations == 600
 
 
 #uci.py's --search-settings and --contempt reach the search: with certainty a mate in two (Kb6 or Kc7) is proven, and
