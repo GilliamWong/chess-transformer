@@ -26,14 +26,14 @@ def played(changes: tuple[str, str], nodes: int | None = None, clock: tuple[floa
     variants = [Variant(name, variant_settings(change, False)) for name, change in zip("ab", changes)]
     games = [(2 * index + colour, opening, colour == 0, (0, 1)) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
     finished = []
-    play([cpu_batches(BoardModel())] * 2, variants, games, 3, 4, nodes, clock, node_rate, None, lambda record, game: finished.append((record, game)))
+    play(cpu_batches(BoardModel()), variants, games, 3, 4, nodes, clock, node_rate, None, lambda record, game: finished.append((record, game)))
     return finished
 
 
 #every opening with a as white and then as black, the variants moving in turn, every game to its end, and each move
 #searched for its nodes, a's twice as many (a search with one legal move stops at once)
 def test_every_opening_is_played_out_with_both_colours():
-    finished = played(("smart_pruning=0,node_scale=2", "smart_pruning=0,policy_temperature=1.5"), nodes=30)
+    finished = played(("smart_pruning=0,node_scale=2", "smart_pruning=0,c_puct=1.5"), nodes=30)
 
     assert sorted(record["game"] for record, _ in finished) == [0, 1, 2, 3]
     for record, game in finished:
@@ -57,28 +57,6 @@ def test_a_clock_in_nodes_is_shared_over_the_moves():
         for variant in (0, 1):
             searched = [ply["nodes"] for ply in game.plies if ply["variant"] == variant]
             assert min(searched) > 0 and sum(searched) < node_rate * (base + increment * len(searched))
-
-
-#engine_search.TimeUse on the clock: a variant that stops at half its planned nodes when its search is steady spends
-#fewer nodes a move than one that keeps to the plan
-def test_time_use_on_a_clock_in_nodes():
-    finished = played(("smart_pruning=0,time_steady=0.5", "smart_pruning=0"), clock=(3.0, 0.1), node_rate=50)
-
-    searched = [sum(ply["nodes"] for _, game in finished for ply in game.plies if ply["variant"] == variant) for variant in (0, 1)]
-    moves = [sum(ply["variant"] == variant for _, game in finished for ply in game.plies) for variant in (0, 1)]
-    assert searched[0] / moves[0] < 0.8 * searched[1] / moves[1]
-
-
-#a variant that plays the best lower confidence bound's move is never stopped by its visit gap, as the plain one is:
-#every search with more than one legal move runs its nodes
-def test_visit_gaps_do_not_stop_a_lower_confidence_bound_variant():
-    stopped_early = [0, 0]
-    for _, game in played(("lcb_stdevs=5", ""), nodes=60):
-        board = chess.Board(game.opening)
-        for ply in game.plies:
-            stopped_early[ply["variant"]] += ply["nodes"] < 60 and board.legal_moves.count() > 1
-            board.push_uci(ply["move"])
-    assert stopped_early[0] == 0 and stopped_early[1] > 0
 
 
 #a's points from both colours: 19 pairs of 1.5 of 2 and one of 0.5, a score of 0.7375 or 179 elo within its interval
@@ -118,7 +96,7 @@ def test_a_match_stops_when_on_result_says_so():
     variants = [Variant(name, variant_settings("", False)) for name in "ab"]
     games = [(2 * index + colour, opening, colour == 0, (0, 1)) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
     finished = []
-    play([cpu_batches(BoardModel())] * 2, variants, games, 3, 4, 20, None, 0.0, None, lambda record, game: finished.append(record) or True)
+    play(cpu_batches(BoardModel()), variants, games, 3, 4, 20, None, 0.0, None, lambda record, game: finished.append(record) or True)
     assert len(finished) == 1
 
 
@@ -131,7 +109,7 @@ def test_the_variants_play_a_common_opponent():
     opponent = Opponent([sys.executable, "-m", "tools.play.uci", "random"], 1, 3, 2)
     finished = []
     try:
-        play([cpu_batches(BoardModel())] * 2, variants, games, 3, 4, 12, None, 0.0, None, lambda record, game: finished.append((record, game)), opponent)
+        play(cpu_batches(BoardModel()), variants, games, 3, 4, 12, None, 0.0, None, lambda record, game: finished.append((record, game)), opponent)
     finally:
         opponent.close()
 
@@ -163,7 +141,8 @@ def test_common_opponent_elo():
 
 
 def test_variant_settings():
-    settings = variant_settings("c_puct=1.2,certainty=1,smart_pruning=0", False)
-    assert settings["c_puct"] == 1.2 and settings["certainty"] is True and settings["smart_pruning"] == 0.0
+    settings = variant_settings("c_puct=1.2,planned_moves=30,smart_pruning=0", False)
+    assert settings["c_puct"] == 1.2 and settings["planned_moves"] == 30 and type(settings["planned_moves"]) is int
+    assert settings["smart_pruning"] == 0.0
     with pytest.raises(ValueError):
         variant_settings("cpuct=1.2", False)

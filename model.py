@@ -31,18 +31,6 @@ def expected_score(value_logits: torch.Tensor) -> torch.Tensor:
     centres = (edges[:-1] + edges[1:]) / 2
     return torch.softmax(value_logits.float(), dim=-1) @ centres
 
-#the standard deviation of the bins' distribution over the expected score: how unsure the network is of its score (0
-#for a single logit, which has no distribution)
-def score_spread(value_logits: torch.Tensor) -> torch.Tensor:
-    bins = value_logits.shape[-1]
-    if bins == 1:
-        return torch.zeros_like(value_logits[..., 0], dtype=torch.float32)
-    edges = value_bin_edges(bins, value_logits.device)
-    centres = (edges[:-1] + edges[1:]) / 2
-    probabilities = torch.softmax(value_logits.float(), dim=-1)
-    mean = probabilities @ centres
-    return (probabilities @ centres.square() - mean.square()).clamp(min=0).sqrt()
-
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_hidden: int):
         super().__init__()

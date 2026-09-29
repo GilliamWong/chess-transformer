@@ -1,5 +1,4 @@
 import chess
-import numpy as np
 
 #constants
 NUM_SQUARES = 64
@@ -81,10 +80,6 @@ PROMOTION_MOVE_IDS = tuple(move_id for move_id, move in enumerate(ALL_POSSIBLE_M
 PROMOTION_TO_SQUARES = tuple(ALL_POSSIBLE_MOVES[move_id].to_square for move_id in PROMOTION_MOVE_IDS)
 PROMOTION_PIECES = tuple(ALL_POSSIBLE_MOVES[move_id].promotion - chess.KNIGHT for move_id in PROMOTION_MOVE_IDS)
 
-#left-right mirror images (files a<->h, square ^ 7): each square's, and each move id's, a permutation of the ids
-FILE_MIRRORED_SQUARES = tuple(square ^ 7 for square in range(NUM_SQUARES))
-FILE_MIRRORED_MOVE_IDS = tuple(MOVE_IDS_BY_SQUARES[move.from_square ^ 7, move.to_square ^ 7, move.promotion] for move in ALL_POSSIBLE_MOVES)
-
 
 #the board is encoded from the side to move: with black to move it is mirrored (ranks flipped, colours swapped),
 #so "white" means the side to move. The turn token keeps the real colour so decode_board can mirror back.
@@ -137,20 +132,6 @@ def decode_board(encoding: list[int]) -> chess.Board:
         board = board.mirror() #also hands the turn to black
 
     return board
-
-#which encoded boards (a row of TOKENS_PER_BOARD each) have no castling rights: only those have a left-right mirror
-#image in chess
-def without_castling(boards: np.ndarray) -> np.ndarray:
-    return (boards[:, WHITE_KINGSIDE_INDEX:BLACK_QUEENSIDE_INDEX + 1] == CASTLING_TOKEN_OFFSET).all(axis=1)
-
-#encoded boards without castling rights mirrored left-right: the squares' tokens and the en passant square swap files
-def file_mirrored_boards(boards: np.ndarray) -> np.ndarray:
-    mirrored = boards.copy()
-    mirrored[:, :NUM_SQUARES] = boards[:, FILE_MIRRORED_SQUARES]
-    #0 is no en passant square, which a1 never is
-    en_passant = boards[:, EN_PASSANT_INDEX].astype(np.int64) - EN_PASSANT_TOKEN_OFFSET
-    mirrored[:, EN_PASSANT_INDEX] = np.where(en_passant > 0, EN_PASSANT_TOKEN_OFFSET + (en_passant ^ 7), boards[:, EN_PASSANT_INDEX])
-    return mirrored
 
 def mirror_move(move: chess.Move) -> chess.Move:
     return chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square), promotion=move.promotion)

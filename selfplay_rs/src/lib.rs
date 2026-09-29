@@ -123,7 +123,7 @@ impl SelfPlayGames {
         let (start, start_keys) = play_out(start_fen, &start_moves)?;
         Ok(SelfPlayGames {
             settings: GameSettings {
-                search: SearchSettings::mcts(c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw),
+                search: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw },
                 simulations,
                 sampled_plies,
                 max_plies,
@@ -195,8 +195,7 @@ impl SelfPlayGames {
         let answers = answers_for(py, &answers, self.waiting.len(), self.answer_width)?;
         for (row, &index) in self.waiting.iter().enumerate() {
             let answer = &answers[row * self.answer_width..(row + 1) * self.answer_width];
-            let settings = &self.settings.search;
-            self.games[index].tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, settings, self.cache.as_mut());
+            self.games[index].tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, self.cache.as_mut());
         }
         self.waiting.clear();
 
@@ -284,9 +283,9 @@ impl Search {
     }
 
     //as player.search_move reports it
-    fn report(&self, settings: &SearchSettings) -> SearchReport {
+    fn report(&self) -> SearchReport {
         let tree = &self.tree;
-        let line = tree.principal_variation(settings);
+        let line = tree.principal_variation();
         //one simulation visits no child: then the root's score for its side to move
         let score = match tree.child(line[0]) {
             Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
@@ -328,7 +327,7 @@ impl Searches {
     fn take_reports(&mut self) -> Vec<SearchReport> {
         let mut reports = Vec::new();
         for search in self.searches.extract_if(.., |search| search.done()) {
-            reports.push(search.report(&self.settings));
+            reports.push(search.report());
             if self.tree_reuse {
                 self.kept.insert(search.id, KeptTree { fen: search.fen, moves: search.moves, tree: search.tree });
             }
@@ -337,10 +336,9 @@ impl Searches {
     }
 
     //the id's kept tree carried on to the position after `moves`, when it is the same game and holds the moves played since
-    //and was searched with the same contempt: its draws' scores and their proofs are that contempt's
-    fn reused_tree(&mut self, id: u64, fen: &str, moves: &[String], contempt: f64) -> Option<Tree> {
+    fn reused_tree(&mut self, id: u64, fen: &str, moves: &[String]) -> Option<Tree> {
         let kept = self.kept.remove(&id)?;
-        if kept.fen != fen || !moves.starts_with(&kept.moves) || kept.tree.contempt != contempt {
+        if kept.fen != fen || !moves.starts_with(&kept.moves) {
             return None;
         }
         let mut tree = kept.tree;
@@ -355,14 +353,10 @@ impl Searches {
 #[pymethods]
 impl Searches {
     //tree_reuse keeps the tree of a game's (an id's) last search for its next search; cache_positions is the size of
-    //the cache of network answers by position (search.rs Cache), 0 for none; the settings after it are SearchSettings'
-    //beyond mcts.py's constants, their defaults mcts.py's search
+    //the cache of network answers by position (search.rs Cache), 0 for none
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
-                        tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, policy_temperature=1.0, certainty=false,
-                        fifty_move_horizon=0.0, cpuct_stdev_scale=0.0, cpuct_stdev_prior=0.2, cpuct_stdev_prior_weight=2.0, lcb_stdevs=0.0,
-                        lcb_least_share=0.1, opponent_c_puct_scale=1.0, opponent_fpu_scale=1.0,
-                        transposition_visits=0, uncertainty_scale=0.0))]
+                        tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -377,47 +371,9 @@ impl Searches {
         tablebase_pieces: usize,
         tree_reuse: bool,
         cache_positions: usize,
-        policy_temperature: f64,
-        certainty: bool,
-        fifty_move_horizon: f64,
-        cpuct_stdev_scale: f64,
-        cpuct_stdev_prior: f64,
-        cpuct_stdev_prior_weight: f64,
-        lcb_stdevs: f64,
-        lcb_least_share: f64,
-        opponent_c_puct_scale: f64,
-        opponent_fpu_scale: f64,
-        transposition_visits: u32,
-        uncertainty_scale: f64,
     ) -> PyResult<Searches> {
-        if policy_temperature <= 0.0 {
-            return Err(PyValueError::new_err(format!("a policy temperature must be above 0, not {policy_temperature}")));
-        }
-        if fifty_move_horizon < 0.0 {
-            return Err(PyValueError::new_err(format!("a fifty move horizon must be 0 (none) or above, not {fifty_move_horizon}")));
-        }
-        if uncertainty_scale < 0.0 {
-            return Err(PyValueError::new_err(format!("an uncertainty scale must be 0 (none) or above, not {uncertainty_scale}")));
-        }
-        if cpuct_stdev_prior <= 0.0 || cpuct_stdev_prior_weight < 0.0 {
-            return Err(PyValueError::new_err("the stdev prior must be above 0 and its weight at least 0"));
-        }
         Ok(Searches {
-            settings: SearchSettings {
-                policy_temperature,
-                certainty,
-                fifty_move_horizon,
-                cpuct_stdev_scale,
-                cpuct_stdev_prior,
-                cpuct_stdev_prior_weight,
-                lcb_stdevs,
-                lcb_least_share,
-                opponent_c_puct_scale,
-                opponent_fpu_scale,
-                transposition_visits,
-                uncertainty_scale,
-                ..SearchSettings::mcts(c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw)
-            },
+            settings: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw },
             move_ids: move_ids(move_id_table)?,
             answer_width,
             tables: open_tables(tablebase_folder, tablebase_pieces)?,
@@ -431,16 +387,10 @@ impl Searches {
 
     //the game's moves let the search see repetitions. Like mcts.search it refuses a finished position, but it searches
     //one the tables cover (search.rs gather). With tree reuse, the tree of this id's last search is kept when it holds
-    //the moves played since and had the same contempt. contempt is taken off a draw's score for the side to move here
-    //and added for the other side (search.rs Tree), 0 is mcts.py's search
-    #[pyo3(signature = (id, fen, moves, simulations, contempt=0.0))]
-    fn start(&mut self, id: u64, fen: &str, moves: Vec<String>, simulations: u32, contempt: f64) -> PyResult<()> {
+    //the moves played since
+    fn start(&mut self, id: u64, fen: &str, moves: Vec<String>, simulations: u32) -> PyResult<()> {
         if simulations == 0 {
             return Err(PyValueError::new_err("a search needs at least one simulation"));
-        }
-        //a draw must stay between a loss and a win, as certainty's proofs tell them apart by their scores
-        if contempt.is_nan() || contempt.abs() >= self.settings.draw.min(1.0 - self.settings.draw) {
-            return Err(PyValueError::new_err(format!("a contempt of {contempt} makes a draw a loss or a win")));
         }
         if self.searches.iter().any(|search| search.id == id) {
             return Err(PyValueError::new_err(format!("search {id} is already running")));
@@ -452,8 +402,7 @@ impl Searches {
         if over.is_some() {
             return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
         }
-        let mut tree = self.reused_tree(id, fen, &moves, contempt).unwrap_or_else(|| Tree::new(board, keys));
-        tree.contempt = contempt;
+        let tree = self.reused_tree(id, fen, &moves).unwrap_or_else(|| Tree::new(board, keys));
         self.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
         Ok(())
     }
@@ -489,7 +438,7 @@ impl Searches {
         for (id, leaves) in round {
             let tree = &mut self.searches[index_of[&id]].tree;
             for answer in rows.by_ref().take(leaves as usize) {
-                tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, &self.settings, self.cache.as_mut());
+                tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, self.cache.as_mut());
             }
         }
         Ok(self.take_reports())
@@ -513,25 +462,6 @@ impl Searches {
         let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
         let (most, second) = search.tree.two_most_visits();
         Ok((search.tree.root().visit_count, most, second))
-    }
-
-    //the move a running search would play now (chosen_edge) and its mean score, None before the root's first visit
-    //to a move: for time management, which spends more while it keeps changing or its score falls
-    fn leader(&self, id: u64) -> PyResult<Option<(String, f64)>> {
-        let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-        let tree = &search.tree;
-        if tree.root().edges().is_empty() {
-            return Ok(None);
-        }
-        let edge = tree.chosen_edge(&self.settings);
-        Ok(tree.child(edge).filter(|child| child.visit_count > 0).map(|child| (uci(tree.chess_move(edge)), child.mean_score())))
-    }
-
-    //with certainty: the running search has proven its root's result (a move wins, or every move's result is known),
-    //so more simulations change nothing
-    fn decided(&self, id: u64) -> PyResult<bool> {
-        let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-        Ok(search.tree.root_decided())
     }
 
     //the searches still running
