@@ -18,27 +18,31 @@ pub struct SearchSettings {
     pub repetitions_for_a_draw: usize,
 }
 
-//mcts.Node, in one vector per tree: the root first, every node's children contiguous
+//mcts.Node's numbers, in one vector per tree with the root first. An expanded node's moves (its edges) are contiguous
+//in the tree's edge vectors, and a move gets a node only once a simulation goes through it, as lc0's edges do: a node
+//for each of a position's ~37 moves took 1.8 KB a simulation, most of them never visited
 #[derive(Clone, Copy)]
 pub struct Node {
-    pub chess_move: Option<Move>, //the move into this node, None for a root
-    pub prior: f64,
     pub visit_count: u32,
     //simulations through this node waiting for the network, and while a round is gathered its collisions
     in_flight: u32,
     pub value_sum: f64,
     visited_policy_sqrt: f64, //sqrt of the sum of visited children's priors, refreshed when that set or the priors change
-    first_child: u32,
-    child_count: u32, //0 until the node is expanded
+    first_edge: u32,
+    edge_count: u32, //0 until the node is expanded
 }
 
+//an edge without a node
+const NO_NODE: u32 = u32::MAX;
+
 impl Node {
-    fn new(chess_move: Option<Move>, prior: f64) -> Node {
-        Node { chess_move, prior, visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, first_child: 0, child_count: 0 }
+    fn new() -> Node {
+        Node { visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, first_edge: 0, edge_count: 0 }
     }
 
-    pub fn children(&self) -> Range<usize> {
-        self.first_child as usize..(self.first_child + self.child_count) as usize
+    //the node's moves, as indices into the tree's edges
+    pub fn edges(&self) -> Range<usize> {
+        self.first_edge as usize..(self.first_edge + self.edge_count) as usize
     }
 
     pub fn mean_score(&self) -> f64 {
@@ -126,17 +130,45 @@ pub struct Tree {
     pub board: Chess,   //the root's position
     pub keys: Vec<u64>, //the position_key of every position of the game, the root's last
     pub nodes: Vec<Node>,
+    //the edges: every expanded node's moves in python-chess's order with their priors, and each move's node once it
+    //has one (NO_NODE before)
+    moves: Vec<Move>,
+    priors: Vec<f64>,
+    children: Vec<u32>,
     pending: VecDeque<PendingLeaf>, //oldest first, the order the network's answers come back in
     logits: Vec<f32>,
 }
 
 impl Tree {
     pub fn new(board: Chess, keys: Vec<u64>) -> Tree {
-        Tree { board, keys, nodes: vec![Node::new(None, 1.0)], pending: VecDeque::new(), logits: Vec::new() }
+        Tree {
+            board,
+            keys,
+            nodes: vec![Node::new()],
+            moves: Vec::new(),
+            priors: Vec::new(),
+            children: Vec::new(),
+            pending: VecDeque::new(),
+            logits: Vec::new(),
+        }
     }
 
     pub fn root(&self) -> &Node {
         &self.nodes[0]
+    }
+
+    pub fn chess_move(&self, edge: usize) -> Move {
+        self.moves[edge]
+    }
+
+    //the edge's node, None until a simulation has gone through it
+    pub fn child(&self, edge: usize) -> Option<&Node> {
+        let child = self.children[edge];
+        (child != NO_NODE).then(|| &self.nodes[child as usize])
+    }
+
+    pub fn visits(&self, edge: usize) -> u32 {
+        self.child(edge).map_or(0, |child| child.visit_count)
     }
 
     //simulations waiting for the network
@@ -147,37 +179,52 @@ impl Tree {
     //the visits of the root's two most visited moves, 0 for a move it does not have
     pub fn two_most_visits(&self) -> (u32, u32) {
         let (mut most, mut second) = (0, 0);
-        for child in &self.nodes[self.root().children()] {
-            if child.visit_count > most {
-                (most, second) = (child.visit_count, most);
-            } else if child.visit_count > second {
-                second = child.visit_count;
+        for visits in self.root().edges().map(|edge| self.visits(edge)) {
+            if visits > most {
+                (most, second) = (visits, most);
+            } else if visits > second {
+                second = visits;
             }
         }
         (most, second)
     }
 
     //mcts.select_child, with the simulations under a child that wait for the network counted in its visits for the
-    //exploration term (lc0's n started)
-    fn select_child(&self, node: usize, settings: &SearchSettings) -> usize {
+    //exploration term (lc0's n started); an edge without a node is a child without visits. Returns the edge
+    fn select_edge(&self, node: usize, settings: &SearchSettings) -> usize {
         let parent = &self.nodes[node];
         let c_puct =
             settings.c_puct + settings.c_puct_factor * ((f64::from(parent.visit_count) + settings.c_puct_base) / settings.c_puct_base).ln();
         let children_visits = parent.visit_count.saturating_sub(1).max(1);
-        let children = &self.nodes[parent.children()];
+        let edges = parent.edges();
         let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt;
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
         let (mut best, mut best_u) = (0, f64::NEG_INFINITY);
-        for (index, child) in children.iter().enumerate() {
-            let q = if child.visit_count > 0 { child.mean_score() } else { first_play_urgency };
-            let started = child.visit_count + child.in_flight;
-            let u = q + (c_puct * child.prior * (sqrt_children_visits / f64::from(1 + started)));
+        for (index, (&prior, &child)) in self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate() {
+            let (q, started) = match child {
+                NO_NODE => (first_play_urgency, 0),
+                child => {
+                    let child = &self.nodes[child as usize];
+                    let q = if child.visit_count > 0 { child.mean_score() } else { first_play_urgency };
+                    (q, child.visit_count + child.in_flight)
+                }
+            };
+            let u = q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started)));
             if u > best_u {
                 (best, best_u) = (index, u);
             }
         }
-        parent.first_child as usize + best
+        edges.start + best
+    }
+
+    //the edge's node, made if the edge has none yet
+    fn child_node(&mut self, edge: usize) -> usize {
+        if self.children[edge] == NO_NODE {
+            self.children[edge] = self.nodes.len() as u32;
+            self.nodes.push(Node::new());
+        }
+        self.children[edge] as usize
     }
 
     //mcts.descend and finish until the round has its leaves or its simulations, the leaves' boards added to boards: a
@@ -204,9 +251,11 @@ impl Tree {
             path.clear();
             path.push(0);
             let mut node = 0;
-            while self.nodes[node].child_count > 0 {
-                node = self.select_child(node, settings);
-                board.play_unchecked(self.nodes[node].chess_move.expect("a child has its move"));
+            while self.nodes[node].edge_count > 0 {
+                let edge = self.select_edge(node, settings);
+                board.play_unchecked(self.moves[edge]);
+                //a descent never ends without a visit or a simulation waiting, so the node is needed
+                node = self.child_node(edge);
                 path.push(node);
                 self.keys.push(position_key(&board));
             }
@@ -277,13 +326,16 @@ impl Tree {
         }
     }
 
-    //mcts.expand
+    //mcts.expand: the moves as edges, without nodes
     fn expand(&mut self, node: usize, moves: &MoveList, priors: &[f32]) {
-        self.nodes[node].first_child = self.nodes.len() as u32;
-        self.nodes[node].child_count = moves.len() as u32;
+        let first_edge = self.moves.len();
         for (&chess_move, &prior) in moves.iter().zip(priors) {
-            self.nodes.push(Node::new(Some(chess_move), f64::from(prior)));
+            self.moves.push(chess_move);
+            self.priors.push(f64::from(prior));
         }
+        self.children.resize(self.moves.len(), NO_NODE);
+        self.nodes[node].first_edge = first_edge as u32;
+        self.nodes[node].edge_count = (self.moves.len() - first_edge) as u32;
     }
 
     fn add_in_flight(&mut self, path: &[usize]) {
@@ -308,82 +360,100 @@ impl Tree {
 
     fn refresh_visited_policy(&mut self, node: usize) {
         //Keep Python's summation order and compensation, including after noise on a reused root.
-        self.nodes[node].visited_policy_sqrt =
-            python_sum(self.nodes[self.nodes[node].children()].iter().filter(|child| child.visit_count > 0).map(|child| child.prior))
-                .sqrt();
+        let edges = self.nodes[node].edges();
+        self.nodes[node].visited_policy_sqrt = python_sum(edges.filter(|&edge| self.visits(edge) > 0).map(|edge| self.priors[edge])).sqrt();
     }
 
     //mcts.add_root_noise: dirichlet noise as gamma draws scaled to add up to 1
     pub fn add_root_noise(&mut self, random: &mut ChaCha8Rng, alpha: f64, share: f64) {
         let gamma = Gamma::new(alpha, 1.0).expect("a positive noise alpha");
-        let children = self.nodes[0].children();
-        let draws: Vec<f64> = children.clone().map(|_| gamma.sample(random)).collect();
+        let edges = self.nodes[0].edges();
+        let draws: Vec<f64> = edges.clone().map(|_| gamma.sample(random)).collect();
         let total: f64 = draws.iter().sum();
-        for (child, draw) in children.zip(draws) {
-            let prior = self.nodes[child].prior;
-            self.nodes[child].prior = (1.0 - share) * prior + share * (draw / total);
+        for (edge, draw) in edges.zip(draws) {
+            let prior = self.priors[edge];
+            self.priors[edge] = (1.0 - share) * prior + share * (draw / total);
         }
         self.refresh_visited_policy(0);
     }
 
-    //mcts.most_visited_move: ties to the better mean score, then the prior, then the first
-    pub fn most_visited_child(&self, node: usize) -> usize {
-        let preference = |node: &Node| {
-            let mean_score = if node.visit_count > 0 { node.mean_score() } else { 0.0 };
-            (node.visit_count, mean_score, node.prior)
+    //mcts.most_visited_move: ties to the better mean score, then the prior, then the first. Returns the edge
+    pub fn most_visited_edge(&self, node: usize) -> usize {
+        let preference = |edge: usize| {
+            let visits = self.visits(edge);
+            let mean_score = if visits > 0 { self.nodes[self.children[edge] as usize].mean_score() } else { 0.0 };
+            (visits, mean_score, self.priors[edge])
         };
-        let mut children = self.nodes[node].children();
-        let mut best = children.next().expect("a searched node has children");
-        for child in children {
-            if preference(&self.nodes[child]) > preference(&self.nodes[best]) {
-                best = child;
+        let mut edges = self.nodes[node].edges();
+        let mut best = edges.next().expect("a searched node has children");
+        for edge in edges {
+            if preference(edge) > preference(best) {
+                best = edge;
             }
         }
         best
     }
 
-    //mcts.principal_variation
+    //mcts.principal_variation, as edges
     pub fn principal_variation(&self) -> Vec<usize> {
         let (mut line, mut node) = (Vec::new(), 0);
-        while self.nodes[node].child_count > 0 {
-            let child = self.most_visited_child(node);
-            if !line.is_empty() && self.nodes[child].visit_count == 0 {
+        while self.nodes[node].edge_count > 0 {
+            let edge = self.most_visited_edge(node);
+            if !line.is_empty() && self.visits(edge) == 0 {
                 break;
             }
-            line.push(child);
-            node = child;
+            line.push(edge);
+            //an edge without a node leads to a node without children
+            match self.children[edge] {
+                NO_NODE => break,
+                child => node = child as usize,
+            }
         }
         line
     }
 
-    //the root's children, the most visited first and ties in their order (a stable sort)
-    pub fn children_by_visits(&self) -> Vec<usize> {
-        let mut children: Vec<usize> = self.root().children().collect();
-        children.sort_by(|&a, &b| self.nodes[b].visit_count.cmp(&self.nodes[a].visit_count));
-        children
+    //the root's edges, the most visited first and ties in their order (a stable sort)
+    pub fn edges_by_visits(&self) -> Vec<usize> {
+        let mut edges: Vec<usize> = self.root().edges().collect();
+        edges.sort_by(|&a, &b| self.visits(b).cmp(&self.visits(a)));
+        edges
     }
 
-    //plays the root's child and makes it the root, with its subtree (tree reuse) or without
-    pub fn play(&mut self, child: usize, keep_subtree: bool) {
+    //plays the root's move and makes its node the root, with its subtree (tree reuse) or without
+    pub fn play(&mut self, edge: usize, keep_subtree: bool) {
         assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
-        let chess_move = self.nodes[child].chess_move.expect("a child has its move");
-        self.nodes = if keep_subtree { self.subtree(child) } else { vec![Node::new(None, 1.0)] };
+        let chess_move = self.moves[edge];
+        let child = self.children[edge];
+        if keep_subtree && child != NO_NODE {
+            self.keep_subtree(child as usize);
+        } else {
+            (self.nodes, self.moves, self.priors, self.children) = (vec![Node::new()], Vec::new(), Vec::new(), Vec::new());
+        }
         self.board.play_unchecked(chess_move);
         self.keys.push(position_key(&self.board));
     }
 
     //the tree under node as a tree of its own, node its root
-    fn subtree(&self, node: usize) -> Vec<Node> {
-        let mut kept = vec![self.nodes[node]];
+    fn keep_subtree(&mut self, node: usize) {
+        let mut nodes = vec![self.nodes[node]];
+        let (mut moves, mut priors, mut children) = (Vec::new(), Vec::new(), Vec::new());
         let mut index = 0;
-        while index < kept.len() {
-            let children = kept[index].children();
-            if !children.is_empty() {
-                kept[index].first_child = kept.len() as u32;
-                kept.extend_from_slice(&self.nodes[children]);
+        while index < nodes.len() {
+            let edges = nodes[index].edges();
+            nodes[index].first_edge = moves.len() as u32;
+            moves.extend_from_slice(&self.moves[edges.clone()]);
+            priors.extend_from_slice(&self.priors[edges.clone()]);
+            for edge in edges {
+                children.push(match self.children[edge] {
+                    NO_NODE => NO_NODE,
+                    child => {
+                        nodes.push(self.nodes[child as usize]);
+                        (nodes.len() - 1) as u32
+                    }
+                });
             }
             index += 1;
         }
-        kept
+        (self.nodes, self.moves, self.priors, self.children) = (nodes, moves, priors, children);
     }
 }

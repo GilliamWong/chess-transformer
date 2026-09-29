@@ -286,15 +286,13 @@ impl Search {
     fn report(&self) -> SearchReport {
         let tree = &self.tree;
         let line = tree.principal_variation();
-        let chosen = &tree.nodes[line[0]];
         //one simulation visits no child: then the root's score for its side to move
-        let score = if chosen.visit_count > 0 { chosen.mean_score() } else { 1.0 - tree.root().mean_score() };
-        let moves =
-            |nodes: &[usize]| -> Vec<String> { nodes.iter().map(|&node| uci(tree.nodes[node].chess_move.expect("a child"))).collect() };
-        let root_moves = tree
-            .children_by_visits()
-            .into_iter()
-            .map(|child| (uci(tree.nodes[child].chess_move.expect("a child")), tree.nodes[child].visit_count));
+        let score = match tree.child(line[0]) {
+            Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
+            _ => 1.0 - tree.root().mean_score(),
+        };
+        let moves = |edges: &[usize]| -> Vec<String> { edges.iter().map(|&edge| uci(tree.chess_move(edge))).collect() };
+        let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(edge)));
         (self.id, moves(&line), score, root_moves.collect(), tree.root().visit_count)
     }
 }
@@ -345,8 +343,8 @@ impl Searches {
         }
         let mut tree = kept.tree;
         for played in &moves[kept.moves.len()..] {
-            let child = tree.root().children().find(|&child| uci(tree.nodes[child].chess_move.expect("a child")) == *played)?;
-            tree.play(child, true);
+            let edge = tree.root().edges().find(|&edge| uci(tree.chess_move(edge)) == *played)?;
+            tree.play(edge, true);
         }
         Some(tree)
     }

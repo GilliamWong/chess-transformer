@@ -75,7 +75,7 @@ impl Game {
 
     //GameInProgress.add_noise_once_expanded
     pub fn add_noise_once_expanded(&mut self, settings: &GameSettings) {
-        if !self.noised && !self.tree.root().children().is_empty() {
+        if !self.noised && !self.tree.root().edges().is_empty() {
             self.tree.add_root_noise(&mut self.random, settings.root_noise_alpha, settings.root_noise_share);
             self.noised = true;
         }
@@ -86,20 +86,14 @@ impl Game {
         let root = *self.tree.root();
         let turn = self.tree.board.turn();
         //the most visited first, ties in the children's order (np.argsort's stable sort)
-        let most_visited: Vec<usize> = self
-            .tree
-            .children_by_visits()
-            .into_iter()
-            .take(settings.top_moves)
-            .filter(|&child| self.tree.nodes[child].visit_count > 0)
-            .collect();
-        let visits: u32 = most_visited.iter().map(|&child| self.tree.nodes[child].visit_count).sum();
+        let most_visited: Vec<usize> =
+            self.tree.edges_by_visits().into_iter().take(settings.top_moves).filter(|&edge| self.tree.visits(edge) > 0).collect();
+        let visits: u32 = most_visited.iter().map(|&edge| self.tree.visits(edge)).sum();
         for slot in 0..settings.top_moves {
             match most_visited.get(slot) {
-                Some(&child) => {
-                    let node = &self.tree.nodes[child];
-                    self.record.visit_moves.push(move_ids.id(node.chess_move.expect("a child has its move"), turn) as i16);
-                    self.record.visit_shares.push((f64::from(node.visit_count) / f64::from(visits)) as f32);
+                Some(&edge) => {
+                    self.record.visit_moves.push(move_ids.id(self.tree.chess_move(edge), turn) as i16);
+                    self.record.visit_shares.push((f64::from(self.tree.visits(edge)) / f64::from(visits)) as f32);
                 }
                 None => {
                     self.record.visit_moves.push(settings.no_move);
@@ -112,23 +106,23 @@ impl Game {
         self.record.root_scores.push((1.0 - root.mean_score()) as f32);
         self.record.white_to_move.push(u8::from(turn == Color::White));
 
-        let chosen = if self.plies < settings.sampled_plies { self.sample_by_visits() } else { self.tree.most_visited_child(0) };
+        let chosen = if self.plies < settings.sampled_plies { self.sample_by_visits() } else { self.tree.most_visited_edge(0) };
         self.tree.play(chosen, settings.tree_reuse);
         self.plies += 1;
         self.noised = false;
         self.add_noise_once_expanded(settings);
     }
 
-    //a child drawn with the chance of its share of the visits (random.choice(p=visits / visits.sum()))
+    //a root's edge drawn with the chance of its share of the visits (random.choice(p=visits / visits.sum()))
     fn sample_by_visits(&mut self) -> usize {
-        let children = self.tree.root().children();
-        let total: u32 = self.tree.nodes[children.clone()].iter().map(|child| child.visit_count).sum();
+        let edges = self.tree.root().edges();
+        let total: u32 = edges.clone().map(|edge| self.tree.visits(edge)).sum();
         let mut draw = self.random.random_range(0..total);
-        for child in children {
-            if draw < self.tree.nodes[child].visit_count {
-                return child;
+        for edge in edges {
+            if draw < self.tree.visits(edge) {
+                return edge;
             }
-            draw -= self.tree.nodes[child].visit_count;
+            draw -= self.tree.visits(edge);
         }
         unreachable!("the draw is below the total")
     }
