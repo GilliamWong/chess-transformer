@@ -1,6 +1,8 @@
 #tools/play/variant_match.py: two variants of the engine's search play out every opening with both colours, on a
-#number of nodes a move or a clock in nodes, and the elo of their pairs of games
+#number of nodes a move or a clock in nodes, or each against a common opponent, and the elo of their pairs of games
 import math
+import sys
+from pathlib import Path
 
 import chess
 import pytest
@@ -8,9 +10,11 @@ import pytest
 from fake_models import BoardModel
 from inference import cpu_batches
 import tools.play.engine_search as engine_search
-from tools.play.variant_match import SPRT_BOUND, Variant, a_points, pair_elo, play, sprt_llr, variant_settings
+from tools.play.variant_match import (OPPONENT, SPRT_BOUND, Opponent, Variant, a_points, common_opponent_elo, pair_elo, play, sprt_llr,
+                                      variant_settings)
 
 OPENINGS = ["r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3", "8/5pk1/6p1/8/8/5PK1/6P1/2R5 b - - 0 1"]
+REPOSITORY = Path(__file__).parent.parent
 
 
 #the variants here change mcts.py's search, whose constants the expectations were set by
@@ -20,7 +24,7 @@ def mcts_constants(monkeypatch):
 
 def played(changes: tuple[str, str], nodes: int | None = None, clock: tuple[float, float] | None = None, node_rate: float = 0.0):
     variants = [Variant(name, variant_settings(change, False)) for name, change in zip("ab", changes)]
-    games = [(2 * index + colour, opening, colour == 0) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
+    games = [(2 * index + colour, opening, colour == 0, (0, 1)) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
     finished = []
     play(cpu_batches(BoardModel()), variants, games, 3, 4, nodes, clock, node_rate, None, lambda record, game: finished.append((record, game)))
     return finished
@@ -100,10 +104,50 @@ def test_sprt_llr():
 #on_result returning True stops the match: the first game to end is the only one recorded
 def test_a_match_stops_when_on_result_says_so():
     variants = [Variant(name, variant_settings("", False)) for name in "ab"]
-    games = [(2 * index + colour, opening, colour == 0) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
+    games = [(2 * index + colour, opening, colour == 0, (0, 1)) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
     finished = []
     play(cpu_batches(BoardModel()), variants, games, 3, 4, 20, None, 0.0, None, lambda record, game: finished.append(record) or True)
     assert len(finished) == 1
+
+
+#each variant plays a common opponent (uci.py's random mover here) with both colours of every opening: the opponent
+#makes the second side's moves, a variant searches the first side's, and each game's record says which variant played
+def test_the_variants_play_a_common_opponent():
+    variants = [Variant(name, variant_settings(change, False)) for name, change in (("a", "smart_pruning=0"), ("b", "smart_pruning=0"))]
+    games = [(4 * index + 2 * variant + colour, opening, colour == 0, (variant, OPPONENT)) for index, opening in enumerate(OPENINGS[:1])
+             for variant in (0, 1) for colour in (0, 1)]
+    opponent = Opponent([sys.executable, "-m", "tools.play.uci", "random"], 1, 3, 2)
+    finished = []
+    try:
+        play(cpu_batches(BoardModel()), variants, games, 3, 4, 12, None, 0.0, None, lambda record, game: finished.append((record, game)), opponent)
+    finally:
+        opponent.close()
+
+    assert sorted(record["game"] for record, _ in finished) == [0, 1, 2, 3]
+    for record, game in finished:
+        assert record["players"] == [record["game"] // 2 % 2, OPPONENT] and game.a_white == (record["game"] % 2 == 0)
+        board = chess.Board(game.opening)
+        for ply in game.plies:
+            ours = ply["variant"] == 0
+            assert ours == ((board.turn == chess.WHITE) == game.a_white)
+            assert (ply["nodes"] >= 12 or board.legal_moves.count() == 1) if ours else (ply["nodes"] == 0 and ply["score"] is None)
+            board.push_uci(ply["move"])
+
+#records of both variants against a common opponent: opening i's games 4i + 2v + c, the points variant v scored with
+#colour c
+def against_opponent(points: list[tuple[float, float, float, float]]) -> list[dict]:
+    results = {1.0: ("1-0", "0-1"), 0.5: ("1/2-1/2", "1/2-1/2"), 0.0: ("0-1", "1-0")}
+    return [{"game": 4 * index + 2 * variant + colour, "a_white": colour == 0, "players": [variant, OPPONENT],
+             "result": results[opening_points[2 * variant + colour]][colour]}
+            for index, opening_points in enumerate(points) for variant in (0, 1) for colour in (0, 1)]
+
+#a scores 0.75 and b 0.5 against the opponent: the elo of each score's difference, 190.8 - 0, inside the interval
+def test_common_opponent_elo():
+    records = against_opponent([(1.0, 0.5, 0.5, 0.5), (1.0, 1.0, 1.0, 0.0), (0.5, 0.5, 0.5, 0.5), (1.0, 0.5, 0.5, 0.5)] * 5)
+    elo, low, high, openings, score_a, score_b = common_opponent_elo(records)
+    assert openings == 20 and (score_a, score_b) == (0.75, 0.5)
+    assert elo == pytest.approx(400 * math.log10(3)) and low < elo < high
+    assert a_points(records[2]) == 0.5 and records[2]["players"][0] == 1
 
 
 def test_variant_settings():
