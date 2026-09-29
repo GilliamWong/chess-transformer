@@ -123,17 +123,7 @@ impl SelfPlayGames {
         let (start, start_keys) = play_out(start_fen, &start_moves)?;
         Ok(SelfPlayGames {
             settings: GameSettings {
-                search: SearchSettings {
-                    c_puct,
-                    c_puct_factor,
-                    c_puct_base,
-                    fpu_reduction,
-                    draw,
-                    repetitions_for_a_draw,
-                    policy_temperature: 1.0,
-                    certainty: false,
-                    fifty_move_horizon: 0.0,
-                },
+                search: SearchSettings::mcts(c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw),
                 simulations,
                 sampled_plies,
                 max_plies,
@@ -294,9 +284,9 @@ impl Search {
     }
 
     //as player.search_move reports it
-    fn report(&self) -> SearchReport {
+    fn report(&self, settings: &SearchSettings) -> SearchReport {
         let tree = &self.tree;
-        let line = tree.principal_variation();
+        let line = tree.principal_variation(settings);
         //one simulation visits no child: then the root's score for its side to move
         let score = match tree.child(line[0]) {
             Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
@@ -338,7 +328,7 @@ impl Searches {
     fn take_reports(&mut self) -> Vec<SearchReport> {
         let mut reports = Vec::new();
         for search in self.searches.extract_if(.., |search| search.done()) {
-            reports.push(search.report());
+            reports.push(search.report(&self.settings));
             if self.tree_reuse {
                 self.kept.insert(search.id, KeptTree { fen: search.fen, moves: search.moves, tree: search.tree });
             }
@@ -365,12 +355,13 @@ impl Searches {
 #[pymethods]
 impl Searches {
     //tree_reuse keeps the tree of a game's (an id's) last search for its next search; cache_positions is the size of
-    //the cache of network answers by position (search.rs Cache), 0 for none; policy_temperature, certainty and
-    //fifty_move_horizon are SearchSettings'
+    //the cache of network answers by position (search.rs Cache), 0 for none; the settings after it are SearchSettings'
+    //beyond mcts.py's constants, their defaults mcts.py's search
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, policy_temperature=1.0, certainty=false,
-                        fifty_move_horizon=0.0))]
+                        fifty_move_horizon=0.0, cpuct_stdev_scale=0.0, cpuct_stdev_prior=0.2, cpuct_stdev_prior_weight=2.0, lcb_stdevs=0.0,
+                        lcb_least_share=0.1))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -388,6 +379,11 @@ impl Searches {
         policy_temperature: f64,
         certainty: bool,
         fifty_move_horizon: f64,
+        cpuct_stdev_scale: f64,
+        cpuct_stdev_prior: f64,
+        cpuct_stdev_prior_weight: f64,
+        lcb_stdevs: f64,
+        lcb_least_share: f64,
     ) -> PyResult<Searches> {
         if policy_temperature <= 0.0 {
             return Err(PyValueError::new_err(format!("a policy temperature must be above 0, not {policy_temperature}")));
@@ -395,17 +391,20 @@ impl Searches {
         if fifty_move_horizon < 0.0 {
             return Err(PyValueError::new_err(format!("a fifty move horizon must be 0 (none) or above, not {fifty_move_horizon}")));
         }
+        if cpuct_stdev_prior <= 0.0 || cpuct_stdev_prior_weight < 0.0 {
+            return Err(PyValueError::new_err("the stdev prior must be above 0 and its weight at least 0"));
+        }
         Ok(Searches {
             settings: SearchSettings {
-                c_puct,
-                c_puct_factor,
-                c_puct_base,
-                fpu_reduction,
-                draw,
-                repetitions_for_a_draw,
                 policy_temperature,
                 certainty,
                 fifty_move_horizon,
+                cpuct_stdev_scale,
+                cpuct_stdev_prior,
+                cpuct_stdev_prior_weight,
+                lcb_stdevs,
+                lcb_least_share,
+                ..SearchSettings::mcts(c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw)
             },
             move_ids: move_ids(move_id_table)?,
             answer_width,
@@ -504,6 +503,18 @@ impl Searches {
         let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
         let (most, second) = search.tree.two_most_visits();
         Ok((search.tree.root().visit_count, most, second))
+    }
+
+    //the move a running search would play now (chosen_edge) and its mean score, None before the root's first visit
+    //to a move: for time management, which spends more while it keeps changing or its score falls
+    fn leader(&self, id: u64) -> PyResult<Option<(String, f64)>> {
+        let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+        let tree = &search.tree;
+        if tree.root().edges().is_empty() {
+            return Ok(None);
+        }
+        let edge = tree.chosen_edge(&self.settings);
+        Ok(tree.child(edge).filter(|child| child.visit_count > 0).map(|child| (uci(tree.chess_move(edge)), child.mean_score())))
     }
 
     //with certainty: the running search has proven its root's result (a move wins, or every move's result is known),

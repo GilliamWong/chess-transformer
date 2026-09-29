@@ -10,6 +10,7 @@ import chess
 import chess.engine
 import numpy as np
 import pytest
+import torch
 from torch import nn
 
 import selfplay_rs
@@ -20,7 +21,7 @@ from model import ChessTransformer
 from selfplay import rust_search_settings
 from tools.checkpoint import save_checkpoint
 import tools.play.engine_search as engine_search
-from tools.play.engine_search import CONTEMPT_FROM_SCORE, EngineSearch, engine_search_settings
+from tools.play.engine_search import CONTEMPT_FROM_SCORE, MCTS_EXTRAS, EngineSearch, LeaderChanges, TimeUse, engine_search_settings
 from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
@@ -108,11 +109,10 @@ def test_one_leaf_a_round_is_the_exact_search_at_every_move(monkeypatch, carlsen
 #the engine's settings are mcts.py's with its own changes over them, and a caller's over those
 def test_the_engines_settings(monkeypatch):
     monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"c_puct": 0.5, "certainty": True})
-    assert engine_search_settings(False) == {**rust_search_settings(False), "policy_temperature": 1.0, "certainty": True,
-                                             "fifty_move_horizon": 0.0, "c_puct": 0.5}
+    assert engine_search_settings(False) == {**rust_search_settings(False), **MCTS_EXTRAS, "certainty": True, "c_puct": 0.5}
     assert engine_search_settings(False, {"c_puct": 0.7})["c_puct"] == 0.7
-    assert engine_search_settings(False, own=False) == {**rust_search_settings(False), "policy_temperature": 1.0, "certainty": False,
-                                                        "fifty_move_horizon": 0.0}
+    assert engine_search_settings(False, own=False) == {**rust_search_settings(False), **MCTS_EXTRAS}
+    assert not MCTS_EXTRAS["certainty"] and MCTS_EXTRAS["cpuct_stdev_scale"] == MCTS_EXTRAS["lcb_stdevs"] == 0.0
 
 
 #with leaves out on the network, rounds stop at the search's simulations (without smart pruning, which stops sooner)
@@ -184,11 +184,13 @@ def test_go_limits():
     assert clock.limits("movetime 1000".split(), white, 800) == (None, pytest.approx(1 - MOVE_OVERHEAD_SECONDS))
     assert clock.limits("movetime 500 nodes 100".split(), white, 800) == (100, pytest.approx(0.5 - MOVE_OVERHEAD_SECONDS))
     assert clock.limits("nodes 5000".split(), black, 800) == (5000, None)
-    assert clock.limits(["infinite"], black, 800) == (800, None)
+    assert clock.limits(["infinite"], black, 800) == (800, None) and clock.most is None
 
     nodes, seconds = clock.limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), black, 800)
     assert nodes is None and seconds == pytest.approx(clock.seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 1))
     assert 0.5 < seconds < 30 * MOST_OF_THE_TIME_LEFT
+    #the most a search on the clock may take, when it runs past its time (engine_search.TimeUse)
+    assert clock.most == pytest.approx((30 - MOVE_OVERHEAD_SECONDS) * MOST_OF_THE_TIME_LEFT)
 
 
 #a search stopped early (smart pruning) leaves time on the clock, and the next moves get it; a movetime search is not
@@ -502,3 +504,80 @@ def test_contempt_starts_once_the_engine_is_ahead():
     assert search.contempt_for(board, ["e2e4", "e7e5", "g1f3"]) == 0.0
     search.last_search = (chess.STARTING_FEN, ["e2e4"], CONTEMPT_FROM_SCORE - 0.01)
     assert search.contempt_for(board, ["e2e4", "e7e5", "g1f3"]) == 0.0
+
+
+#positions of the replayed games, every few plies
+def game_positions(carlsen_games, every: int) -> list[chess.Board]:
+    positions = []
+    for game in carlsen_games:
+        board = game.board()
+        for ply, move in enumerate(game.mainline_moves()):
+            board.push(move)
+            if ply % every == every - 1 and not board.is_game_over():
+                positions.append(chess.Board(board.fen()))
+    return positions
+
+#the uniform model, but a position's score is a hash of its board, spread over 0 to 1
+class NoisyScores(nn.Module):
+    def forward(self, boards):
+        logits, _ = UniformModel()(boards)
+        hashed = (boards.long() * torch.arange(1, 71)).sum(dim=1, keepdim=True) % 97
+        return logits, (hashed.float() - 48) / 8
+
+#katago's c_puct scaled by the spread of a node's scores: where the scores never vary the scale shrinks exploration,
+#and the moves visited first keep the visits (first play urgency holds back the others); where they vary widely it
+#grows it, and more of the root's moves are tried
+@pytest.mark.parametrize("model, explores_more", [(UniformModel(), False), (NoisyScores(), True)])
+def test_c_puct_scaled_by_the_scores_spread(model, explores_more):
+    evaluate = cpu_batches(model).evaluate_boards
+    tried = {}
+    for scale in (0.0, 0.9):
+        searches = selfplay_rs.Searches(**rust_search_settings(False), cpuct_stdev_scale=scale)
+        _, _, _, root_moves, _ = searched(searches, chess.Board(), 60, evaluate)
+        tried[scale] = sum(visits > 0 for _, visits in root_moves)
+    assert (tried[0.9] > tried[0.0]) == explores_more and tried[0.9] != tried[0.0]
+
+
+#the move played by its lower confidence bound: with a bound of almost no standard errors it is the best scoring of
+#the moves visited at least a tenth as often as the most visited, never worse scoring than the most visited, and in
+#some positions another move
+def test_the_lower_confidence_bound_picks_the_move(carlsen_games):
+    evaluate = cpu_batches(BoardModel()).evaluate_boards
+    different = 0
+    for board in game_positions(carlsen_games, 11):
+        reports = []
+        for lcb_stdevs in (0.0, 1e-9):
+            searches = selfplay_rs.Searches(**rust_search_settings(False), lcb_stdevs=lcb_stdevs, lcb_least_share=0.1)
+            reports.append(searched(searches, board, 200, evaluate))
+        (_, most_visited_line, most_visited_score, root_moves, _), (_, lcb_line, lcb_score, _, _) = reports
+        assert lcb_score >= most_visited_score and dict(root_moves)[lcb_line[0]] >= 0.1 * root_moves[0][1]
+        different += lcb_line[0] != most_visited_line[0]
+    assert different > 0
+
+
+#TimeUse's budget: the planned time by default, more for changes of the best move and a falling score, less when
+#neither happened, never past the most
+def test_time_use_budget():
+    assert TimeUse().budget(1.0, 3.0, changes=4, fall=0.1) == 1.0
+    time_use = TimeUse(change_weight=0.5, fall_weight=10.0, steady=0.7)
+    assert time_use.budget(1.0, 3.0, changes=0, fall=0.0) == pytest.approx(0.7)
+    assert time_use.budget(1.0, 3.0, changes=2, fall=0.0) == pytest.approx(2.0)
+    assert time_use.budget(1.0, 3.0, changes=0, fall=0.05) == pytest.approx(1.5)
+    assert time_use.budget(1.0, 3.0, changes=2, fall=0.05) == 3.0
+
+    changes = LeaderChanges()
+    for leader, counts in (("e2e4", False), ("d2d4", False), ("e2e4", True), ("e2e4", True), ("g1f3", True)):
+        changes.observe(leader, counts)
+    assert changes.changes == 2
+
+#a search on a clock with TimeUse: the uniform model's leader keeps changing, so the search runs to the most it may
+#take; a mate in one found at once is steady, and stops at the steady share of its time
+def test_a_search_uses_its_time_as_time_use_says():
+    time_use = TimeUse(change_weight=1.0, steady=0.5)
+    timed = {}
+    for name, fen in (("changing", chess.STARTING_FEN), ("steady", "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1")):
+        search = EngineSearch(cpu_batches(UniformModel()), 16, smart_pruning=False, time_use=time_use)
+        started = time.perf_counter()
+        search.search(chess.Board(fen), seconds=0.2, most_seconds=0.5)
+        timed[name] = time.perf_counter() - started
+    assert 0.4 < timed["changing"] < 0.6 and timed["steady"] < 0.15

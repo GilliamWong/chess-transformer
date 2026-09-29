@@ -27,6 +27,39 @@ pub struct SearchSettings {
     //the network does not see the fifty move rule's count: its score is drawn towards a draw by halfmoves / this
     //(stockfish scales its eval so), so that the side ahead makes progress. 0 for none, as mcts.py
     pub fifty_move_horizon: f64,
+    //exploration scaled by how much the scores backed up through a node vary (katago's cpuctUtilityStdevScale): a
+    //node's c_puct is multiplied by 1 + scale * (stdev / prior - 1), its stdev taken as if `prior` had been seen
+    //prior_weight times more. A scale of 0 for none, as mcts.py
+    pub cpuct_stdev_scale: f64,
+    pub cpuct_stdev_prior: f64,
+    pub cpuct_stdev_prior_weight: f64,
+    //the move played is the root move with the best lower confidence bound on its score, its mean less lcb_stdevs
+    //standard errors, among those with at least lcb_least_share of the most visited's visits (leela zero's and
+    //katago's lcb). 0 for none: the most visited, as mcts.py
+    pub lcb_stdevs: f64,
+    pub lcb_least_share: f64,
+}
+
+impl SearchSettings {
+    //mcts.py's search: its constants, the engine's own settings off
+    pub fn mcts(c_puct: f64, c_puct_factor: f64, c_puct_base: f64, fpu_reduction: f64, draw: f64, repetitions_for_a_draw: usize) -> Self {
+        SearchSettings {
+            c_puct,
+            c_puct_factor,
+            c_puct_base,
+            fpu_reduction,
+            draw,
+            repetitions_for_a_draw,
+            policy_temperature: 1.0,
+            certainty: false,
+            fifty_move_horizon: 0.0,
+            cpuct_stdev_scale: 0.0,
+            cpuct_stdev_prior: 0.2,
+            cpuct_stdev_prior_weight: 2.0,
+            lcb_stdevs: 0.0,
+            lcb_least_share: 0.1,
+        }
+    }
 }
 
 //the network's score for the side to move, drawn towards a draw by SearchSettings' fifty_move_horizon
@@ -76,6 +109,7 @@ pub struct Node {
     //simulations through this node waiting for the network, and while a round is gathered its collisions
     in_flight: u32,
     pub value_sum: f64,
+    value_square_sum: f64, //of the scores' squares, for their spread
     visited_policy_sqrt: f64, //sqrt of the sum of visited children's priors, refreshed when that set or the priors change
     first_edge: u32,
     edge_count: u32, //0 until the node is expanded
@@ -87,7 +121,16 @@ const NO_NODE: u32 = u32::MAX;
 
 impl Node {
     fn new() -> Node {
-        Node { visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, first_edge: 0, edge_count: 0, proof: None }
+        Node {
+            visit_count: 0,
+            in_flight: 0,
+            value_sum: 0.0,
+            value_square_sum: 0.0,
+            visited_policy_sqrt: 0.0,
+            first_edge: 0,
+            edge_count: 0,
+            proof: None,
+        }
     }
 
     //the node's moves, as indices into the tree's edges
@@ -97,6 +140,18 @@ impl Node {
 
     pub fn mean_score(&self) -> f64 {
         self.value_sum / f64::from(self.visit_count)
+    }
+
+    //the standard deviation of the scores backed up through the node, as if `prior` had been seen `weight` times more
+    //(katago's); `prior` itself until there are two
+    fn score_stdev(&self, prior: f64, weight: f64) -> f64 {
+        let visits = f64::from(self.visit_count);
+        if visits <= 1.0 {
+            return prior;
+        }
+        let mean = self.mean_score();
+        let variance = ((mean * mean + prior * prior) * weight + self.value_square_sum) / (weight + visits - 1.0) - mean * mean;
+        variance.max(0.0).sqrt()
     }
 }
 
@@ -253,8 +308,12 @@ impl Tree {
     //exploration term (lc0's n started); an edge without a node is a child without visits. Returns the edge
     fn select_edge(&self, node: usize, settings: &SearchSettings) -> usize {
         let parent = &self.nodes[node];
-        let c_puct =
+        let mut c_puct =
             settings.c_puct + settings.c_puct_factor * ((f64::from(parent.visit_count) + settings.c_puct_base) / settings.c_puct_base).ln();
+        if settings.cpuct_stdev_scale != 0.0 {
+            let stdev = parent.score_stdev(settings.cpuct_stdev_prior, settings.cpuct_stdev_prior_weight);
+            c_puct *= 1.0 + settings.cpuct_stdev_scale * (stdev / settings.cpuct_stdev_prior - 1.0);
+        }
         let children_visits = parent.visit_count.saturating_sub(1).max(1);
         let edges = parent.edges();
         let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt;
@@ -458,6 +517,7 @@ impl Tree {
             self.nodes[node].visit_count += 1;
             self.nodes[node].in_flight -= in_flight;
             self.nodes[node].value_sum += score;
+            self.nodes[node].value_square_sum += score * score;
             if self.nodes[node].visit_count == 1 && depth > 0 {
                 self.refresh_visited_policy(path[depth - 1]);
             }
@@ -466,16 +526,20 @@ impl Tree {
     }
 
     //proves the path's last node: its visits so far count the proven score instead of theirs, in its ancestors too
-    //(lc0's AdjustForTerminal); a visit's score goes to the node and 1 - it to the parent, so the change alternates
+    //(lc0's AdjustForTerminal). A visit's score s goes to the node and 1 - s to the parent, so the sums' change
+    //alternates, and the squares' change in the parent's is the node's less twice the sums'
     fn prove(&mut self, path: &[usize], proof: Proof) {
         let (&node, ancestors) = path.split_last().expect("a node to prove");
-        let proven_sum = f64::from(self.nodes[node].visit_count) * proof.value;
-        let mut change = proven_sum - self.nodes[node].value_sum;
-        self.nodes[node].value_sum = proven_sum;
+        let visits = f64::from(self.nodes[node].visit_count);
+        let (proven_sum, proven_squares) = (visits * proof.value, visits * proof.value * proof.value);
+        let change = proven_sum - self.nodes[node].value_sum;
+        let square_change = proven_squares - self.nodes[node].value_square_sum;
+        (self.nodes[node].value_sum, self.nodes[node].value_square_sum) = (proven_sum, proven_squares);
         self.nodes[node].proof = Some(proof);
-        for &ancestor in ancestors.iter().rev() {
-            change = -change;
-            self.nodes[ancestor].value_sum += change;
+        for (distance, &ancestor) in ancestors.iter().rev().enumerate() {
+            let flipped = distance % 2 == 0;
+            self.nodes[ancestor].value_sum += if flipped { -change } else { change };
+            self.nodes[ancestor].value_square_sum += if flipped { square_change - 2.0 * change } else { square_change };
         }
     }
 
@@ -561,11 +625,36 @@ impl Tree {
         best
     }
 
-    //mcts.principal_variation, as edges
-    pub fn principal_variation(&self) -> Vec<usize> {
+    //the root's move to play: with SearchSettings' lcb_stdevs the move with the best lower confidence bound on its
+    //score among those visited at least lcb_least_share as often as the most visited (at least twice), unless the
+    //most visited is a proven win; else the most visited
+    pub fn chosen_edge(&self, settings: &SearchSettings) -> usize {
+        let most_visited = self.most_visited_edge(0);
+        let proven_win = self.child(most_visited).and_then(|child| child.proof).is_some_and(|proof| proof.outcome == Outcome::Win);
+        if settings.lcb_stdevs == 0.0 || proven_win || self.visits(most_visited) < 2 {
+            return most_visited;
+        }
+        let least_visits = (f64::from(self.visits(most_visited)) * settings.lcb_least_share).max(2.0);
+        let lower_bound = |edge: usize| {
+            let child = self.child(edge).expect("a visited move");
+            let stdev = child.score_stdev(settings.cpuct_stdev_prior, settings.cpuct_stdev_prior_weight);
+            child.mean_score() - settings.lcb_stdevs * stdev / f64::from(child.visit_count).sqrt()
+        };
+        let mut best = (most_visited, lower_bound(most_visited));
+        for edge in self.root().edges().filter(|&edge| f64::from(self.visits(edge)) >= least_visits) {
+            let bound = lower_bound(edge);
+            if bound > best.1 {
+                best = (edge, bound);
+            }
+        }
+        best.0
+    }
+
+    //mcts.principal_variation, as edges, from the root's chosen_edge
+    pub fn principal_variation(&self, settings: &SearchSettings) -> Vec<usize> {
         let (mut line, mut node) = (Vec::new(), 0);
         while self.nodes[node].edge_count > 0 {
-            let edge = self.most_visited_edge(node);
+            let edge = if node == 0 { self.chosen_edge(settings) } else { self.most_visited_edge(node) };
             if !line.is_empty() && self.visits(edge) == 0 {
                 break;
             }

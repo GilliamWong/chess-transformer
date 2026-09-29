@@ -46,6 +46,16 @@ def test_a_clock_in_nodes_is_shared_over_the_moves():
             assert min(searched) > 0 and sum(searched) < node_rate * (base + increment * len(searched))
 
 
+#engine_search.TimeUse on the clock: a variant that stops at half its planned nodes when its search is steady spends
+#fewer nodes a move than one that keeps to the plan
+def test_time_use_on_a_clock_in_nodes():
+    finished = played(("smart_pruning=0,time_steady=0.5", "smart_pruning=0"), clock=(3.0, 0.1), node_rate=50)
+
+    searched = [sum(ply["nodes"] for _, game in finished for ply in game.plies if ply["variant"] == variant) for variant in (0, 1)]
+    moves = [sum(ply["variant"] == variant for _, game in finished for ply in game.plies) for variant in (0, 1)]
+    assert searched[0] / moves[0] < 0.8 * searched[1] / moves[1]
+
+
 #a's points from both colours: 19 pairs of 1.5 of 2 and one of 0.5, a score of 0.7375 or 179 elo within its interval
 def test_pair_elo():
     records = [{"game": game, "a_white": game % 2 == 0, "result": "1-0" if game % 2 == 0 else "1/2-1/2"} for game in range(40)]
