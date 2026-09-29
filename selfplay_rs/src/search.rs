@@ -170,14 +170,15 @@ impl Node {
     }
 
     //the standard deviation of the scores backed up through the node, as if `prior` had been seen `weight` times more
-    //(katago's); `prior` itself until there are two
+    //(katago's, on scores centred on a draw as its utilities are centred on 0); `prior` itself until there are two
     fn score_stdev(&self, prior: f64, weight: f64) -> f64 {
         let visits = f64::from(self.visit_count);
         if visits <= 1.0 {
             return prior;
         }
-        let mean = self.mean_score();
-        let variance = ((mean * mean + prior * prior) * weight + self.value_square_sum) / (weight + self.weight_sum - 1.0) - mean * mean;
+        let mean = self.mean_score() - 0.5;
+        let square_sum = self.value_square_sum - self.value_sum + 0.25 * self.weight_sum;
+        let variance = ((mean * mean + prior * prior) * weight + square_sum) / (weight + self.weight_sum - 1.0) - mean * mean;
         variance.max(0.0).sqrt()
     }
 }
