@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import shutil
 
 import chess
 import numpy as np
@@ -199,19 +200,27 @@ def test_the_engine_takes_the_tables_move_at_6_pieces(tablebase6):
     assert report.simulations == 0 and report.line == [ranked_moves(tablebase6, board)[0].move]
     assert default.simulations > 0
 
+#the table sets with the 6 piece one as its wdl tables alone: hard links in a folder of their own, removed afterwards (a
+#link left in pytest's temporary folders would keep 73 GB on the disk after the tables are deleted)
+@pytest.fixture(scope="module")
+def wdl_only_table_sets(tablebase6, tmp_path_factory):
+    five, six = TABLE_SETS
+    wdl_only = TableSet(6, tmp_path_factory.mktemp("syzygy6"), six.lichess_name, six.tables_per_half)
+    try:
+        try:
+            for table in six.folder.glob("*.rtbw"):
+                os.link(table, wdl_only.folder / table.name)
+        except OSError as error:
+            pytest.skip(f"no hard links from {six.folder} to {wdl_only.folder}: {error}")
+        yield five, wdl_only
+    finally:
+        shutil.rmtree(wdl_only.folder)
+
 #with only the 6 piece wdl tables the engine searches a 6 piece root (probing no dtz table) and takes the rook, which the
 #tables call a win; from 7 pieces its search sees that win in the 6 pieces after the capture
 @pytest.mark.parametrize("fen", [SIX_PIECES, SEVEN_PIECES])
-def test_the_engine_searches_6_pieces_without_their_dtz_tables(tablebase6, tmp_path, monkeypatch, fen):
-    five, six = TABLE_SETS
-    wdl_only = TableSet(6, tmp_path / "syzygy6", six.lichess_name, six.tables_per_half)
-    wdl_only.folder.mkdir()
-    try:
-        for table in six.folder.glob("*.rtbw"):
-            os.link(table, wdl_only.folder / table.name)
-    except OSError as error:
-        pytest.skip(f"no hard links from {six.folder} to {tmp_path}: {error}")
-    monkeypatch.setattr("tools.tablebase.TABLE_SETS", (five, wdl_only))
+def test_the_engine_searches_6_pieces_without_their_dtz_tables(wdl_only_table_sets, monkeypatch, fen):
+    monkeypatch.setattr("tools.tablebase.TABLE_SETS", wdl_only_table_sets)
 
     report = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True, tablebase_pieces=6).search(chess.Board(fen), 400)
 
