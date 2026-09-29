@@ -199,8 +199,10 @@ def test_the_engine_takes_the_tables_move_at_6_pieces(tablebase6):
     assert report.simulations == 0 and report.line == [ranked_moves(tablebase6, board)[0].move]
     assert default.simulations > 0
 
-#with only the 6 piece wdl tables the engine searches a 6 piece root (probing no dtz table) and keeps the win
-def test_the_engine_searches_6_pieces_without_their_dtz_tables(tablebase6, tmp_path, monkeypatch):
+#with only the 6 piece wdl tables the engine searches a 6 piece root (probing no dtz table) and takes the rook, which the
+#tables call a win; from 7 pieces its search sees that win in the 6 pieces after the capture
+@pytest.mark.parametrize("fen", [SIX_PIECES, SEVEN_PIECES])
+def test_the_engine_searches_6_pieces_without_their_dtz_tables(tablebase6, tmp_path, monkeypatch, fen):
     five, six = TABLE_SETS
     wdl_only = TableSet(6, tmp_path / "syzygy6", six.lichess_name, six.tables_per_half)
     wdl_only.folder.mkdir()
@@ -210,10 +212,9 @@ def test_the_engine_searches_6_pieces_without_their_dtz_tables(tablebase6, tmp_p
     except OSError as error:
         pytest.skip(f"no hard links from {six.folder} to {tmp_path}: {error}")
     monkeypatch.setattr("tools.tablebase.TABLE_SETS", (five, wdl_only))
-    board = chess.Board(SIX_PIECES)
 
-    report = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True, tablebase_pieces=6).search(board, simulations=400)
+    report = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True, tablebase_pieces=6).search(chess.Board(fen), 400)
 
-    assert report.simulations > 0
-    board.push(report.line[0])
-    assert tablebase6.probe_wdl(board) == -2
+    #smart pruning stops the search once the move is decided
+    takes_the_rook = chess.Move.from_uci("d1d5")
+    assert report.line[0] == takes_the_rook and dict(report.root_moves)[takes_the_rook] > report.simulations / 2
