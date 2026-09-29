@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
-from model import NUM_SQUARES, TransformerBlock
+from model import NUM_SQUARES, SquareFeatures, TransformerBlock
 
 #an instance of the kernel takes BLOCK_M query rows of one head for CHUNK positions; fastest on an RTX 4090 of the
 #tried 16/32/64 rows, chunks of 4/8/16 and 2/4/8 warps (41 us a block of 64 positions, the first version 57 us)
@@ -201,7 +201,53 @@ class FusedBlock(nn.Module):
         return linear(linear(self.ln2(x), self.gate_up, gated=True), self.down, residual=x)
 
 
-#the model with its blocks swapped for FusedBlocks, for inference only; embeddings, square features and heads unchanged
+#squares a program of feature_sum_kernel sums
+FEATURE_SQUARES = 8
+
+
+#embedding_bag's sum of each square's feature rows, in fp32 and in the same order, as one kernel: torch's took 62 us
+#of a 1.6 ms batch of 64, torch.compile's gather and sum 71 us
+@triton.jit
+def feature_sum_kernel(rows_ptr, table_ptr, out_ptr, squares, D, FEATURES: tl.constexpr, BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr):
+    square = tl.program_id(0) * BLOCK_S + tl.arange(0, BLOCK_S)
+    d = tl.arange(0, BLOCK_D)
+    square_ok, d_ok = square < squares, d < D
+    total = tl.zeros((BLOCK_S, BLOCK_D), dtype=tl.float32)
+    for feature in range(FEATURES):
+        row = tl.load(rows_ptr + square * FEATURES + feature, mask=square_ok, other=0)
+        total += tl.load(table_ptr + row[:, None] * D + d[None, :], mask=square_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    tl.store(out_ptr + square[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=square_ok[:, None] & d_ok[None, :])
+
+
+@torch.library.custom_op("chess::feature_sum", mutates_args=())
+def feature_sum(rows: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    rows, table = rows.contiguous(), table.contiguous()
+    features, D = rows.shape[-1], table.shape[1]
+    out = table.new_empty(*rows.shape[:-1], D)
+    squares = rows.numel() // features
+    feature_sum_kernel[(triton.cdiv(squares, FEATURE_SQUARES),)](rows, table, out, squares, D, FEATURES=features, BLOCK_S=FEATURE_SQUARES,
+                                                                  BLOCK_D=triton.next_power_of_2(D))
+    return out
+
+
+@feature_sum.register_fake
+def _(rows, table):
+    return table.new_empty(*rows.shape[:-1], table.shape[1])
+
+
+#model.SquareFeatures with its rows summed by feature_sum_kernel
+class SummedSquareFeatures(nn.Module):
+    def __init__(self, features: SquareFeatures):
+        super().__init__()
+        self.features = features
+
+    def forward(self, board_state: torch.Tensor) -> torch.Tensor:
+        return feature_sum(self.features.indices(board_state) + self.features.row_offsets, self.features.table)
+
+
+#the model with its blocks swapped for FusedBlocks and its square features summed as above, for inference only;
+#embeddings and heads unchanged
 def fuse_blocks(model: nn.Module) -> nn.Module:
     model.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
+    model.square_features = SummedSquareFeatures(model.square_features)
     return model

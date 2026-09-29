@@ -84,8 +84,9 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
     assert torch.allclose(expected_score(value_logits.float()), expected_score(expected_value_logits), atol=0.01)
 
 
-#fused_blocks.FusedBlock must compute what model.TransformerBlock does: with random templates (zeros at init would hide
-#the template bias), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel)
+#fused_blocks.FusedBlock must compute what model.TransformerBlock does, and SummedSquareFeatures what SquareFeatures
+#does: with random templates and square features (zeros at init would hide them), grouped key/value heads and
+#query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_fused_blocks_compute_what_the_model_does():
     from fused_blocks import fuse_blocks
