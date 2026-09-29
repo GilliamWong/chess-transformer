@@ -94,11 +94,23 @@ def _(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_c
     return projected.new_empty(B, T, heads * dv)
 
 
-#a tile of the blocks' matmuls is LINEAR_ROWS x LINEAR_COLUMNS, LINEAR_DEPTH deep (a gated matmul's is LINEAR_COLUMNS / 2
-#columns of the gate and the same of up), and GROUP_M row tiles go through the columns together so their rows stay in
-#L2. The fastest on an RTX 4090 at 64 positions of 32 to 128 rows, 64 to 256 columns, 2 to 4 stages and 4 or 8 warps;
-#smaller tiles for smaller batches gained under 1% of a search
+#a tile of the blocks' matmuls is LINEAR_ROWS (+ linear_extra_rows()) x LINEAR_COLUMNS, LINEAR_DEPTH deep (a gated
+#matmul's is LINEAR_COLUMNS / 2 columns of the gate and the same of up), and GROUP_M row tiles go through the columns
+#together so their rows stay in L2. The fastest on an RTX 4090 at 64 positions of 32 to 128 rows, 64 to 256 columns,
+#2 to 4 stages and 4 or 8 warps; smaller tiles for smaller batches gained under 1% of a search
 LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_DEPTH, LINEAR_WARPS, LINEAR_STAGES, GROUP_M = 128, 128, 32, 4, 3, 8
+#a tile's extra rows each cost about this many of its LINEAR_ROWS (they are a smaller matmul of their own)
+EXTRA_ROW_COST = 1.5
+
+
+#the rows (0, 16, 32 or 64) a tile takes after its LINEAR_ROWS: a matmul runs in waves of a tile per multiprocessor,
+#and a few tiles more than a whole number of waves cost a whole wave. At 64 positions (4,480 rows) a 512 column
+#matmul has 140 tiles of 128 rows for 128 multiprocessors, or 128 tiles of 144
+def linear_extra_rows(M: int, column_tiles: int, multiprocessors: int) -> int:
+    def cost(extra: int) -> float:
+        waves = triton.cdiv(triton.cdiv(M, LINEAR_ROWS + extra) * column_tiles, multiprocessors)
+        return waves * (LINEAR_ROWS + EXTRA_ROW_COST * extra)
+    return min((0, 16, 32, 64), key=cost)
 
 
 #out = x @ w (w is in_features x out_features), then in the same kernel the bias, silu(gate) * up (gated: w's first
@@ -106,42 +118,67 @@ LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_DEPTH, LINEAR_WARPS, LINEAR_STAGES, GROUP_M 
 #blocks, as cuBLAS did with allow_fp16_accumulation (twice fp32 accumulation's speed on a geforce card); the
 #elementwise work is in fp32
 @triton.jit
-def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride_w,
-                  HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, ACC_TYPE: tl.constexpr,
-                  BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
-    pid = tl.program_id(0)
-    grid_m, grid_n = tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N)
-    in_group = GROUP_M * grid_n
-    first_m = pid // in_group * GROUP_M
-    group_rows = min(grid_m - first_m, GROUP_M)
-    pid_m = first_m + pid % in_group % group_rows
-    pid_n = pid % in_group // group_rows
-    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    depth = tl.arange(0, BLOCK_K)
+def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr,
+                    HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr):
     row_ok, col_ok = rows < M, cols < N
-    x_ptrs = x_ptr + rows[:, None] * K + depth[None, :]
-    w_ptrs = w_ptr + depth[:, None] * stride_w + cols[None, :]
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
-    up = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
-    for _ in range(0, K, BLOCK_K):
-        x = tl.load(x_ptrs, mask=row_ok[:, None], other=0.0)
-        acc = tl.dot(x, tl.load(w_ptrs, mask=col_ok[None, :], other=0.0), acc, out_dtype=ACC_TYPE)
-        if GATED:
-            up = tl.dot(x, tl.load(w_ptrs + N, mask=col_ok[None, :], other=0.0), up, out_dtype=ACC_TYPE)
-        x_ptrs += BLOCK_K
-        w_ptrs += BLOCK_K * stride_w
-
     out = acc.to(tl.float32)
     if HAS_BIAS:
         out += tl.load(bias_ptr + cols, mask=col_ok, other=0.0).to(tl.float32)[None, :]
     if GATED:
         out = out * tl.sigmoid(out) * up.to(tl.float32)
-    out_offsets = rows[:, None] * N + cols[None, :]
+    offsets = rows[:, None] * N + cols[None, :]
     if HAS_RESIDUAL:
-        out += tl.load(residual_ptr + out_offsets, mask=row_ok[:, None] & col_ok[None, :], other=0.0).to(tl.float32)
-    tl.store(out_ptr + out_offsets, out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None] & col_ok[None, :])
+        out += tl.load(residual_ptr + offsets, mask=row_ok[:, None] & col_ok[None, :], other=0.0).to(tl.float32)
+    tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None] & col_ok[None, :])
+
+
+@triton.jit
+def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride_w,
+                  HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, ACC_TYPE: tl.constexpr,
+                  BLOCK_M: tl.constexpr, EXTRA_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+    pid = tl.program_id(0)
+    TILE_M: tl.constexpr = BLOCK_M + EXTRA_M
+    grid_m, grid_n = tl.cdiv(M, TILE_M), tl.cdiv(N, BLOCK_N)
+    in_group = GROUP_M * grid_n
+    first_m = pid // in_group * GROUP_M
+    group_rows = min(grid_m - first_m, GROUP_M)
+    pid_m = first_m + pid % in_group % group_rows
+    pid_n = pid % in_group // group_rows
+    rows = pid_m * TILE_M + tl.arange(0, BLOCK_M)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    depth = tl.arange(0, BLOCK_K)
+    col_ok = cols < N
+    x_ptrs = x_ptr + rows[:, None] * K + depth[None, :]
+    w_ptrs = w_ptr + depth[:, None] * stride_w + cols[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    up = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    #the tile's EXTRA_M rows after its BLOCK_M, a matmul of their own on the same weights (a row's sums are the same
+    #bits in either)
+    if EXTRA_M > 0:
+        extra_rows = pid_m * TILE_M + BLOCK_M + tl.arange(0, EXTRA_M)
+        extra_ptrs = x_ptr + extra_rows[:, None] * K + depth[None, :]
+        extra_acc = tl.zeros((EXTRA_M, BLOCK_N), dtype=ACC_TYPE)
+        extra_up = tl.zeros((EXTRA_M, BLOCK_N), dtype=ACC_TYPE)
+
+    for _ in range(0, K, BLOCK_K):
+        w = tl.load(w_ptrs, mask=col_ok[None, :], other=0.0)
+        x = tl.load(x_ptrs, mask=(rows < M)[:, None], other=0.0)
+        acc = tl.dot(x, w, acc, out_dtype=ACC_TYPE)
+        if GATED:
+            w_up = tl.load(w_ptrs + N, mask=col_ok[None, :], other=0.0)
+            up = tl.dot(x, w_up, up, out_dtype=ACC_TYPE)
+        if EXTRA_M > 0:
+            x_extra = tl.load(extra_ptrs, mask=(extra_rows < M)[:, None], other=0.0)
+            extra_acc = tl.dot(x_extra, w, extra_acc, out_dtype=ACC_TYPE)
+            if GATED:
+                extra_up = tl.dot(x_extra, w_up, extra_up, out_dtype=ACC_TYPE)
+            extra_ptrs += BLOCK_K
+        x_ptrs += BLOCK_K
+        w_ptrs += BLOCK_K * stride_w
+
+    linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL, GATED)
+    if EXTRA_M > 0:
+        linear_epilogue(extra_acc, extra_up, extra_rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL, GATED)
 
 
 #an opaque op for torch.compile, as template_attention. fp16 inputs accumulate in fp16 and give fp16, or with
@@ -158,13 +195,14 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = No
     acc_type = tl.float16 if x.dtype == torch.float16 and not accumulate_fp32 else tl.float32
     M = x.numel() // K
     columns = LINEAR_COLUMNS // 2 if gated else LINEAR_COLUMNS
+    extra = linear_extra_rows(M, triton.cdiv(N, columns), torch.cuda.get_device_properties(x.device).multi_processor_count)
     #the pointers of unused inputs are never read
     bias_ = bias if bias is not None else weight
     residual_ = residual.contiguous() if residual is not None else out
-    grid = (triton.cdiv(M, LINEAR_ROWS) * triton.cdiv(N, columns),)
+    grid = (triton.cdiv(M, LINEAR_ROWS + extra) * triton.cdiv(N, columns),)
     linear_kernel[grid](x, weight, bias_, residual_, out, M, N, K, weight.stride(0), HAS_BIAS=bias is not None, HAS_RESIDUAL=residual is not None,
-                        GATED=gated, ACC_TYPE=acc_type, BLOCK_M=LINEAR_ROWS, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M, num_warps=LINEAR_WARPS,
-                        num_stages=LINEAR_STAGES)
+                        GATED=gated, ACC_TYPE=acc_type, BLOCK_M=LINEAR_ROWS, EXTRA_M=extra, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M,
+                        num_warps=LINEAR_WARPS, num_stages=LINEAR_STAGES)
     return out
 
 

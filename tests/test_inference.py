@@ -135,6 +135,33 @@ def test_linear_kernel_in_fp16(gated):
     assert torch.allclose(out.float(), expected, atol=0.03, rtol=0.01)
 
 
+#a tile's extra rows (fused_blocks.linear_extra_rows) are a matmul of their own on the same weights: every row comes
+#out the same bits whichever tile it falls in, in plain, gated and fp32 accumulating matmuls
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("gated, accumulate_fp32", [(False, False), (True, False), (False, True)])
+def test_extra_rows_leave_every_row_the_same(monkeypatch, gated, accumulate_fp32):
+    import fused_blocks
+    torch.manual_seed(0)
+    x = torch.randn(1000, 512, device="cuda").half()
+    weight = (torch.randn(512, 400 if gated else 200, device="cuda") / 512**0.5).half()
+    bias = None if gated else torch.randn(200, device="cuda").half()
+
+    outs = []
+    for extra in (0, 16, 32, 64):
+        monkeypatch.setattr(fused_blocks, "linear_extra_rows", lambda M, column_tiles, multiprocessors, extra=extra: extra)
+        outs.append(fused_blocks.linear(x, weight, bias, None, gated, accumulate_fp32))
+
+    assert all(torch.equal(out, outs[0]) for out in outs[1:])
+
+
+#at 64 positions (4,480 rows) a 512 column matmul's 140 tiles of 128 rows take two waves of an RTX 4090's 128
+#multiprocessors and 128 tiles of 144 rows one; tiles that fill their waves take no extra rows
+def test_extra_rows_save_a_wave():
+    fused_blocks = pytest.importorskip("fused_blocks")
+    assert fused_blocks.linear_extra_rows(64 * 70, 4, 128) == 16
+    assert fused_blocks.linear_extra_rows(56 * 70, 4, 128) == 0
+
+
 #the policy head's from and to projections (fused_blocks.HalfInputLinear): fp16 inputs accumulating in fp32 and
 #giving fp32, as close to the fp32 matmul as fp16's rounding of the weights allows
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
