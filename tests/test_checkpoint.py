@@ -79,7 +79,7 @@ def test_a_warm_start_with_other_bins_renews_only_the_last_layer_of_the_eval_hea
 def test_checkpoint_with_template_maps_points_to_the_commit_that_has_them(tmp_path):
     torch.save({"model_settings": {**SETTINGS, "template_maps": 192}, "state_dict": {}}, tmp_path / "old.pt")
 
-    with pytest.raises(ValueError, match="634f2e3"):
+    with pytest.raises(ValueError, match="1a976d9"):
         load_checkpoint(tmp_path / "old.pt", CPU)
 
 

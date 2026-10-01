@@ -36,7 +36,7 @@ finished run.
 
 Older runs are in `artifacts/runs_archive/` (`uv run tensorboard --logdir artifacts/runs_archive --port 6007`).
 Checkpoints from before the 2026-09-23 cleanup load only from a checkout of tag `pre-cleanup-2026-09-23`, and the two
-that used template maps from commit `634f2e3`; loading one here says so.
+that used template maps from commit `1a976d9`; loading one here says so.
 
 A training set is `artifacts/processed_data/<name>_{train,val}_boards.bin` plus Stockfish's labels of every position,
 `<name>_{train,val}_stockfish_{moves,evals}.bin`. The default, `full_sf8_30M_mix`, is 30M positions of whole games from
@@ -98,14 +98,14 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
   from 0.06 early to 0.010 at the end, a fixed head start of about 1,000 steps plus a lasting gain. With 5 layers the
   features gain 0.022 (1.8752 against 1.8973), matching the 6-layer model without them. Against Stockfish 1700 (1,000
   games) +9 ± 28 Elo at 6 layers. Cost per step: QK-norm +0.6% at d128, +3.4% at d512; the features +5% at d128,
-  nothing measurable at d512. The sink, in the model from 76062f9, was taken out again: no gain, and it did not stop
+  nothing measurable at d512. The sink, in the model from f47b28e, was taken out again: no gain, and it did not stop
   block 1's scores running away.
 - Gated attention (Qiu et al. 2025, a sigmoid of the query's state on each head's output) was tried on the same bed and
   left out: one gate per head 1.8686 (nothing), one per channel 1.8509 but with 9% more block parameters, 1.8591 with
   the MLP narrowed to match them (-0.009, one seed). The gates stayed near 0.46 rather than going sparse as in the
   paper, and at d512 the per-channel gate would cost about 15% of a block's matrix work.
-- Checkpoints from before the sink load from commit 0ef8f7d, with the sink but before QK-norm from 474e5ed, with the
-  sink and QK-norm but before the square features from 6b4d786 (which also soft-caps the scores).
+- Checkpoints from before the sink load from commit d969ada, with the sink but before QK-norm from ee34470, with the
+  sink and QK-norm but before the square features from d1803d0 (which also soft-caps the scores).
 - The blunder penalty, `--blunder-weight 4`: +27 Elo on a d128. It needs blunder labels next to the set
   (`<set>_{split}_worst_{moves,losses}.bin`); a set without them trains as if the weight were 0. A move counts as a
   blunder from 0.3 expected score lost (`--blunder-threshold`): thresholds 0.1, 0.2 and 0.3 played the same Elo
@@ -155,7 +155,7 @@ Target changes (1, 2) can raise val loss against the depth-12 labels while playi
 judge's big-mistake rate and by Elo. Every win on the 4-minute d128 bed needs an equal-position long run before adoption.
 Distillation (`main.py --teacher-weight`, `tools/teacher_targets.py`) is in the code. The tested-and-dropped items 2 and 4-7,
 and the MLP study's flags, were taken out again; their code is in `artifacts/experiments_20261001.patch` (applies to
-e144d40), and their runs' checkpoints load only with it applied.
+c7021d6), and their runs' checkpoints load only with it applied.
 
 1. [~] **Distill from our own bigger model.** Tested 2026-10-01 (d128 4-min, teacher = the 10-pass d512): teacher weight 1 -0.019 val, the per-move judge's best on every measure (lost/move 0.0249 vs 0.0259, >0.2 2.5% vs 2.8%), +32 Elo (+-45); weight 0.5 -0.013. Next: does it last at 100M positions. Students train on the d512's full move and value distributions mixed with
    the Stockfish targets (the labels say nothing about most legal moves). Test: the d512's outputs on the 30M set, then
