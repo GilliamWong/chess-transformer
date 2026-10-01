@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
-from model import NUM_SQUARES, SquareFeatures, TransformerBlock
+from model.model import NUM_SQUARES, SquareFeatures, TransformerBlock
 
 #an instance of the kernel takes BLOCK_M query rows of one head for CHUNK positions; fastest on an RTX 4090 of the
 #tried 16/32/64 rows, chunks of 4/8/16 and 2/4/8 warps (41 us a block of 64 positions, the first version 57 us)

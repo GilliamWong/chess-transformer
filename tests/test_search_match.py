@@ -5,7 +5,7 @@ import chess
 import pytest
 
 from fake_models import UniformModel
-from inference import cpu_batches
+from engine.inference import cpu_batches
 from tools.play.search_match import OUR_NAME, play_match, result
 
 

@@ -3,7 +3,7 @@ from random import Random
 import chess
 import pytest
 
-from encoding import (
+from model.encoding import (
     ALL_POSSIBLE_MOVES,
     CASTLING_TOKEN_OFFSET,
     EN_PASSANT_TOKEN_OFFSET,

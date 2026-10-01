@@ -1,6 +1,6 @@
-#self play for expert iteration: every position is saved with what mcts found there, as a training set for main.py.
-#   python selfplay.py artifacts/runs/rl_start_d128_4min/model.pt --name selfplay_r1 --positions 1_000_000 --tablebase
-#   python main.py --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix
+#self play for expert iteration: every position is saved with what mcts found there, as a training set for train.py.
+#   python -m engine.selfplay artifacts/runs/rl_start_d128_4min/model.pt --name selfplay_r1 --positions 1_000_000 --tablebase
+#   python -m training.train --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix
 #the games run in rust (selfplay_rs/): mirror any change to mcts.py's search or the rules there, tests/test_selfplay_rs.py
 #holds it to the python reference in tests/reference_selfplay.py
 from __future__ import annotations
@@ -26,14 +26,14 @@ except ImportError:
 import chess
 import numpy as np
 from tqdm import tqdm
-import mcts
+from engine import mcts
 import selfplay_rs
-from encoding import MOVE_IDS_BY_SQUARES, NUM_MOVE_IDS, TOKENS_PER_BOARD
+from model.encoding import MOVE_IDS_BY_SQUARES, NUM_MOVE_IDS, TOKENS_PER_BOARD
 from tools.label_with_stockfish import NO_MOVE
 from tools.tablebase import TABLEBASE_PIECES, open_tablebase, tablebase_path
 #every worker imports this file, so nothing at the top may import torch (data.py, tools.checkpoint and inference.py do)
 
-SIMULATIONS = 64 #+390 elo over the policy alone (artifacts/mcts_ladder_2026-09-23.md)
+SIMULATIONS = 64 #+390 elo over the policy alone (artifacts/reports/mcts_ladder_2026-09-23.md)
 TOP_MOVES = 8
 SAMPLED_PLIES = 30
 #the move played keeps its subtree: the same target quality for 38 new simulations a move instead of 64
@@ -176,7 +176,7 @@ class SelfPlaySet:
 
     #every file of a split, with the bytes one position takes in it
     def files(self, split: str) -> dict[str, tuple[Path, int]]:
-        from data import SELF_PLAY_FILES
+        from training.data import SELF_PLAY_FILES
         widths = {"boards": TOKENS_PER_BOARD, "visit_moves": TOP_MOVES, "visit_shares": TOP_MOVES, "outcomes": 1, "root_scores": 1}
         dtypes = {"boards": np.uint8, **SELF_PLAY_FILES}
         return {kind: (self.folder / f"{self.name}_{split}_{kind}.bin", widths[kind] * np.dtype(dtypes[kind]).itemsize) for kind in widths}
@@ -287,7 +287,7 @@ class Workers:
 
         self.served_calls, self.served_positions = context.Value("q", 0, lock=False), context.Value("q", 0, lock=False)
         self.inference_ready, self.inference_stop = context.Event(), context.Event()
-        from inference import inference_process
+        from engine.inference import inference_process
         slot_names = [(slot.boards.name, slot.answers.name) for slot in self.slots]
         self.inference = context.Process(target=inference_process, daemon=True,
                                          args=(checkpoint_path, compile_model, precision, games_per_process, slot_names, [slot.server_end for slot in self.slots],
@@ -379,7 +379,7 @@ def set_priority(priority_class: int) -> None:
 
 def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use_tablebase: bool, processes: int, games_per_process: int, seed: int,
          tree_reuse: bool, compile_model: bool, precision: str) -> None:
-    from data import PROCESSED_DATA_DIR
+    from training.data import PROCESSED_DATA_DIR
     from tools.checkpoint import RUNS_DIR
     if simulations < 2:
         raise ValueError("a search of fewer than 2 simulations visits no move, so there would be no visit shares to learn")
@@ -495,7 +495,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
     print(f"{name}: {record['positions']['train']:,} train and {record['positions']['val']:,} val positions from {record['games']:,} games "
           f"({games.positions() / record['games']:.0f} plies a game), white {record['white_scores']['1.0']}, draws {record['white_scores']['0.5']}, "
           f"black {record['white_scores']['0.0']}, {games.positions() / record['seconds'] * 3600:,.0f} positions an hour")
-    print(f"fine-tune on it: python main.py --init-checkpoint {checkpoint_path} --training-set {name} --mix-set full_sf8_30M_mix")
+    print(f"fine-tune on it: python -m training.train --init-checkpoint {checkpoint_path} --training-set {name} --mix-set full_sf8_30M_mix")
 
 
 if __name__ == "__main__":

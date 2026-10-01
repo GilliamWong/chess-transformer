@@ -10,10 +10,10 @@ import chess
 import numpy as np
 import torch
 from torch import nn
-from encoding import TOKENS_PER_BOARD, encode_board
-from model import expected_score
-from selfplay import ANSWER_WIDTH, set_priority, slot_arrays
-from tools.play.player import load_model
+from model.encoding import TOKENS_PER_BOARD, encode_board
+from model.model import expected_score
+from engine.selfplay import ANSWER_WIDTH, set_priority, slot_arrays
+from engine.player import load_model
 
 #a row of ANSWER_WIDTH numbers per board: the move logits, then the expected score
 def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -136,14 +136,14 @@ FP16_RESIDUAL_SCALE = 1 / 16
 #(total variation 0.0012 against 0.0049). It sets torch's matmul flags for the whole process
 def fp16_model(checkpoint_path: Path) -> nn.Module:
     #imported here: it needs Triton, which the cpu-only paths do not
-    from fused_blocks import fuse_blocks
+    from model.fused_blocks import fuse_blocks
     torch.backends.cuda.matmul.allow_fp16_accumulation = True
     #the heads' fp32 matmuls
     torch.backends.cuda.matmul.allow_tf32 = True
     model = load_model(checkpoint_path, torch.device("cuda")).scale_residual_stream(FP16_RESIDUAL_SCALE)
     return fuse_blocks(model).half_except_heads(torch.float16)
 
-#bf16 autocast, as main.py trains: targets as good as tf32's, and ~150k positions/s instead of 110k (d128, compiled)
+#bf16 autocast, as train.py trains: targets as good as tf32's, and ~150k positions/s instead of 110k (d128, compiled)
 class Bf16(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()

@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from main import value_correct, value_error, value_loss, value_target_bins
-from model import ChessTransformer, expected_score
+from training.train import value_correct, value_error, value_loss, value_target_bins
+from model.model import ChessTransformer, expected_score
 from tools.checkpoint import load_checkpoint, save_checkpoint
 
 CPU = torch.device("cpu")

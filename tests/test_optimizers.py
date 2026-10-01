@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from main import WEIGHT_DECAY, MasterWeights, blunder_loss, make_optimizers, policy_loss, value_loss
+from training.train import WEIGHT_DECAY, MasterWeights, blunder_loss, make_optimizers, policy_loss, value_loss
 from tools.label_with_stockfish import NO_MOVE
-from model import ChessTransformer
+from model.model import ChessTransformer
 
 CPU = torch.device("cpu")
 BLOCK_LINEAR_LAYERS = ["Q", "K", "V", "combine_heads", "mlp.up_projection", "mlp.gate_projection", "mlp.down_projection", "template_mix"]
@@ -95,7 +95,7 @@ def test_training_with_muon_learns_a_batch():
         assert not torch.equal(dict(model.named_parameters())[name], weights_before[name]), name
 
 
-#a step of main.train's: the bf16 copy's gradients reach the fp32 weights whole, and the copy then has the stepped
+#a step of train.train's: the bf16 copy's gradients reach the fp32 weights whole, and the copy then has the stepped
 #weights. A copy that kept its own weights, or optimizers stepping it directly, would train in bf16 alone
 def test_master_weights_step_the_fp32_model_and_the_bf16_copy_follows():
     model = small_model()

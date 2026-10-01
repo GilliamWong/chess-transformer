@@ -5,9 +5,9 @@ import pytest
 import torch
 from torch import nn
 
-from encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD, encode_board, encode_move_to_id
-from main import value_loss
-from model import VALUE_BINS, ChessTransformer, mlp_hidden_width
+from model.encoding import NUM_MOVE_IDS, PROMOTION_MOVE_IDS, TOKENS_PER_BOARD, encode_board, encode_move_to_id
+from training.train import value_loss
+from model.model import VALUE_BINS, ChessTransformer, mlp_hidden_width
 
 BATCH_SIZE = 16
 

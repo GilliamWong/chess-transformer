@@ -1,6 +1,6 @@
 #monte carlo tree search over the model: the policy gives the priors, the eval head scores the leaves.
 #scores are expected scores, 0 lost to 1 won. Watch one search:
-#   python mcts.py artifacts/runs/rl_start_d128_4min/model.pt --fen "<fen>" --simulations 800 --cpu
+#   python -m engine.mcts artifacts/runs/rl_start_d128_4min/model.pt --fen "<fen>" --simulations 800 --cpu
 from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import chess
 import chess.syzygy
 import numpy as np
-from encoding import encode_board, encode_move_to_id
+from model.encoding import encode_board, encode_move_to_id
 from tools.tablebase import covers, open_tablebase, ranked_moves, wdl_score
 #self play's workers import this file for its constants and must not import torch
 if TYPE_CHECKING:
@@ -52,7 +52,7 @@ def evaluate(model: nn.Module, board: chess.Board, device: torch.device) -> tupl
 
 def evaluate_many(model: nn.Module, boards: list[chess.Board], device: torch.device) -> list[tuple[dict[chess.Move, float], float]]:
     import torch
-    from model import expected_score
+    from model.model import expected_score
     legal_moves = [list(board.legal_moves) for board in boards]
     for board, moves in zip(boards, legal_moves):
         if len(moves) == 0:
@@ -209,7 +209,7 @@ def print_search(root: Node, board: chess.Board, top: int = 10) -> None:
         print(f"{board.san(move):<8}{child.prior:>8.1%}{child.visit_count:>8}{score:>8}")
 
 def main(checkpoint_path: Path, fen: str, simulations: int, device: torch.device, use_tablebase: bool = False) -> None:
-    from tools.play.player import load_model
+    from engine.player import load_model
     global tablebase
     if use_tablebase:
         tablebase = open_tablebase()

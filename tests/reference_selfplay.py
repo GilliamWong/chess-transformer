@@ -1,13 +1,13 @@
 #self play in python, with mcts.py's search: the reference the rust games (selfplay_rs) are held to in test_selfplay_rs.py.
-#a change to the search or the rules goes here and into selfplay_rs/src alike
+#a change to the search or the rules goes here and into engine/selfplay_rs/src alike
 from collections.abc import Iterable, Iterator
 import chess
 import numpy as np
 import torch
 from torch import nn
-import mcts
-from encoding import TOKENS_PER_BOARD, encode_board, encode_move_to_id
-from selfplay import MAX_PLIES, SAMPLED_PLIES, SEED, TOP_MOVES, TREE_REUSE, Game
+from engine import mcts
+from model.encoding import TOKENS_PER_BOARD, encode_board, encode_move_to_id
+from engine.selfplay import MAX_PLIES, SAMPLED_PLIES, SEED, TOP_MOVES, TREE_REUSE, Game
 from tools.label_with_stockfish import NO_MOVE
 from tools.tablebase import covers, wdl_score
 

@@ -7,10 +7,10 @@ import pytest
 import torch
 from torch import nn
 
-import data
-from data import EXPECTED_SCORE_PER_CENTIPAWN, load_training_set
-from encoding import TOKENS_PER_BOARD, encode_move_to_id
-from main import policy_loss
+from training import data
+from training.data import EXPECTED_SCORE_PER_CENTIPAWN, load_training_set
+from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
+from training.train import policy_loss
 from tools import label_with_stockfish
 from tools.label_with_stockfish import MATE_EVAL, NO_EVAL, NO_MOVE, score_to_eval, whole_games_prefix
 from tools.play.download_engines import STOCKFISH

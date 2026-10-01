@@ -14,18 +14,20 @@ uv sync
 ```
 
 This installs Python, every dependency (PyTorch's CUDA 13.0 build) and compiles self-play's Rust module
-(`selfplay_rs/`, rebuilt whenever its source changes). A machine that only trains can skip Rust with
+(`engine/selfplay_rs/`, rebuilt whenever its source changes). A machine that only trains can skip Rust with
 `uv sync --no-group selfplay`. Training needs an NVIDIA GPU with a recent driver.
 
 ## Train
 
+Every script runs as a module from the repository root (`uv run python -m <folder>.<script>`), so the folders import each other.
+
 ```
-uv run main.py                              4 minutes of a d128 with 6 layers: the standard comparison
-uv run main.py --note "final layer norm"    the same, with a note for the results page
-uv run main.py --minutes 30                 a longer run
-uv run main.py --positions 10_000_000       a budget in positions instead (about 3 minutes per 10M on an RTX 5070 Ti)
-uv run main.py --d-model 256 --layers 8 --heads 8 --lr 3e-3    see --help for every flag
-uv run python -m tools.compare_runs         every finished run, grouped by budget, best first
+uv run python -m training.train                              4 minutes of a d128 with 6 layers: the standard comparison
+uv run python -m training.train --note "final layer norm"    the same, with a note for the results page
+uv run python -m training.train --minutes 30                 a longer run
+uv run python -m training.train --positions 10_000_000       a budget in positions instead (about 3 minutes per 10M on an RTX 5070 Ti)
+uv run python -m training.train --d-model 256 --layers 8 --heads 8 --lr 3e-3    see --help for every flag
+uv run python -m tools.compare_runs                          every finished run, grouped by budget, best first
 ```
 
 Training starts TensorBoard at localhost:6006 (`--no-tensorboard` skips it). Runs with the same budget are comparable:
@@ -58,11 +60,11 @@ uv run python -m tools.evaluate_checkpoint <model.pt> --training-set <set>    a 
 
 ### Multiple GPUs
 
-`multi_gpu/train_ddp.py` is a Distributed Data Parallel version of `main.py` for Linux (NCCL), one process per GPU:
+`training/train_ddp.py` is a Distributed Data Parallel version of `training/train.py` for Linux (NCCL), one process per GPU:
 
 ```
-uv run torchrun --standalone --nproc-per-node=2 -m multi_gpu.train_ddp --minutes 30 --no-tensorboard
-uv run torchrun --standalone --nproc-per-node=4 -m multi_gpu.train_ddp --positions 360_000_000 --name big --resume
+uv run torchrun --standalone --nproc-per-node=2 -m training.train_ddp --minutes 30 --no-tensorboard
+uv run torchrun --standalone --nproc-per-node=4 -m training.train_ddp --positions 360_000_000 --name big --resume
 ```
 
 - `--batch-size` and `--positions` are global, across all GPUs; the batch must divide evenly between them.
@@ -74,7 +76,7 @@ uv run torchrun --standalone --nproc-per-node=4 -m multi_gpu.train_ddp --positio
 
 ## The current recipe
 
-What the September 2026 experiments settled on (evidence in `artifacts/overnight_2026-09-23.md`):
+What the September 2026 experiments settled on (evidence in `artifacts/reports/overnight_2026-09-23.md`):
 
 - The model sees only the current board; its value head learns Stockfish's eval; 8 position templates, SwiGLU, no
   dropout, no board-wide input embedding (template maps only helped shallow models).
@@ -113,7 +115,7 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
 - Narrower queries and keys in the early layers (`--qk-ratio 0.25 0.5 0.5 0.75` at 4 layers, `0.25 0.25` + `0.5` x5 +
   `0.75` x13 at 20) and half as many key/value heads (`--kv-heads`): the same quality at 17-20% fewer FLOPs.
 - d128 with 6 layers as the quick model (`--lr 6e-3`). Looping the same layers (`--loops`) lost to real depth.
-- An MLP in every block. Fewer MLPs (tested 2026-10-01; the code is in `artifacts/experiments_20261001.patch`) is a worse trade than fewer layers: on the
+- An MLP in every block. Fewer MLPs (tested 2026-10-01; the code is in `artifacts/patches/experiments_20261001.patch`) is a worse trade than fewer layers: on the
   d128 bed dense L5 beat MLPs in every 2nd block by 0.019 at nearly the same engine speed. In the trained d512 the
   first MLP (piece-on-square and attack facts) and the last (the readout, 8 times the residual's size) are essential,
   and the middle ten each cost 0.04-0.09 alone; a model trained without its first MLP mostly learns around it
@@ -123,7 +125,7 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
 
 ## Where it stands
 
-September 2026, details in `artifacts/selfplay_and_leela_2026-09-26.md` and `artifacts/scaling_grid_20260925/`:
+September 2026, details in `artifacts/reports/selfplay_and_leela_2026-09-26.md` and `artifacts/scaling_grid_20260925/`:
 
 - The d512 with this recipe (22M parameters, 360M positions, about 3e18 training FLOPs) ties the d640 L20 against
   Stockfish (65.6% against UCI_Elo 2500) at about a quarter of its compute. Without search it loses to Leela's BT4 by
@@ -149,7 +151,7 @@ September 2026, details in `artifacts/selfplay_and_leela_2026-09-26.md` and `art
 
 ## To try next: distillation
 
-On the 4-minute d128 test, a student trained on the 10-pass d512's move and value distributions (`main.py
+On the 4-minute d128 test, a student trained on the 10-pass d512's move and value distributions (`training/train.py
 --teacher-weight 1`, with targets from `tools/teacher_targets.py`) beat Stockfish-only targets by 0.019 val loss and
 was the best on every per-move judge measure (2026-10-01). Still to find out:
 
@@ -183,9 +185,9 @@ uv run python -m tools.play.analyze_match                    judge the last matc
 
 The policy plays `avoid-repetition` by default (argmax, but no draw by repetition when clearly ahead). A search match
 against Stockfish runs every game in one process (`tools/play/search_match.py`): the searches in Rust, their leaves
-through the network together on the GPU; other matches run under cutechess-cli with `tools/play/uci.py` as the engine.
+through the network together on the GPU; other matches run under cutechess-cli with `engine/uci.py` as the engine.
 Since 2026-09-26 the search match's network runs in fp16 (tf32 before, so its numbers differ a little from results
-logged earlier) and a cache answers positions reached again; the search is still `mcts.py`'s, 4.5x faster for the
+logged earlier) and a cache answers positions reached again; the search is still `engine/mcts.py`'s, 4.5x faster for the
 d512 at 32 games.
 Games are saved to `artifacts/match.pgn` (with the search's scores as `[%eval]`), and results against Stockfish are
 logged to `artifacts/elo_results.jsonl` and the `elo` chart in TensorBoard.
@@ -193,38 +195,38 @@ logged to `artifacts/elo_results.jsonl` and the `elo` chart in TensorBoard.
 As a UCI engine with a clock (`go movetime`, `nodes`, `wtime`/`btime`), for timed matches against lc0 and others:
 
 ```
-uv run python -m tools.play.uci artifacts/runs/<run>/model.pt --select mcts --gpu
+uv run python -m engine.uci artifacts/runs/<run>/model.pt --select mcts --gpu
 ```
 
-The search (`tools/play/engine_search.py`) runs in Rust and gathers 64 leaves for each network call, as lc0 does, with
+The search (`engine/engine_search.py`) runs in Rust and gathers 64 leaves for each network call, as lc0 does, with
 the next round gathered while one is on the GPU; the network runs in fp16 as CUDA graphs, a cache answers positions
 reached again by another order of moves, and the tree is kept for the next move. The d512 does ~27k simulations a
 second on the 5070 Ti in one search, lc0 with BT4 ~6k nodes. Smart pruning stops a search once the simulations left
 cannot change its move (at 1 s a move 3 searches in 4 stop early, a quarter of the time saved), and on a clock the
-time saved goes to the moves that are not decided. `--leaves 1` is `mcts.py`'s search, without pruning. The first start
+time saved goes to the moves that are not decided. `--leaves 1` is `engine/mcts.py`'s search, without pruning. The first start
 after an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to
 answer `isready`, so start the engine once by hand before a match.
 
 ## Self-play (expert iteration)
 
 ```
-uv run selfplay.py artifacts/runs/rl_start_d128_4min/model.pt --name selfplay_r1 --positions 1_000_000 --tablebase
-uv run main.py --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix --positions 3_000_000 --name rl_r1
+uv run python -m engine.selfplay artifacts/runs/rl_start_d128_4min/model.pt --name selfplay_r1 --positions 1_000_000 --tablebase
+uv run python -m training.train  --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix --positions 3_000_000 --name rl_r1
 uv run python -m tools.play.evaluate_elo --checkpoint artifacts/runs/rl_r1/model.pt --elo 1700 --games 200 --concurrency 12
 ```
 
-`selfplay.py` plays the model against itself with 64 simulations a move (root noise, the first 30 plies sampled from
+`engine/selfplay.py` plays the model against itself with 64 simulations a move (root noise, the first 30 plies sampled from
 the visits, tree reuse) and saves every position with the search's visit shares, the game's result and the root's
-score. Worker processes play the games in Rust (`selfplay_rs/`); one inference process runs the network for all of them
+score. Worker processes play the games in Rust (`engine/selfplay_rs/`); one inference process runs the network for all of them
 on the GPU, in fp16 since 2026-09-26 (bf16 before: `--precision bf16`), and each worker keeps a cache of the network's
 answers by position. The games are the same search either way; for the d512 at 64 simulations 423 positions/s instead
 of 249. `+` and `-` add or remove a worker while it runs; ctrl+c finishes the games being played, a second ctrl+c
 stops at once, and running it again with the same flags carries on.
 
-The Rust search and rules must match `mcts.py` and the Python reference games in `tests/reference_selfplay.py`
+The Rust search and rules must match `engine/mcts.py` and the Python reference games in `tests/reference_selfplay.py`
 exactly; `tests/test_selfplay_rs.py` plays both and compares every number, so a change to the search goes in both.
 
-`main.py --init-checkpoint` fine-tunes at a peak learning rate of 1e-3. `--result-weight` blends the result and the
+`training/train.py --init-checkpoint` fine-tunes at a peak learning rate of 1e-3. `--result-weight` blends the result and the
 root's score into the value target, `--visit-temperature` sharpens the visit shares, and `--mix-set` keeps a quarter of
 every batch (`--mix-share`) from a Stockfish-labelled set.
 
@@ -238,14 +240,10 @@ uv run pytest
 
 | Path | What it is |
 |---|---|
-| `encoding.py` | Boards to 70 tokens, moves to one of 1,968 ids, and back |
-| `data.py` | Training sets as datasets and loaders |
-| `model.py` | The transformer: board tokens in, move logits and an eval out |
-| `main.py` | The single-GPU training loop |
-| `mcts.py` | Monte Carlo tree search over the model |
-| `selfplay.py`, `inference.py` | Self-play: the worker processes and the GPU inference process |
-| `multi_gpu/` | The DDP trainer |
-| `selfplay_rs/` | The search and self-play games in Rust |
-| `tools/` | Checkpoints, run comparison, labelling, puzzles, attention probes and maps (`plot_attention.py`, like `plot_templates.py`), the scaling grid's and attention report's figures, and `play/` (UCI engine, matches, Elo log) |
-| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games), `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget), `selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish), `attention_lookups_20260927/` (weight decay for long runs, the block-1 attention collapse, and what every head looks up, with charts) and `mlp_layers_20261001/` (what each MLP layer does, and what dropping some costs in quality and buys in speed) |
+| `model/` | The architecture: `encoding.py` (boards to 70 tokens, moves to one of 1,968 ids, and back), `model.py` (the transformer: board tokens in, move logits and an eval out) and `fused_blocks.py` (the same blocks as Triton kernels for the engine's GPU inference; a change to `model.py`'s blocks goes here too) |
+| `training/` | `train.py` (the single-GPU training loop), `train_ddp.py` (the DDP trainer) and `data.py` (training sets as datasets and loaders) |
+| `engine/` | Playing chess: `mcts.py` (Monte Carlo tree search over the model), `player.py` (move selection and model loading), `engine_search.py` and `uci.py` (the UCI engine and its batched search), `selfplay.py` and `inference.py` (self-play's worker processes and GPU inference process), and `selfplay_rs/` (the search and self-play games in Rust) |
+| `tools/` | Checkpoints, run comparison, labelling, puzzles, attention probes and maps (`plot_attention.py`, like `plot_templates.py`), the scaling grid's and attention report's figures, and `play/` (matches against other engines, match analysis, the Elo log) |
+| `artifacts/` | Data, checkpoints, runs, engines, results and reports. Code here is only the scripts and source snapshots an experiment or audit ran with, kept beside its results. Dated folders hold one experiment each, `plots/` the attention, template and embedding pictures, `reports/` the write-ups that span several, `patches/` code for experiments that were not merged, and `elo_results.jsonl` the match log. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games), `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget), `reports/selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish), `attention_lookups_20260927/` (weight decay for long runs, the block-1 attention collapse, and what every head looks up, with charts) and `mlp_layers_20261001/` (what each MLP layer does, and what dropping some costs in quality and buys in speed) |
 | `tests/` | `uv run pytest` |
+| `notes.txt` | Running notes: ideas to try and small experiments' results |

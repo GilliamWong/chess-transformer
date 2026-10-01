@@ -1,6 +1,6 @@
 import pytest
 
-from main import DECAY_FRACTION, WARMUP_STEPS, lr_multiplier
+from training.train import DECAY_FRACTION, WARMUP_STEPS, lr_multiplier
 
 AFTER_WARMUP = WARMUP_STEPS + 1
 

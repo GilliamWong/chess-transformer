@@ -1,5 +1,5 @@
 """Multi-GPU DDP trainer, from the repository root on Linux:
-uv run torchrun --standalone --nproc-per-node=2 -m multi_gpu.train_ddp --minutes 30
+uv run torchrun --standalone --nproc-per-node=2 -m training.train_ddp --minutes 30
 --batch-size and --positions are global, across all processes."""
 
 import argparse
@@ -18,9 +18,9 @@ from torch.utils.data import BatchSampler, DataLoader, Sampler, SequentialSample
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-import main as single
-from data import concatenate_batches
-from model import ChessTransformer, mlp_hidden_width
+from training import train as single
+from training.data import concatenate_batches
+from model.model import ChessTransformer, mlp_hidden_width
 from tools.budget import Budget
 from tools.checkpoint import RUNS_DIR, save_checkpoint, warm_start
 from tools.compare_runs import write_progress_page
@@ -65,7 +65,7 @@ def endless_batches(loader: DataLoader):
         loader.sampler.epoch += 1
 
 
-#the training set's batches, with a mix set each joined with the mix set's next one (main.py's MixedLoader); each set
+#the training set's batches, with a mix set each joined with the mix set's next one (train.py's MixedLoader); each set
 #starts its next epoch when it runs out
 def training_batches(loader: DataLoader, mix_loader: DataLoader | None):
     if mix_loader is None:
@@ -111,7 +111,7 @@ def make_scheduler(optimizer, budget: Budget, schedule: str):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
 
-#main.py's val numbers with the batches shared out: every rank measures every world_size-th batch and the totals are
+#train.py's val numbers with the batches shared out: every rank measures every world_size-th batch and the totals are
 #added up. Takes the unwrapped model, whose forward waits for no other rank
 def evaluate(model, loader, device, max_batches=None):
     rank, world_size = dist.get_rank(), dist.get_world_size()
@@ -460,7 +460,7 @@ def parse_args(argv=None):
 def main():
     args = parse_args()
     if "RANK" not in os.environ or "LOCAL_RANK" not in os.environ:
-        raise SystemExit("launch from the repository root with: uv run torchrun --standalone --nproc-per-node=2 -m multi_gpu.train_ddp [options]")
+        raise SystemExit("launch from the repository root with: uv run torchrun --standalone --nproc-per-node=2 -m training.train_ddp [options]")
     local_rank = int(os.environ["LOCAL_RANK"])
     if args.device == "cuda":
         if not dist.is_nccl_available():

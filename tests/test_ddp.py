@@ -16,11 +16,11 @@ import torch.multiprocessing as mp
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-import data
-import main as single
-from encoding import BOARD_VOCAB_SIZE, NUM_PIECE_CODES, NUM_SQUARES, TOKENS_PER_BOARD
-from model import ChessTransformer
-from multi_gpu import train_ddp
+from training import data
+from training import train as single
+from model.encoding import BOARD_VOCAB_SIZE, NUM_PIECE_CODES, NUM_SQUARES, TOKENS_PER_BOARD
+from model.model import ChessTransformer
+from training import train_ddp
 from tools.budget import Budget
 from tools.checkpoint import load_checkpoint
 
@@ -123,7 +123,7 @@ def check_shared_clock(rank):
 
 
 def check_shared_evaluation():
-    #the ranks' shares add up to main.py's numbers, also when some ranks get no batch
+    #the ranks' shares add up to train.py's numbers, also when some ranks get no batch
     rows = np.random.default_rng(5)
     size = 11
     val_dataset = data.ChessGamesDataset(

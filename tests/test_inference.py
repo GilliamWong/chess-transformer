@@ -5,11 +5,11 @@ import numpy as np
 import pytest
 import torch
 
-from encoding import EN_PASSANT_TOKEN_OFFSET, encode_board
-from inference import GraphedBatches, answer_rows, fp16_model, graph_sizes, small_graph_sizes
-from model import VALUE_BINS, ChessTransformer, expected_score
+from model.encoding import EN_PASSANT_TOKEN_OFFSET, encode_board
+from engine.inference import GraphedBatches, answer_rows, fp16_model, graph_sizes, small_graph_sizes
+from model.model import VALUE_BINS, ChessTransformer, expected_score
 from tools.checkpoint import save_checkpoint
-from tools.play.player import CudaGraphModel
+from engine.player import CudaGraphModel
 
 
 #every batch up to max_batch has a graph, and past 16 boards pads by fewer than 4 boards or a sixteenth: steps of 16
@@ -100,7 +100,7 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
 #query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_fused_blocks_compute_what_the_model_does():
-    from fused_blocks import fuse_blocks
+    from model.fused_blocks import fuse_blocks
     torch.manual_seed(0)
     model = ChessTransformer(d_model=128, num_layers=3, n_heads=4, kv_heads=2, qk_ratio=[0.25, 0.5, 0.75], value_bins=16).cuda().eval()
     with torch.no_grad():
@@ -126,7 +126,7 @@ def test_fused_blocks_compute_what_the_model_does():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 @pytest.mark.parametrize("gated", [False, True])
 def test_linear_kernel_in_fp16(gated):
-    from fused_blocks import linear
+    from model.fused_blocks import linear
     torch.manual_seed(0)
     width = 200
     x = torch.randn(3, 70, 512, device="cuda").half()
@@ -151,7 +151,7 @@ def test_linear_kernel_in_fp16(gated):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 @pytest.mark.parametrize("gated, accumulate_fp32", [(False, False), (True, False), (False, True)])
 def test_extra_rows_leave_every_row_the_same(monkeypatch, gated, accumulate_fp32):
-    import fused_blocks
+    from model import fused_blocks
     torch.manual_seed(0)
     x = torch.randn(1000, 512, device="cuda").half()
     weight = (torch.randn(512, 400 if gated else 200, device="cuda") / 512**0.5).half()
@@ -168,7 +168,7 @@ def test_extra_rows_leave_every_row_the_same(monkeypatch, gated, accumulate_fp32
 #at 64 positions (4,480 rows) a 512 column matmul's 140 tiles of 128 rows take two waves of an RTX 4090's 128
 #multiprocessors and 128 tiles of 144 rows one; tiles that fill their waves take no extra rows
 def test_extra_rows_save_a_wave():
-    fused_blocks = pytest.importorskip("fused_blocks")
+    fused_blocks = pytest.importorskip("model.fused_blocks")
     assert fused_blocks.linear_extra_rows(64 * 70, 4, 128) == 16
     assert fused_blocks.linear_extra_rows(56 * 70, 4, 128) == 0
 
@@ -177,7 +177,7 @@ def test_extra_rows_save_a_wave():
 #giving fp32, as close to the fp32 matmul as fp16's rounding of the weights allows
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_linear_kernel_accumulating_in_fp32():
-    from fused_blocks import linear
+    from model.fused_blocks import linear
     torch.manual_seed(0)
     x = torch.randn(3, 64, 512, device="cuda").half()
     weight = (torch.randn(512, 200, device="cuda") / 512**0.5).half()

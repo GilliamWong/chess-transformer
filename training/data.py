@@ -1,5 +1,5 @@
 from pathlib import Path
-from encoding import TOKENS_PER_BOARD
+from model.encoding import TOKENS_PER_BOARD
 from tools.label_with_stockfish import NO_MOVE
 from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, SequentialSampler
 import numpy as np
@@ -7,7 +7,7 @@ import torch
 import warnings
 
 #no code lives here: pgns, training sets, checkpoints, runs, engines
-ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
+ARTIFACTS_DIR = Path(__file__).resolve().parent.parent / "artifacts"
 
 #training sets as raw arrays on disk, see processed_data/scripts_used/ for how they were made
 PROCESSED_DATA_DIR = ARTIFACTS_DIR / "processed_data"

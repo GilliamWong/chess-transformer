@@ -1,6 +1,6 @@
 import torch
 
-from model import expected_score
+from model.model import expected_score
 from tools.teacher_targets import teacher_targets
 
 

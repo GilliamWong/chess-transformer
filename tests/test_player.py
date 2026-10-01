@@ -8,12 +8,12 @@ import pytest
 import torch
 from torch import nn
 
-from data import EXPECTED_SCORE_PER_CENTIPAWN
-from encoding import NUM_MOVE_IDS, encode_move_to_id
+from training.data import EXPECTED_SCORE_PER_CENTIPAWN
+from model.encoding import NUM_MOVE_IDS, encode_move_to_id
 from tools.play.evaluate_elo import annotate_searches, elo_difference, model_engine, parse_score
-from model import ChessTransformer
-from tools.play.player import AHEAD_SCORE, choose_move, score_to_centipawns, search_move
-from tools.play.uci import parse_position
+from model.model import ChessTransformer
+from engine.player import AHEAD_SCORE, choose_move, score_to_centipawns, search_move
+from engine.uci import parse_position
 
 CPU = torch.device("cpu")
 

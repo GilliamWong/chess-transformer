@@ -1,8 +1,7 @@
-#the uci engine's search (tools/play/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
+#the uci engine's search (engine/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
 #deadline and node limit, smart pruning, the tree kept for the next move, the engine's own settings, and uci.py's go
 #limits and clock
 import io
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -13,17 +12,17 @@ import numpy as np
 import pytest
 
 import selfplay_rs
-from encoding import TOKENS_PER_BOARD
+from model.encoding import TOKENS_PER_BOARD
 from fake_models import BoardModel, UniformModel
-from inference import cpu_batches
-from model import ChessTransformer
-from selfplay import rust_search_settings
+from engine.inference import cpu_batches
+from model.model import ChessTransformer
+from engine.selfplay import rust_search_settings
 from tools.checkpoint import save_checkpoint
-import tools.play.engine_search as engine_search
-from tools.play.engine_search import EngineSearch, engine_search_settings
-from tools.play.player import SearchReport
-import tools.play.uci as uci
-from tools.play.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
+from engine import engine_search
+from engine.engine_search import EngineSearch, engine_search_settings
+from engine.player import SearchReport
+from engine import uci
+from engine.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
 
@@ -315,7 +314,7 @@ def test_the_engine_takes_search_settings(tmp_path):
     save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
     found = []
     for changes in ("c_puct=0.1", "c_puct=10"):
-        engine = chess.engine.SimpleEngine.popen_uci([sys.executable, "-m", "tools.play.uci", str(tmp_path / "model.pt"), "--select", "mcts",
+        engine = chess.engine.SimpleEngine.popen_uci([sys.executable, "-m", "engine.uci", str(tmp_path / "model.pt"), "--select", "mcts",
                                                       "--search-settings", changes], cwd=REPOSITORY)
         try:
             played = engine.play(chess.Board(), chess.engine.Limit(nodes=400), info=chess.engine.INFO_ALL)
@@ -330,7 +329,7 @@ def test_the_engine_takes_search_settings(tmp_path):
 def test_the_engine_keeps_to_gos_limits(tmp_path):
     settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": 16}
     save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
-    engine = chess.engine.SimpleEngine.popen_uci([sys.executable, "-m", "tools.play.uci", str(tmp_path / "model.pt"), "--select", "mcts"],
+    engine = chess.engine.SimpleEngine.popen_uci([sys.executable, "-m", "engine.uci", str(tmp_path / "model.pt"), "--select", "mcts"],
                                                  cwd=REPOSITORY)
     try:
         board = chess.Board()

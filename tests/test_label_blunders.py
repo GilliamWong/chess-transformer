@@ -3,7 +3,7 @@ import chess
 import numpy as np
 import pytest
 
-from encoding import encode_board, encode_move_to_id
+from model.encoding import encode_board, encode_move_to_id
 from tools import label_blunders
 from tools.label_blunders import MIN_LOSS, NO_MOVE, SLOTS, STOCKFISH, Engine, label_position
 

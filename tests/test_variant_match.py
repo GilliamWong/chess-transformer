@@ -8,8 +8,8 @@ import chess
 import pytest
 
 from fake_models import BoardModel
-from inference import cpu_batches
-import tools.play.engine_search as engine_search
+from engine.inference import cpu_batches
+from engine import engine_search
 from tools.play.variant_match import (OPPONENT, SPRT_BOUND, Opponent, Variant, a_points, common_opponent_elo, pair_elo, play, sprt_llr,
                                       variant_settings)
 
@@ -106,7 +106,7 @@ def test_the_variants_play_a_common_opponent():
     variants = [Variant(name, variant_settings(change, False)) for name, change in (("a", "smart_pruning=0"), ("b", "smart_pruning=0"))]
     games = [(4 * index + 2 * variant + colour, opening, colour == 0, (variant, OPPONENT)) for index, opening in enumerate(OPENINGS[:1])
              for variant in (0, 1) for colour in (0, 1)]
-    opponent = Opponent([sys.executable, "-m", "tools.play.uci", "random"], 1, 3, 2)
+    opponent = Opponent([sys.executable, "-m", "engine.uci", "random"], 1, 3, 2)
     finished = []
     try:
         play(cpu_batches(BoardModel()), variants, games, 3, 4, 12, None, 0.0, None, lambda record, game: finished.append((record, game)), opponent)

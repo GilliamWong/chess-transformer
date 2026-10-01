@@ -6,8 +6,8 @@ import torch
 
 from tools import checkpoint
 from tools.checkpoint import load_checkpoint, save_checkpoint, warm_start
-from model import ChessTransformer
-from tools.play.player import choose_move, load_model
+from model.model import ChessTransformer
+from engine.player import choose_move, load_model
 
 CPU = torch.device("cpu")
 

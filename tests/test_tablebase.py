@@ -7,17 +7,17 @@ import numpy as np
 import pytest
 import torch
 
-import mcts
+from engine import mcts
 import selfplay_rs
-from encoding import TOKENS_PER_BOARD, encode_move_to_id
+from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import UniformModel
-from inference import cpu_batches
+from engine.inference import cpu_batches
 from reference_selfplay import final_result
-from selfplay import ANSWER_WIDTH, rust_search_settings
+from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from tools.label_with_stockfish import NO_EVAL, NO_MOVE
 from tools.label_with_tablebase import TABLEBASE_WIN_EVAL, label_position
-from tools.play.engine_search import EngineSearch
-from tools.play.player import choose_move
+from engine.engine_search import EngineSearch
+from engine.player import choose_move
 from tools.tablebase import TABLE_SETS, TableSet, covers, open_tablebase, ranked_moves, ranked_pieces
 
 CPU = torch.device("cpu")

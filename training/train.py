@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from data import ARTIFACTS_DIR, BLUNDER_THRESHOLD, RESULT_WEIGHT, VISIT_TEMPERATURE, MixedLoader, datasets_to_dataloaders, load_training_set
+from training.data import ARTIFACTS_DIR, BLUNDER_THRESHOLD, RESULT_WEIGHT, VISIT_TEMPERATURE, MixedLoader, datasets_to_dataloaders, load_training_set
 import torch
 import torch.nn.functional as F
 import math
@@ -22,9 +22,9 @@ from tools.checkpoint import RUNS_DIR, load_checkpoint, save_checkpoint
 from tools.compare_runs import write_progress_page
 from tools.label_with_stockfish import NO_MOVE
 from tools.tensorboard_server import start_tensorboard
-from model import ChessTransformer, expected_score, mlp_hidden_width, value_bin_edges
+from model.model import ChessTransformer, expected_score, mlp_hidden_width, value_bin_edges
 
-#the model, each of these has a command line flag (python main.py --help)
+#the model, each of these has a command line flag (python -m training.train --help)
 D_MODEL = 128
 #at equal compute a d128 reached val loss 1.904 with 6 layers, 1.937 with 4 and 1.901 with 8
 NUM_LAYERS = 6
@@ -259,7 +259,7 @@ def evaluate_model(
     with torch.no_grad():
 
         num_batches = len(test_data_loader) if max_batches is None else min(max_batches, len(test_data_loader))
-        #show_progress=False where several processes evaluate at once (multi_gpu/train_ddp.py)
+        #show_progress=False where several processes evaluate at once (training/train_ddp.py)
         progress = tqdm(islice(test_data_loader, num_batches), total=num_batches, desc="val", leave=False, dynamic_ncols=True, disable=not show_progress)
 
         #no blunder penalty: val loss stays the move loss alone

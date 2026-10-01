@@ -67,7 +67,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8" }]
-selfplay = [{ name = "selfplay-rs", directory = "selfplay_rs" }]
+selfplay = [{ name = "selfplay-rs", directory = "engine/selfplay_rs" }]
 
 [[package]]
 name = "colorama"
@@ -1593,7 +1593,7 @@ wheels = [
 [[package]]
 name = "selfplay-rs"
 version = "0.1.0"
-source = { directory = "selfplay_rs" }
+source = { directory = "engine/selfplay_rs" }
 
 [[package]]
 name = "setuptools"

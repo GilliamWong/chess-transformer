@@ -7,14 +7,14 @@ import pytest
 import torch
 from torch import nn
 
-import mcts
-import selfplay
+from engine import mcts
+from engine import selfplay
 import selfplay_rs
-from encoding import encode_board, encode_move_to_id
+from model.encoding import encode_board, encode_move_to_id
 from fake_models import BoardModel, UniformModel
-from inference import cpu_batches
+from engine.inference import cpu_batches
 from reference_selfplay import final_result, play_game
-from selfplay import ANSWER_WIDTH, MAX_PLIES, RustSelfPlayBatch, play_games_in_rust, rust_search_settings
+from engine.selfplay import ANSWER_WIDTH, MAX_PLIES, RustSelfPlayBatch, play_games_in_rust, rust_search_settings
 
 CPU = torch.device("cpu")
 

@@ -2,7 +2,7 @@
 import torch
 from torch import nn
 
-from encoding import NUM_MOVE_IDS
+from model.encoding import NUM_MOVE_IDS
 
 #material in pawns by board token: the side to move's pieces count for it, the other side's against
 PIECE_VALUES = torch.tensor([0, 1, 3, 3, 5, 9, 0, -1, -3, -3, -5, -9, 0], dtype=torch.float)

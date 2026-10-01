@@ -10,12 +10,12 @@ import pytest
 import torch
 from torch import nn
 
-import data
-import selfplay
-from data import SelfPlayDataset, load_training_set
-from encoding import NUM_MOVE_IDS
-from inference import cpu_batches, serve
-from selfplay import TOP_MOVES, Game, RemoteNetwork, SelfPlaySet, Slot, play_games_in_rust, slot_arrays
+from training import data
+from engine import selfplay
+from training.data import SelfPlayDataset, load_training_set
+from model.encoding import NUM_MOVE_IDS
+from engine.inference import cpu_batches, serve
+from engine.selfplay import TOP_MOVES, Game, RemoteNetwork, SelfPlaySet, Slot, play_games_in_rust, slot_arrays
 from tools.label_with_stockfish import NO_MOVE
 
 SETTINGS = {"simulations": 16}
@@ -200,6 +200,6 @@ def test_games_through_the_inference_process_are_the_games_played_directly():
 
 #torch would cost every worker about half a gigabyte
 def test_a_worker_does_not_import_torch():
-    imported = subprocess.run([sys.executable, "-c", "import sys, selfplay; print('torch' in sys.modules)"], capture_output=True, text=True,
-                              check=True, cwd=Path(selfplay.__file__).parent)
+    imported = subprocess.run([sys.executable, "-c", "import sys, engine.selfplay; print('torch' in sys.modules)"], capture_output=True, text=True,
+                              check=True, cwd=Path(selfplay.__file__).parent.parent)
     assert imported.stdout.strip() == "False"

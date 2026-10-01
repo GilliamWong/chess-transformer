@@ -4,10 +4,10 @@ import pytest
 import torch
 from torch import nn
 
-from encoding import MOVE_TO_ID, NUM_MOVE_IDS, NUM_SQUARES
+from model.encoding import MOVE_TO_ID, NUM_MOVE_IDS, NUM_SQUARES
 from fake_models import PIECE_VALUES, UniformModel
-from mcts import DRAW, Node, evaluate, evaluate_many, game_result, most_visited_move, search
-from model import ChessTransformer
+from engine.mcts import DRAW, Node, evaluate, evaluate_many, game_result, most_visited_move, search
+from model.model import ChessTransformer
 
 CPU = torch.device("cpu")
 

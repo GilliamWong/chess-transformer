@@ -24,4 +24,10 @@ artifacts/pgn_data/*.7z
 artifacts/pgn_data/fishtest/*.pgn.gz
 artifacts/puzzles/lichess_db_puzzle.csv
 
-selfplay_rs/target/
+engine/selfplay_rs/target/
+
+# tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
