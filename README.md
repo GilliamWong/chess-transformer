@@ -113,6 +113,11 @@ What the September 2026 experiments settled on (evidence in `artifacts/overnight
 - Narrower queries and keys in the early layers (`--qk-ratio 0.25 0.5 0.5 0.75` at 4 layers, `0.25 0.25` + `0.5` x5 +
   `0.75` x13 at 20) and half as many key/value heads (`--kv-heads`): the same quality at 17-20% fewer FLOPs.
 - d128 with 6 layers as the quick model (`--lr 6e-3`). Looping the same layers (`--loops`) lost to real depth.
+- An MLP in every block. Fewer MLPs (tested 2026-10-01; the code is in `artifacts/experiments_20261001.patch`) is a worse trade than fewer layers: on the
+  d128 bed dense L5 beat MLPs in every 2nd block by 0.019 at nearly the same engine speed. In the trained d512 the
+  first MLP (piece-on-square and attack facts) and the last (the readout, 8 times the residual's size) are essential,
+  and the middle ten each cost 0.04-0.09 alone; a model trained without its first MLP mostly learns around it
+  (`artifacts/mlp_layers_20261001/`).
 - At scale, train with `train_ddp.py` at a global batch of about 4096 (the gradient noise scale of a d640 is 2.5k-7k
   positions) and stay within about 4 passes over the data (`full_sf8_20260922` has 290M positions).
 
@@ -141,6 +146,41 @@ September 2026, details in `artifacts/selfplay_and_leela_2026-09-26.md` and `art
   fp16's limit (NaN in the search engine); a learned sink does not prevent it, and Leela's BT4 has no such heads.
   Across 8 models the heads look up the kings and queens, the neighbouring squares, the first piece along each line
   and the metadata: `artifacts/attention_lookups_20260927/`.
+
+## To try next
+
+More quality per unit of engine time and per parameter, from the 2026-10-01 review (given the results in
+`artifacts/mlp_layers_20261001/`). Ranked; all but tier 3 cost nothing in the engine.
+Target changes (1, 2) can raise val loss against the depth-12 labels while playing better, so judge them by the per-move
+judge's big-mistake rate and by Elo. Every win on the 4-minute d128 bed needs an equal-position long run before adoption.
+Distillation (`main.py --teacher-weight`, `tools/teacher_targets.py`) is in the code. The tested-and-dropped items 2 and 4-7,
+and the MLP study's flags, were taken out again; their code is in `artifacts/experiments_20261001.patch` (applies to
+e144d40), and their runs' checkpoints load only with it applied.
+
+1. [~] **Distill from our own bigger model.** Tested 2026-10-01 (d128 4-min, teacher = the 10-pass d512): teacher weight 1 -0.019 val, the per-move judge's best on every measure (lost/move 0.0249 vs 0.0259, >0.2 2.5% vs 2.8%), +32 Elo (+-45); weight 0.5 -0.013. Next: does it last at 100M positions. Students train on the d512's full move and value distributions mixed with
+   the Stockfish targets (the labels say nothing about most legal moves). Test: the d512's outputs on the 30M set, then
+   d128 on Stockfish only / half and half / teacher only. A d512 student needs a bigger teacher (the L24 pilot).
+2. [x] (no gain: +0.006 val at equal time from 8% fewer positions, about a tie per step, judge no better) **A training-only head for every labelled move's score**, from scratch (the flat child-value runs were
+   fine-tunes of the saturated d512). The labels already hold the scores. An opponent-reply head is close to the
+   neutral future head of 2026-09-22.
+3. [ ] **Two-step tactical features**: the second piece along each ray (x-rays, pins, batteries) and each square's
+   cheapest attacker and defender. Block 0's neurons spend their capacity computing these.
+4. [x] (value residual worse, +0.004 on both seeds) **Value residual and skip connections** (Zhou et al. 2025, ResFormer): every block's attention values mix in
+   block 0's. No extra FLOPs; reported matching loss with about 15% fewer parameters and less attention concentration
+   (the block-1 collapse).
+5. [x] (rank 16: -0.008 on seed 42, +0.006 on seed 7, judge equal: no gain) **A low-rank attention-output gate** (rank 16-32): the full per-channel gate gave -0.009 at 15% more block work.
+6. [x] (+0.0005 over two seeds: nothing) **Per-piece scaling of the MLPs' hidden units**: a learned 13 x hidden table chosen by the piece on the square.
+   Expected small (the middle MLPs depend on context).
+7. [x] (d128: 1+3 min ties, 2+2 +0.015; d512 L12 stacked to L24 for 25M positions 1.5173 = the L12 continued alike 1.5174, both below the starting 1.5134, at twice the cost) **Grow instead of training from scratch**: start a deep model from a trained shallow one stacked (Du et al.
+   2024); test d128 L3 -> L6 against L6 from scratch at equal total compute.
+8. [ ] **Engine speed, no quality risk**: LayerNorm inside the matmul kernels, feature indices computed in Rust, the
+   two policy projections folded into one. A few Elo at most at tournament node counts.
+9. [ ] **Fewer tokens in the middle blocks** (Funnel-Transformer): about 32 instead of 70 for blocks 2-9. The one idea
+   with about 1.4x engine speed, and the one that could cost 0.03.
+
+Not worth it on present evidence: product-key memory, more MLP restructuring (removal, MoE, placement, looping),
+activation sweeps, more fine-tunes of the d512, low-rank feature embeddings, mirror augmentation while data is not the
+limit.
 
 ## Play against it and measure its strength
 
@@ -222,5 +262,5 @@ uv run pytest
 | `multi_gpu/` | The DDP trainer |
 | `selfplay_rs/` | The search and self-play games in Rust |
 | `tools/` | Checkpoints, run comparison, labelling, puzzles, attention probes and maps (`plot_attention.py`, like `plot_templates.py`), the scaling grid's and attention report's figures, and `play/` (UCI engine, matches, Elo log) |
-| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games), `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget), `selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish) and `attention_lookups_20260927/` (weight decay for long runs, the block-1 attention collapse, and what every head looks up, with charts) |
+| `artifacts/` | Data, checkpoints, runs, engines, results and reports; no code. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games), `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget), `selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish), `attention_lookups_20260927/` (weight decay for long runs, the block-1 attention collapse, and what every head looks up, with charts) and `mlp_layers_20261001/` (what each MLP layer does, and what dropping some costs in quality and buys in speed) |
 | `tests/` | `uv run pytest` |

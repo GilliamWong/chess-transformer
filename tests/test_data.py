@@ -219,3 +219,43 @@ def test_blunder_labels_must_come_in_pairs_of_the_same_shape():
     with pytest.raises(ValueError):
         ChessGamesDataset(boards, labels, labels, TEMPERATURE, np.zeros((2, 3), dtype=np.int16), np.zeros((2, 2), dtype=np.float16))
 
+
+
+#teacher targets for every split: moves 900 and 901 at 0.75 / 0.25, expected score 0.9
+def write_teacher_targets(folder, name, positions_per_split):
+    for split, positions in positions_per_split.items():
+        (folder / f"{name}_{split}_teacher_moves.bin").write_bytes(np.tile(np.array([900, 901], dtype=np.int16), (positions, 1)).tobytes())
+        (folder / f"{name}_{split}_teacher_probabilities.bin").write_bytes(np.tile(np.array([0.75, 0.25], dtype=np.float16), (positions, 1)).tobytes())
+        (folder / f"{name}_{split}_teacher_scores.bin").write_bytes(np.full(positions, 0.9, dtype=np.float16).tobytes())
+
+
+#the teacher's share of each target: its moves after stockfish's with the weights scaled so all still add up to 1,
+#its score mixed into the value; val stays stockfish's alone so val loss compares across runs
+def test_teacher_targets_take_their_share_of_the_train_targets(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    write_training_set(tmp_path, "taught", {"train": 4, "val": 2})
+    write_teacher_targets(tmp_path, "taught", {"train": 4, "val": 2})
+    stockfish_value = torch.sigmoid(torch.tensor(EXPECTED_SCORE_PER_CENTIPAWN * EVAL)).item()
+
+    train_dataset, val_dataset = load_training_set("taught", TEMPERATURE, teacher_weight=0.25)
+    _, moves, probabilities, values, _ = train_dataset[[1]]
+    assert moves.tolist() == [[1, 0, 900, 901]]
+    assert probabilities[0].tolist() == pytest.approx([0.75, 0.0, 0.25 * 0.75, 0.25 * 0.25])
+    assert values.item() == pytest.approx(0.75 * stockfish_value + 0.25 * 0.9, abs=1e-3)
+    assert len(train_dataset.tensors()) == 6  #the teacher's files are warmed with the rest
+
+    _, val_moves, val_probabilities, val_values, _ = val_dataset[[1]]
+    assert val_moves.tolist() == [[1, 0]] and val_probabilities[0].tolist() == pytest.approx([1.0, 0.0])
+    assert val_values.item() == pytest.approx(stockfish_value, abs=1e-6)
+
+    #weight 0 reads no teacher at all: the same targets as a set without one
+    plain, _ = load_training_set("taught", TEMPERATURE)
+    assert plain[[1]][1].tolist() == [[1, 0]]
+
+
+#a run asked to distil must not quietly train on stockfish alone
+def test_a_teacher_weight_without_teacher_targets_is_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    write_training_set(tmp_path, "untaught", {"train": 4, "val": 2})
+    with pytest.raises(FileNotFoundError, match="teacher_targets"):
+        load_training_set("untaught", TEMPERATURE, teacher_weight=0.5)

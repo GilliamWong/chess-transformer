@@ -295,8 +295,8 @@ def evaluate_model(
 
 def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE,
                      result_weight: float = RESULT_WEIGHT, visit_temperature: float = VISIT_TEMPERATURE,
-                     blunder_threshold: float = BLUNDER_THRESHOLD) -> tuple[DataLoader, DataLoader]:
-    train_dataset, val_dataset = load_training_set(training_set, target_temperature, result_weight, visit_temperature, blunder_threshold)
+                     blunder_threshold: float = BLUNDER_THRESHOLD, teacher_weight: float = 0.0) -> tuple[DataLoader, DataLoader]:
+    train_dataset, val_dataset = load_training_set(training_set, target_temperature, result_weight, visit_temperature, blunder_threshold, teacher_weight)
     warm_file_cache(train_dataset, val_dataset)
     return datasets_to_dataloaders(
         train_dataset,
@@ -430,7 +430,8 @@ def main(
     blunder_threshold: float = BLUNDER_THRESHOLD,
     weight_decay: float = WEIGHT_DECAY,
     muon_momentum: float = MUON_MOMENTUM,
-    snapshot_every: int = 0):
+    snapshot_every: int = 0,
+    teacher_weight: float = 0.0):
 
     #a fine-tune is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -470,7 +471,7 @@ def main(
     print(f"training on {device}")
 
     mix_batch_size = round(batch_size * mix_share) if mix_set is not None else 0
-    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size - mix_batch_size, result_weight, visit_temperature, blunder_threshold)
+    train_data_loader, val_data_loader = load_dataloaders(training_set, target_temperature, seed, batch_size - mix_batch_size, result_weight, visit_temperature, blunder_threshold, teacher_weight)
     print(f"{training_set}: {len(train_data_loader.dataset):,} train positions, {len(val_data_loader.dataset):,} val positions")
     mix_val_loader = None
     if mix_set is not None:
@@ -521,6 +522,7 @@ def main(
         "blunder_threshold": blunder_threshold,
         "weight_decay": weight_decay,
         "muon_momentum": muon_momentum,
+        "teacher_weight": teacher_weight,
         #the blunder penalty only acts on a set with blunder labels
         "blunder_labels": getattr(train_data_loader.dataset, "worst_moves", None) is not None,
         "budget": budget.describe(),
@@ -630,6 +632,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-every", type=int, default=EVAL_EVERY, help="steps between two looks at the val set, default %(default)s")
     parser.add_argument("--snapshot-every", type=int, default=0, help="steps between two copies of the weights kept in the run folder (snapshot_<positions>.pt), 0 for none")
     parser.add_argument("--compile-mode", choices=["default", "max-autotune-no-cudagraphs"], default="default", help="torch.compile's mode, default %(default)s")
+    parser.add_argument("--teacher-weight", type=float, default=0.0, help="share of the train targets from a bigger model's (tools/teacher_targets.py); val keeps stockfish's. Default %(default)s")
     parser.add_argument("--visit-temperature", type=float, default=VISIT_TEMPERATURE, help="self play sets: sharpens the visit shares, 1 as recorded, 0 the most visited move alone. Default %(default)s")
     arguments = parser.parse_args()
 
@@ -667,4 +670,5 @@ if __name__ == "__main__":
          value_bins=arguments.value_bins,
          blunder_threshold=arguments.blunder_threshold,
          weight_decay=arguments.weight_decay,
-         muon_momentum=arguments.muon_momentum)
+         muon_momentum=arguments.muon_momentum,
+         teacher_weight=arguments.teacher_weight)
