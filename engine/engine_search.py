@@ -12,6 +12,7 @@ import numpy as np
 import selfplay_rs
 from model.encoding import TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
+from engine.inference import GraphedBatches
 from engine.player import ROOT_MOVES_REPORTED, SearchReport
 from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, ranked_moves, ranked_pieces, wdl_score
 
@@ -67,9 +68,9 @@ def parse_changes(text: str, settings: dict) -> dict:
 
 #the network in fp16 (inference.fp16_model) as cuda graphs for a round's leaves, from one to max_batch, a lane a round out
 def engine_network(checkpoint_path: Path, max_batch: int = LEAVES):
-    from engine.inference import ExactSizeCompiled, GraphedBatches, fp16_model, small_graph_sizes
+    from engine.inference import ExactSizeCompiled, fp16_model, small_graph_sizes
     sizes = small_graph_sizes(max_batch)
-    return GraphedBatches(ExactSizeCompiled(fp16_model(checkpoint_path), sizes[-1]), sizes, ROUNDS_IN_FLIGHT)
+    return GraphedBatches(ExactSizeCompiled(fp16_model(checkpoint_path), sizes[-1]), sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1)
 
 
 class EngineSearch:
@@ -86,6 +87,7 @@ class EngineSearch:
         self.round_simulations = SIMULATIONS_PER_LEAF * leaves
         self.collisions = COLLISIONS if batched else 0
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1
+        self.rounds_at_once = batched and isinstance(network, GraphedBatches) and len(network.lanes) > 1
         self.smart_pruning = batched and smart_pruning
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces)
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=CACHE_POSITIONS)
@@ -117,10 +119,9 @@ class EngineSearch:
         #the rounds left once the report is in have no leaves, but Searches still expects their finish
         while report is None or rounds:
             if report is None and not stopping:
-                #the lanes run the rounds on the gpu at once and they come back about together, so the round gathered
-                #now would come back about a round time (round_seconds, the time between rounds coming back) after the
-                #newest of them: stop if that is past the deadline
-                round_times = max(len(rounds), 1)
+                #the round gathered now would come back after those on the gpu: stop if that is past the deadline. Rounds
+                #on lanes of their own run at once and come back about together, so it comes a round time after the newest
+                round_times = max(len(rounds), 1) if self.rounds_at_once else len(rounds) + 1
                 if gathered and deadline is not None and time.perf_counter() + round_times * self.round_seconds >= deadline:
                     stopping = True
                     report = self.searches.stop(GAME)
