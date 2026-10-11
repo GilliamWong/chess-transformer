@@ -123,7 +123,15 @@ impl SelfPlayGames {
         let (start, start_keys) = play_out(start_fen, &start_moves)?;
         Ok(SelfPlayGames {
             settings: GameSettings {
-                search: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw },
+                search: SearchSettings {
+                    c_puct,
+                    c_puct_factor,
+                    c_puct_base,
+                    fpu_reduction,
+                    draw,
+                    repetitions_for_a_draw,
+                    value_sharpness: 1.0,
+                },
                 simulations,
                 sampled_plies,
                 max_plies,
@@ -195,7 +203,13 @@ impl SelfPlayGames {
         let answers = answers_for(py, &answers, self.waiting.len(), self.answer_width)?;
         for (row, &index) in self.waiting.iter().enumerate() {
             let answer = &answers[row * self.answer_width..(row + 1) * self.answer_width];
-            self.games[index].tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, self.cache.as_mut());
+            self.games[index].tree.finish_leaf(
+                |column| answer[column].get(),
+                self.answer_width,
+                &self.move_ids,
+                self.cache.as_mut(),
+                &self.settings.search,
+            );
         }
         self.waiting.clear();
 
@@ -353,10 +367,10 @@ impl Searches {
 #[pymethods]
 impl Searches {
     //tree_reuse keeps the tree of a game's (an id's) last search for its next search; cache_positions is the size of
-    //the cache of network answers by position (search.rs Cache), 0 for none
+    //the cache of network answers by position (search.rs Cache), 0 for none; value_sharpness see search.rs sharpen
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
-                        tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0))]
+                        tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -371,9 +385,15 @@ impl Searches {
         tablebase_pieces: usize,
         tree_reuse: bool,
         cache_positions: usize,
+        value_sharpness: f64,
     ) -> PyResult<Searches> {
+        if value_sharpness <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "value_sharpness multiplies the value's logit, it must be positive, not {value_sharpness}"
+            )));
+        }
         Ok(Searches {
-            settings: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw },
+            settings: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw, value_sharpness },
             move_ids: move_ids(move_id_table)?,
             answer_width,
             tables: open_tables(tablebase_folder, tablebase_pieces)?,
@@ -438,7 +458,7 @@ impl Searches {
         for (id, leaves) in round {
             let tree = &mut self.searches[index_of[&id]].tree;
             for answer in rows.by_ref().take(leaves as usize) {
-                tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, self.cache.as_mut());
+                tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, self.cache.as_mut(), &self.settings);
             }
         }
         Ok(self.take_reports())

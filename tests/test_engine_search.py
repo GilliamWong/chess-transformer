@@ -14,9 +14,9 @@ import pytest
 import selfplay_rs
 from model.encoding import TOKENS_PER_BOARD
 from fake_models import BoardModel, UniformModel
-from engine.inference import cpu_batches
+from engine.inference import ImmediateBatches, cpu_batches
 from model.model import ChessTransformer
-from engine.selfplay import rust_search_settings
+from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from tools.checkpoint import save_checkpoint
 from engine import engine_search
 from engine.engine_search import EngineSearch, engine_search_settings
@@ -119,6 +119,31 @@ def test_the_engines_settings(monkeypatch):
     assert engine_search_settings(False) == {**rust_search_settings(False), "fpu_reduction": 0.25, "c_puct": 0.5}
     assert engine_search_settings(False, {"c_puct": 0.7})["c_puct"] == 0.7
     assert engine_search_settings(False, own=False) == rust_search_settings(False)
+
+
+#every position's answer: no move preferred, expected score 0.6
+def answers_of_0_6(boards: np.ndarray) -> np.ndarray:
+    answers = np.zeros((len(boards), ANSWER_WIDTH), dtype=np.float32)
+    answers[:, -1] = 0.6
+    return answers
+
+
+#the network's value goes into the search and the cache sharpened (its logit times value_sharpness), so a position the
+#cache answers is not sharpened again; 1 leaves the value as it was
+@pytest.mark.parametrize("sharpness, expected", [(1.0, 0.6), (3.0, 1 / (1 + (0.4 / 0.6) ** 3))])
+def test_the_value_is_sharpened_once(sharpness, expected):
+    searches = selfplay_rs.Searches(**rust_search_settings(False), cache_positions=1000, value_sharpness=sharpness)
+    scores = []
+    for _ in range(2):
+        searches.start(0, chess.STARTING_FEN, [], 1)
+        scores.append(searches.finish(answers_of_0_6(leaf_boards(searches.descend())))[0][2])
+    assert scores == pytest.approx([expected, expected])
+
+
+#the engine reports its score on the network's own scale, as before the value was sharpened
+def test_the_engine_reports_the_score_unsharpened():
+    search = EngineSearch(ImmediateBatches(answers_of_0_6), 16, settings={"value_sharpness": 3.0})
+    assert search.search(chess.Board(), simulations=1).score == pytest.approx(0.6)
 
 
 #with leaves out on the network, rounds stop at the search's simulations (without smart pruning, which stops sooner)

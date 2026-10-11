@@ -16,6 +16,7 @@ pub struct SearchSettings {
     pub fpu_reduction: f64,
     pub draw: f64,
     pub repetitions_for_a_draw: usize,
+    pub value_sharpness: f64, //the network's value through sharpen; 1 is mcts.py's search
 }
 
 //mcts.Node's numbers, in one vector per tree with the root first. An expanded node's moves (its edges) are contiguous
@@ -74,6 +75,15 @@ pub fn softmax(logits: &mut [f32]) {
     for weight in logits.iter_mut() {
         *weight /= total;
     }
+}
+
+//the value's logit times sharpness, E' = 1 / (1 + ((1 - E) / E)^sharpness); 1 leaves it exactly as it was
+pub fn sharpen(value: f32, sharpness: f64) -> f32 {
+    if sharpness == 1.0 {
+        return value;
+    }
+    let value = f64::from(value);
+    (1.0 / (1.0 + ((1.0 - value) / value).powf(sharpness))) as f32
 }
 
 //a simulation waiting for the network: its nodes from the root down, and its leaf's position and legal moves
@@ -313,13 +323,20 @@ impl Tree {
         Ok(gathered)
     }
 
-    //mcts.finish for the oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it
-    pub fn finish_leaf(&mut self, answer: impl Fn(usize) -> f32, answer_width: usize, move_ids: &MoveIds, cache: Option<&mut Cache>) {
+    //mcts.finish for the oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it, sharpened
+    pub fn finish_leaf(
+        &mut self,
+        answer: impl Fn(usize) -> f32,
+        answer_width: usize,
+        move_ids: &MoveIds,
+        cache: Option<&mut Cache>,
+        settings: &SearchSettings,
+    ) {
         let leaf = self.pending.pop_front().expect("a waiting simulation");
         self.logits.clear();
         self.logits.extend(leaf.moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, leaf.turn))));
         softmax(&mut self.logits);
-        let value = answer(answer_width - 1);
+        let value = sharpen(answer(answer_width - 1), settings.value_sharpness);
 
         let node = *leaf.path.last().expect("the root at least");
         let priors = std::mem::take(&mut self.logits);

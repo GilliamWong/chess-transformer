@@ -39,11 +39,16 @@ SPEED_ROUNDS = 8
 #calls. The engine's own: every self-play worker has a selfplay.CACHE_POSITIONS cache
 CACHE_POSITIONS = 5_000_000
 #the engine's own changes to mcts.py's search, which self-play keeps (tools/play/variant_match.py tunes them). One leaf
-#a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. None yet: c_puct 0.4 won +78 elo at 4k nodes a move
-#and +46 at 30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29), so
-#its self-play gain is self-play's bias towards narrow search
-ENGINE_SETTINGS: dict = {}
+#a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. c_puct 0.4 won +78 elo at 4k nodes a move and +46 at
+#30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
+#towards narrow search. value_sharpness 3: the value labels' human scale is ~3x flatter than stockfish's win rate, and
+#the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11)
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0}
 
+
+#search.rs sharpen: the value's logit times sharpness; 1 / sharpness undoes it, and 1 leaves the score exactly as it was
+def sharpen(score: float, sharpness: float) -> float:
+    return score if sharpness == 1 or score in (0.0, 1.0) else 1 / (1 + ((1 - score) / score) ** sharpness)
 
 #Searches' settings: mcts.py's with the engine's own (own), then changes (parse_changes') over them
 def engine_search_settings(use_tablebase: bool, changes: dict | None = None, own: bool = True, tablebase_pieces: int = TABLEBASE_PIECES) -> dict:
@@ -84,6 +89,8 @@ class EngineSearch:
         self.smart_pruning = batched and smart_pruning
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces)
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=CACHE_POSITIONS)
+        #reports give the score on the network's own scale, as a gui showed and adjudicated it before sharpening
+        self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         self.tablebase = open_tablebase(tablebase_pieces) if use_tablebase else None
         #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
         self.ranked_pieces = ranked_pieces(tablebase_pieces) if use_tablebase else 0
@@ -145,7 +152,7 @@ class EngineSearch:
                     report = self.searches.stop(GAME)
 
         _, line, score, root_moves, visits = report
-        return SearchReport(score, [chess.Move.from_uci(move) for move in line], visits,
+        return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
                             [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]])
 
     #the simulations the search has left: those waiting for the network count as left, so a move is only decided if
