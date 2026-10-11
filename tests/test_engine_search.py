@@ -89,6 +89,37 @@ def test_the_cache_answers_transpositions_as_the_network_would():
     assert evaluated_with_cache < 0.9 * evaluated_without
 
 
+#with dedupe_in_flight a leaf whose position is already waiting for the network (another order of moves to it, in its
+#round or the one out) sends no board and takes that leaf's answer, sharpened once. Rounds that stop at their
+#simulations make the same descents either way, so they send every position once and grow the same tree
+def test_a_transposition_waiting_takes_its_twins_answer():
+    board_model = cpu_batches(BoardModel()).evaluate_boards
+
+    #BoardModel's priors with a score of every position's own, so that a twin given another answer shows
+    def evaluate(boards: np.ndarray) -> np.ndarray:
+        answers = board_model(boards)
+        answers[:, -1] = (boards.astype(np.int64).sum(axis=1) % 7 + 1) / 8
+        return answers
+
+    both = [selfplay_rs.Searches(**rust_search_settings(False), cache_positions=100_000, value_sharpness=3.0, dedupe_in_flight=dedupe)
+            for dedupe in (False, True)]
+    for searches in both:
+        searches.start(0, chess.STARTING_FEN, [], 3000)
+    sent, reports = [0, 0], [[], []]
+    while not reports[0]:
+        rounds = [[leaf_boards(searches.descend(64, 64, 48)) for _ in range(2)] for searches in both]
+        every, deduped = (np.concatenate(boards) for boards in rounds)
+        assert {board.tobytes() for board in deduped} == {board.tobytes() for board in every}
+        assert len({board.tobytes() for board in deduped}) == len(deduped)
+        for index, (searches, boards) in enumerate(zip(both, rounds)):
+            sent[index] += sum(map(len, boards))
+            for round_boards in boards:
+                reports[index] = searches.finish(evaluate(round_boards)) or reports[index]
+
+    assert reports[1] == reports[0]
+    assert sent[1] < sent[0]
+
+
 #one leaf a round is mcts.py's search (Searches' defaults, test_selfplay_rs.py) at every move, as evaluate_elo's logged
 #results were played, whatever the engine's own settings: a second round out on the network would change it. From a
 #middlegame, where captures move the material count, so that an answer changes the next choice

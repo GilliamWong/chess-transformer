@@ -16,7 +16,8 @@ pub struct SearchSettings {
     pub fpu_reduction: f64,
     pub draw: f64,
     pub repetitions_for_a_draw: usize,
-    pub value_sharpness: f64, //the network's value through sharpen; 1 is mcts.py's search
+    pub value_sharpness: f64,   //the network's value through sharpen; 1 is mcts.py's search
+    pub dedupe_in_flight: bool, //a leaf whose position is already waiting for the network waits for that answer (gather)
 }
 
 //mcts.Node's numbers, in one vector per tree with the root first. An expanded node's moves (its edges) are contiguous
@@ -147,6 +148,10 @@ pub struct Tree {
     priors: Vec<f64>,
     children: Vec<u32>,
     pending: VecDeque<PendingLeaf>, //oldest first, the order the network's answers come back in
+    //with dedupe_in_flight, by the position of every leaf in pending (its key and number of moves, as the cache checks):
+    //the leaves of that position reached by another order of moves while it waits, which take its answer
+    twins: HashMap<(u64, usize), Vec<PendingLeaf>>,
+    twin_count: usize,
     logits: Vec<f32>,
 }
 
@@ -162,6 +167,8 @@ impl Tree {
             priors: Vec::new(),
             children: Vec::new(),
             pending: VecDeque::new(),
+            twins: HashMap::new(),
+            twin_count: 0,
             logits: Vec::new(),
         }
     }
@@ -186,7 +193,7 @@ impl Tree {
 
     //simulations waiting for the network
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.twin_count
     }
 
     //the visits of the root's two most visited moves, 0 for a move it does not have
@@ -244,7 +251,9 @@ impl Tree {
     //mcts.descend and finish until the round has its leaves or its simulations, the leaves' boards added to boards: a
     //leaf that needs no network (the game's result, or an answer in the cache) is finished at once. A descent that ends
     //on a leaf already waiting (a collision) counts as waiting along its path, so the next descents turn elsewhere; the
-    //collisions are taken off again at the end. Returns the leaves gathered
+    //collisions are taken off again at the end. With dedupe_in_flight a leaf whose position is already waiting (reached
+    //by another order of moves) sends no board: the network sees no history, so it takes that leaf's answer. Returns the
+    //leaves gathered
     pub fn gather(
         &mut self,
         round: &Round,
@@ -262,7 +271,7 @@ impl Tree {
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         while gathered < round.leaves
             && simulations < round.simulations
-            && self.root().visit_count as usize + self.pending.len() < round.visit_limit as usize
+            && self.root().visit_count as usize + self.pending() < round.visit_limit as usize
         {
             let mut board = self.board.clone();
             let root_keys = self.keys.len();
@@ -312,10 +321,23 @@ impl Tree {
                     self.backup(&path, f64::from(answer.value), 0);
                 }
                 None => {
-                    encode_board(&board, boards);
                     self.add_in_flight(&path);
-                    self.pending.push_back(PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() });
-                    gathered += 1;
+                    let leaf = PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() };
+                    let position = (leaf_key, leaf.moves.len());
+                    match self.twins.get_mut(&position) {
+                        Some(twins) => {
+                            twins.push(leaf);
+                            self.twin_count += 1;
+                        }
+                        None => {
+                            if settings.dedupe_in_flight {
+                                self.twins.insert(position, Vec::new());
+                            }
+                            encode_board(&board, boards);
+                            self.pending.push_back(leaf);
+                            gathered += 1;
+                        }
+                    }
                 }
             }
         }
@@ -327,7 +349,8 @@ impl Tree {
         Ok(gathered)
     }
 
-    //mcts.finish for the oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it, sharpened
+    //mcts.finish for the oldest waiting leaf and its twins; answer is the move logits, then the expected score. The cache
+    //keeps it, sharpened
     pub fn finish_leaf(
         &mut self,
         answer: impl Fn(usize) -> f32,
@@ -346,6 +369,13 @@ impl Tree {
         let priors = std::mem::take(&mut self.logits);
         self.expand(node, &leaf.moves, &priors);
         self.backup(&leaf.path, f64::from(value), 1);
+        if settings.dedupe_in_flight {
+            for twin in self.twins.remove(&(leaf.key, leaf.moves.len())).expect("the waiting leaf's twins") {
+                self.twin_count -= 1;
+                self.expand(*twin.path.last().expect("the root at least"), &twin.moves, &priors);
+                self.backup(&twin.path, f64::from(value), 1);
+            }
+        }
         match cache {
             Some(cache) => cache.insert(leaf.key, Answer { priors: priors.into_boxed_slice(), value }),
             None => self.logits = priors,
