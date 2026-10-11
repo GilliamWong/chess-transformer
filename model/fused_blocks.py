@@ -22,6 +22,9 @@ from model.model import NUM_SQUARES, TOKENS_PER_BOARD, ChessTransformer, SquareF
 SQUARE_WARPS, META_WARPS = 2, 2
 #rows of template_bias_kernel's matmuls: (position, head) pairs
 BIAS_PAIRS = 64
+#positions whose template bias is made and read at a time, in one buffer that stays in L2: the bias of a whole batch
+#of 256 made the network 4% slower, and of 64 with two batches on the gpu at once (two streams) 1%
+BIAS_POSITIONS = 32
 
 
 #the template bias of every (position, head) pair, made before the attention: in its kernel, with the templates in
@@ -99,17 +102,22 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
     B, T, _ = projected.shape
     q, k, v, c = projected.split([heads * dq, kv_heads * dq, kv_heads * dv, heads * templates_count], dim=-1)
     out = torch.empty(B, T, heads * dv, device=projected.device, dtype=projected.dtype)
-    bias = torch.empty(B, heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
-    template_bias_kernel[(NUM_SQUARES, triton.cdiv(B * heads, BIAS_PAIRS))](c, templates, bias, B * heads, projected.stride(0), projected.stride(1),
-                                                                         HEADS=heads, TEMPLATES=templates_count,
-                                                                         BLOCK_TEMPLATES=max(16, triton.next_power_of_2(templates_count)), PAIRS=BIAS_PAIRS)
+    bias = torch.empty(min(B, BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
     heads_per_kv, block_meta = heads // kv_heads, max(16, triton.next_power_of_2(T - NUM_SQUARES))
-    shapes = dict(T=T, HEADS=heads, HEADS_PER_KV=heads_per_kv, DQ=dq, DV=dv, BLOCK_META=block_meta, BLOCK_DQ=max(16, triton.next_power_of_2(dq)))
-    arguments = (q, k, v, bias, q_gain, k_gain, out, projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
     square_rows = triton.next_power_of_2(heads_per_kv * NUM_SQUARES)
-    template_attention_kernel[(kv_heads, B)](*arguments, FIRST_ROW=0, ROWS_PER_HEAD=NUM_SQUARES, BLOCK_ROWS=square_rows,
-                                             num_warps=SQUARE_WARPS * square_rows // NUM_SQUARES, **shapes)
-    template_attention_kernel[(kv_heads, B)](*arguments, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
+    shapes = dict(T=T, HEADS=heads, HEADS_PER_KV=heads_per_kv, DQ=dq, DV=dv, BLOCK_META=block_meta, BLOCK_DQ=max(16, triton.next_power_of_2(dq)))
+    scalars = (projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
+    for start in range(0, B, BIAS_POSITIONS):
+        positions = slice(start, min(B, start + BIAS_POSITIONS))
+        count = positions.stop - start
+        template_bias_kernel[(NUM_SQUARES, triton.cdiv(count * heads, BIAS_PAIRS))](c[positions], templates, bias, count * heads, projected.stride(0),
+                                                                                 projected.stride(1), HEADS=heads, TEMPLATES=templates_count,
+                                                                                 BLOCK_TEMPLATES=max(16, triton.next_power_of_2(templates_count)),
+                                                                                 PAIRS=BIAS_PAIRS)
+        template_attention_kernel[(kv_heads, count)](q[positions], k[positions], v[positions], bias, q_gain, k_gain, out[positions], *scalars, FIRST_ROW=0,
+                                                     ROWS_PER_HEAD=NUM_SQUARES, BLOCK_ROWS=square_rows,
+                                                     num_warps=SQUARE_WARPS * square_rows // NUM_SQUARES, **shapes)
+    template_attention_kernel[(kv_heads, B)](q, k, v, bias, q_gain, k_gain, out, *scalars, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
                                              BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes)
     return out
 

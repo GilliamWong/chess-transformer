@@ -130,13 +130,14 @@ def test_fused_blocks_compute_what_the_model_does():
 
 #fused_blocks.template_attention in fp16 as the engine runs it, against the attention in fp32 at the d768's shapes:
 #every query row (the squares' with the template bias, the metadata tokens' without), one, two and three query heads
-#to a key/value head (three fill no power of two of rows), query/key widths padded in the kernel or not
+#to a key/value head (three fill no power of two of rows), query/key widths padded in the kernel or not, and more
+#positions than one bias buffer takes
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 @pytest.mark.parametrize("heads, kv_heads, dq", [(24, 12, 24), (24, 12, 8), (4, 4, 16), (6, 2, 16)])
 def test_template_attention_in_fp16(heads, kv_heads, dq):
-    from model.fused_blocks import template_attention
+    from model.fused_blocks import BIAS_POSITIONS, template_attention
     torch.manual_seed(0)
-    B, T, dv, templates_count, eps = 5, TOKENS_PER_BOARD, 32, 8, 1e-5
+    B, T, dv, templates_count, eps = BIAS_POSITIONS + 5, TOKENS_PER_BOARD, 32, 8, 1e-5
     projected = torch.randn(B, T, heads * dq + kv_heads * dq + kv_heads * dv + heads * templates_count, device="cuda").half()
     templates = (torch.randn(templates_count, NUM_SQUARES, NUM_SQUARES, device="cuda") / 2).half()
     q_gain, k_gain = (1 + torch.randn(2, dq, device="cuda") / 10).half()
