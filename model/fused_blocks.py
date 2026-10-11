@@ -17,6 +17,8 @@ from model.model import NUM_SQUARES, TOKENS_PER_BOARD, ChessTransformer, SquareF
 
 #warps an attention instance has for each 64 of its square rows, and for its metadata rows
 SQUARE_WARPS, META_WARPS = 2, 2
+#the most warps Triton gives an instance
+MAX_WARPS = 32
 #rows of template_bias_kernel's matmuls: (position, head) pairs
 BIAS_PAIRS = 64
 #positions whose template bias is made and read at a time: a buffer that stays in L2
@@ -36,7 +38,8 @@ def template_bias_kernel(c_ptr, templates_ptr, bias_ptr, pairs_count, stride_b, 
     coefficients = tl.load(c_ptr + b[:, None] * stride_b + i * stride_t + h[:, None] * TEMPLATES + t[None, :],
                            mask=pair_ok[:, None] & (t < TEMPLATES)[None, :], other=0.0)
     templates = tl.load(templates_ptr + t[:, None] * 4096 + i * 64 + squares[None, :], mask=(t < TEMPLATES)[:, None], other=0.0)
-    bias = tl.dot(coefficients, templates)
+    #ieee: fp32 inputs (the tests' fp32 model) would otherwise be rounded to tf32
+    bias = tl.dot(coefficients, templates, input_precision="ieee")
     tl.store(bias_ptr + pairs[:, None] * 4096 + i * 64 + squares[None, :], bias.to(bias_ptr.dtype.element_ty), mask=pair_ok[:, None])
 
 
@@ -98,6 +101,9 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
     bias = torch.empty(min(B, BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
     heads_per_kv, block_meta = heads // kv_heads, max(16, triton.next_power_of_2(T - NUM_SQUARES))
     square_rows = triton.next_power_of_2(heads_per_kv * NUM_SQUARES)
+    square_warps = SQUARE_WARPS * square_rows // NUM_SQUARES
+    if square_warps > MAX_WARPS:
+        raise ValueError(f"template_attention takes at most {MAX_WARPS // SQUARE_WARPS} query heads a key/value head, not {heads_per_kv}")
     shapes = dict(T=T, HEADS=heads, HEADS_PER_KV=heads_per_kv, DQ=dq, DV=dv, BLOCK_META=block_meta, BLOCK_DQ=max(16, triton.next_power_of_2(dq)))
     scalars = (projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
     for start in range(0, B, BIAS_POSITIONS):
@@ -109,7 +115,7 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
                                                                                  PAIRS=BIAS_PAIRS)
         template_attention_kernel[(kv_heads, count)](q[positions], k[positions], v[positions], bias, q_gain, k_gain, out[positions], *scalars, FIRST_ROW=0,
                                                      ROWS_PER_HEAD=NUM_SQUARES, BLOCK_ROWS=square_rows,
-                                                     num_warps=SQUARE_WARPS * square_rows // NUM_SQUARES, **shapes)
+                                                     num_warps=square_warps, **shapes)
     template_attention_kernel[(kv_heads, B)](q, k, v, bias, q_gain, k_gain, out, *scalars, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
                                              BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes)
     return out
@@ -350,13 +356,14 @@ class FusedTransformer(nn.Module):
                 embed_state = block(embed_state, self.templates, original_board_embed)
         model_output = self.ln(embed_state)
 
-        #on every token: the metadata tokens' a is not needed, but slicing out the squares' would copy them
-        a = linear(model_output.half(), self.a_weight, self.a_bias, accumulate_fp32=True)
-        model_output = model_output.float()
-        narrow = F.linear(model_output, self.narrow_weight, self.narrow_bias) #B T: s, the promotion logits, board_down_project's
-        squares = narrow[:, :NUM_SQUARES]
-        logits = a[:, :NUM_SQUARES] @ model_output[:, :NUM_SQUARES].transpose(1, 2) + squares[..., :1]
-        combined_logits = logits[:, self.from_squares, self.to_squares]
-        combined_logits[:, self.promotion_move_ids] += squares[..., self.promotion_columns][:, self.promotion_to_squares, self.promotion_pieces]
-        compressed_board = self.board_down_activation(narrow[..., self.down_columns]).reshape(board_state.shape[0], -1)
-        return combined_logits, self.eval_head(compressed_board)
+        with torch.autocast(device_type=board_state.device.type, enabled=False):
+            #on every token: the metadata tokens' a is not needed, but slicing out the squares' would copy them
+            a = linear(model_output.half(), self.a_weight, self.a_bias, accumulate_fp32=True)
+            model_output = model_output.float()
+            narrow = F.linear(model_output, self.narrow_weight, self.narrow_bias) #B T: s, the promotion logits, board_down_project's
+            squares = narrow[:, :NUM_SQUARES]
+            logits = a[:, :NUM_SQUARES] @ model_output[:, :NUM_SQUARES].transpose(1, 2) + squares[..., :1]
+            combined_logits = logits[:, self.from_squares, self.to_squares]
+            combined_logits[:, self.promotion_move_ids] += squares[..., self.promotion_columns][:, self.promotion_to_squares, self.promotion_pieces]
+            compressed_board = self.board_down_activation(narrow[..., self.down_columns]).reshape(board_state.shape[0], -1)
+            return combined_logits, self.eval_head(compressed_board)
