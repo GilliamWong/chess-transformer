@@ -76,6 +76,8 @@ def graph_sizes(max_batch: int) -> list[int]:
 class Lane:
     def __init__(self, model: nn.Module, sizes: list[int]):
         self.stream = torch.cuda.Stream()
+        #launched and not yet collected: another launch would write over its answers
+        self.pending = False
         largest = sizes[-1]
         #recorded on real boards: zero boards once hit a device-side assert
         self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
@@ -112,6 +114,9 @@ class GraphedBatches:
         count = len(boards)
         size = next(size for size in self.sizes if size >= count)
         lane = self.lanes[self.turn]
+        if lane.pending:
+            raise RuntimeError("more batches in flight than lanes")
+        lane.pending = True
         self.turn = (self.turn + 1) % len(self.lanes)
         lane.boards_host[:count] = torch.from_numpy(boards)
         with torch.cuda.stream(lane.stream):
@@ -124,6 +129,7 @@ class GraphedBatches:
         lane, size, count = launched
         with torch.cuda.stream(lane.stream):
             lane.answers_host[:count].copy_(lane.answers[size][:count])
+        lane.pending = False
         return lane.answers_host[:count].numpy()
 
 #GraphedBatches' interface without a gpu (and in the tests): launch does the work
@@ -202,7 +208,8 @@ def inference_process(checkpoint_path: str, compile_model: bool, precision: str,
         if compile_model:
             #most of a big batch's forwards are whole chunks
             model = ExactSizeCompiled(model, CHUNK_POSITIONS)
-        network = GraphedBatches(model, graph_sizes(len(slot_names) * games_per_process))
+        #serve keeps two batches out
+        network = GraphedBatches(model, graph_sizes(len(slot_names) * games_per_process), in_flight=2)
     else:
         network = cpu_batches(load_model(Path(checkpoint_path), CPU))
     ready.set()

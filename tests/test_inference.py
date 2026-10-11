@@ -110,6 +110,19 @@ def test_graphs_keep_their_model_alive():
     assert np.allclose(answers, expected, atol=1e-3)
 
 
+#a launch on a lane whose batch is not yet collected would write over its answers, so it is refused
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_more_batches_out_than_lanes_are_refused():
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    boards = np.array([encode_board(chess.Board())], dtype=np.uint8)
+    graphs = GraphedBatches(model, [1], in_flight=1)
+    launched = graphs.launch(boards)
+    with pytest.raises(RuntimeError, match="more batches in flight than lanes"):
+        graphs.launch(boards)
+    graphs.collect(launched)
+    graphs.collect(graphs.launch(boards))
+
+
 #two batches out at once in two lanes come back with the bits each gets alone: lanes recorded on one stream into one
 #memory pool wrote over each other's activations. A model big enough that the two batches overlap
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
