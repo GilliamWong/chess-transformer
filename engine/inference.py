@@ -161,6 +161,18 @@ def fp16_model(checkpoint_path: Path) -> nn.Module:
     model = load_model(checkpoint_path, torch.device("cuda")).scale_residual_stream(FP16_RESIDUAL_SCALE)
     return FusedTransformer(model.half_except_heads(torch.float16))
 
+#the model compiled for batches of exactly exact_size boards, and with dynamic shapes for the others; only recording a
+#graph calls it, so the choice costs the graphs nothing. Inductor's kernels for a known batch made the engine's rounds of
+#64 leaves 2% faster, and compiling every graph size exactly made a cold start 200 s rather than 41 (this one 51)
+class ExactSizeCompiled(nn.Module):
+    def __init__(self, model: nn.Module, exact_size: int):
+        super().__init__()
+        self.exact_size = exact_size
+        self.exact, self.dynamic = torch.compile(model, dynamic=False), torch.compile(model, dynamic=True)
+
+    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return (self.exact if len(boards) == self.exact_size else self.dynamic)(boards)
+
 #bf16 autocast, as train.py trains: targets as good as tf32's, and ~150k positions/s instead of 110k (d128, compiled)
 class Bf16(nn.Module):
     def __init__(self, model: nn.Module):
