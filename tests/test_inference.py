@@ -115,6 +115,27 @@ def test_more_batches_out_than_lanes_are_refused():
     graphs.collect(graphs.launch(boards))
 
 
+#batches may be collected in any order: a launch takes whichever lane is free, not the next in turn
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_batches_are_collected_in_any_order():
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    board, boards = chess.Board(), []
+    for san in ("e4", "d5", "exd5"):
+        board.push_san(san)
+        boards.append(encode_board(board))
+    boards = np.array(boards, dtype=np.uint8)
+    graphs = GraphedBatches(model, [1, 2])
+    expected = graphs.collect(graphs.launch(boards[1:])).copy()
+
+    first, second = graphs.launch(boards[:1]), graphs.launch(boards[1:])
+    graphs.collect(second)
+    third = graphs.launch(boards[1:])
+    graphs.collect(first)
+
+    assert np.array_equal(graphs.collect(third), expected)
+
+
 #two batches out at once in two lanes come back with the bits each gets alone: lanes recorded on one stream into one
 #memory pool wrote over each other's activations. A model big enough that the two batches overlap
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")

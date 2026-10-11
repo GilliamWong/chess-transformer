@@ -99,8 +99,8 @@ class Lane:
             with torch.cuda.graph(self.graphs[size], pool=pool, stream=self.stream), torch.no_grad():
                 self.answers[size] = chunked_answer_rows(model, self.boards[:size])
 
-#the model as cuda graphs in in_flight lanes that take the batches in turn and run them at once, a batch through the
-#smallest graph that holds it. launch returns at once and collect waits: at most in_flight batches may be out
+#the model as cuda graphs in in_flight lanes that run their batches at once, a batch through the smallest graph that
+#holds it on the first lane free. launch returns at once and collect waits, in any order: at most in_flight batches out
 class GraphedBatches:
     def __init__(self, model: nn.Module, sizes: list[int], in_flight: int = 2):
         #the graphs read the model's weights where they were when recorded: freed, their memory went to the next
@@ -108,16 +108,14 @@ class GraphedBatches:
         self.model = model
         self.sizes = sizes
         self.lanes = [Lane(model, sizes) for _ in range(in_flight)]
-        self.turn = 0
 
     def launch(self, boards: np.ndarray) -> tuple[Lane, int, int]:
         count = len(boards)
         size = next(size for size in self.sizes if size >= count)
-        lane = self.lanes[self.turn]
-        if lane.pending:
+        lane = next((lane for lane in self.lanes if not lane.pending), None)
+        if lane is None:
             raise RuntimeError("more batches in flight than lanes")
         lane.pending = True
-        self.turn = (self.turn + 1) % len(self.lanes)
         lane.boards_host[:count] = torch.from_numpy(boards)
         with torch.cuda.stream(lane.stream):
             lane.boards[:count].copy_(lane.boards_host[:count], non_blocking=True)
