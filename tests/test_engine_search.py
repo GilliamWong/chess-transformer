@@ -3,6 +3,7 @@
 #limits and clock
 from collections import deque
 import io
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ import pytest
 
 import selfplay_rs
 from model.encoding import TOKENS_PER_BOARD
-from fake_models import BoardModel, UniformModel
+from fake_models import BoardModel, CountingNetwork, UniformModel
 from engine.inference import ImmediateBatches, cpu_batches
 from model.model import ChessTransformer
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
@@ -38,20 +39,6 @@ def mcts_constants(monkeypatch):
 
 def leaf_boards(leaves: bytes) -> np.ndarray:
     return np.frombuffer(bytearray(leaves), dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
-
-#the model on the cpu, counting the boards it evaluates
-class CountingNetwork:
-    def __init__(self, model):
-        self.network = cpu_batches(model)
-        self.boards = 0
-
-    def launch(self, boards: np.ndarray) -> np.ndarray:
-        self.boards += len(boards)
-        return self.network.launch(boards)
-
-    def collect(self, launched: np.ndarray) -> np.ndarray:
-        return self.network.collect(launched)
-
 
 #the first round finds only the root to evaluate; then a round spreads over the root's moves, and a round gathered
 #while another is out takes none of its leaves again
@@ -411,6 +398,20 @@ def test_the_engine_takes_search_settings(tmp_path):
             engine.quit()
         found.append((played.info["pv"], played.info["score"], played.info["nodes"]))
     assert found[0][2] == found[1][2] == 400 and found[0][:2] != found[1][:2]
+
+
+#uci.py's --precision reaches the network the search runs, and is refused where no such network runs
+def test_the_engine_takes_a_precision(monkeypatch, tmp_path):
+    settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": 16}
+    save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
+    built = []
+    monkeypatch.setattr(uci, "engine_network", lambda checkpoint, leaves, precision: built.append(precision) or cpu_batches(BoardModel()))
+    search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {}, "int8")
+    refused = subprocess.run([sys.executable, "-m", "engine.uci", str(tmp_path / "model.pt"), "--select", "mcts", "--precision", "int8"],
+                             cwd=REPOSITORY, capture_output=True, text=True, input="")
+
+    assert built == ["int8"] and search.search(chess.Board(), simulations=20).simulations == 20
+    assert refused.returncode == 2 and "--precision needs --select mcts --gpu" in refused.stderr
 
 
 #the engine as a gui drives it: a move within go movetime, go nodes' simulations (in a new game: a kept tree's visits

@@ -1,7 +1,9 @@
 #stand-in networks shared by the search and self play tests
+import numpy as np
 import torch
 from torch import nn
 
+from engine.inference import cpu_batches
 from model.encoding import NUM_MOVE_IDS
 
 #material in pawns by board token: the side to move's pieces count for it, the other side's against
@@ -21,3 +23,16 @@ class BoardModel(nn.Module):
 
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return boards.float() @ self.weights / 100, PIECE_VALUES[boards[:, :64].long()].sum(dim=1, keepdim=True)
+
+#the model on the cpu, counting the boards it evaluates
+class CountingNetwork:
+    def __init__(self, model):
+        self.network = cpu_batches(model)
+        self.boards = 0
+
+    def launch(self, boards: np.ndarray) -> np.ndarray:
+        self.boards += len(boards)
+        return self.network.launch(boards)
+
+    def collect(self, launched: np.ndarray) -> np.ndarray:
+        return self.network.collect(launched)

@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
-from engine.engine_search import LEAVES, EngineSearch, engine_network, engine_search_settings, parse_changes
+from engine.engine_search import LEAVES, PRECISIONS, EngineSearch, engine_network, engine_search_settings, parse_changes
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES
@@ -129,22 +129,25 @@ def load_engine_model(checkpoint_path: Path, gpu: bool) -> nn.Module:
         return CudaGraphModel(load_model(checkpoint_path, torch.device("cuda")))
     return load_model(checkpoint_path, DEVICE)
 
-#the search for --select mcts: on the gpu `leaves` leaves a round; on the cpu one, which is mcts.py's search. options
-#are EngineSearch's keyword arguments (smart pruning, the tables' pieces, changes to the search's settings)
-def load_engine_search(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, options: dict) -> EngineSearch:
+#the search for --select mcts: on the gpu `leaves` leaves a round, the network in `precision`; on the cpu one, which is
+#mcts.py's search. options are EngineSearch's keyword arguments (smart pruning, the tables' pieces, changes to the
+#search's settings)
+def load_engine_search(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, options: dict, precision: str) -> EngineSearch:
     if gpu:
-        return EngineSearch(engine_network(checkpoint_path, leaves), leaves, use_tablebase=tablebase, **options)
+        return EngineSearch(engine_network(checkpoint_path, leaves, precision), leaves, use_tablebase=tablebase, **options)
     return EngineSearch(cpu_batches(load_model(checkpoint_path, DEVICE)), 1, use_tablebase=tablebase, **options)
 
 #what picks the moves: the search for --select mcts, else the model
-def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, tablebase: bool, search_options: dict) -> nn.Module | EngineSearch:
+def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, tablebase: bool, search_options: dict,
+                precision: str) -> nn.Module | EngineSearch:
     if selection == "mcts":
-        return load_engine_search(checkpoint_path, gpu, leaves, tablebase, search_options)
+        return load_engine_search(checkpoint_path, gpu, leaves, tablebase, search_options, precision)
     return load_engine_model(checkpoint_path, gpu)
 
 def main(checkpoint_path: Path | None = None, random_mover: bool = False, selection: str = "argmax",
          temperature: float = TEMPERATURE, sample_plies: int = SAMPLE_PLIES, simulations: int = SIMULATIONS,
-         gpu: bool = False, leaves: int = LEAVES, tablebase: bool = False, search_log: Path | None = None, search_options: dict | None = None):
+         gpu: bool = False, leaves: int = LEAVES, tablebase: bool = False, search_log: Path | None = None, search_options: dict | None = None,
+         precision: str = "fp16"):
     torch.set_num_threads(1)
     search_options = search_options or {}
     player = None
@@ -166,7 +169,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         elif command == "isready":
             #loaded here, not at startup, so "uci" is answered at once
             if player is None and not random_mover:
-                player = load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options)
+                player = load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options, precision)
             send("readyok")
 
         elif command == "ucinewgame":
@@ -183,7 +186,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
                 move = choose_random_move(board)
             else:
                 if player is None:
-                    player = load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options)
+                    player = load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options, precision)
                 if selection == "mcts":
                     nodes, seconds = clock.limits(arguments, board, simulations)
                     report = player.search(board, nodes, seconds)
@@ -213,6 +216,8 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", action="store_true", help="run the model on the gpu: faster for one search, slower when many games share it")
     parser.add_argument("--leaves", type=int, default=LEAVES,
                         help="for --select mcts --gpu: leaves gathered for each network call, default %(default)s; 1 is mcts.py's search")
+    parser.add_argument("--precision", choices=PRECISIONS, default="fp16",
+                        help="for --select mcts --gpu: the network's precision (engine_search.PRECISIONS), default %(default)s")
     parser.add_argument("--tablebase", action="store_true", help="for --select mcts: positions of at most --tablebase-pieces pieces from the syzygy tables")
     parser.add_argument("--tablebase-pieces", type=int, choices=[table_set.pieces for table_set in TABLE_SETS], default=TABLEBASE_PIECES,
                         help="for --tablebase: the most pieces, default %(default)s; 6 needs python -m tools.tablebase --pieces 6, and without "
@@ -225,12 +230,14 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     if arguments.tablebase_pieces != TABLEBASE_PIECES and not arguments.tablebase:
         parser.error("--tablebase-pieces needs --tablebase")
+    if arguments.precision != "fp16" and not (arguments.select == "mcts" and arguments.gpu):
+        parser.error("--precision needs --select mcts --gpu")
     if arguments.checkpoint == "random":
         main(random_mover=True)
     else:
         main(Path(arguments.checkpoint) if arguments.checkpoint else latest_checkpoint(),
              selection=arguments.select, temperature=arguments.temperature, sample_plies=arguments.sample_plies,
              simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
-             search_log=arguments.search_log,
+             search_log=arguments.search_log, precision=arguments.precision,
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase))})
