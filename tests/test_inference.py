@@ -103,29 +103,38 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
 #fused_blocks.FusedBlock must compute what model.TransformerBlock does, SummedSquareFeatures what SquareFeatures does
 #and FusedTransformer's one matmul what the heads do: with random templates and square features (zeros at init would
 #hide them), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel), and the
-#input skip away from its start
+#input skip away from its start. In fp32, and in fp16 as the engine runs it (fp16_model)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
-def test_fused_blocks_compute_what_the_model_does():
+@pytest.mark.parametrize("fp16", [False, True])
+def test_fused_blocks_compute_what_the_model_does(tmp_path, fp16):
     from model.fused_blocks import FusedTransformer
     torch.manual_seed(0)
-    model = ChessTransformer(d_model=128, num_layers=3, n_heads=4, kv_heads=2, qk_ratio=[0.25, 0.5, 0.75], value_bins=16).cuda().eval()
+    settings = {"d_model": 128, "num_layers": 3, "n_heads": 4, "kv_heads": 2, "qk_ratio": [0.25, 0.5, 0.75], "mlp_hidden": 320, "value_bins": 16}
+    model = ChessTransformer(**settings).cuda().eval()
     mix_in_the_input(model)
     with torch.no_grad():
         model.templates.normal_()
         model.square_features.table.normal_(std=0.1)
+    save_checkpoint(model, settings, tmp_path / "model.pt")
     board, boards = chess.Board(), []
     for san in "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6 Be3 e5 Nb3 Be6 f3 Be7".split():
         board.push_san(san)
         boards.append(encode_board(board))
     boards = torch.tensor(boards).cuda()
 
-    with torch.no_grad():
-        logits, value_logits = model(boards)
-        fused_logits, fused_value_logits = FusedTransformer(copy.deepcopy(model))(boards)
+    #fp16_model sets these for the whole process
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        with torch.no_grad():
+            logits, value_logits = model(boards)
+            fused = fp16_model(tmp_path / "model.pt") if fp16 else FusedTransformer(copy.deepcopy(model))
+            fused_logits, fused_value_logits = fused(boards)
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
-    assert torch.allclose(fused_logits, logits, atol=1e-2)
+    assert torch.allclose(fused_logits.float(), logits, atol=1e-2)
     assert torch.equal(fused_logits.argmax(-1), logits.argmax(-1))
-    assert torch.allclose(expected_score(fused_value_logits), expected_score(value_logits), atol=1e-3)
+    assert torch.allclose(expected_score(fused_value_logits.float()), expected_score(value_logits), atol=1e-3)
 
 
 #fused_blocks.template_attention in fp16 as the engine runs it, against the attention in fp32 at the d768's shapes:
