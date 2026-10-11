@@ -165,21 +165,22 @@ def _(x, original, residual_scale, input_scale, gain, eps):
 
 
 #rows of h (M x N fp16) times the block-diagonal Hadamard matrix of +-1 (blocks of BLOCK), rounded to int8 with a scale
-#per row, written WIDTH wide with zeros past N. A program's ROWS rows are read as ROWS * WIDTH / BLOCK rows of BLOCK,
-#which the Hadamard block multiplies as they are; only the blocks' maxima are rearranged into rows
+#per row, written WIDTH wide with zeros past N. A program's ROWS rows are read as ROWS * SLOTS rows of BLOCK (SLOTS, a
+#power of two, holds a row's WIDTH / BLOCK blocks), which the Hadamard block multiplies as they are; only the blocks'
+#maxima are rearranged into rows
 @triton.jit
-def rotate_quant_kernel(h_ptr, hadamard_ptr, q_ptr, scale_ptr, M, N, WIDTH: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr):
-    BLOCKS: tl.constexpr = WIDTH // BLOCK
-    r = tl.arange(0, ROWS * BLOCKS)
-    tokens = tl.program_id(0) * ROWS + r // BLOCKS
+def rotate_quant_kernel(h_ptr, hadamard_ptr, q_ptr, scale_ptr, M, N, WIDTH: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr,
+                        SLOTS: tl.constexpr):
+    r = tl.arange(0, ROWS * SLOTS)
+    tokens = tl.program_id(0) * ROWS + r // SLOTS
     i = tl.arange(0, BLOCK)
-    cols = (r % BLOCKS)[:, None] * BLOCK + i[None, :]
-    token_ok = tokens < M
-    h = tl.load(h_ptr + tokens[:, None] * N + cols, mask=token_ok[:, None] & (cols < N), other=0.0)
+    cols = (r % SLOTS)[:, None] * BLOCK + i[None, :]
+    stored = (tokens < M)[:, None] & (cols < WIDTH)
+    h = tl.load(h_ptr + tokens[:, None] * N + cols, mask=stored & (cols < N), other=0.0)
     rotated = tl.dot(h, tl.load(hadamard_ptr + i[:, None] * BLOCK + i[None, :]))
-    absmax = tl.maximum(tl.max(tl.reshape(tl.max(tl.abs(rotated), 1), (ROWS, BLOCKS)), 1), 1e-20)
-    inverse_step = tl.reshape(tl.broadcast_to((127.0 / absmax)[:, None], (ROWS, BLOCKS)), (ROWS * BLOCKS,))
-    tl.store(q_ptr + tokens[:, None] * WIDTH + cols, libdevice.rint(rotated * inverse_step[:, None]).to(tl.int8), mask=token_ok[:, None])
+    absmax = tl.maximum(tl.max(tl.reshape(tl.max(tl.abs(rotated), 1), (ROWS, SLOTS)), 1), 1e-20)
+    inverse_step = tl.reshape(tl.broadcast_to((127.0 / absmax)[:, None], (ROWS, SLOTS)), (ROWS * SLOTS,))
+    tl.store(q_ptr + tokens[:, None] * WIDTH + cols, libdevice.rint(rotated * inverse_step[:, None]).to(tl.int8), mask=stored)
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     tl.store(scale_ptr + rows, absmax / 127.0, mask=rows < M)
 
@@ -191,8 +192,9 @@ def rotate_quant(h: torch.Tensor, hadamard_signs: torch.Tensor, width: int) -> t
     M = h.numel() // N
     q = torch.empty(*h.shape[:-1], width, device=h.device, dtype=torch.int8)
     scale = torch.empty(h.shape[:-1], device=h.device, dtype=torch.float32)
-    rotate_quant_kernel[(triton.cdiv(M, ROTATE_ROWS),)](h, hadamard_signs, q, scale, M, N, WIDTH=width, ROWS=ROTATE_ROWS, BLOCK=hadamard_signs.shape[0],
-                                                        num_warps=4)
+    block = hadamard_signs.shape[0]
+    rotate_quant_kernel[(triton.cdiv(M, ROTATE_ROWS),)](h, hadamard_signs, q, scale, M, N, WIDTH=width, ROWS=ROTATE_ROWS, BLOCK=block,
+                                                        SLOTS=triton.next_power_of_2(width // block), num_warps=4)
     return q, scale
 
 

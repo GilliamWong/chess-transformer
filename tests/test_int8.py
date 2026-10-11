@@ -96,12 +96,12 @@ def test_norm_quant_rounds_the_rmsnorm():
 
 
 #rotate_quant rounds each row times the block-diagonal Hadamard matrix to int8 steps of its absmax / 127, written wider
-#with zeros
+#with zeros: with blocks that fill a power of two of slots (the d768's 1,024 of 992) and blocks that do not
 @gpu
-def test_rotate_quant_rounds_the_rotated_rows():
+@pytest.mark.parametrize("hidden, width", [(992, 1024), (320, 384)])
+def test_rotate_quant_rounds_the_rotated_rows(hidden, width):
     from model.int8_blocks import HADAMARD_BLOCK, hadamard, rotate_quant
     torch.manual_seed(0)
-    hidden, width = 160, 256
     h = torch.randn(3, 70, hidden, device="cuda").half()
 
     integers, scale = rotate_quant(h, hadamard(HADAMARD_BLOCK).cuda().half(), width)
