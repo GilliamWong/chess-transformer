@@ -88,8 +88,18 @@ pub fn legal_moves_in_python_order(board: &Chess) -> MoveList {
 
 pub fn sort_moves_in_python_order(board: &Chess, moves: &mut MoveList) {
     let in_check = board.is_check();
-    //The key branches on move type: computing it once per move is cheaper than on every comparison.
-    moves.sort_by_cached_key(|&chess_move| python_order(chess_move, in_check));
+    //each move's key (below 2^19) above its index, sorted as u32s on the stack: sort_by_cached_key's stable order without
+    //the allocation it makes on every call
+    let mut keys = [0u32; 256];
+    let keys = &mut keys[..moves.len()];
+    for (index, (key, &chess_move)) in keys.iter_mut().zip(moves.iter()).enumerate() {
+        *key = python_order(chess_move, in_check) << 9 | index as u32;
+    }
+    keys.sort_unstable();
+    let unsorted = moves.clone();
+    for (chess_move, key) in moves.iter_mut().zip(keys.iter()) {
+        *chess_move = unsorted[(key & 511) as usize];
+    }
 }
 
 fn python_order(chess_move: Move, in_check: bool) -> u32 {
