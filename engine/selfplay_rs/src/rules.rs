@@ -88,8 +88,7 @@ pub fn legal_moves_in_python_order(board: &Chess) -> MoveList {
 
 pub fn sort_moves_in_python_order(board: &Chess, moves: &mut MoveList) {
     let in_check = board.is_check();
-    //each move's key (below 2^19) above its index, sorted as u32s on the stack: sort_by_cached_key's stable order without
-    //the allocation it makes on every call
+    //key << 9 | index sorted on the stack: sort_by_cached_key's stable order without its allocation on every call
     let mut keys = [0u32; 256];
     let keys = &mut keys[..moves.len()];
     for (index, (key, &chess_move)) in keys.iter_mut().zip(moves.iter()).enumerate() {

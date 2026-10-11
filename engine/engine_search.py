@@ -43,10 +43,8 @@ CACHE_POSITIONS = 5_000_000
 #a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. c_puct 0.4 won +78 elo at 4k nodes a move and +46 at
 #30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
 #towards narrow search. value_sharpness 3: the value labels' human scale is ~3x flatter than stockfish's win rate, and
-#the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11). simulations_per_leaf
-#is the rounds' rather than Searches': a round's simulations for each leaf it may gather, those the cache or the game's
-#end answer at once included (lc0's out of order evaluations). It and dedupe_in_flight (search.rs gather) save network
-#calls but change the search, so they keep self-play's values (SIMULATIONS_PER_LEAF, no dedupe) until their elo is known
+#the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11)
+#simulations_per_leaf (a round's, lc0's out of order evaluations) and dedupe_in_flight change the search: self-play's values
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "dedupe_in_flight": False, "simulations_per_leaf": SIMULATIONS_PER_LEAF}
 
 
@@ -54,8 +52,7 @@ ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "dedupe_in_flight": False, "sim
 def sharpen(score: float, sharpness: float) -> float:
     return score if sharpness == 1 or score in (0.0, 1.0) else 1 / (1 + ((1 - score) / score) ** sharpness)
 
-#Searches' settings and the rounds' simulations_per_leaf: mcts.py's with the engine's own (own), then changes
-#(parse_changes') over them
+#Searches' settings and the rounds' simulations_per_leaf: mcts.py's, the engine's own (own), then changes (parse_changes')
 def engine_search_settings(use_tablebase: bool, changes: dict | None = None, own: bool = True, tablebase_pieces: int = TABLEBASE_PIECES) -> dict:
     return {**rust_search_settings(use_tablebase, tablebase_pieces), **(ENGINE_SETTINGS if own else {}), **(changes or {})}
 

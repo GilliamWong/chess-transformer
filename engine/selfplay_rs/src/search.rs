@@ -148,8 +148,7 @@ pub struct Tree {
     priors: Vec<f64>,
     children: Vec<u32>,
     pending: VecDeque<PendingLeaf>, //oldest first, the order the network's answers come back in
-    //with dedupe_in_flight, by the position of every leaf in pending (its key and number of moves, as the cache checks):
-    //the leaves of that position reached by another order of moves while it waits, which take its answer
+    //with dedupe_in_flight, by each pending leaf's key and number of moves: its position's leaves reached by other moves
     twins: HashMap<(u64, usize), Vec<PendingLeaf>>,
     twin_count: usize,
     logits: Vec<f32>,
@@ -251,9 +250,7 @@ impl Tree {
     //mcts.descend and finish until the round has its leaves or its simulations, the leaves' boards added to boards: a
     //leaf that needs no network (the game's result, or an answer in the cache) is finished at once. A descent that ends
     //on a leaf already waiting (a collision) counts as waiting along its path, so the next descents turn elsewhere; the
-    //collisions are taken off again at the end. With dedupe_in_flight a leaf whose position is already waiting (reached
-    //by another order of moves) sends no board: the network sees no history, so it takes that leaf's answer. Returns the
-    //leaves gathered
+    //collisions are taken off again at the end. Returns the leaves gathered
     pub fn gather(
         &mut self,
         round: &Round,
@@ -324,6 +321,7 @@ impl Tree {
                     self.add_in_flight(&path);
                     let leaf = PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() };
                     let position = (leaf_key, leaf.moves.len());
+                    //the network sees no history, so a leaf whose position is already waiting can take its answer
                     match self.twins.get_mut(&position) {
                         Some(twins) => {
                             twins.push(leaf);
@@ -369,8 +367,8 @@ impl Tree {
         let priors = std::mem::take(&mut self.logits);
         self.expand(node, &leaf.moves, &priors);
         self.backup(&leaf.path, f64::from(value), 1);
-        if settings.dedupe_in_flight {
-            for twin in self.twins.remove(&(leaf.key, leaf.moves.len())).expect("the waiting leaf's twins") {
+        if let Some(twins) = self.twins.remove(&(leaf.key, leaf.moves.len())) {
+            for twin in twins {
                 self.twin_count -= 1;
                 self.expand(*twin.path.last().expect("the root at least"), &twin.moves, &priors);
                 self.backup(&twin.path, f64::from(value), 1);
