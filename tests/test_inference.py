@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from model.encoding import EN_PASSANT_TOKEN_OFFSET, NUM_SQUARES, TOKENS_PER_BOARD, encode_board
+from engine import inference
 from engine.inference import GraphedBatches, answer_rows, fp16_model, graph_sizes, small_graph_sizes
 from model.model import VALUE_BINS, ChessTransformer, expected_score
 from tools.checkpoint import save_checkpoint
@@ -46,6 +47,27 @@ def test_graphs_answer_like_the_model():
 
     assert np.allclose(answers, expected, atol=1e-3)
     assert np.allclose(answer_rows((logits, value)).numpy(), expected[:1], atol=1e-3)
+
+
+#a batch bigger than CHUNK_POSITIONS runs as forwards of that many in its graph: every board's answer in its place, the
+#last chunk part padding
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_chunked_graphs_answer_like_the_model(monkeypatch):
+    monkeypatch.setattr(inference, "CHUNK_POSITIONS", 3)
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    board, boards = chess.Board(), []
+    for san in "e4 c5 Nf3 d6 d4 cxd4 Nxd4".split():
+        board.push_san(san)
+        boards.append(encode_board(board))
+    boards = np.array(boards, dtype=np.uint8)
+    with torch.no_grad():
+        expected = answer_rows(model(torch.from_numpy(boards).long().cuda())).cpu().numpy()
+
+    graphs = GraphedBatches(model, [8])
+    answers = graphs.collect(graphs.launch(boards))
+
+    assert np.allclose(answers, expected, atol=1e-3)
 
 
 #the graphs read the model's weights in place, so GraphedBatches must keep a model nothing else holds (as

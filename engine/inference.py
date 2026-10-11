@@ -20,6 +20,16 @@ def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     move_logits, value_logits = outputs
     return torch.cat([move_logits.float(), expected_score(value_logits).unsqueeze(1)], dim=1)
 
+#boards a forward of the model takes at once: a bigger batch runs as forwards of this many in its graph, so their
+#activations stay in the gpu's L2 cache (a d768's do at 128 boards in the RTX 5070 Ti's 48 MB, not at 256: 256 at once
+#ran 7% fewer boards a second, 512 and 1024 9% fewer)
+CHUNK_POSITIONS = 128
+
+#answer_rows for every board, CHUNK_POSITIONS boards at a time
+def chunked_answer_rows(model: nn.Module, boards: torch.Tensor) -> torch.Tensor:
+    rows = [answer_rows(model(chunk)) for chunk in boards.split(CHUNK_POSITIONS)]
+    return rows[0] if len(rows) == 1 else torch.cat(rows)
+
 CPU = torch.device("cpu")
 
 
@@ -79,7 +89,7 @@ class Lane:
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream), torch.no_grad():
             for size in sizes:
-                model(self.boards[:size])
+                chunked_answer_rows(model, self.boards[:size])
         torch.cuda.current_stream().wait_stream(self.stream)
 
         #recorded on the stream they run on: graphs of two lanes recorded on one stream into one pool shared their
@@ -89,7 +99,7 @@ class Lane:
         for size in reversed(sizes):
             self.graphs[size] = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graphs[size], pool=pool, stream=self.stream), torch.no_grad():
-                self.answers[size] = answer_rows(model(self.boards[:size]))
+                self.answers[size] = chunked_answer_rows(model, self.boards[:size])
 
 #the model as cuda graphs in `in_flight` lanes (Lane) that take the batches in turn: at most in_flight batches may be
 #launched and not yet collected. A batch runs through the smallest graph that holds it; launch returns at once and
