@@ -1,11 +1,13 @@
 import copy
+import math
 
 import chess
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
-from model.encoding import EN_PASSANT_TOKEN_OFFSET, encode_board
+from model.encoding import EN_PASSANT_TOKEN_OFFSET, NUM_SQUARES, TOKENS_PER_BOARD, encode_board
 from engine.inference import GraphedBatches, answer_rows, fp16_model, graph_sizes, small_graph_sizes
 from model.model import VALUE_BINS, ChessTransformer, expected_score
 from tools.checkpoint import save_checkpoint
@@ -124,6 +126,32 @@ def test_fused_blocks_compute_what_the_model_does():
     assert torch.allclose(fused_logits, logits, atol=1e-2)
     assert torch.equal(fused_logits.argmax(-1), logits.argmax(-1))
     assert torch.allclose(expected_score(fused_value_logits), expected_score(value_logits), atol=1e-3)
+
+
+#fused_blocks.template_attention in fp16 as the engine runs it, against the attention in fp32 at the d768's shapes:
+#every query row (the squares' with the template bias, the metadata tokens' without), one and two query heads to a
+#key/value head, query/key widths padded in the kernel or not, and a batch that fills no block of positions
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("heads, kv_heads, dq", [(24, 12, 24), (24, 12, 8), (4, 4, 16)])
+def test_template_attention_in_fp16(heads, kv_heads, dq):
+    from model.fused_blocks import template_attention
+    torch.manual_seed(0)
+    B, T, dv, templates_count, eps = 5, TOKENS_PER_BOARD, 32, 8, 1e-5
+    projected = torch.randn(B, T, heads * dq + kv_heads * dq + kv_heads * dv + heads * templates_count, device="cuda").half()
+    templates = (torch.randn(templates_count, NUM_SQUARES, NUM_SQUARES, device="cuda") / 2).half()
+    q_gain, k_gain = (1 + torch.randn(2, dq, device="cuda") / 10).half()
+
+    out = template_attention(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_count, eps)
+
+    q, k, v, c = projected.float().split([heads * dq, kv_heads * dq, kv_heads * dv, heads * templates_count], dim=-1)
+    q = F.rms_norm(q.reshape(B, T, heads, dq), (dq,), q_gain.float(), eps).transpose(1, 2)
+    k = F.rms_norm(k.reshape(B, T, kv_heads, dq), (dq,), k_gain.float(), eps).transpose(1, 2).repeat_interleave(heads // kv_heads, 1)
+    v = v.reshape(B, T, kv_heads, dv).transpose(1, 2).repeat_interleave(heads // kv_heads, 1)
+    bias = torch.einsum("biht,tij->bhij", c[:, :NUM_SQUARES].reshape(B, NUM_SQUARES, heads, templates_count), templates.float())
+    scores = q @ k.transpose(-2, -1) / math.sqrt(dq) + F.pad(bias, (0, T - NUM_SQUARES, 0, T - NUM_SQUARES))
+    expected = (torch.softmax(scores, -1) @ v).transpose(1, 2).reshape(B, T, heads * dv)
+    assert out.dtype == torch.float16 and out.shape == expected.shape
+    assert torch.allclose(out.float(), expected, atol=1e-2)
 
 
 #fused_blocks.linear in fp16 as the engine runs it, accumulating in fp16, with the bias and residual added (the

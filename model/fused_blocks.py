@@ -1,10 +1,10 @@
 #the engine's transformer blocks for inference on the gpu: the same arithmetic as model.TransformerBlock, arranged
 #for speed (tests/test_inference.py checks they agree, so a change to the block must be made here too). Q, K, V and
-#the template mix are one matmul, the mlp's gate and up another, and attention is one Triton kernel: it RMS-normalises
-#the queries and keys (QK-norm), adds the template bias, takes the softmax and mixes the values without writing the
-#scores, the bias or any transposed copy to memory, and each query head reads its group's key/value head in place
-#instead of a copy (repeat_interleave). The matmuls are a Triton kernel too, with the bias, the mlp's silu(gate) * up
-#and the residual add in the same kernel
+#the template mix are one matmul, the mlp's gate and up another, and attention is a Triton kernel: it RMS-normalises
+#the queries and keys (QK-norm), adds the template bias (made by a kernel of its own), takes the softmax and mixes the
+#values without writing the scores or any transposed copy to memory, and reads each key/value head once for all the
+#query heads of its group instead of a copy for each (repeat_interleave). The matmuls are a Triton kernel too, with
+#the bias, the mlp's silu(gate) * up and the residual add in the same kernel
 import math
 
 import torch
@@ -15,34 +15,58 @@ from torch import nn
 
 from model.model import NUM_SQUARES, TOKENS_PER_BOARD, ChessTransformer, SquareFeatures, TransformerBlock
 
-#an instance of the kernel takes one head of one position: SQUARE_ROWS of the squares' query rows, with the template
-#bias, or the metadata tokens' rows, without it. The row blocks are the grid's slowest axis, so the instances on the
-#gpu at once read the same rows of the templates. Of 16/32/64 square rows, 1 to 8 positions an instance (the templates
-#kept for them) and 1 to 8 warps, the fastest on an RTX 5070 Ti
-SQUARE_ROWS, WARPS = 32, 2
+#an instance of the attention kernel takes one position and one key/value head with all the query heads that read it,
+#their query rows stacked, so it reads and normalises the keys and values once: the squares' rows in one launch, with
+#the template bias, the metadata tokens' in another, without it. SQUARE_WARPS for each query head's square rows (of 2
+#and 4; 1 and 2 for the metadata rows) were the fastest on an RTX 5070 Ti
+SQUARE_WARPS, META_WARPS = 2, 2
+#rows of template_bias_kernel's matmuls: (position, head) pairs
+BIAS_PAIRS = 64
+
+
+#the template bias of every (position, head) pair, made before the attention: in its kernel, with the templates in
+#registers, it took two fifths of the attention's time. For each query square i, bias[(b, h), i, :] = c[(b, h), i, :]
+#@ templates[:, i, :], one tensor-core matmul with the templates padded with zeros; fp16 products are exact in its
+#fp32 sums, and the bias is stored in the activations' precision
+@triton.jit
+def template_bias_kernel(c_ptr, templates_ptr, bias_ptr, pairs_count, stride_b, stride_t,
+                         HEADS: tl.constexpr, TEMPLATES: tl.constexpr, BLOCK_TEMPLATES: tl.constexpr, PAIRS: tl.constexpr):
+    i, p = tl.program_id(0), tl.program_id(1)
+    pairs = p * PAIRS + tl.arange(0, PAIRS)
+    pair_ok = pairs < pairs_count
+    b, h = pairs // HEADS, pairs % HEADS
+    t = tl.arange(0, BLOCK_TEMPLATES)
+    squares = tl.arange(0, 64)
+    coefficients = tl.load(c_ptr + b[:, None] * stride_b + i * stride_t + h[:, None] * TEMPLATES + t[None, :],
+                           mask=pair_ok[:, None] & (t < TEMPLATES)[None, :], other=0.0)
+    templates = tl.load(templates_ptr + t[:, None] * 4096 + i * 64 + squares[None, :], mask=(t < TEMPLATES)[:, None], other=0.0)
+    bias = tl.dot(coefficients, templates)
+    tl.store(bias_ptr + pairs[:, None] * 4096 + i * 64 + squares[None, :], bias.to(bias_ptr.dtype.element_ty), mask=pair_ok[:, None])
 
 
 #the keys are the 64 squares (template bias) and the metadata tokens (none), 64 + 16 columns rather than 70 padded to
-#128; SQUARES: the query rows are squares' (BLOCK_M of them) rather than the metadata tokens'
+#128. Row r of an instance is query head g * HEADS_PER_KV + r // ROWS_PER_HEAD at token FIRST_ROW + r % ROWS_PER_HEAD
 @triton.jit
-def template_attention_kernel(q_ptr, k_ptr, v_ptr, c_ptr, templates_ptr, q_gain_ptr, k_gain_ptr, out_ptr,
+def template_attention_kernel(q_ptr, k_ptr, v_ptr, bias_ptr, q_gain_ptr, k_gain_ptr, out_ptr,
                               stride_b, stride_t, out_stride_b, out_stride_t, eps, scale,
-                              T: tl.constexpr, HEADS_PER_KV: tl.constexpr, DQ: tl.constexpr, DV: tl.constexpr, TEMPLATES: tl.constexpr,
-                              SQUARES: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_META: tl.constexpr, BLOCK_DQ: tl.constexpr):
-    h, b, m = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    g = h // HEADS_PER_KV
-    rows = (0 if SQUARES else 64) + m * BLOCK_M + tl.arange(0, BLOCK_M)
+                              T: tl.constexpr, HEADS: tl.constexpr, HEADS_PER_KV: tl.constexpr, DQ: tl.constexpr, DV: tl.constexpr,
+                              FIRST_ROW: tl.constexpr, ROWS_PER_HEAD: tl.constexpr, BLOCK_ROWS: tl.constexpr, BLOCK_META: tl.constexpr,
+                              BLOCK_DQ: tl.constexpr):
+    g, b = tl.program_id(0), tl.program_id(1)
+    r = tl.arange(0, BLOCK_ROWS)
+    head = g * HEADS_PER_KV + r // ROWS_PER_HEAD
+    token = FIRST_ROW + r % ROWS_PER_HEAD
     squares = tl.arange(0, 64)
     meta = 64 + tl.arange(0, BLOCK_META)
     d = tl.arange(0, BLOCK_DQ)
     dv = tl.arange(0, DV)
-    row_ok, meta_ok, d_ok = rows < T, meta < T, d < DQ
+    row_ok, meta_ok, d_ok = (r < HEADS_PER_KV * ROWS_PER_HEAD) & (token < T), meta < T, d < DQ
 
     q_gain = tl.load(q_gain_ptr + d, mask=d_ok, other=0.0).to(tl.float32)
     k_gain = tl.load(k_gain_ptr + d, mask=d_ok, other=0.0).to(tl.float32)
-    #q, k, v and the template coefficients are column slices of one projection, so they share its strides
+    #q, k and v are column slices of one projection, so they share its strides
     base = b * stride_b
-    q = tl.load(q_ptr + base + rows[:, None] * stride_t + h * DQ + d[None, :], mask=row_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    q = tl.load(q_ptr + base + token[:, None] * stride_t + head[:, None] * DQ + d[None, :], mask=row_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
     q = (q * tl.rsqrt(tl.sum(q * q, 1) / DQ + eps)[:, None] * q_gain[None, :]).to(tl.float16)
     k_sq = tl.load(k_ptr + base + squares[:, None] * stride_t + g * DQ + d[None, :], mask=d_ok[None, :], other=0.0).to(tl.float32)
     k_sq = k_sq * tl.rsqrt(tl.sum(k_sq * k_sq, 1) / DQ + eps)[:, None] * k_gain[None, :]
@@ -50,13 +74,9 @@ def template_attention_kernel(q_ptr, k_ptr, v_ptr, c_ptr, templates_ptr, q_gain_
     k_meta = k_meta * tl.rsqrt(tl.sum(k_meta * k_meta, 1) / DQ + eps)[:, None] * k_gain[None, :]
     s_sq = tl.dot(q, tl.trans(k_sq.to(tl.float16))) * scale
     s_meta = tl.dot(q, tl.trans(k_meta.to(tl.float16))) * scale
-
-    if SQUARES:
-        #bias[i, j] = the sum over templates t of coefficient[i, t] * template[t, i, j]
-        tt = tl.arange(0, TEMPLATES)
-        templates = tl.load(templates_ptr + tt[:, None, None] * 4096 + rows[None, :, None] * 64 + squares[None, None, :]).to(tl.float32)
-        coefficients = tl.load(c_ptr + base + rows[None, :] * stride_t + h * TEMPLATES + tt[:, None]).to(tl.float32)
-        s_sq += tl.sum(coefficients[:, :, None] * templates, 0)
+    if FIRST_ROW == 0:
+        #the group's heads are consecutive, so their bias is one block
+        s_sq += tl.load(bias_ptr + (b * HEADS + g * HEADS_PER_KV) * 4096 + r[:, None] * 64 + squares[None, :], mask=row_ok[:, None], other=0.0).to(tl.float32)
 
     s_meta = tl.where(meta_ok[None, :], s_meta, float("-inf"))
     top = tl.maximum(tl.max(s_sq, 1), tl.max(s_meta, 1))
@@ -67,7 +87,8 @@ def template_attention_kernel(q_ptr, k_ptr, v_ptr, c_ptr, templates_ptr, q_gain_
     v_meta = tl.load(v_ptr + base + meta[:, None] * stride_t + g * DV + dv[None, :], mask=meta_ok[:, None], other=0.0)
     out = tl.dot(p_sq.to(tl.float16), v_sq.to(tl.float16)) + tl.dot(p_meta.to(tl.float16), v_meta.to(tl.float16))
     out = out / total[:, None]
-    tl.store(out_ptr + b * out_stride_b + rows[:, None] * out_stride_t + h * DV + dv[None, :], out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None])
+    tl.store(out_ptr + b * out_stride_b + token[:, None] * out_stride_t + head[:, None] * DV + dv[None, :], out.to(out_ptr.dtype.element_ty),
+             mask=row_ok[:, None])
 
 
 #an opaque op for torch.compile: compiling through the kernel call made it ~15x slower
@@ -78,12 +99,17 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
     B, T, _ = projected.shape
     q, k, v, c = projected.split([heads * dq, kv_heads * dq, kv_heads * dv, heads * templates_count], dim=-1)
     out = torch.empty(B, T, heads * dv, device=projected.device, dtype=projected.dtype)
-    block_meta = max(16, triton.next_power_of_2(T - NUM_SQUARES))
-    shapes = dict(T=T, HEADS_PER_KV=heads // kv_heads, DQ=dq, DV=dv, TEMPLATES=templates_count, BLOCK_META=block_meta,
-                  BLOCK_DQ=max(16, triton.next_power_of_2(dq)), num_warps=WARPS)
-    arguments = (q, k, v, c, templates, q_gain, k_gain, out, projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
-    template_attention_kernel[(heads, B, NUM_SQUARES // SQUARE_ROWS)](*arguments, SQUARES=True, BLOCK_M=SQUARE_ROWS, **shapes)
-    template_attention_kernel[(heads, B, 1)](*arguments, SQUARES=False, BLOCK_M=block_meta, **shapes)
+    bias = torch.empty(B, heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
+    template_bias_kernel[(NUM_SQUARES, triton.cdiv(B * heads, BIAS_PAIRS))](c, templates, bias, B * heads, projected.stride(0), projected.stride(1),
+                                                                         HEADS=heads, TEMPLATES=templates_count,
+                                                                         BLOCK_TEMPLATES=max(16, triton.next_power_of_2(templates_count)), PAIRS=BIAS_PAIRS)
+    heads_per_kv, block_meta = heads // kv_heads, max(16, triton.next_power_of_2(T - NUM_SQUARES))
+    shapes = dict(T=T, HEADS=heads, HEADS_PER_KV=heads_per_kv, DQ=dq, DV=dv, BLOCK_META=block_meta, BLOCK_DQ=max(16, triton.next_power_of_2(dq)))
+    arguments = (q, k, v, bias, q_gain, k_gain, out, projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
+    template_attention_kernel[(kv_heads, B)](*arguments, FIRST_ROW=0, ROWS_PER_HEAD=NUM_SQUARES,
+                                             BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * NUM_SQUARES), num_warps=SQUARE_WARPS * heads_per_kv, **shapes)
+    template_attention_kernel[(kv_heads, B)](*arguments, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
+                                             BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes)
     return out
 
 
