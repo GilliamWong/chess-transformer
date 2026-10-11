@@ -10,6 +10,7 @@ from engine.inference import GraphedBatches, answer_rows, fp16_model, graph_size
 from model.model import VALUE_BINS, ChessTransformer, expected_score
 from tools.checkpoint import save_checkpoint
 from engine.player import CudaGraphModel
+from tests.test_model import mix_in_the_input
 
 
 #every batch up to max_batch has a graph, and past 16 boards pads by fewer than 4 boards or a sixteenth: steps of 16
@@ -65,11 +66,13 @@ def test_graphs_keep_their_model_alive():
 
 #the d512_selfplay_sf12_10pass run's residual stream passes fp16's 65,504 on the en-passant token: every board came back
 #NaN and the engine's search put all its visits on one arbitrary move
+#an RMSNorm squaring that stream in fp16 would overflow the same way
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
     torch.manual_seed(0)
     settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": VALUE_BINS}
     model = ChessTransformer(**settings).eval()
+    mix_in_the_input(model)
     with torch.no_grad():
         #the token of a board without en passant, so on every board
         model.embed.weight[EN_PASSANT_TOKEN_OFFSET, 0] = 2e5
@@ -97,12 +100,13 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
 
 #fused_blocks.FusedBlock must compute what model.TransformerBlock does, and SummedSquareFeatures what SquareFeatures
 #does: with random templates and square features (zeros at init would hide them), grouped key/value heads and
-#query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel)
+#query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel), and the input skip away from its start
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_fused_blocks_compute_what_the_model_does():
     from model.fused_blocks import fuse_blocks
     torch.manual_seed(0)
     model = ChessTransformer(d_model=128, num_layers=3, n_heads=4, kv_heads=2, qk_ratio=[0.25, 0.5, 0.75], value_bins=16).cuda().eval()
+    mix_in_the_input(model)
     with torch.no_grad():
         model.templates.normal_()
         model.square_features.table.normal_(std=0.1)

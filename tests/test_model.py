@@ -18,6 +18,14 @@ def small_model() -> ChessTransformer:
     return ChessTransformer(d_model=32, num_layers=2, n_heads=2)
 
 
+#the input skip's scales away from their 1 and 0, where an input embedding that went missing would not show
+def mix_in_the_input(model: ChessTransformer) -> None:
+    with torch.no_grad():
+        for block in model.encoder:
+            block.residual_scale.fill_(0.8)
+            block.input_scale.fill_(0.5)
+
+
 @pytest.fixture(scope="module")
 def batch(carlsen_games) -> tuple[torch.Tensor, torch.Tensor]:
     """the first positions of a real game, with the moves played from them"""
@@ -103,11 +111,11 @@ def test_the_size_of_the_queries_and_keys_does_not_matter(batch):
     x = model.embed(boards) + model.position_embed
 
     with torch.no_grad():
-        before = block(x, model.templates)
+        before = block(x, model.templates, x)
         for projection in (block.Q, block.K):
             projection.weight *= 100
             projection.bias *= 100
-        assert torch.allclose(block(x, model.templates), before, atol=1e-4)
+        assert torch.allclose(block(x, model.templates, x), before, atol=1e-4)
 
 
 #the search runs the model in fp16, whose largest number is 65,504: queries and keys this big made every score inf and
@@ -126,15 +134,16 @@ def test_fp16_stays_finite_with_huge_queries_and_keys(batch):
 
 
 #fp16 inference shrinks the residual stream (inference.fp16_model); anything writing into it that the scaling misses
-#would change the moves. The LayerNorms' eps is the one thing that sees the scale, so it is 0 here
+#would change the moves. The norms' eps is the one thing that sees the scale, so it is 0 here
 def test_scaling_the_residual_stream_changes_no_output(batch):
     boards, _ = batch
     model = small_model().eval()
     with torch.no_grad():
         #zeros at init would hide the table being missed
         model.square_features.table.normal_()
+    mix_in_the_input(model)
     for module in model.modules():
-        if isinstance(module, nn.LayerNorm):
+        if isinstance(module, nn.RMSNorm):
             module.eps = 0.0
 
     with torch.no_grad():
@@ -143,6 +152,32 @@ def test_scaling_the_residual_stream_changes_no_output(batch):
 
     for output, expected_output in zip(scaled, expected, strict=True):
         assert torch.allclose(output, expected_output, atol=1e-4)
+
+
+#catches the input skip starting anywhere but a plain block: a new block reads none of the input embedding
+def test_a_new_block_does_not_read_the_input_embedding(batch):
+    boards, _ = batch
+    model = small_model().eval()
+    block = model.encoder[1]
+    x = model.embed(boards) + model.position_embed
+    with torch.no_grad():
+        assert torch.equal(block(x, model.templates, x), block(x, model.templates, torch.randn_like(x)))
+
+
+#catches the skip mixing in anything but the input embedding (the stream so far, say): with residual_scale 0 and
+#input_scale 1 every block starts again from the embedding, so the first block's weights cannot reach the output
+def test_the_input_skip_mixes_in_the_input_embedding(batch):
+    boards, _ = batch
+    model = small_model().eval()
+    with torch.no_grad():
+        for block in model.encoder:
+            block.residual_scale.fill_(0.0)
+            block.input_scale.fill_(1.0)
+        before = model(boards)
+        for parameter in model.encoder[0].parameters():
+            parameter.normal_()
+        for output, expected in zip(model(boards), before, strict=True):
+            assert torch.equal(output, expected)
 
 
 #white: king e1, rook a1, knight c3, pawn e2; black: king e8, queen d5, pawn d7. White to move, so no mirroring

@@ -83,6 +83,34 @@ def test_checkpoint_with_template_maps_points_to_the_commit_that_has_them(tmp_pa
         load_checkpoint(tmp_path / "old.pt", CPU)
 
 
+#catches a LayerNorm model (every one before 2026-10-07) failing on a mismatched state dict instead of pointing to
+#the code that still runs it
+@pytest.mark.parametrize("old", ["layernorm", "no_input_skip"])
+def test_a_checkpoint_from_before_rmsnorm_and_the_input_skip_points_to_the_commit_that_has_them(tmp_path, old):
+    state_dict = ChessTransformer(**SETTINGS).state_dict()
+    if old == "layernorm":
+        state_dict["ln.bias"] = torch.zeros(SETTINGS["d_model"])
+    else:
+        state_dict = {name: tensor for name, tensor in state_dict.items() if not name.endswith(("residual_scale", "input_scale"))}
+    torch.save({"model_settings": SETTINGS, "state_dict": state_dict}, tmp_path / "old.pt")
+
+    with pytest.raises(ValueError, match="6742baf"):
+        load_checkpoint(tmp_path / "old.pt", CPU)
+
+
+#catches the runs of 2026-10-07, which named input_skip and rms_norm in their settings, no longer loading
+def test_a_checkpoint_naming_the_input_skip_and_rmsnorm_settings_still_loads(tmp_path):
+    model = ChessTransformer(**SETTINGS).eval()
+    save_checkpoint(model, {**SETTINGS, "input_skip": True, "rms_norm": True}, tmp_path / "model.pt")
+
+    loaded, loaded_settings = load_checkpoint(tmp_path / "model.pt", CPU)
+
+    assert loaded_settings == SETTINGS
+    boards = torch.randint(0, 13, (2, 70))
+    with torch.no_grad():
+        assert torch.equal(loaded.eval()(boards)[0], model(boards)[0])
+
+
 def test_player_loads_a_model_that_is_not_the_default_size(tmp_path):
     save_checkpoint(ChessTransformer(**SETTINGS), SETTINGS, tmp_path / "model.pt")
 

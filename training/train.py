@@ -44,7 +44,10 @@ WARMUP_STEPS = 500
 #   hold      the peak, then a straight line to zero over the last DECAY_FRACTION of the run
 #   constant  the peak throughout
 SCHEDULE = "cosine"
-DECAY_FRACTION = 0.2
+#4-minute d128 runs: 0.2 was the worst of 0.2 / 0.4 / 0.6, and 0.6 tied cosine
+DECAY_FRACTION = 0.3
+#the input embeddings' learning rate (token, position, square features) as a multiple of everything else's
+EMBED_LR_MULTIPLIER = 1.0
 BATCH_SIZE = 1024
 
 #for Muon and AdamW both: 0.1 beat 0.01 by 0.007 val loss on two seeds (d128 L6, 10M positions)
@@ -341,15 +344,24 @@ def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE) -> float
 #Muon for the weight matrices inside the blocks, AdamW for the rest; match_rms_adamw lets both share one learning rate.
 #d128: val loss 1.9414 against 1.9929 with AdamW alone. AdamW comes first, the training loop logs its learning rate
 def make_optimizers(model: ChessTransformer, learn_rate: float, device: torch.device, weight_decay: float = WEIGHT_DECAY,
-                    muon_momentum: float = MUON_MOMENTUM) -> list[torch.optim.Optimizer]:
+                    muon_momentum: float = MUON_MOMENTUM, embed_lr_multiplier: float = EMBED_LR_MULTIPLIER) -> list[torch.optim.Optimizer]:
+    if embed_lr_multiplier <= 0:
+        raise ValueError(f"the embeddings' learning rate multiplier must be above 0, got {embed_lr_multiplier}")
     block_matrices = [parameter for parameter in model.encoder.parameters() if parameter.ndim == 2]
     #QK-norm's gains alone set how sharp attention can be: decayed at 0.1 they fell to 0.3 and the heads went near uniform
     qk_gains = [norm.weight for block in model.encoder for norm in (block.q_norm, block.k_norm)]
-    elsewhere = {id(parameter) for parameter in block_matrices + qk_gains}
+    #the input skip's scales (model.TransformerBlock): decayed, the residual stream's scale would be pulled towards 0
+    skip_scales = [scale for block in model.encoder for scale in (block.residual_scale, block.input_scale)]
+    undecayed = qk_gains + skip_scales
+    #the input embeddings at their own learning rate. AdamW decays by lr * weight_decay a step, so their decay is divided
+    #by the multiplier: decaying them faster as well would be a second change
+    embeddings = [model.embed.weight, model.position_embed, model.square_features.table]
+    elsewhere = {id(parameter) for parameter in block_matrices + undecayed + embeddings}
     rest = [parameter for parameter in model.parameters() if id(parameter) not in elsewhere]
     #a tensor: compile_muon_step's graph would bake a float in and recompile whenever the schedule changes it
     muon = torch.optim.Muon(block_matrices, lr=torch.tensor(learn_rate, device=device), weight_decay=weight_decay, momentum=muon_momentum, adjust_lr_fn="match_rms_adamw") #type: ignore[arg-type]
-    groups = [{"params": rest}, {"params": qk_gains, "weight_decay": 0.0}]
+    groups = [{"params": rest}, {"params": undecayed, "weight_decay": 0.0},
+              {"params": embeddings, "lr": learn_rate * embed_lr_multiplier, "weight_decay": weight_decay / embed_lr_multiplier}]
     return [torch.optim.AdamW(groups, lr=learn_rate, weight_decay=weight_decay, fused=device.type == "cuda"), muon]
 
 #Muon's step as one compiled cuda graph: eager 28 ms next to an 80 ms d256 training step, graphed 5 ms.
@@ -431,7 +443,8 @@ def main(
     weight_decay: float = WEIGHT_DECAY,
     muon_momentum: float = MUON_MOMENTUM,
     snapshot_every: int = 0,
-    teacher_weight: float = 0.0):
+    teacher_weight: float = 0.0,
+    embed_lr_multiplier: float = EMBED_LR_MULTIPLIER):
 
     #a fine-tune is the size the checkpoint says, whatever the flags say
     initial_model = None
@@ -486,7 +499,7 @@ def main(
     master_weights = MasterWeights(model)
     compute_model = master_weights.compute_model
     compiled_model = torch.compile(compute_model) if compile_mode == "default" else torch.compile(compute_model, mode=compile_mode)
-    optimizers = make_optimizers(model, peak_learn_rate, device, weight_decay, muon_momentum)
+    optimizers = make_optimizers(model, peak_learn_rate, device, weight_decay, muon_momentum, embed_lr_multiplier)
 
     #the schedule runs over the part of the budget left when the warmup ends
     warmup_end = 0.0
@@ -516,6 +529,7 @@ def main(
         "parameters": num_parameters,
         "peak_learn_rate": peak_learn_rate,
         "schedule": schedule,
+        "embed_lr_multiplier": embed_lr_multiplier,
         "seed": seed,
         "value_loss_weight": value_loss_weight,
         "blunder_weight": blunder_weight,
@@ -617,6 +631,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="for Muon and AdamW both, default %(default)s")
     parser.add_argument("--muon-momentum", type=float, default=MUON_MOMENTUM, help="default %(default)s")
     parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="the learning rate after the warmup, see SCHEDULE. Default %(default)s")
+    parser.add_argument("--embed-lr-multiplier", type=float, default=EMBED_LR_MULTIPLIER, help="the input embeddings' learning rate as a multiple of the rest's, see make_optimizers. Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
     parser.add_argument("--mlp-ratio", type=float, help="hidden size of the swiglu mlp as a multiple of d-model, rounded down to a multiple of 32. Default 8/3")
     parser.add_argument("--target-temperature", type=float, default=TARGET_TEMPERATURE, help="how stockfish's moves share the target, see TARGET_TEMPERATURE. Default %(default)s")
@@ -671,4 +686,5 @@ if __name__ == "__main__":
          blunder_threshold=arguments.blunder_threshold,
          weight_decay=arguments.weight_decay,
          muon_momentum=arguments.muon_momentum,
-         teacher_weight=arguments.teacher_weight)
+         teacher_weight=arguments.teacher_weight,
+         embed_lr_multiplier=arguments.embed_lr_multiplier)

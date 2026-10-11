@@ -53,8 +53,8 @@ class SwiGLU(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, position_templates: int, mlp_hidden: int, qk_ratio: float = 1.0, kv_heads: int | None = None):
         super().__init__()
-        #prenorm encoder block, no causal mask:
-        #x = x + attention(ln1(x)), then x = x + mlp(ln2(x))
+        #prenorm encoder block, no causal mask: x starts as residual_scale * x + input_scale * the input embedding,
+        #then x = x + attention(ln1(x)), then x = x + mlp(ln2(x))
 
         self.d_model = d_model
         self.n_heads = n_heads
@@ -76,8 +76,9 @@ class TransformerBlock(nn.Module):
         self.q_norm = nn.RMSNorm(self.d_qk_head, eps=1e-5)
         self.k_norm = nn.RMSNorm(self.d_qk_head, eps=1e-5)
 
-        self.ln1 = nn.LayerNorm(self.d_model)
-        self.ln2 = nn.LayerNorm(self.d_model)
+        #eps given: nn.RMSNorm's default is the dtype's, ~1e-3 in fp16, big next to the stream fp16 inference shrinks 16x
+        self.ln1 = nn.RMSNorm(self.d_model, eps=1e-5)
+        self.ln2 = nn.RMSNorm(self.d_model, eps=1e-5)
 
         self.combine_heads = nn.Linear(self.d_model, self.d_model)
 
@@ -85,10 +86,14 @@ class TransformerBlock(nn.Module):
 
         self.template_mix = nn.Linear(self.d_model, position_templates * self.n_heads)
 
-    def forward(self, x: torch.Tensor, templates: torch.Tensor) -> torch.Tensor:
+        #how much of the stream and of the input embedding the block reads; 1 and 0 start it as a plain block
+        self.residual_scale = nn.Parameter(torch.ones(1))
+        self.input_scale = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor, templates: torch.Tensor, original_board_embed: torch.Tensor) -> torch.Tensor:
         #x is B T d_model, templates is position_templates 64 64 and shared by every block
         B, T, d_model = x.shape
-        residual = x
+        residual = (self.residual_scale * x) + (self.input_scale * original_board_embed)
         x_norm = self.ln1(residual)
 
         Q = self.Q(x_norm) #B T n_heads * d_qk_head
@@ -205,6 +210,8 @@ class SquareFeatures(nn.Module):
         #B 64 d_model; embedding_bag sums the 23 rows without holding them all
         B = board_state.shape[0]
         rows = self.indices(board_state) + self.row_offsets
+        if torch.compiler.is_exporting(): #the onnx exporter makes embedding_bag a loop over the bags (engine/lc0_network.py)
+            return self.table[rows].sum(dim=-2)
         return F.embedding_bag(rows.reshape(B * NUM_SQUARES, -1), self.table, mode="sum").reshape(B, NUM_SQUARES, -1)
 
 
@@ -266,7 +273,7 @@ class ChessTransformer(nn.Module):
         self.to_projection = nn.Linear(self.d_model, self.d_model)
         self.promotion_projection = nn.Linear(self.d_model, 4) #one per piece a pawn can become
 
-        self.ln = nn.LayerNorm(self.d_model)
+        self.ln = nn.RMSNorm(self.d_model, eps=1e-5)
 
     #bf16 (or fp16) weights for all but the heads, which forward runs in fp32 on fp32 inputs. The heads are left alone
     #rather than converted back, which would round their weights to the half precision
@@ -279,8 +286,9 @@ class ChessTransformer(nn.Module):
             setattr(self, name, nn.Parameter(parameter.detach().to(dtype)))
         return self
 
-    #every read of the residual stream is a LayerNorm, which ignores its scale (all but eps), so scaling everything
-    #written into it changes no output. fp16 inference shrinks it this way (inference.fp16_model)
+    #every read of the residual stream is an RMSNorm, which ignores its scale (all but eps), so scaling everything written
+    #into it changes no output; the input skip's scales mix two scaled things. fp16 inference shrinks it this way
+    #(inference.fp16_model)
     def scale_residual_stream(self, scale: float) -> "ChessTransformer":
         with torch.no_grad():
             for weight in (self.embed.weight, self.position_embed, self.square_features.table):
@@ -300,9 +308,11 @@ class ChessTransformer(nn.Module):
         #the squares' features; the metadata tokens have none
         embed_state = embed_state + F.pad(self.square_features(board_state), (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
 
+        original_board_embed = embed_state
+
         for _ in range(self.loops):
             for block in self.encoder:
-                embed_state = block(embed_state, self.templates)
+                embed_state = block(embed_state, self.templates, original_board_embed)
         model_output = self.ln(embed_state)
 
         with torch.autocast(device_type=board_state.device.type, enabled=False):

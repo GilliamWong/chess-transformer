@@ -41,14 +41,36 @@ def test_muon_takes_the_weight_matrices_inside_the_blocks_and_adamw_the_rest():
     assert muon.param_groups[0]["momentum"] == 0.9
 
 
-#QK-norm's gains set how sharp attention can be, so weight decay must not pull them to zero
-def test_the_qk_norm_gains_are_not_decayed():
+#QK-norm's gains set how sharp attention can be and the input skip's scales how big the residual stream is, so weight
+#decay must not pull them to zero
+def test_the_qk_norm_gains_and_input_skip_scales_are_not_decayed():
     model = small_model()
-    adamw, _ = make_optimizers(model, 1e-3, CPU, weight_decay=0.1)
+    adamw, muon = make_optimizers(model, 1e-3, CPU, weight_decay=0.1)
 
     names = {id(parameter): name for name, parameter in model.named_parameters()}
     undecayed = {names[id(parameter)] for group in adamw.param_groups if group["weight_decay"] == 0 for parameter in group["params"]}
-    assert undecayed == {f"encoder.{block}.{norm}.weight" for block in range(2) for norm in ("q_norm", "k_norm")}
+    qk_gains = {f"encoder.{block}.{norm}.weight" for block in range(2) for norm in ("q_norm", "k_norm")}
+    skip_scales = {f"encoder.{block}.{scale}" for block in range(2) for scale in ("residual_scale", "input_scale")}
+    assert undecayed == qk_gains | skip_scales
+    assert names_in(muon, model) | names_in(adamw, model) == set(names.values())
+
+
+#catches the embeddings left at the shared learning rate, their decay sped up along with it, or the schedule moving
+#them apart from the rest
+def test_the_embeddings_get_their_own_learning_rate():
+    model = small_model()
+    adamw, _ = make_optimizers(model, 1e-3, CPU, weight_decay=0.1, embed_lr_multiplier=10)
+
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    embeddings = next(group for group in adamw.param_groups if any(names[id(parameter)] == "embed.weight" for parameter in group["params"]))
+    assert {names[id(parameter)] for parameter in embeddings["params"]} == {"embed.weight", "position_embed", "square_features.table"}
+    assert embeddings["lr"] == pytest.approx(1e-2)
+    assert embeddings["lr"] * embeddings["weight_decay"] == pytest.approx(1e-3 * 0.1)
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(adamw, lambda step: 1 / (1 + step))
+    for _ in range(3):
+        scheduler.step()
+    assert embeddings["lr"] == pytest.approx(10 * adamw.param_groups[0]["lr"])
 
 
 #Muon's learning rate is a tensor; the schedule has to move it just like AdamW's float

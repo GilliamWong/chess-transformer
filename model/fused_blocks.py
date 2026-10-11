@@ -217,7 +217,7 @@ def transposed(weight: torch.Tensor) -> nn.Parameter:
 
 
 #a head's fp32 linear layer (from_projection, to_projection) on fp16 inputs and weights accumulating in fp32, giving
-#fp32: its input is the last LayerNorm's fp16 output, and fp16's 10 bit mantissas are tf32's, which the fp32 matmul
+#fp32: its input is the last norm's fp16 output, and fp16's 10 bit mantissas are tf32's, which the fp32 matmul
 #used, at twice tf32's speed
 class HalfInputLinear(nn.Module):
     def __init__(self, layer: nn.Linear):
@@ -236,6 +236,7 @@ class FusedBlock(nn.Module):
         self.heads, self.kv_heads = block.n_heads, block.kv_heads
         self.dq, self.dv, self.templates_count = block.d_qk_head, block.d_head, block.position_templates
         self.ln1, self.ln2 = block.ln1, block.ln2
+        self.residual_scale, self.input_scale = block.residual_scale, block.input_scale
         self.q_gain, self.k_gain = block.q_norm.weight, block.k_norm.weight
         self.eps = block.q_norm.eps if block.q_norm.eps is not None else torch.finfo(torch.float32).eps
         projections = (block.Q, block.K, block.V, block.template_mix)
@@ -247,7 +248,8 @@ class FusedBlock(nn.Module):
         self.gate_up = transposed(torch.cat([mlp.gate_projection.weight, mlp.up_projection.weight]))
         self.down = transposed(mlp.down_projection.weight)
 
-    def forward(self, x: torch.Tensor, templates: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, templates: torch.Tensor, original_board_embed: torch.Tensor) -> torch.Tensor:
+        x = self.residual_scale * x + self.input_scale * original_board_embed
         attended = template_attention(linear(self.ln1(x), self.projection, self.projection_bias), templates, self.q_gain, self.k_gain, self.heads,
                                       self.kv_heads, self.dq, self.dv, self.templates_count, self.eps)
         x = linear(attended, self.combine_heads, self.combine_heads_bias, residual=x)
