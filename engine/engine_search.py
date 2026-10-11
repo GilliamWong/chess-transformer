@@ -65,8 +65,7 @@ def parse_changes(text: str, settings: dict) -> dict:
         changes[name] = kind(float(value))
     return changes
 
-#the network in fp16 (inference.fp16_model) as cuda graphs for a round's leaves, from one to max_batch, in a lane for
-#each round in flight. Most rounds fill the largest graph, whose forward is compiled for exactly its size
+#the network in fp16 (inference.fp16_model) as cuda graphs for a round's leaves, from one to max_batch, a lane a round out
 def engine_network(checkpoint_path: Path, max_batch: int = LEAVES):
     from engine.inference import ExactSizeCompiled, GraphedBatches, fp16_model, small_graph_sizes
     sizes = small_graph_sizes(max_batch)

@@ -20,9 +20,7 @@ def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     move_logits, value_logits = outputs
     return torch.cat([move_logits.float(), expected_score(value_logits).unsqueeze(1)], dim=1)
 
-#boards a forward of the model takes at once: a bigger batch runs as forwards of this many in its graph, so their
-#activations stay in the gpu's L2 cache (a d768's do at 128 boards in the RTX 5070 Ti's 48 MB, not at 256: 256 at once
-#ran 7% fewer boards a second, 512 and 1024 9% fewer)
+#boards a forward takes at once, a bigger batch's graph running several: a d768's activations for 128 fit a 48 MB L2
 CHUNK_POSITIONS = 128
 
 #answer_rows for every board, CHUNK_POSITIONS boards at a time
@@ -74,8 +72,7 @@ def graph_sizes(max_batch: int) -> list[int]:
         sizes.append(sizes[-1] + (64 if sizes[-1] < 1024 else 128 if sizes[-1] < 2048 else 256))
     return sizes
 
-#a batch in flight's own stream, cuda graphs (one for every batch size in sizes, ascending, sharing a memory pool: they
-#run one after another on the stream) and buffers: pinned memory for the boards and answers, the graphs' boards on the gpu
+#a batch in flight's own stream, cuda graphs (one for every size in sizes, sharing a memory pool) and buffers
 class Lane:
     def __init__(self, model: nn.Module, sizes: list[int]):
         self.stream = torch.cuda.Stream()
@@ -92,8 +89,7 @@ class Lane:
                 chunked_answer_rows(model, self.boards[:size])
         torch.cuda.current_stream().wait_stream(self.stream)
 
-        #recorded on the stream they run on: graphs of two lanes recorded on one stream into one pool shared their
-        #activations (and cublas's workspace, kept for each stream) and wrote over each other's while they ran at once
+        #recorded on their own stream: lanes recorded on one stream into one pool wrote over each other's activations
         pool = torch.cuda.graph_pool_handle()
         self.graphs, self.answers = {}, {}
         for size in reversed(sizes):
@@ -101,10 +97,8 @@ class Lane:
             with torch.cuda.graph(self.graphs[size], pool=pool, stream=self.stream), torch.no_grad():
                 self.answers[size] = chunked_answer_rows(model, self.boards[:size])
 
-#the model as cuda graphs in `in_flight` lanes (Lane) that take the batches in turn: at most in_flight batches may be
-#launched and not yet collected. A batch runs through the smallest graph that holds it; launch returns at once and
-#collect waits. The lanes' batches run at once, one's latency-bound kernels (attention, norms) beside the other's
-#matmuls: 2 at 64 boards are 5% faster than one after another
+#the model as cuda graphs in in_flight lanes that take the batches in turn and run them at once, a batch through the
+#smallest graph that holds it. launch returns at once and collect waits: at most in_flight batches may be out
 class GraphedBatches:
     def __init__(self, model: nn.Module, sizes: list[int], in_flight: int = 2):
         #the graphs read the model's weights where they were when recorded: freed, their memory went to the next
@@ -125,8 +119,7 @@ class GraphedBatches:
             lane.graphs[size].replay()
         return lane, size, count
 
-    #the answers are copied out only now: the gpu's copies go one after another, so a copy queued at launch waited for
-    #its batch and held the next batch's boards behind it, and the lanes never ran at once
+    #copied here, not at launch: the gpu's copies queue, and a copy at launch held the other lane's boards behind it
     def collect(self, launched: tuple[Lane, int, int]) -> np.ndarray:
         lane, size, count = launched
         with torch.cuda.stream(lane.stream):
@@ -161,10 +154,7 @@ def fp16_model(checkpoint_path: Path) -> nn.Module:
     model = load_model(checkpoint_path, torch.device("cuda")).scale_residual_stream(FP16_RESIDUAL_SCALE)
     return FusedTransformer(model.half_except_heads(torch.float16))
 
-#the model compiled for batches of exactly exact_size boards, and with dynamic shapes for the others; only recording a
-#graph calls it, so the choice costs the graphs nothing. Inductor's kernels for a known batch made the engine's rounds of
-#64 leaves 2% faster and self-play's chunks of 128 boards 2%, and compiling every graph size exactly made the engine's
-#cold start 200 s rather than 41 (this one 51)
+#compiled for exactly exact_size boards, the size most batches fill, and dynamically for the rest (all exact: minutes to start)
 class ExactSizeCompiled(nn.Module):
     def __init__(self, model: nn.Module, exact_size: int):
         super().__init__()
