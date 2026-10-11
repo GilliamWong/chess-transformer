@@ -14,62 +14,59 @@ from torch import nn
 
 from model.model import NUM_SQUARES, SquareFeatures, TransformerBlock
 
-#an instance of the kernel takes BLOCK_M query rows of one head for CHUNK positions; fastest on an RTX 4090 of the
-#tried 16/32/64 rows, chunks of 4/8/16 and 2/4/8 warps (41 us a block of 64 positions, the first version 57 us)
-BLOCK_M, CHUNK, WARPS = 16, 4, 2
+#an instance of the kernel takes one head of one position: SQUARE_ROWS of the squares' query rows, with the template
+#bias, or the metadata tokens' rows, without it. The row blocks are the grid's slowest axis, so the instances on the
+#gpu at once read the same rows of the templates. Of 16/32/64 square rows, 1 to 8 positions an instance (the templates
+#kept for them) and 1 to 8 warps, the fastest on an RTX 5070 Ti
+SQUARE_ROWS, WARPS = 32, 2
 
 
-#an instance reads its rows of the templates once and keeps them for its whole chunk of positions. The keys are the 64
-#squares (template bias) and the metadata tokens (none), 64 + 16 columns rather than 70 padded to 128
+#the keys are the 64 squares (template bias) and the metadata tokens (none), 64 + 16 columns rather than 70 padded to
+#128; SQUARES: the query rows are squares' (BLOCK_M of them) rather than the metadata tokens'
 @triton.jit
 def template_attention_kernel(q_ptr, k_ptr, v_ptr, c_ptr, templates_ptr, q_gain_ptr, k_gain_ptr, out_ptr,
-                              B, stride_b, stride_t, out_stride_b, out_stride_t, eps, scale,
+                              stride_b, stride_t, out_stride_b, out_stride_t, eps, scale,
                               T: tl.constexpr, HEADS_PER_KV: tl.constexpr, DQ: tl.constexpr, DV: tl.constexpr, TEMPLATES: tl.constexpr,
-                              BLOCK_M: tl.constexpr, BLOCK_META: tl.constexpr, BLOCK_DQ: tl.constexpr, CHUNK: tl.constexpr):
-    m, h, chunk = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+                              SQUARES: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_META: tl.constexpr, BLOCK_DQ: tl.constexpr):
+    h, b, m = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     g = h // HEADS_PER_KV
-    rows = m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rows = (0 if SQUARES else 64) + m * BLOCK_M + tl.arange(0, BLOCK_M)
     squares = tl.arange(0, 64)
     meta = 64 + tl.arange(0, BLOCK_META)
     d = tl.arange(0, BLOCK_DQ)
     dv = tl.arange(0, DV)
-    row_ok, meta_ok, d_ok, square_rows = rows < T, meta < T, d < DQ, rows < 64
+    row_ok, meta_ok, d_ok = rows < T, meta < T, d < DQ
 
     q_gain = tl.load(q_gain_ptr + d, mask=d_ok, other=0.0).to(tl.float32)
     k_gain = tl.load(k_gain_ptr + d, mask=d_ok, other=0.0).to(tl.float32)
-    #TEMPLATES x BLOCK_M x 64
-    tt = tl.arange(0, TEMPLATES)
-    templates = tl.load(templates_ptr + tt[:, None, None] * 4096 + rows[None, :, None] * 64 + squares[None, None, :],
-                        mask=square_rows[None, :, None], other=0.0).to(tl.float32)
+    #q, k, v and the template coefficients are column slices of one projection, so they share its strides
+    base = b * stride_b
+    q = tl.load(q_ptr + base + rows[:, None] * stride_t + h * DQ + d[None, :], mask=row_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    q = (q * tl.rsqrt(tl.sum(q * q, 1) / DQ + eps)[:, None] * q_gain[None, :]).to(tl.float16)
+    k_sq = tl.load(k_ptr + base + squares[:, None] * stride_t + g * DQ + d[None, :], mask=d_ok[None, :], other=0.0).to(tl.float32)
+    k_sq = k_sq * tl.rsqrt(tl.sum(k_sq * k_sq, 1) / DQ + eps)[:, None] * k_gain[None, :]
+    k_meta = tl.load(k_ptr + base + meta[:, None] * stride_t + g * DQ + d[None, :], mask=meta_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    k_meta = k_meta * tl.rsqrt(tl.sum(k_meta * k_meta, 1) / DQ + eps)[:, None] * k_gain[None, :]
+    s_sq = tl.dot(q, tl.trans(k_sq.to(tl.float16))) * scale
+    s_meta = tl.dot(q, tl.trans(k_meta.to(tl.float16))) * scale
 
-    for i in range(CHUNK):
-        b = chunk * CHUNK + i
-        if b < B:
-            #q, k, v and the template coefficients are column slices of one projection, so they share its strides
-            base = b * stride_b
-            q = tl.load(q_ptr + base + rows[:, None] * stride_t + h * DQ + d[None, :], mask=row_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
-            q = (q * tl.rsqrt(tl.sum(q * q, 1) / DQ + eps)[:, None] * q_gain[None, :]).to(tl.float16)
-            k_sq = tl.load(k_ptr + base + squares[:, None] * stride_t + g * DQ + d[None, :], mask=d_ok[None, :], other=0.0).to(tl.float32)
-            k_sq = k_sq * tl.rsqrt(tl.sum(k_sq * k_sq, 1) / DQ + eps)[:, None] * k_gain[None, :]
-            k_meta = tl.load(k_ptr + base + meta[:, None] * stride_t + g * DQ + d[None, :], mask=meta_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
-            k_meta = k_meta * tl.rsqrt(tl.sum(k_meta * k_meta, 1) / DQ + eps)[:, None] * k_gain[None, :]
-            s_sq = tl.dot(q, tl.trans(k_sq.to(tl.float16))) * scale
-            s_meta = tl.dot(q, tl.trans(k_meta.to(tl.float16))) * scale
+    if SQUARES:
+        #bias[i, j] = the sum over templates t of coefficient[i, t] * template[t, i, j]
+        tt = tl.arange(0, TEMPLATES)
+        templates = tl.load(templates_ptr + tt[:, None, None] * 4096 + rows[None, :, None] * 64 + squares[None, None, :]).to(tl.float32)
+        coefficients = tl.load(c_ptr + base + rows[None, :] * stride_t + h * TEMPLATES + tt[:, None]).to(tl.float32)
+        s_sq += tl.sum(coefficients[:, :, None] * templates, 0)
 
-            #bias[i, j] = the sum over templates t of coefficient[i, t] * template[t, i, j]
-            coefficients = tl.load(c_ptr + base + rows[None, :] * stride_t + h * TEMPLATES + tt[:, None], mask=square_rows[None, :], other=0.0).to(tl.float32)
-            s_sq += tl.sum(coefficients[:, :, None] * templates, 0)
-
-            s_meta = tl.where(meta_ok[None, :], s_meta, float("-inf"))
-            top = tl.maximum(tl.max(s_sq, 1), tl.max(s_meta, 1))
-            p_sq = tl.exp(s_sq - top[:, None])
-            p_meta = tl.exp(s_meta - top[:, None])
-            total = tl.sum(p_sq, 1) + tl.sum(p_meta, 1)
-            v_sq = tl.load(v_ptr + base + squares[:, None] * stride_t + g * DV + dv[None, :])
-            v_meta = tl.load(v_ptr + base + meta[:, None] * stride_t + g * DV + dv[None, :], mask=meta_ok[:, None], other=0.0)
-            out = tl.dot(p_sq.to(tl.float16), v_sq.to(tl.float16)) + tl.dot(p_meta.to(tl.float16), v_meta.to(tl.float16))
-            out = out / total[:, None]
-            tl.store(out_ptr + b * out_stride_b + rows[:, None] * out_stride_t + h * DV + dv[None, :], out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None])
+    s_meta = tl.where(meta_ok[None, :], s_meta, float("-inf"))
+    top = tl.maximum(tl.max(s_sq, 1), tl.max(s_meta, 1))
+    p_sq = tl.exp(s_sq - top[:, None])
+    p_meta = tl.exp(s_meta - top[:, None])
+    total = tl.sum(p_sq, 1) + tl.sum(p_meta, 1)
+    v_sq = tl.load(v_ptr + base + squares[:, None] * stride_t + g * DV + dv[None, :])
+    v_meta = tl.load(v_ptr + base + meta[:, None] * stride_t + g * DV + dv[None, :], mask=meta_ok[:, None], other=0.0)
+    out = tl.dot(p_sq.to(tl.float16), v_sq.to(tl.float16)) + tl.dot(p_meta.to(tl.float16), v_meta.to(tl.float16))
+    out = out / total[:, None]
+    tl.store(out_ptr + b * out_stride_b + rows[:, None] * out_stride_t + h * DV + dv[None, :], out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None])
 
 
 #an opaque op for torch.compile: compiling through the kernel call made it ~15x slower
@@ -80,11 +77,12 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
     B, T, _ = projected.shape
     q, k, v, c = projected.split([heads * dq, kv_heads * dq, kv_heads * dv, heads * templates_count], dim=-1)
     out = torch.empty(B, T, heads * dv, device=projected.device, dtype=projected.dtype)
-    grid = (triton.cdiv(T, BLOCK_M), heads, triton.cdiv(B, CHUNK))
-    template_attention_kernel[grid](q, k, v, c, templates, q_gain, k_gain, out, B, projected.stride(0), projected.stride(1), out.stride(0), out.stride(1),
-                                    eps, 1 / math.sqrt(dq), T=T, HEADS_PER_KV=heads // kv_heads, DQ=dq, DV=dv, TEMPLATES=templates_count,
-                                    BLOCK_M=BLOCK_M, BLOCK_META=max(16, triton.next_power_of_2(T - NUM_SQUARES)),
-                                    BLOCK_DQ=max(16, triton.next_power_of_2(dq)), CHUNK=CHUNK, num_warps=WARPS)
+    block_meta = max(16, triton.next_power_of_2(T - NUM_SQUARES))
+    shapes = dict(T=T, HEADS_PER_KV=heads // kv_heads, DQ=dq, DV=dv, TEMPLATES=templates_count, BLOCK_META=block_meta,
+                  BLOCK_DQ=max(16, triton.next_power_of_2(dq)), num_warps=WARPS)
+    arguments = (q, k, v, c, templates, q_gain, k_gain, out, projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
+    template_attention_kernel[(heads, B, NUM_SQUARES // SQUARE_ROWS)](*arguments, SQUARES=True, BLOCK_M=SQUARE_ROWS, **shapes)
+    template_attention_kernel[(heads, B, 1)](*arguments, SQUARES=False, BLOCK_M=block_meta, **shapes)
     return out
 
 
