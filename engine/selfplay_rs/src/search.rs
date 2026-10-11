@@ -140,6 +140,7 @@ pub struct Tree {
     pub board: Chess,   //the root's position
     pub keys: Vec<u64>, //the position_key of every position of the game, the root's last
     pub nodes: Vec<Node>,
+    node_keys: Vec<u64>, //each node's position_key, made with the node
     //the edges: every expanded node's moves in python-chess's order with their priors, and each move's node once it
     //has one (NO_NODE before)
     moves: Vec<Move>,
@@ -151,10 +152,12 @@ pub struct Tree {
 
 impl Tree {
     pub fn new(board: Chess, keys: Vec<u64>) -> Tree {
+        let root_key = *keys.last().expect("the root's key");
         Tree {
             board,
             keys,
             nodes: vec![Node::new()],
+            node_keys: vec![root_key],
             moves: Vec::new(),
             priors: Vec::new(),
             children: Vec::new(),
@@ -228,11 +231,12 @@ impl Tree {
         edges.start + best
     }
 
-    //the edge's node, made if the edge has none yet
-    fn child_node(&mut self, edge: usize) -> usize {
+    //the edge's node, made if the edge has none yet; board is the node's position
+    fn child_node(&mut self, edge: usize, board: &Chess) -> usize {
         if self.children[edge] == NO_NODE {
             self.children[edge] = self.nodes.len() as u32;
             self.nodes.push(Node::new());
+            self.node_keys.push(position_key(board));
         }
         self.children[edge] as usize
     }
@@ -269,9 +273,9 @@ impl Tree {
                 let edge = self.select_edge(node, settings);
                 board.play_unchecked(self.moves[edge]);
                 //a descent never ends without a visit or a simulation waiting, so the node is needed
-                node = self.child_node(edge);
+                node = self.child_node(edge, &board);
                 path.push(node);
-                self.keys.push(position_key(&board));
+                self.keys.push(self.node_keys[node]);
             }
 
             if self.nodes[node].in_flight > 0 {
@@ -446,18 +450,20 @@ impl Tree {
         assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
         let chess_move = self.moves[edge];
         let child = self.children[edge];
+        self.board.play_unchecked(chess_move);
+        self.keys.push(position_key(&self.board));
         if keep_subtree && child != NO_NODE {
             self.keep_subtree(child as usize);
         } else {
             (self.nodes, self.moves, self.priors, self.children) = (vec![Node::new()], Vec::new(), Vec::new(), Vec::new());
+            self.node_keys = vec![*self.keys.last().expect("the root's key")];
         }
-        self.board.play_unchecked(chess_move);
-        self.keys.push(position_key(&self.board));
     }
 
     //the tree under node as a tree of its own, node its root
     fn keep_subtree(&mut self, node: usize) {
         let mut nodes = vec![self.nodes[node]];
+        let mut node_keys = vec![self.node_keys[node]];
         let (mut moves, mut priors, mut children) = (Vec::new(), Vec::new(), Vec::new());
         let mut index = 0;
         while index < nodes.len() {
@@ -470,12 +476,13 @@ impl Tree {
                     NO_NODE => NO_NODE,
                     child => {
                         nodes.push(self.nodes[child as usize]);
+                        node_keys.push(self.node_keys[child as usize]);
                         (nodes.len() - 1) as u32
                     }
                 });
             }
             index += 1;
         }
-        (self.nodes, self.moves, self.priors, self.children) = (nodes, moves, priors, children);
+        (self.nodes, self.moves, self.priors, self.children, self.node_keys) = (nodes, moves, priors, children, node_keys);
     }
 }
