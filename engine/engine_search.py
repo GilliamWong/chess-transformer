@@ -118,8 +118,11 @@ class EngineSearch:
         #the rounds left once the report is in have no leaves, but Searches still expects their finish
         while report is None or rounds:
             if report is None and not stopping:
-                #the round gathered now would come back after those on the gpu: stop if that is past the deadline
-                if gathered and deadline is not None and time.perf_counter() + (len(rounds) + 1) * self.round_seconds >= deadline:
+                #the lanes run the rounds on the gpu at once and they come back about together, so the round gathered
+                #now would come back about a round time (round_seconds, the time between rounds coming back) after the
+                #newest of them: stop if that is past the deadline
+                round_times = max(len(rounds), 1)
+                if gathered and deadline is not None and time.perf_counter() + round_times * self.round_seconds >= deadline:
                     stopping = True
                     report = self.searches.stop(GAME)
                     continue
