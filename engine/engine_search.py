@@ -10,6 +10,7 @@ import time
 import chess
 import numpy as np
 import selfplay_rs
+import torch
 from model.encoding import TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
 from engine.inference import ExactSizeCompiled, GraphedBatches, fp16_model, int8_model, small_graph_sizes
@@ -74,7 +75,9 @@ PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
 def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = "fp16"):
     model = PRECISIONS[precision](checkpoint_path)
     sizes = small_graph_sizes(max_batch)
-    return GraphedBatches(ExactSizeCompiled(model, sizes[-1]), sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1)
+    #one board a round (mcts.py's search) never fills the largest graph
+    compiled = ExactSizeCompiled(model, sizes[-1]) if max_batch > 1 else torch.compile(model, dynamic=True)
+    return GraphedBatches(compiled, sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1)
 
 
 class EngineSearch:
