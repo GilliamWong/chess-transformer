@@ -17,8 +17,8 @@ from model.model import NUM_SQUARES, TOKENS_PER_BOARD, ChessTransformer, SquareF
 
 #an instance of the attention kernel takes one position and one key/value head with all the query heads that read it,
 #their query rows stacked, so it reads and normalises the keys and values once: the squares' rows in one launch, with
-#the template bias, the metadata tokens' in another, without it. SQUARE_WARPS for each query head's square rows (of 2
-#and 4; 1 and 2 for the metadata rows) were the fastest on an RTX 5070 Ti
+#the template bias, the metadata tokens' in another, without it. SQUARE_WARPS for each 64 of its square rows (of 2 and
+#4; 1 and 2 for the metadata rows) were the fastest on an RTX 5070 Ti
 SQUARE_WARPS, META_WARPS = 2, 2
 #rows of template_bias_kernel's matmuls: (position, head) pairs
 BIAS_PAIRS = 64
@@ -106,8 +106,9 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
     heads_per_kv, block_meta = heads // kv_heads, max(16, triton.next_power_of_2(T - NUM_SQUARES))
     shapes = dict(T=T, HEADS=heads, HEADS_PER_KV=heads_per_kv, DQ=dq, DV=dv, BLOCK_META=block_meta, BLOCK_DQ=max(16, triton.next_power_of_2(dq)))
     arguments = (q, k, v, bias, q_gain, k_gain, out, projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
-    template_attention_kernel[(kv_heads, B)](*arguments, FIRST_ROW=0, ROWS_PER_HEAD=NUM_SQUARES,
-                                             BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * NUM_SQUARES), num_warps=SQUARE_WARPS * heads_per_kv, **shapes)
+    square_rows = triton.next_power_of_2(heads_per_kv * NUM_SQUARES)
+    template_attention_kernel[(kv_heads, B)](*arguments, FIRST_ROW=0, ROWS_PER_HEAD=NUM_SQUARES, BLOCK_ROWS=square_rows,
+                                             num_warps=SQUARE_WARPS * square_rows // NUM_SQUARES, **shapes)
     template_attention_kernel[(kv_heads, B)](*arguments, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
                                              BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes)
     return out
