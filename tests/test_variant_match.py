@@ -7,9 +7,11 @@ from pathlib import Path
 import chess
 import pytest
 
+import selfplay_rs
 from fake_models import BoardModel
 from engine.inference import cpu_batches
 from engine import engine_search
+from engine.selfplay import SIMULATIONS_PER_LEAF
 from tools.play.variant_match import (OPPONENT, SPRT_BOUND, Opponent, Variant, a_points, common_opponent_elo, pair_elo, play, sprt_llr,
                                       variant_settings)
 
@@ -59,12 +61,28 @@ def test_a_clock_in_nodes_is_shared_over_the_moves():
             assert min(searched) > 0 and sum(searched) < node_rate * (base + increment * len(searched))
 
 
-#the engine's simulations_per_leaf goes to a variant's rounds rather than to its Searches
+#the engine's simulations_per_leaf goes to a variant's rounds rather than to its Searches: a's rounds of 4 leaves
+#descend for 8 x 4 simulations, b's for its own
 def test_a_variant_takes_its_rounds_simulations(monkeypatch):
-    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"simulations_per_leaf": 3})
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"simulations_per_leaf": SIMULATIONS_PER_LEAF})
+    searches_class, round_simulations = selfplay_rs.Searches, set()
+
+    class RecordedSearches:
+        def __init__(self, **settings):
+            self.searches = searches_class(**settings)
+
+        def descend(self, leaves: int, collisions: int, simulations: int) -> bytes:
+            round_simulations.add(simulations)
+            return self.searches.descend(leaves, collisions, simulations)
+
+        def __getattr__(self, name: str):
+            return getattr(self.searches, name)
+
+    monkeypatch.setattr(selfplay_rs, "Searches", RecordedSearches)
     finished = played(("simulations_per_leaf=8", ""), nodes=30)
 
     assert sorted(record["game"] for record, _ in finished) == [0, 1, 2, 3]
+    assert round_simulations == {8 * 4, SIMULATIONS_PER_LEAF * 4}
 
 
 #a's points from both colours: 19 pairs of 1.5 of 2 and one of 0.5, a score of 0.7375 or 179 elo within its interval

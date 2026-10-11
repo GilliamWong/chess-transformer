@@ -1,6 +1,7 @@
 #the uci engine's search (engine/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
 #deadline and node limit, smart pruning, the tree kept for the next move, the engine's own settings, and uci.py's go
 #limits and clock
+from collections import deque
 import io
 import sys
 import time
@@ -121,6 +122,22 @@ def test_a_transposition_waiting_takes_its_twins_answer():
     assert sent[1] < sent[0]
 
 
+#with dedupe_in_flight a search still stops at its node limit: the twins waiting for their leaf's answer count as waiting,
+#or the last rounds would gather past it
+def test_a_search_with_twins_waiting_stops_at_its_limit():
+    evaluate = cpu_batches(BoardModel()).evaluate_boards
+    searches = selfplay_rs.Searches(**rust_search_settings(False), cache_positions=100_000, dedupe_in_flight=True)
+    searches.start(0, chess.STARTING_FEN, [], 1001)
+    rounds, reports = deque(), []
+    while not reports:
+        while len(rounds) < 2:
+            rounds.append(leaf_boards(searches.descend(64, 64, 192)))
+        reports = searches.finish(evaluate(rounds.popleft()))
+
+    _, _, _, _, visits = reports[0]
+    assert visits == 1001
+
+
 #one leaf a round is mcts.py's search (Searches' defaults, test_selfplay_rs.py) at every move, as evaluate_elo's logged
 #results were played, whatever the engine's own settings: a second round out on the network would change it. From a
 #middlegame, where captures move the material count, so that an answer changes the next choice
@@ -153,13 +170,19 @@ def test_the_engines_settings(monkeypatch):
     assert engine_search_settings(False, own=False) == rust_search_settings(False)
 
 
-#the engine's own settings all reach its search: simulations_per_leaf its rounds, the rest Searches
+#the engine's own settings all reach its search: simulations_per_leaf its rounds, the rest Searches, where
+#dedupe_in_flight sends fewer boards for as many simulations
 def test_the_engine_takes_its_own_settings(monkeypatch):
     monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", ENGINE_SETTINGS)
-    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, settings={"simulations_per_leaf": 8, "dedupe_in_flight": True})
+    boards_sent = []
+    for dedupe in (False, True):
+        network = CountingNetwork(BoardModel())
+        search = EngineSearch(network, 16, smart_pruning=False, settings={"simulations_per_leaf": 8, "dedupe_in_flight": dedupe})
+        assert search.round_simulations == 8 * 16
+        assert search.search(chess.Board(), simulations=2000).simulations == 2000
+        boards_sent.append(network.boards)
 
-    assert search.round_simulations == 8 * 16
-    assert search.search(chess.Board(), simulations=500).simulations == 500
+    assert boards_sent[1] < boards_sent[0]
 
 
 #every position's answer: no move preferred, expected score 0.6
