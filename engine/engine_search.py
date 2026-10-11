@@ -91,7 +91,8 @@ class EngineSearch:
         batched = leaves > 1
         self.collisions = COLLISIONS if batched else 0
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1
-        self.rounds_at_once = batched and isinstance(network, GraphedBatches) and len(network.lanes) > 1
+        #rounds on lanes of their own (GraphedBatches') run at once
+        self.rounds_at_once = batched and len(getattr(network, "lanes", ())) > 1
         self.smart_pruning = batched and smart_pruning
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces)
         self.round_simulations = search_settings.pop("simulations_per_leaf", SIMULATIONS_PER_LEAF) * leaves
