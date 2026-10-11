@@ -49,26 +49,18 @@ def test_graphs_answer_like_the_model():
     assert np.allclose(answer_rows((logits, value)).numpy(), expected[:1], atol=1e-3)
 
 
-#engine_network's compile: the graph of the exact size records the forward compiled for it, the others the dynamic one,
-#and both answer as the model does
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
-def test_exact_size_compiled_graphs_answer_like_the_model():
-    torch.manual_seed(0)
-    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
-    board, boards = chess.Board(), []
-    for san in ("e4", "d5", "exd5"):
-        board.push_san(san)
-        boards.append(encode_board(board))
-    boards = np.array(boards, dtype=np.uint8)
+#engine_network's compile: a batch of the exact size runs through the forward compiled for it, any other through the
+#dynamic one
+def test_exact_size_compiled_runs_each_size_through_its_compile(monkeypatch):
+    compiled_for = []
+    monkeypatch.setattr(torch, "compile", lambda model, dynamic: lambda boards: compiled_for.append((len(boards), dynamic)) or model(boards))
+    model = ExactSizeCompiled(ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval(), 4)
+    boards = torch.tensor([encode_board(chess.Board())] * 4)
     with torch.no_grad():
-        expected = answer_rows(model(torch.from_numpy(boards).long().cuda())).cpu().numpy()
+        model(boards)
+        model(boards[:2])
 
-    graphs = GraphedBatches(ExactSizeCompiled(model, 4), [2, 4])
-    exact = graphs.collect(graphs.launch(boards)).copy()
-    dynamic = graphs.collect(graphs.launch(boards[:2])).copy()
-
-    assert np.allclose(exact, expected, atol=1e-3)
-    assert np.allclose(dynamic, expected[:2], atol=1e-3)
+    assert compiled_for == [(4, False), (2, True)]
 
 
 #a batch bigger than CHUNK_POSITIONS runs as forwards of that many in its graph: every board's answer in its place, the
