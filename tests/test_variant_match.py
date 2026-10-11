@@ -146,3 +146,14 @@ def test_variant_settings():
     assert settings["smart_pruning"] == 0.0
     with pytest.raises(ValueError):
         variant_settings("cpuct=1.2", False)
+
+
+#a sharpened variant's scores are on the network's own scale, as EngineSearch reports them: a one-node search's score
+#is the root's value whatever the sharpness
+def test_scores_are_on_the_network_scale(monkeypatch):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"value_sharpness": 1.0})
+    finished = played(("smart_pruning=0,value_sharpness=3", "smart_pruning=0"), nodes=1)
+
+    first_scores = {(game.opening, game.a_white): game.plies[0]["score"] for _, game in finished}
+    for opening in OPENINGS:
+        assert first_scores[(opening, True)] == pytest.approx(first_scores[(opening, False)], abs=1e-6)
