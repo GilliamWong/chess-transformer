@@ -170,6 +170,26 @@ def test_a_timed_search_ends_by_its_deadline():
     assert report.simulations > 16 and time.perf_counter() - started < 0.3 + 0.1
 
 
+#a network with lanes, as a wrapper passes on GraphedBatches'
+class Laned:
+    def __init__(self, network, lanes: list):
+        self.network, self.lanes = network, lanes
+
+    def launch(self, boards: np.ndarray):
+        return self.network.launch(boards)
+
+    def collect(self, launched):
+        return self.network.collect(launched)
+
+
+#the deadline counts rounds as coming back together only when they run at once: many leaves a round on two lanes or more
+def test_rounds_run_at_once_only_on_lanes_of_their_own():
+    assert EngineSearch(Laned(cpu_batches(BoardModel()), [0, 0]), 4).rounds_at_once
+    assert not EngineSearch(Laned(cpu_batches(BoardModel()), [0, 0]), 1).rounds_at_once
+    assert not EngineSearch(Laned(cpu_batches(BoardModel()), [0]), 4).rounds_at_once
+    assert not EngineSearch(cpu_batches(BoardModel()), 4).rounds_at_once
+
+
 #the same position again needs only the simulations it lacks; the reply to the move played is searched from the kept
 #tree; another game's position gets a tree of its own
 def test_the_next_search_carries_on_the_last_tree():
