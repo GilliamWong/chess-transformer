@@ -269,6 +269,57 @@ def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopp
         assert settings["final_mix_val_loss"] > 0 and settings["final_mix_val_loss"] != settings["final_val_loss"]
 
 
+def micro_batch_worker(rank, folder, world_size):
+    torch.set_num_threads(1)
+    folder = Path(folder)
+    dist.init_process_group("gloo", init_method=(folder / "rendezvous").as_uri(),
+                            rank=rank, world_size=world_size, timeout=timedelta(seconds=90))
+    try:
+        data.PROCESSED_DATA_DIR = folder
+        train_ddp.RUNS_DIR = folder / "runs"
+        import tools.compare_runs as reports
+        reports.RUNS_DIR = train_ddp.RUNS_DIR
+        reports.PROGRESS_PAGE = folder / "progress.html"
+        single.BATCH_SIZE, single.EVAL_BATCHES = 8, 1
+        single.WARMUP_STEPS = 2
+        flags = ["--device", "cpu", "--no-compile", "--no-tensorboard", "--positions", "320", "--batch-size", "16",
+                 "--d-model", "16", "--layers", "1", "--heads", "2", "--templates", "2", "--training-set", "b",
+                 "--eval-every", "3", "--resume", "--checkpoint-minutes", "0", "--snapshot-every", "5"]
+        train_ddp.run(train_ddp.parse_args(flags + ["--name", "whole"]), torch.device("cpu"))
+
+        batches_on_device = single.batches_on_device
+        def stopped_before_step_8(batches, device):
+            for number, batch in enumerate(batches_on_device(batches, device)):
+                if number == 7:
+                    raise Preempted
+                yield batch
+        with patch.object(single, "batches_on_device", stopped_before_step_8), pytest.raises(Preempted):
+            train_ddp.run(train_ddp.parse_args(flags + ["--name", "parts"]), torch.device("cpu"))
+        dist.barrier()
+        #carried on where 48 GB cards hold only half the local batch at once
+        train_ddp.run(train_ddp.parse_args(flags + ["--name", "parts", "--micro-batch", "4"]), torch.device("cpu"))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
+def test_a_run_resumed_in_micro_batches_trains_like_one_in_whole_batches(tmp_path):
+    #catches parts that do not add up to the whole local batch's step, such as boards split from their targets (the
+    #optimizers and clipping hide a gradient scale, and syncing every part averages the same sum)
+    write_varied_set(tmp_path, "b")
+    mp.spawn(micro_batch_worker, args=(str(tmp_path), 2), nprocs=2)
+    runs = tmp_path / "runs"
+    def weights(run, checkpoint):
+        state = torch.load(runs / run / checkpoint)["state_dict"]
+        return torch.cat([tensor.flatten().float() for tensor in state.values() if tensor.is_floating_point()])
+    #bf16 rounds the parts' gradients differently from the whole batch's, ~0.5% of how far training moved the weights
+    #after step 5 (before the stop); a part split from its targets moves them about as far as training does
+    whole, parts = weights("whole", "final.pt"), weights("parts", "final.pt")
+    assert (parts - whole).norm() < 0.03 * (whole - weights("whole", "snapshot_80.pt")).norm()
+    settings = json.loads((runs / "parts" / "settings.json").read_text())
+    assert settings["micro_batches"] == 1 and settings["resumed"][0]["micro_batches"] == 2
+
+
 #every mixed batch is the training set's local batch and then the mix set's, and each set moves on to its next epoch
 #when it runs out: a mix set whose rows never reached training, or came in the wrong share, would pass silently
 def test_mixed_training_batches_are_the_training_sets_rows_then_the_mix_sets():

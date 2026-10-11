@@ -3,6 +3,7 @@ uv run torchrun --standalone --nproc-per-node=2 -m training.train_ddp --minutes 
 --batch-size and --positions are global, across all processes."""
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -139,11 +140,11 @@ def log_validation(writer, metrics, step, final=False):
 
 #model is master_weights' compute model under DDP. best_val_loss is the best evaluation so far (a resumed run's).
 #save_resume(best_val_loss) is rank zero's, called every resume_every_seconds of its wall clock; save_snapshot too,
-#every snapshot_every steps
+#every snapshot_every steps. Each step's local batch goes through in micro_batches equal parts (see --micro-batch)
 def train(model, master_weights, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
           value_weight, eval_every, writer=None, save_best=None, blunder_weight=single.BLUNDER_WEIGHT,
           best_val_loss=float("inf"), save_resume=None, resume_every_seconds=None, mix_loader=None,
-          save_snapshot=None, snapshot_every=0):
+          save_snapshot=None, snapshot_every=0, micro_batches=1):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     #summed on the device over an eval interval: policy + value loss, the unweighted blunder penalty, and the gradient
     #norm before clipping
@@ -156,10 +157,17 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
     try:
         for batch in single.batches_on_device(training_batches(train_loader, mix_loader), device):
             master_weights.zero_grad()
-            logits, value_logits = model(batch[0])
-            loss = single.policy_loss(logits, batch[1], batch[2]) + value_weight * single.value_loss(value_logits, batch[3])
-            penalty = single.blunder_loss(logits, batch[4]) if blunder_weight else torch.zeros((), device=device)
-            (loss + blunder_weight * penalty).backward()
+            #the parts' gradients add up on this rank and DDP averages them across the ranks on the last part's
+            #backward: the same step as the whole local batch at once, in a fraction of the memory
+            loss = penalty = torch.zeros((), device=device)
+            for part, micro_batch in enumerate(zip(*(tensor.chunk(micro_batches) for tensor in batch))):
+                with contextlib.nullcontext() if part == micro_batches - 1 else model.no_sync():
+                    logits, value_logits = model(micro_batch[0])
+                    part_loss = single.policy_loss(logits, micro_batch[1], micro_batch[2]) + value_weight * single.value_loss(value_logits, micro_batch[3])
+                    part_penalty = single.blunder_loss(logits, micro_batch[4]) if blunder_weight else torch.zeros((), device=device)
+                    ((part_loss + blunder_weight * part_penalty) / micro_batches).backward()
+                loss = loss + part_loss.detach() / micro_batches
+                penalty = penalty + part_penalty.detach() / micro_batches
             master_weights.gradients_to_master()
             gradient_norm = torch.nn.utils.clip_grad_norm_(master_weights.parameters, 1.0)
             #the gradients are averaged after backward, so every rank steps all of the weights itself, Muon's too
@@ -230,6 +238,10 @@ def run(args, device: torch.device):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     if args.batch_size <= 0 or args.batch_size % world_size:
         raise ValueError("--batch-size must be positive and divisible by the process count")
+    local_batch = args.batch_size // world_size
+    if args.micro_batch is not None and (args.micro_batch <= 0 or local_batch % args.micro_batch):
+        raise ValueError(f"--micro-batch must divide the local batch of {local_batch} positions, got {args.micro_batch}")
+    micro_batches = local_batch // args.micro_batch if args.micro_batch is not None else 1
     budget = make_budget(args)
     clock = make_budget(args) if rank == 0 else None  #see step_budget
     if not budget.timed and budget.max_steps <= single.WARMUP_STEPS:
@@ -302,7 +314,7 @@ def run(args, device: torch.device):
     model = DDP(master_weights.compute_model, device_ids=[device.index] if device.type == "cuda" else None)
     if not args.no_compile:
         model = torch.compile(model) if args.compile_mode == "default" else torch.compile(model, mode=args.compile_mode)
-    optimizers = single.make_optimizers(raw_model, args.lr, device, args.weight_decay, args.muon_momentum)
+    optimizers = single.make_optimizers(raw_model, args.lr, device, args.weight_decay, args.muon_momentum, args.embed_lr_multiplier)
     #the schedulers first: making one sets its optimizer's learning rate for step 0, which the saved states then replace
     schedulers = [make_scheduler(optimizer, budget, args.schedule) for optimizer in optimizers]
     best_val_loss = float("inf")
@@ -338,15 +350,16 @@ def run(args, device: torch.device):
             writer = SummaryWriter(str(run_dir), purge_step=budget.steps + 1 if args.resume else None)
             if resumed is not None:
                 settings = json.loads(settings_path.read_text(encoding="utf-8"))
-                settings["resumed"] = settings.get("resumed", []) + [dict(step=budget.steps, at=datetime.now().isoformat(timespec="seconds"))]
+                settings["resumed"] = settings.get("resumed", []) + [dict(step=budget.steps, at=datetime.now().isoformat(timespec="seconds"),
+                                                                          world_size=world_size, micro_batches=micro_batches)]
             else:
                 settings = dict(
                     model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
-                    peak_learn_rate=args.lr, schedule=args.schedule, seed=args.seed,
+                    peak_learn_rate=args.lr, schedule=args.schedule, embed_lr_multiplier=args.embed_lr_multiplier, seed=args.seed,
                     value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight, blunder_threshold=args.blunder_threshold,
                     weight_decay=args.weight_decay, muon_momentum=args.muon_momentum,
                     blunder_labels=getattr(train_dataset, "worst_moves", None) is not None,
-                    budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=args.batch_size // world_size,
+                    budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=local_batch, micro_batches=micro_batches,
                     training_set=args.training_set, target_temperature=args.target_temperature,
                     result_weight=args.result_weight, visit_temperature=args.visit_temperature,
                     mix_set=args.mix_set, mix_share=mix_batch_size / args.batch_size if args.mix_set is not None else None,
@@ -360,7 +373,7 @@ def run(args, device: torch.device):
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
             print(f"DDP: {world_size} processes on {device.type}, global batch {args.batch_size}"
                   + (f" ({mix_batch_size} of it from {args.mix_set})" if args.mix_set is not None else "")
-                  + f", local batch {args.batch_size // world_size}; " + (f"resumed at step {budget.steps:,}, val loss {metrics[0]:.3f}"
+                  + f", local batch {local_batch}" + (f" in {micro_batches} parts" if micro_batches > 1 else "") + "; " + (f"resumed at step {budget.steps:,}, val loss {metrics[0]:.3f}"
                                                            if resumed is not None else f"{'starting point' if args.init_from is not None else 'untrained'} val loss {metrics[0]:.3f}"))
             print(f"logging to {run_dir}")
             if not args.no_tensorboard:
@@ -378,7 +391,7 @@ def run(args, device: torch.device):
         train(model, master_weights, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
               args.value_weight, args.eval_every, writer, save_best if rank == 0 else None, args.blunder_weight,
               best_val_loss, save_resume if rank == 0 and args.resume else None, args.checkpoint_minutes * 60, mix_loader,
-              save_snapshot if rank == 0 and args.snapshot_every else None, args.snapshot_every)
+              save_snapshot if rank == 0 and args.snapshot_every else None, args.snapshot_every, micro_batches)
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
@@ -411,6 +424,9 @@ def parse_args(argv=None):
                          help="wall minutes of training, excluding first-step compilation and evaluation")
     budgets.add_argument("--positions", type=int, help="positions across all GPUs, rounded down to full global batches")
     parser.add_argument("--batch-size", type=int, default=single.BATCH_SIZE, help="GLOBAL batch size, default %(default)s")
+    parser.add_argument("--micro-batch", type=int,
+                        help="positions a GPU puts through at once: the local batch goes in equal parts whose gradients add up "
+                             "(gradient accumulation), the same step in less memory. Default the whole local batch")
     parser.add_argument("--name", help="new run folder name; existing folders are rejected (except by --resume)")
     parser.add_argument("--resume", action="store_true",
                         help="carry on the --name run from its last saved state, or start it. Needs --positions")
@@ -438,6 +454,7 @@ def parse_args(argv=None):
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="query/key width as a multiple of the values', one for every block or one per block")
     parser.add_argument("--lr", type=float, default=single.PEAK_LEARN_RATE)
     parser.add_argument("--schedule", choices=("cosine", "hold", "constant"), default=single.SCHEDULE)
+    parser.add_argument("--embed-lr-multiplier", type=float, default=single.EMBED_LR_MULTIPLIER, help="the input embeddings' learning rate as a multiple of the rest's (train.make_optimizers)")
     parser.add_argument("--seed", type=int, default=single.SEED)
     parser.add_argument("--training-set", default=single.TRAINING_SET)
     parser.add_argument("--mix-set", help="a second training set that fills --mix-share of every batch, e.g. full_sf8_20260922 while fine-tuning on self play")
