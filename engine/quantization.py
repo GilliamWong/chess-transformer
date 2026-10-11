@@ -1,7 +1,8 @@
 #the int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022): each weight's
 #rounding error is made up for by the weights not yet rounded, through the inverse Hessian of the matmul's inputs on
-#CALIBRATION_POSITIONS positions. Computed in fp64, so the same checkpoint gives the same weights on any gpu, and kept
-#in CACHE named by the checkpoint file's sha256 and VERSION.
+#CALIBRATION_POSITIONS positions. Computed in fp64, so that machines summing in other orders round them the same (the
+#cpu and an RTX 5070 Ti agree on every weight of the d768), and kept in CACHE named by the checkpoint file's sha256
+#and VERSION.
 #   python -m engine.quantization <model.pt>    computes them ahead of a match (~1 min on an RTX 5070 Ti)
 import argparse
 import hashlib
@@ -101,6 +102,7 @@ def input_hessians(model: ChessTransformer, boards: torch.Tensor, batch: int = 1
 #int8 weights of every block but the last (its down matmul alone costs the policy as much as all the others'),
 #{layer: {name: (int8 N x K, scale per row)}}: projection is Q|K|V|template mix as fused_blocks joins them, gate_up the
 #gate's rows then up's, down the mlp's down with its inputs padded to down_inputs and rotated as Int8Block rotates them
+@torch.no_grad()
 def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
     hessians = input_hessians(model, boards)
     weights = {}
