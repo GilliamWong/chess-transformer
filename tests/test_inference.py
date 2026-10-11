@@ -98,12 +98,13 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
     assert torch.allclose(expected_score(value_logits.float()), expected_score(expected_value_logits), atol=0.01)
 
 
-#fused_blocks.FusedBlock must compute what model.TransformerBlock does, and SummedSquareFeatures what SquareFeatures
-#does: with random templates and square features (zeros at init would hide them), grouped key/value heads and
-#query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel), and the input skip away from its start
+#fused_blocks.FusedBlock must compute what model.TransformerBlock does, SummedSquareFeatures what SquareFeatures does
+#and FusedTransformer's one matmul what the heads do: with random templates and square features (zeros at init would
+#hide them), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel), and the
+#input skip away from its start
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_fused_blocks_compute_what_the_model_does():
-    from model.fused_blocks import fuse_blocks
+    from model.fused_blocks import FusedTransformer
     torch.manual_seed(0)
     model = ChessTransformer(d_model=128, num_layers=3, n_heads=4, kv_heads=2, qk_ratio=[0.25, 0.5, 0.75], value_bins=16).cuda().eval()
     mix_in_the_input(model)
@@ -118,7 +119,7 @@ def test_fused_blocks_compute_what_the_model_does():
 
     with torch.no_grad():
         logits, value_logits = model(boards)
-        fused_logits, fused_value_logits = fuse_blocks(copy.deepcopy(model))(boards)
+        fused_logits, fused_value_logits = FusedTransformer(copy.deepcopy(model))(boards)
 
     assert torch.allclose(fused_logits, logits, atol=1e-2)
     assert torch.equal(fused_logits.argmax(-1), logits.argmax(-1))
@@ -177,8 +178,8 @@ def test_extra_rows_save_a_wave():
     assert fused_blocks.linear_extra_rows(56 * 70, 4, 128) == 0
 
 
-#the policy head's from and to projections (fused_blocks.HalfInputLinear): fp16 inputs accumulating in fp32 and
-#giving fp32, as close to the fp32 matmul as fp16's rounding of the weights allows
+#the heads' matmul (fused_blocks.FusedTransformer): fp16 inputs accumulating in fp32 and giving fp32, as close to the
+#fp32 matmul as fp16's rounding of the weights allows
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_linear_kernel_accumulating_in_fp32():
     from model.fused_blocks import linear

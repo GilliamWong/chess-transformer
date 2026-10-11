@@ -8,11 +8,12 @@
 import math
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
 
-from model.model import NUM_SQUARES, SquareFeatures, TransformerBlock
+from model.model import NUM_SQUARES, TOKENS_PER_BOARD, ChessTransformer, SquareFeatures, TransformerBlock
 
 #an instance of the kernel takes one head of one position: SQUARE_ROWS of the squares' query rows, with the template
 #bias, or the metadata tokens' rows, without it. The row blocks are the grid's slowest axis, so the instances on the
@@ -214,19 +215,6 @@ def transposed(weight: torch.Tensor) -> nn.Parameter:
     return nn.Parameter(weight.detach().t().contiguous())
 
 
-#a head's fp32 linear layer (from_projection, to_projection) on fp16 inputs and weights accumulating in fp32, giving
-#fp32: its input is the last norm's fp16 output, and fp16's 10 bit mantissas are tf32's, which the fp32 matmul
-#used, at twice tf32's speed
-class HalfInputLinear(nn.Module):
-    def __init__(self, layer: nn.Linear):
-        super().__init__()
-        self.weight = transposed(layer.weight.half())
-        self.bias = layer.bias
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear(x.half(), self.weight, self.bias, accumulate_fp32=True)
-
-
 class FusedBlock(nn.Module):
     #takes over a trained block's weights (copied into the joined, transposed matmuls, or shared)
     def __init__(self, block: TransformerBlock):
@@ -298,10 +286,55 @@ class SummedSquareFeatures(nn.Module):
         return feature_sum(self.features.indices(board_state) + self.features.row_offsets, self.features.table)
 
 
-#the model with its blocks swapped for FusedBlocks, its square features summed and its policy head's from and to
-#projections as above, for inference only; embeddings and the other heads unchanged
-def fuse_blocks(model: nn.Module) -> nn.Module:
-    model.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
-    model.square_features = SummedSquareFeatures(model.square_features)
-    model.from_projection, model.to_projection = HalfInputLinear(model.from_projection), HalfInputLinear(model.to_projection)
-    return model
+#the heads' matmuls on the last norm's output as one, in_features x out_features: the policy's logits[i, j] =
+#(W_f x_i + b_f) . (W_t x_j + b_t) / sqrt(d) are a_i . x_j + s_i, with a_i = W_t^T (W_f x_i + b_f) / sqrt(d) and s_i =
+#(W_f x_i + b_f) . b_t / sqrt(d), so one d x d matmul where the from and to projections were two. Its columns are a, s,
+#the promotion logits and board_down_project's; worked out in fp64 from the fp32 heads, then fp16
+def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        from_weight, from_bias = model.from_projection.weight.double(), model.from_projection.bias.double()
+        to_weight, to_bias = model.to_projection.weight.double(), model.to_projection.bias.double()
+        promotion, down = model.promotion_projection, model.board_down_project[0]
+        scale = 1 / math.sqrt(model.d_model)
+        weight = torch.cat([from_weight.T @ to_weight * scale, (from_weight.T @ to_bias)[:, None] * scale, promotion.weight.double().T,
+                            down.weight.double().T], dim=1)
+        bias = torch.cat([to_weight.T @ from_bias * scale, (from_bias @ to_bias)[None] * scale, promotion.bias.double(), down.bias.double()])
+    return weight.half(), bias.float()
+
+
+#the model for inference: model.ChessTransformer with its blocks FusedBlocks, its square features summed by
+#feature_sum_kernel and its heads' matmuls on the last norm's output one (head_weights), fp16 inputs accumulating in
+#fp32 as the from and to projections did. The same arithmetic as ChessTransformer.forward otherwise (tests/
+#test_inference.py checks they agree). The trunk keeps the precision model has, so a half precision one is converted
+#(half_except_heads) before
+class FusedTransformer(nn.Module):
+    def __init__(self, model: ChessTransformer):
+        super().__init__()
+        self.embed, self.position_embed, self.templates, self.ln, self.loops = model.embed, model.position_embed, model.templates, model.ln, model.loops
+        self.square_features = SummedSquareFeatures(model.square_features)
+        self.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
+        self.board_down_activation, self.eval_head = model.board_down_project[1], model.eval_head
+        for name in ("from_squares", "to_squares", "promotion_move_ids", "promotion_to_squares", "promotion_pieces"):
+            self.register_buffer(name, getattr(model, name))
+        weight, bias = head_weights(model)
+        self.head_weight, self.head_bias = nn.Parameter(weight, requires_grad=False), nn.Parameter(bias, requires_grad=False)
+        d, promotions = model.d_model, model.promotion_projection.out_features
+        self.a_columns, self.s_columns = slice(0, d), slice(d, d + 1)
+        self.promotion_columns, self.down_columns = slice(d + 1, d + 1 + promotions), slice(d + 1 + promotions, None)
+
+    def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        embed_state = self.embed(board_state) + self.position_embed
+        embed_state = embed_state + F.pad(self.square_features(board_state), (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
+        original_board_embed = embed_state
+        for _ in range(self.loops):
+            for block in self.encoder:
+                embed_state = block(embed_state, self.templates, original_board_embed)
+        model_output = self.ln(embed_state)
+
+        heads = linear(model_output.half(), self.head_weight, self.head_bias, accumulate_fp32=True) #B T head_weight's columns
+        squares = heads[:, :NUM_SQUARES]
+        logits = squares[..., self.a_columns] @ model_output[:, :NUM_SQUARES].float().transpose(1, 2) + squares[..., self.s_columns]
+        combined_logits = logits[:, self.from_squares, self.to_squares]
+        combined_logits[:, self.promotion_move_ids] += squares[..., self.promotion_columns][:, self.promotion_to_squares, self.promotion_pieces]
+        compressed_board = self.board_down_activation(heads[..., self.down_columns]).reshape(board_state.shape[0], -1)
+        return combined_logits, self.eval_head(compressed_board)
