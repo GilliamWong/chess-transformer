@@ -181,9 +181,7 @@ def test_the_int8_weights_are_cached_by_the_checkpoints_content(tmp_path, small_
         changed.encoder[0].Q.weight[0, 0] += 1
     save_checkpoint(changed, SMALL_SETTINGS, tmp_path / "changed.pt")
     recomputed = quantization.int8_weights(tmp_path / "changed.pt")
-    for path in quantization.CACHE.iterdir():
-        if path.name.startswith(quantization.checkpoint_digest(tmp_path / "changed.pt")):
-            path.unlink()
+    quantization.cached_weights_path(tmp_path / "changed.pt").unlink()
     recomputed_again = quantization.int8_weights(tmp_path / "changed.pt")
 
     def failing(*arguments):

@@ -1,8 +1,7 @@
 #the int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022): each weight's
 #rounding error is made up for by the weights not yet rounded, through the inverse Hessian of the matmul's inputs on
 #CALIBRATION_POSITIONS positions. Computed in fp64, so that machines summing in other orders round them the same (the
-#cpu and an RTX 5070 Ti agree on every weight of the d768), and kept in CACHE named by the checkpoint file's sha256
-#and VERSION.
+#cpu and an RTX 5070 Ti agree on every weight of the d768), and kept in CACHE (cached_weights_path).
 #   python -m engine.quantization <model.pt>    computes them ahead of a match (~1 min on an RTX 5070 Ti)
 import argparse
 import hashlib
@@ -22,7 +21,8 @@ from tools.play.evaluate_elo import CARLSEN_PGN
 #derived from the checkpoint and remade when missing: kept in the home folder rather than beside the checkpoint, whose
 #folder may be read-only, and found by every hyak node, whose home folders are shared
 CACHE = Path.home() / ".cache" / "chess_transformer" / "int8"
-#changed with the rounding, the calibration or the layers in int8, so that weights rounded the old way are not read
+#changed with the rounding, the calibration or the layers in int8, so that weights rounded the old way are not read (the
+#names carry int8_blocks.HADAMARD_BLOCK too)
 VERSION = 1
 #every CALIBRATION_STEP plies of Carlsen's games from CALIBRATION_FIRST_GAME on: the first games are the tests' and the
 #accuracy benchmark's
@@ -120,14 +120,16 @@ def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> dict[
     return weights
 
 
-def checkpoint_digest(checkpoint_path: Path) -> str:
+#the checkpoint's int8 weights' file in CACHE, named by the checkpoint file's content
+def cached_weights_path(checkpoint_path: Path) -> Path:
     with open(checkpoint_path, "rb") as checkpoint:
-        return hashlib.file_digest(checkpoint, "sha256").hexdigest()
+        digest = hashlib.file_digest(checkpoint, "sha256").hexdigest()
+    return CACHE / f"{digest}_v{VERSION}_hadamard{HADAMARD_BLOCK}.pt"
 
 
 #the checkpoint's int8 weights (compute_int8_weights) on the cpu, from CACHE or computed on the gpu and cached
 def int8_weights(checkpoint_path: Path) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
-    path = CACHE / f"{checkpoint_digest(checkpoint_path)}_v{VERSION}.pt"
+    path = cached_weights_path(checkpoint_path)
     if path.exists():
         return torch.load(path, weights_only=True)
     #fp64 but the heads, whose inputs the model casts to fp32
@@ -149,4 +151,4 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     arguments = parser.parse_args()
     int8_weights(arguments.checkpoint)
-    print(CACHE / f"{checkpoint_digest(arguments.checkpoint)}_v{VERSION}.pt")
+    print(cached_weights_path(arguments.checkpoint))
