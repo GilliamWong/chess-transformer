@@ -44,7 +44,7 @@ CACHE_POSITIONS = 5_000_000
 #30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
 #towards narrow search. value_sharpness 3: the value labels' human scale is ~3x flatter than stockfish's win rate, and
 #the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11)
-#simulations_per_leaf (a round's, lc0's out of order evaluations) and dedupe_in_flight change the search: self-play's values
+#simulations_per_leaf (a round's, lc0's out of order evaluations) and dedupe_in_flight change the search: as self-play's
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "dedupe_in_flight": False, "simulations_per_leaf": SIMULATIONS_PER_LEAF}
 
 
@@ -67,7 +67,7 @@ def parse_changes(text: str, settings: dict) -> dict:
         changes[name] = kind(float(value))
     return changes
 
-#the network's precisions. int8: not yet judged in games, and its answers depend on the batch, so not for self-play or labels
+#int8 is not yet judged in games, and its answers depend on the rest of the batch: not for self-play or labels
 PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
 
 

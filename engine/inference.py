@@ -160,7 +160,7 @@ def fp16_model(checkpoint_path: Path) -> nn.Module:
     model = load_model(checkpoint_path, torch.device("cuda")).scale_residual_stream(FP16_RESIDUAL_SCALE)
     return FusedTransformer(model.half_except_heads(torch.float16))
 
-#compiled for exactly exact_size boards, the size most batches fill, and dynamically for the rest (all exact: minutes to start)
+#compiled for exactly exact_size boards, the size most batches fill, dynamically for the rest (all exact: slow to start)
 class ExactSizeCompiled(nn.Module):
     def __init__(self, model: nn.Module, exact_size: int):
         super().__init__()
