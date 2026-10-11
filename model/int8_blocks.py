@@ -1,10 +1,4 @@
-#the engine's blocks with their matmuls on normalised inputs (Q|K|V|template mix and gate|up) and the mlp's down in
-#int8, for speed: an RTX 5070 Ti multiplies int8 at twice fp16's rate (int32 sums, exact). The weights are int8 with a
-#scale per output channel (engine/quantization.py rounds them), the inputs int8 with a scale per token found as they
-#are made: the RMSNorm rounds its output, and the mlp's hidden activations are rotated by a Hadamard matrix in blocks
-#of HADAMARD_BLOCK first, which spreads their outlier channels over the block (the down weights are rotated to match,
-#H H^T being HADAMARD_BLOCK times the identity: (h H)(W H / HADAMARD_BLOCK)^T = h W^T). combine_heads stays fp16: its
-#input needs a scale per head
+#the engine's blocks with their matmuls in int8 but combine_heads: weights scaled per output channel, inputs per token
 import torch
 import triton
 import triton.language as tl
@@ -13,11 +7,11 @@ from triton.language.extra import libdevice
 
 from model.fused_blocks import GROUP_M, FusedBlock, linear, linear_epilogue, template_attention
 
+#the mlp's hidden is rotated in blocks of this many to spread its outlier channels, down's weights to match (H H^T = 32 I)
 HADAMARD_BLOCK = 32
 #the down matmul reads its inputs (the mlp's hidden width, padded with zeros) BLOCK_K at a time
 DOWN_INPUT_MULTIPLE = 128
-#tiles of the int8 matmuls: BLOCK_M rows x BLOCK_N columns (a gated matmul's of the gate and as many of up), BLOCK_K
-#deep, warps, pipeline stages. Each fits in the 99 KB of shared memory an sm_86 / sm_89 / sm_120 block can have
+#int8 matmul tiles (rows, columns, depth, warps, stages), each within the 99 KB of shared memory of an sm_86/89/120 block
 PROJECTION_TILE = (128, 128, 64, 8, 3)
 GATE_UP_TILE = (128, 64, 64, 4, 2)
 DOWN_TILE = (128, 128, 64, 4, 3)
@@ -39,9 +33,7 @@ def down_inputs(hidden: int) -> int:
     return triton.cdiv(hidden, DOWN_INPUT_MULTIPLE) * DOWN_INPUT_MULTIPLE
 
 
-#out = (x @ w^T) dequantised by x's scale per row and w's per column, then linear_epilogue's bias, silu(gate) * up and
-#residual. x is M x K int8, w N x K int8 (gated: the gate's N rows then up's). Rows and columns past the end are read
-#wrapped round, whole loads without masks, and never stored
+#x @ w^T (x M x K, w N x K, gated: the gate's rows then up's) dequantised, then linear_epilogue; loads past the end wrap
 @triton.jit
 def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K,
                        HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr,
@@ -104,8 +96,7 @@ def _(x, x_scale, weight, weight_scale, bias, residual, gated, tile):
     return x.new_empty(*x.shape[:-1], weight.shape[0] // 2 if gated else weight.shape[0], dtype=torch.float16)
 
 
-#rows of x RMS-normalised (with gain) and rounded to int8 with a scale per row, their absmax / 127. With MIX, x is
-#first the block's input mix residual_scale * x + input_scale * original, which is written out in fp16 too
+#rows RMS-normalised (with gain) and rounded to int8, a row's scale its absmax / 127; MIX first mixes in the block's input
 @triton.jit
 def norm_quant_kernel(x_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, gain_ptr, mixed_ptr, q_ptr, scale_ptr, M, D, eps,
                       MIX: tl.constexpr, ROWS: tl.constexpr, BLOCK_D: tl.constexpr):
@@ -164,10 +155,7 @@ def _(x, original, residual_scale, input_scale, gain, eps):
     return x.new_empty(x.shape, dtype=torch.float16), x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[:-1], dtype=torch.float32)
 
 
-#rows of h (M x N fp16) times the block-diagonal Hadamard matrix of +-1 (blocks of BLOCK), rounded to int8 with a scale
-#per row, written WIDTH wide with zeros past N. A program's ROWS rows are read as ROWS * SLOTS rows of BLOCK (SLOTS, a
-#power of two, holds a row's WIDTH / BLOCK blocks), which the Hadamard block multiplies as they are; only the blocks'
-#maxima are rearranged into rows
+#h's rows times the block-diagonal Hadamard matrix, rounded to int8 WIDTH wide; read as rows of BLOCK for one matmul
 @triton.jit
 def rotate_quant_kernel(h_ptr, hadamard_ptr, q_ptr, scale_ptr, M, N, WIDTH: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr,
                         SLOTS: tl.constexpr):
@@ -204,9 +192,7 @@ def _(h, hadamard_signs, width):
 
 
 class Int8Block(nn.Module):
-    #takes over a FusedBlock's norms, attention and combine_heads, with the int8 weights and their scales of its
-    #projection, gate_up and down (engine/quantization.py); output_scale multiplies down's, as fp16 inference shrinks
-    #what the blocks write into the residual stream
+    #takes over a FusedBlock with its int8 weights; output_scale multiplies down's, as fp16 inference shrinks the residual
     def __init__(self, block: FusedBlock, weights: dict[str, tuple[torch.Tensor, torch.Tensor]], output_scale: float):
         super().__init__()
         self.heads, self.kv_heads, self.dq, self.dv, self.templates_count = block.heads, block.kv_heads, block.dq, block.dv, block.templates_count
@@ -214,6 +200,7 @@ class Int8Block(nn.Module):
         self.residual_scale, self.input_scale = block.residual_scale, block.input_scale
         self.q_gain, self.k_gain, self.eps = block.q_gain, block.k_gain, block.eps
         self.projection_bias = block.projection_bias
+        #fp16: combine_heads' input would need a scale per head
         self.combine_heads, self.combine_heads_bias = block.combine_heads, block.combine_heads_bias
         device = block.projection.device
         for name, (integers, scale) in weights.items():
@@ -233,7 +220,7 @@ class Int8Block(nn.Module):
         return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, DOWN_TILE)
 
 
-#the fused model (fuse_blocks) with the blocks of the layers in weights swapped for Int8Blocks
+#the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks
 def quantize_blocks(model: nn.Module, weights: dict[int, dict], output_scale: float) -> nn.Module:
     model.encoder = nn.ModuleList(Int8Block(block, weights[layer], output_scale) if layer in weights else block
                                   for layer, block in enumerate(model.encoder))

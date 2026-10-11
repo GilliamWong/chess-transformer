@@ -1,8 +1,5 @@
-#the int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022): each weight's
-#rounding error is made up for by the weights not yet rounded, through the inverse Hessian of the matmul's inputs on
-#CALIBRATION_POSITIONS positions. Computed in fp64, so that machines summing in other orders round them the same (the
-#cpu and an RTX 5070 Ti agree on every weight of the d768), and kept in CACHE (cached_weights_path).
-#   python -m engine.quantization <model.pt>    computes them ahead of a match (~1 min on an RTX 5070 Ti)
+#the int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022) and cached
+#   python -m engine.quantization <model.pt>    computes them ahead of a match
 import argparse
 import hashlib
 import os
@@ -18,13 +15,11 @@ from model.int8_blocks import DOWN_INPUT_MULTIPLE, HADAMARD_BLOCK, down_inputs, 
 from model.model import ChessTransformer
 from training.data import CARLSEN_PGN
 
-#derived from the checkpoint and remade when missing: kept in the home folder rather than beside the checkpoint, whose
-#folder may be read-only, and found by every hyak node, whose home folders are shared
+#in the home folder, not the checkpoint's: that may be read-only, and hyak's nodes share their home folders
 CACHE = Path.home() / ".cache" / "chess_transformer" / "int8"
 #the rounding code's version, changed with it: it and the settings below name the cached file with the checkpoint
 VERSION = 1
-#every CALIBRATION_STEP plies of Carlsen's games from CALIBRATION_FIRST_GAME on: the first games are the tests' and the
-#accuracy benchmark's
+#every CALIBRATION_STEP plies of Carlsen's games from CALIBRATION_FIRST_GAME, after the tests' and the benchmarks' games
 CALIBRATION_POSITIONS = 1024
 CALIBRATION_FIRST_GAME = 1000
 CALIBRATION_STEP = 9
@@ -54,9 +49,9 @@ def calibration_boards() -> torch.Tensor:
     return torch.from_numpy(np.array(boards)).long()
 
 
-#the weight (N x K) rounded to int8 with a scale per row, its absmax / INT8_MAX, by GPTQ on the Hessian (K x K) of its
-#inputs: the columns are rounded in order, each one's error spread over the columns after it. Returns (int8, scale)
+#(int8, scale a row) of the weight (N x K) by GPTQ on its inputs' Hessian: each column's error spread over the later ones
 def gptq(weight: torch.Tensor, hessian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    #fp64: machines summing in other orders round every weight alike
     weight, hessian = weight.double().clone(), hessian.double().clone()
     #inputs that are always zero (the down matmul's padding) have no curvature: their weights are left at zero
     dead = torch.diag(hessian) == 0
@@ -100,9 +95,8 @@ def input_hessians(model: ChessTransformer, boards: torch.Tensor, batch: int = 1
     return hessians
 
 
-#int8 weights of every block but the last FP16_LAST_LAYERS, {layer: {name: (int8 N x K, scale per row)}}: projection is
-#Q|K|V|template mix as fused_blocks joins them, gate_up the gate's rows then up's, down the mlp's down with its inputs
-#padded to down_inputs and rotated as Int8Block rotates them
+#{layer: {name: (int8 N x K, scale a row)}} of all but the last FP16_LAST_LAYERS blocks, laid out as Int8Block reads them:
+#projection Q|K|V|template mix, gate_up the gate's rows then up's, down padded to down_inputs and rotated
 @torch.no_grad()
 def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
     hessians = input_hessians(model, boards)
