@@ -12,7 +12,7 @@ import numpy as np
 import selfplay_rs
 from model.encoding import TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
-from engine.inference import GraphedBatches
+from engine.inference import ExactSizeCompiled, GraphedBatches, fp16_model, int8_model, small_graph_sizes
 from engine.player import ROOT_MOVES_REPORTED, SearchReport
 from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, ranked_moves, ranked_pieces, wdl_score
 
@@ -67,15 +67,13 @@ def parse_changes(text: str, settings: dict) -> dict:
         changes[name] = kind(float(value))
     return changes
 
-#the network's precisions: fp16 (inference.fp16_model) or int8 (inference.int8_model), ~1.3x as fast but its priors
-#further from fp32's, not yet judged in games
-PRECISIONS = ("fp16", "int8")
+#the network's precisions. int8: not yet judged in games, and its answers depend on the batch, so not for self-play or labels
+PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
 
 
 #the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out
 def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = "fp16"):
-    from engine.inference import ExactSizeCompiled, fp16_model, int8_model, small_graph_sizes
-    model = {"fp16": fp16_model, "int8": int8_model}[precision](checkpoint_path)
+    model = PRECISIONS[precision](checkpoint_path)
     sizes = small_graph_sizes(max_batch)
     return GraphedBatches(ExactSizeCompiled(model, sizes[-1]), sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1)
 
