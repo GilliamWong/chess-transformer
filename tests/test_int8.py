@@ -44,30 +44,35 @@ def dequantised(integers: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return integers.double() * scale.double()[:, None]
 
 
-#int8_linear's output is the dequantised operands' matmul (exact in int32) with linear_epilogue's bias, residual or
-#silu(gate) * up, to fp16's rounding, on rows and columns that leave part of a tile empty
+#int8_linear's output is the dequantised operands' matmul (exact in int32) with each block matmul's tile and epilogue
+#(the projection's bias, gate_up's silu(gate) * up, down's residual over its 1,024 inputs), to fp16's rounding: on one
+#board's rows (less than a tile) and three boards', and on columns that leave part of a tile empty
 @gpu
-@pytest.mark.parametrize("gated", [False, True])
-def test_int8_linear_is_the_dequantised_matmul(gated):
-    from model.int8_blocks import PROJECTION_TILE, GATE_UP_TILE, int8_linear
+@pytest.mark.parametrize("matmul", ["projection", "gate_up", "down"])
+@pytest.mark.parametrize("boards", [1, 3])
+def test_int8_linear_is_the_dequantised_matmul(matmul, boards):
+    from model.int8_blocks import DOWN_TILE, GATE_UP_TILE, PROJECTION_TILE, int8_linear
     torch.manual_seed(0)
-    width = 200
-    x = torch.randint(-127, 128, (3, 70, 256), device="cuda", dtype=torch.int8)
-    x_scale = torch.rand(3, 70, device="cuda") / 100
-    weight = torch.randint(-127, 128, (2 * width if gated else width, 256), device="cuda", dtype=torch.int8)
+    width, depth, gated = 200, 1024 if matmul == "down" else 256, matmul == "gate_up"
+    x = torch.randint(-127, 128, (boards, 70, depth), device="cuda", dtype=torch.int8)
+    x_scale = torch.rand(boards, 70, device="cuda") / 100
+    weight = torch.randint(-127, 128, (2 * width if gated else width, depth), device="cuda", dtype=torch.int8)
     weight_scale = torch.rand(len(weight), device="cuda") / 100
-    bias = None if gated else torch.randn(width, device="cuda").half()
-    residual = None if gated else torch.randn(3, 70, width, device="cuda").half()
+    bias = torch.randn(width, device="cuda").half() if matmul == "projection" else None
+    residual = torch.randn(boards, 70, width, device="cuda").half() if matmul == "down" else None
+    tile = {"projection": PROJECTION_TILE, "gate_up": GATE_UP_TILE, "down": DOWN_TILE}[matmul]
 
-    out = int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, list(GATE_UP_TILE if gated else PROJECTION_TILE))
+    out = int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, list(tile))
 
-    projected = dequantised(x.reshape(-1, 256), x_scale.reshape(-1)) @ dequantised(weight, weight_scale).t()
-    if gated:
+    projected = dequantised(x.reshape(-1, depth), x_scale.reshape(-1)) @ dequantised(weight, weight_scale).t()
+    if matmul == "projection":
+        expected = projected + bias.double()
+    elif matmul == "gate_up":
         gate, up = projected.chunk(2, dim=-1)
         expected = F.silu(gate) * up
     else:
-        expected = projected + bias.double() + residual.reshape(-1, width).double()
-    assert out.dtype == torch.float16 and out.shape == (3, 70, width)
+        expected = projected + residual.reshape(-1, width).double()
+    assert out.dtype == torch.float16 and out.shape == (boards, 70, width)
     assert torch.allclose(out.reshape(-1, width).double(), expected, atol=1e-3, rtol=2e-3)
 
 
