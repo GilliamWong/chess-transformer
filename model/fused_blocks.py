@@ -15,22 +15,15 @@ from torch import nn
 
 from model.model import NUM_SQUARES, TOKENS_PER_BOARD, ChessTransformer, SquareFeatures, TransformerBlock
 
-#an instance of the attention kernel takes one position and one key/value head with all the query heads that read it,
-#their query rows stacked, so it reads and normalises the keys and values once: the squares' rows in one launch, with
-#the template bias, the metadata tokens' in another, without it. SQUARE_WARPS for each 64 of its square rows (of 2 and
-#4; 1 and 2 for the metadata rows) were the fastest on an RTX 5070 Ti
+#warps an attention instance has for each 64 of its square rows, and for its metadata rows
 SQUARE_WARPS, META_WARPS = 2, 2
 #rows of template_bias_kernel's matmuls: (position, head) pairs
 BIAS_PAIRS = 64
-#positions whose template bias is made and read at a time, in one buffer that stays in L2: the bias of a whole batch
-#of 256 made the network 4% slower, and of 64 with two batches on the gpu at once (two streams) 1%
+#positions whose template bias is made and read at a time: a buffer that stays in L2
 BIAS_POSITIONS = 32
 
 
-#the template bias of every (position, head) pair, made before the attention: in its kernel, with the templates in
-#registers, it took two fifths of the attention's time. For each query square i, bias[(b, h), i, :] = c[(b, h), i, :]
-#@ templates[:, i, :], one tensor-core matmul with the templates padded with zeros; fp16 products are exact in its
-#fp32 sums, and the bias is stored in the activations' precision
+#bias[(b, h), i] = c[(b, h), i] @ templates[:, i] for each query square i, on tensor cores (in the attention it was slow)
 @triton.jit
 def template_bias_kernel(c_ptr, templates_ptr, bias_ptr, pairs_count, stride_b, stride_t,
                          HEADS: tl.constexpr, TEMPLATES: tl.constexpr, BLOCK_TEMPLATES: tl.constexpr, PAIRS: tl.constexpr):
@@ -47,14 +40,14 @@ def template_bias_kernel(c_ptr, templates_ptr, bias_ptr, pairs_count, stride_b, 
     tl.store(bias_ptr + pairs[:, None] * 4096 + i * 64 + squares[None, :], bias.to(bias_ptr.dtype.element_ty), mask=pair_ok[:, None])
 
 
-#the keys are the 64 squares (template bias) and the metadata tokens (none), 64 + 16 columns rather than 70 padded to
-#128. Row r of an instance is query head g * HEADS_PER_KV + r // ROWS_PER_HEAD at token FIRST_ROW + r % ROWS_PER_HEAD
+#the keys are the 64 squares (template bias) and the metadata tokens (none), 64 + 16 columns rather than 70 padded to 128
 @triton.jit
 def template_attention_kernel(q_ptr, k_ptr, v_ptr, bias_ptr, q_gain_ptr, k_gain_ptr, out_ptr,
                               stride_b, stride_t, out_stride_b, out_stride_t, eps, scale,
                               T: tl.constexpr, HEADS: tl.constexpr, HEADS_PER_KV: tl.constexpr, DQ: tl.constexpr, DV: tl.constexpr,
                               FIRST_ROW: tl.constexpr, ROWS_PER_HEAD: tl.constexpr, BLOCK_ROWS: tl.constexpr, BLOCK_META: tl.constexpr,
                               BLOCK_DQ: tl.constexpr):
+    #all the query heads of key/value head g at once, so its keys and values are read and normalised once
     g, b = tl.program_id(0), tl.program_id(1)
     r = tl.arange(0, BLOCK_ROWS)
     head = g * HEADS_PER_KV + r // ROWS_PER_HEAD
@@ -321,11 +314,7 @@ class SummedSquareFeatures(nn.Module):
         return feature_sum(self.features.indices(board_state) + self.features.row_offsets, self.features.table)
 
 
-#the heads' matmuls on the last norm's output: the policy's logits[i, j] = (W_f x_i + b_f) . (W_t x_j + b_t) / sqrt(d)
-#are a_i . x_j + s_i, with a_i = W_t^T (W_f x_i + b_f) / sqrt(d) and s_i = (W_f x_i + b_f) . b_t / sqrt(d), so one d x d
-#matmul where the from and to projections were two. a's weight (in_features x out_features, fp16) and bias, then the
-#narrow ones' (out_features x in_features, fp32): s, the promotion logits and board_down_project's. Worked out in fp64
-#from the fp32 heads
+#logits[i, j] = (W_f x_i + b_f) . (W_t x_j + b_t) / sqrt(d) = a_i . x_j + s_i: from and to as one d x d matmul (a)
 def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         from_weight, from_bias = model.from_projection.weight.double(), model.from_projection.bias.double()
@@ -338,11 +327,7 @@ def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, t
                 narrow_bias.float())
 
 
-#the model for inference: model.ChessTransformer with its blocks FusedBlocks, its square features summed by
-#feature_sum_kernel and its heads' matmuls on the last norm's output two (head_weights): a in linear_kernel, fp16 inputs
-#accumulating in fp32 as the from and to projections did, and the narrow ones as fp32 matmuls as before. The same
-#arithmetic as ChessTransformer.forward otherwise (tests/test_inference.py checks they agree). The trunk keeps the
-#precision model has, so a half precision one is converted (half_except_heads) before
+#ChessTransformer.forward with FusedBlocks and head_weights' matmuls, for inference: a change to it must be made here too
 class FusedTransformer(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
