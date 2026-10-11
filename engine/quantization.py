@@ -14,15 +14,14 @@ import torch
 
 from engine.player import load_model
 from model.encoding import encode_board
-from model.int8_blocks import HADAMARD_BLOCK, down_inputs, hadamard
+from model.int8_blocks import DOWN_INPUT_MULTIPLE, HADAMARD_BLOCK, down_inputs, hadamard
 from model.model import ChessTransformer
-from tools.play.evaluate_elo import CARLSEN_PGN
+from training.data import CARLSEN_PGN
 
 #derived from the checkpoint and remade when missing: kept in the home folder rather than beside the checkpoint, whose
 #folder may be read-only, and found by every hyak node, whose home folders are shared
 CACHE = Path.home() / ".cache" / "chess_transformer" / "int8"
-#changed with the rounding, the calibration or the layers in int8, so that weights rounded the old way are not read (the
-#names carry int8_blocks.HADAMARD_BLOCK too)
+#the rounding code's version, changed with it: it and the settings below name the cached file with the checkpoint
 VERSION = 1
 #every CALIBRATION_STEP plies of Carlsen's games from CALIBRATION_FIRST_GAME on: the first games are the tests' and the
 #accuracy benchmark's
@@ -32,6 +31,8 @@ CALIBRATION_STEP = 9
 #GPTQ's dampening of the Hessian, a share of its mean diagonal, and the columns it rounds before passing on their error
 DAMPENING = 0.01
 GPTQ_COLUMNS = 128
+#the last layer stays fp16: its down matmul alone costs the policy as much as all the others'
+FP16_LAST_LAYERS = 1
 INT8_MAX = 127
 
 
@@ -99,14 +100,14 @@ def input_hessians(model: ChessTransformer, boards: torch.Tensor, batch: int = 1
     return hessians
 
 
-#int8 weights of every block but the last (its down matmul alone costs the policy as much as all the others'),
-#{layer: {name: (int8 N x K, scale per row)}}: projection is Q|K|V|template mix as fused_blocks joins them, gate_up the
-#gate's rows then up's, down the mlp's down with its inputs padded to down_inputs and rotated as Int8Block rotates them
+#int8 weights of every block but the last FP16_LAST_LAYERS, {layer: {name: (int8 N x K, scale per row)}}: projection is
+#Q|K|V|template mix as fused_blocks joins them, gate_up the gate's rows then up's, down the mlp's down with its inputs
+#padded to down_inputs and rotated as Int8Block rotates them
 @torch.no_grad()
 def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
     hessians = input_hessians(model, boards)
     weights = {}
-    for layer, (block, sums) in enumerate(list(zip(model.encoder, hessians))[:-1]):
+    for layer, (block, sums) in enumerate(list(zip(model.encoder, hessians))[:len(hessians) - FP16_LAST_LAYERS]):
         projection = torch.cat([layer_.weight for layer_ in (block.Q, block.K, block.V, block.template_mix)])
         gate_up = torch.cat([block.mlp.gate_projection.weight, block.mlp.up_projection.weight])
         hidden = block.mlp.down_projection.weight.shape[1]
@@ -120,11 +121,13 @@ def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> dict[
     return weights
 
 
-#the checkpoint's int8 weights' file in CACHE, named by the checkpoint file's content
+#the checkpoint's int8 weights' file in CACHE, named by the checkpoint file's content and everything else that rounds them
 def cached_weights_path(checkpoint_path: Path) -> Path:
     with open(checkpoint_path, "rb") as checkpoint:
         digest = hashlib.file_digest(checkpoint, "sha256").hexdigest()
-    return CACHE / f"{digest}_v{VERSION}_hadamard{HADAMARD_BLOCK}.pt"
+    rounding = (VERSION, CALIBRATION_POSITIONS, CALIBRATION_FIRST_GAME, CALIBRATION_STEP, DAMPENING, GPTQ_COLUMNS, FP16_LAST_LAYERS,
+                HADAMARD_BLOCK, DOWN_INPUT_MULTIPLE)
+    return CACHE / f"{digest}_{hashlib.sha256(repr(rounding).encode()).hexdigest()[:16]}.pt"
 
 
 #the checkpoint's int8 weights (compute_int8_weights) on the cpu, from CACHE or computed on the gpu and cached

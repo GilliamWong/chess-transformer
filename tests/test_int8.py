@@ -185,9 +185,9 @@ def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):
     assert abs(answers - expected).max() < 0.05
 
 
-#the weights are computed once per checkpoint content and read back as they were saved: a copy of the checkpoint
-#elsewhere reads them too, a checkpoint with another weight gets its own, and computing them again gives the same
-#bits (GPTQ in fp64)
+#the weights are computed once per checkpoint content and rounding settings and read back as they were saved: a copy of
+#the checkpoint elsewhere reads them too, a checkpoint with another weight or another rounding setting gets its own, and
+#computing them again gives the same bits (GPTQ in fp64)
 @gpu
 def test_the_int8_weights_are_cached_by_the_checkpoints_content(tmp_path, small_calibration, monkeypatch):
     model, _ = small_checkpoint(tmp_path)
@@ -215,3 +215,6 @@ def test_the_int8_weights_are_cached_by_the_checkpoints_content(tmp_path, small_
             assert torch.equal(cached[layer][name][0], integers) and torch.equal(cached[layer][name][1], scale)
             assert all(torch.equal(a, b) for a, b in zip(recomputed[layer][name], recomputed_again[layer][name]))
     assert not torch.equal(recomputed[0]["projection"][0], computed[0]["projection"][0])
+    path = quantization.cached_weights_path(tmp_path / "model.pt")
+    monkeypatch.setattr(quantization, "DAMPENING", 2 * quantization.DAMPENING)
+    assert quantization.cached_weights_path(tmp_path / "model.pt") != path
