@@ -59,6 +59,14 @@ def test_a_clock_in_nodes_is_shared_over_the_moves():
             assert min(searched) > 0 and sum(searched) < node_rate * (base + increment * len(searched))
 
 
+#the engine's simulations_per_leaf goes to a variant's rounds rather than to its Searches
+def test_a_variant_takes_its_rounds_simulations(monkeypatch):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"simulations_per_leaf": 3})
+    finished = played(("simulations_per_leaf=8", ""), nodes=30)
+
+    assert sorted(record["game"] for record, _ in finished) == [0, 1, 2, 3]
+
+
 #a's points from both colours: 19 pairs of 1.5 of 2 and one of 0.5, a score of 0.7375 or 179 elo within its interval
 def test_pair_elo():
     records = [{"game": game, "a_white": game % 2 == 0, "result": "1-0" if game % 2 == 0 else "1/2-1/2"} for game in range(40)]

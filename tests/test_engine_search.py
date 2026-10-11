@@ -25,6 +25,7 @@ from engine import uci
 from engine.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
+ENGINE_SETTINGS = engine_search.ENGINE_SETTINGS
 
 
 #the searches here are mcts.py's, whose constants the expectations were set by; the engine's own changes over them are
@@ -150,6 +151,15 @@ def test_the_engines_settings(monkeypatch):
     assert engine_search_settings(False) == {**rust_search_settings(False), "fpu_reduction": 0.25, "c_puct": 0.5}
     assert engine_search_settings(False, {"c_puct": 0.7})["c_puct"] == 0.7
     assert engine_search_settings(False, own=False) == rust_search_settings(False)
+
+
+#the engine's own settings all reach its search: simulations_per_leaf its rounds, the rest Searches
+def test_the_engine_takes_its_own_settings(monkeypatch):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", ENGINE_SETTINGS)
+    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, settings={"simulations_per_leaf": 8, "dedupe_in_flight": True})
+
+    assert search.round_simulations == 8 * 16
+    assert search.search(chess.Board(), simulations=500).simulations == 500
 
 
 #every position's answer: no move preferred, expected score 0.6

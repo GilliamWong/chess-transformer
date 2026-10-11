@@ -43,16 +43,19 @@ CACHE_POSITIONS = 5_000_000
 #a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. c_puct 0.4 won +78 elo at 4k nodes a move and +46 at
 #30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
 #towards narrow search. value_sharpness 3: the value labels' human scale is ~3x flatter than stockfish's win rate, and
-#the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11). dedupe_in_flight
-#(search.rs gather) saves network calls but changes the rounds' leaves, so it is off until its elo is known
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "dedupe_in_flight": False}
+#the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11). simulations_per_leaf
+#is the rounds' rather than Searches': a round's simulations for each leaf it may gather, those the cache or the game's
+#end answer at once included (lc0's out of order evaluations). It and dedupe_in_flight (search.rs gather) save network
+#calls but change the search, so they keep self-play's values (SIMULATIONS_PER_LEAF, no dedupe) until their elo is known
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "dedupe_in_flight": False, "simulations_per_leaf": SIMULATIONS_PER_LEAF}
 
 
 #search.rs sharpen: the value's logit times sharpness; 1 / sharpness undoes it, and 1 leaves the score exactly as it was
 def sharpen(score: float, sharpness: float) -> float:
     return score if sharpness == 1 or score in (0.0, 1.0) else 1 / (1 + ((1 - score) / score) ** sharpness)
 
-#Searches' settings: mcts.py's with the engine's own (own), then changes (parse_changes') over them
+#Searches' settings and the rounds' simulations_per_leaf: mcts.py's with the engine's own (own), then changes
+#(parse_changes') over them
 def engine_search_settings(use_tablebase: bool, changes: dict | None = None, own: bool = True, tablebase_pieces: int = TABLEBASE_PIECES) -> dict:
     return {**rust_search_settings(use_tablebase, tablebase_pieces), **(ENGINE_SETTINGS if own else {}), **(changes or {})}
 
@@ -85,12 +88,12 @@ class EngineSearch:
         self.network = network
         self.leaves = leaves
         batched = leaves > 1
-        self.round_simulations = SIMULATIONS_PER_LEAF * leaves
         self.collisions = COLLISIONS if batched else 0
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1
         self.rounds_at_once = batched and isinstance(network, GraphedBatches) and len(network.lanes) > 1
         self.smart_pruning = batched and smart_pruning
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces)
+        self.round_simulations = search_settings.pop("simulations_per_leaf", SIMULATIONS_PER_LEAF) * leaves
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=CACHE_POSITIONS)
         #reports give the score on the network's own scale, as a gui showed and adjudicated it before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
