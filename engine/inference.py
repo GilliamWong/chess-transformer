@@ -163,7 +163,8 @@ def fp16_model(checkpoint_path: Path) -> nn.Module:
 
 #the model compiled for batches of exactly exact_size boards, and with dynamic shapes for the others; only recording a
 #graph calls it, so the choice costs the graphs nothing. Inductor's kernels for a known batch made the engine's rounds of
-#64 leaves 2% faster, and compiling every graph size exactly made a cold start 200 s rather than 41 (this one 51)
+#64 leaves 2% faster and self-play's chunks of 128 boards 2%, and compiling every graph size exactly made the engine's
+#cold start 200 s rather than 41 (this one 51)
 class ExactSizeCompiled(nn.Module):
     def __init__(self, model: nn.Module, exact_size: int):
         super().__init__()
@@ -209,7 +210,8 @@ def inference_process(checkpoint_path: str, compile_model: bool, precision: str,
             if precision == "bf16":
                 model = Bf16(model)
         if compile_model:
-            model = torch.compile(model, dynamic=True)
+            #most of a big batch's forwards are whole chunks
+            model = ExactSizeCompiled(model, CHUNK_POSITIONS)
         network = GraphedBatches(model, graph_sizes(len(slot_names) * games_per_process))
     else:
         network = cpu_batches(load_model(Path(checkpoint_path), CPU))
