@@ -161,7 +161,7 @@ def test_the_int8_model_computes_what_the_model_does(tmp_path, small_calibration
 
     assert [isinstance(block, Int8Block) for block in int8.encoder] == [True, True, False]
     distance = lambda found: 0.5 * (torch.softmax(found.float(), dim=-1) - torch.softmax(expected_logits, dim=-1)).abs().sum(dim=-1)
-    assert distance(logits).max() < 0.02 and distance(fp16_logits).max() < distance(logits).max()
+    assert distance(logits).max() < 0.005 and distance(fp16_logits).max() < distance(logits).max()
     assert torch.equal(logits.argmax(-1), expected_logits.argmax(-1))
     assert torch.allclose(expected_score(values.float()), expected_score(expected_values), atol=5e-3)
 
