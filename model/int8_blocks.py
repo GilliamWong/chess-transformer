@@ -22,8 +22,8 @@ PROJECTION_TILE = (128, 128, 64, 8, 3)
 GATE_UP_TILE = (128, 64, 64, 4, 2)
 DOWN_TILE = (128, 128, 64, 4, 3)
 #rows a program of norm_quant_kernel and of rotate_quant_kernel takes, and its warps
-NORM_ROWS, NORM_WARPS = 1, 4
-ROTATE_ROWS = 32
+NORM_ROWS, NORM_WARPS = 1, 2
+ROTATE_ROWS = 8
 
 
 #Sylvester's Hadamard matrix of +-1, size a power of two: symmetric, and its square is size times the identity
@@ -164,26 +164,24 @@ def _(x, original, residual_scale, input_scale, gain, eps):
     return x.new_empty(x.shape, dtype=torch.float16), x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[:-1], dtype=torch.float32)
 
 
-#rows of h (M x N fp16) times the block-diagonal Hadamard matrix of +-1 (blocks of hadamard_signs' size), rounded to
-#int8 with a scale per row, written WIDTH wide with zeros past N. A first pass finds each row's absmax and a second
-#rotates again and rounds: the rows are read twice, from L2, rather than held
+#rows of h (M x N fp16) times the block-diagonal Hadamard matrix of +-1 (blocks of BLOCK), rounded to int8 with a scale
+#per row, written WIDTH wide with zeros past N. A program's ROWS rows are read as ROWS * WIDTH / BLOCK rows of BLOCK,
+#which the Hadamard block multiplies as they are; only the blocks' maxima are rearranged into rows
 @triton.jit
 def rotate_quant_kernel(h_ptr, hadamard_ptr, q_ptr, scale_ptr, M, N, WIDTH: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr):
-    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    BLOCKS: tl.constexpr = WIDTH // BLOCK
+    r = tl.arange(0, ROWS * BLOCKS)
+    tokens = tl.program_id(0) * ROWS + r // BLOCKS
     i = tl.arange(0, BLOCK)
-    row_ok = rows < M
-    hadamard = tl.load(hadamard_ptr + i[:, None] * BLOCK + i[None, :])
-    absmax = tl.full((ROWS,), 1e-20, tl.float32)
-    for start in range(0, WIDTH, BLOCK):
-        cols = start + i
-        h = tl.load(h_ptr + rows[:, None] * N + cols[None, :], mask=row_ok[:, None] & (cols < N)[None, :], other=0.0)
-        absmax = tl.maximum(absmax, tl.max(tl.abs(tl.dot(h, hadamard)), 1))
-    for start in range(0, WIDTH, BLOCK):
-        cols = start + i
-        h = tl.load(h_ptr + rows[:, None] * N + cols[None, :], mask=row_ok[:, None] & (cols < N)[None, :], other=0.0)
-        q = libdevice.rint(tl.dot(h, hadamard) * (127.0 / absmax)[:, None]).to(tl.int8)
-        tl.store(q_ptr + rows[:, None] * WIDTH + cols[None, :], q, mask=row_ok[:, None])
-    tl.store(scale_ptr + rows, absmax / 127.0, mask=row_ok)
+    cols = (r % BLOCKS)[:, None] * BLOCK + i[None, :]
+    token_ok = tokens < M
+    h = tl.load(h_ptr + tokens[:, None] * N + cols, mask=token_ok[:, None] & (cols < N), other=0.0)
+    rotated = tl.dot(h, tl.load(hadamard_ptr + i[:, None] * BLOCK + i[None, :]))
+    absmax = tl.maximum(tl.max(tl.reshape(tl.max(tl.abs(rotated), 1), (ROWS, BLOCKS)), 1), 1e-20)
+    inverse_step = tl.reshape(tl.broadcast_to((127.0 / absmax)[:, None], (ROWS, BLOCKS)), (ROWS * BLOCKS,))
+    tl.store(q_ptr + tokens[:, None] * WIDTH + cols, libdevice.rint(rotated * inverse_step[:, None]).to(tl.int8), mask=token_ok[:, None])
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    tl.store(scale_ptr + rows, absmax / 127.0, mask=rows < M)
 
 
 @torch.library.custom_op("chess::rotate_quant", mutates_args=())
