@@ -14,7 +14,7 @@ DOWN_INPUT_MULTIPLE = 128
 #int8 matmul tiles (rows, columns, depth, warps, stages), each within the 99 KB of shared memory of an sm_86/89/120 block
 PROJECTION_TILE = (128, 128, 64, 8, 3)
 GATE_UP_TILE = (128, 64, 64, 4, 2)
-DOWN_TILE = (128, 128, 64, 4, 3)
+DOWN_TILE = (128, 128, 64, 8, 3)
 #the rows a program of norm_quant_kernel takes and its warps, and the rows a program of rotate_quant_kernel takes
 NORM_ROWS, NORM_WARPS = 1, 2
 ROTATE_ROWS = 8
