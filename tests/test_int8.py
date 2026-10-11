@@ -166,6 +166,25 @@ def test_the_int8_model_computes_what_the_model_does(tmp_path, small_calibration
     assert torch.allclose(expected_score(values.float()), expected_score(expected_values), atol=5e-3)
 
 
+#engine_network in int8: the int8 model compiled and recorded as cuda graphs answers as it does uncompiled
+@gpu
+def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):
+    from engine.engine_search import engine_network
+    from engine.inference import answer_rows, int8_model
+    _, boards = small_checkpoint(tmp_path)
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        network = engine_network(tmp_path / "model.pt", 4, "int8")
+        answers = network.collect(network.launch(boards[:3].numpy().astype("uint8")))
+        with torch.no_grad():
+            expected = answer_rows(int8_model(tmp_path / "model.pt")(boards[:3].cuda())).cpu().numpy()
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    #fp16's rounding differs a little once compiled; a graph reading the wrong buffers is off by whole logits
+    assert abs(answers - expected).max() < 0.05
+
+
 #the weights are computed once per checkpoint content and read back as they were saved: a copy of the checkpoint
 #elsewhere reads them too, a checkpoint with another weight gets its own, and computing them again gives the same
 #bits (GPTQ in fp64)
