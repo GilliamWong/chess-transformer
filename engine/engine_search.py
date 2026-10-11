@@ -21,7 +21,7 @@ from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, ranked_mov
 #judging 2,000 positions)
 LEAVES = 64
 COLLISIONS = 64
-#a round is gathered while the last one is on the gpu (+9% simulations/s); GraphedBatches double-buffers, so at most 2
+#a round is gathered while the last one is on the gpu (+9% simulations/s), and the two run at once (GraphedBatches)
 ROUNDS_IN_FLIGHT = 2
 #as many simulations as the search can do, for a search with only a deadline
 UNLIMITED = 2**32 - 1
@@ -65,11 +65,12 @@ def parse_changes(text: str, settings: dict) -> dict:
         changes[name] = kind(float(value))
     return changes
 
-#the network in fp16 (inference.fp16_model) as cuda graphs for a round's leaves, from one to max_batch
+#the network in fp16 (inference.fp16_model) as cuda graphs for a round's leaves, from one to max_batch, in a lane for
+#each round in flight
 def engine_network(checkpoint_path: Path, max_batch: int = LEAVES):
     import torch
     from engine.inference import GraphedBatches, fp16_model, small_graph_sizes
-    return GraphedBatches(torch.compile(fp16_model(checkpoint_path), dynamic=True), small_graph_sizes(max_batch))
+    return GraphedBatches(torch.compile(fp16_model(checkpoint_path), dynamic=True), small_graph_sizes(max_batch), ROUNDS_IN_FLIGHT)
 
 
 class EngineSearch:

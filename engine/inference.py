@@ -64,56 +64,64 @@ def graph_sizes(max_batch: int) -> list[int]:
         sizes.append(sizes[-1] + (64 if sizes[-1] < 1024 else 128 if sizes[-1] < 2048 else 256))
     return sizes
 
-#a cuda graph for every batch size in sizes (ascending), sharing one memory pool; a batch runs through the smallest that
-#holds it. launch returns at once and collect waits. Two pinned buffers each way let the next batch fill while the last
-#one runs, so at most two batches may be launched and not yet collected
-class GraphedBatches:
+#a batch in flight's own stream, cuda graphs (one for every batch size in sizes, ascending, sharing a memory pool: they
+#run one after another on the stream) and buffers: pinned memory for the boards and answers, the graphs' boards on the gpu
+class Lane:
     def __init__(self, model: nn.Module, sizes: list[int]):
+        self.stream = torch.cuda.Stream()
+        largest = sizes[-1]
+        #recorded on real boards: zero boards once hit a device-side assert
+        self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
+        self.boards_host = torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, pin_memory=True)
+        self.answers_host = torch.zeros(largest, ANSWER_WIDTH, dtype=torch.float32, pin_memory=True)
+
+        #warmup calls off the default stream, as recording a graph needs
+        self.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream), torch.no_grad():
+            for size in sizes:
+                model(self.boards[:size])
+        torch.cuda.current_stream().wait_stream(self.stream)
+
+        #recorded on the stream they run on: graphs of two lanes recorded on one stream into one pool shared their
+        #activations (and cublas's workspace, kept for each stream) and wrote over each other's while they ran at once
+        pool = torch.cuda.graph_pool_handle()
+        self.graphs, self.answers = {}, {}
+        for size in reversed(sizes):
+            self.graphs[size] = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graphs[size], pool=pool, stream=self.stream), torch.no_grad():
+                self.answers[size] = answer_rows(model(self.boards[:size]))
+
+#the model as cuda graphs in `in_flight` lanes (Lane) that take the batches in turn: at most in_flight batches may be
+#launched and not yet collected. A batch runs through the smallest graph that holds it; launch returns at once and
+#collect waits. The lanes' batches run at once, one's latency-bound kernels (attention, norms) beside the other's
+#matmuls: 2 at 64 boards are 5% faster than one after another
+class GraphedBatches:
+    def __init__(self, model: nn.Module, sizes: list[int], in_flight: int = 2):
         #the graphs read the model's weights where they were when recorded: freed, their memory went to the next
         #tensors made and every answer came back wrong
         self.model = model
         self.sizes = sizes
-        largest = self.sizes[-1]
-        #recorded on real boards: zero boards once hit a device-side assert
-        self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
-        self.boards_host = [torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, pin_memory=True) for _ in range(2)]
-        self.answers_host = [torch.zeros(largest, ANSWER_WIDTH, dtype=torch.float32, pin_memory=True) for _ in range(2)]
+        self.lanes = [Lane(model, sizes) for _ in range(in_flight)]
         self.turn = 0
 
-        #warmup calls on a side stream, as recording a graph needs
-        side_stream = torch.cuda.Stream()
-        side_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side_stream), torch.no_grad():
-            for size in self.sizes:
-                model(self.boards[:size])
-        torch.cuda.current_stream().wait_stream(side_stream)
-
-        #one pool is safe: the graphs run one after another on one stream, and answers are copied out before the next
-        pool = torch.cuda.graph_pool_handle()
-        self.graphs, self.answers = {}, {}
-        for size in reversed(self.sizes):
-            self.graphs[size] = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graphs[size], pool=pool), torch.no_grad():
-                self.answers[size] = answer_rows(model(self.boards[:size]))
-
-    def launch(self, boards: np.ndarray) -> tuple[torch.cuda.Event, torch.Tensor]:
+    def launch(self, boards: np.ndarray) -> tuple[Lane, int, int]:
         count = len(boards)
         size = next(size for size in self.sizes if size >= count)
-        #the buffers of the batch before last, whose answers serve has already handed out
-        boards_host, answers_host = self.boards_host[self.turn], self.answers_host[self.turn]
-        self.turn = 1 - self.turn
-        boards_host[:count] = torch.from_numpy(boards)
-        self.boards[:count].copy_(boards_host[:count], non_blocking=True)
-        self.graphs[size].replay()
-        answers_host[:count].copy_(self.answers[size][:count], non_blocking=True)
-        done = torch.cuda.Event()
-        done.record()
-        return done, answers_host[:count]
+        lane = self.lanes[self.turn]
+        self.turn = (self.turn + 1) % len(self.lanes)
+        lane.boards_host[:count] = torch.from_numpy(boards)
+        with torch.cuda.stream(lane.stream):
+            lane.boards[:count].copy_(lane.boards_host[:count], non_blocking=True)
+            lane.graphs[size].replay()
+        return lane, size, count
 
-    def collect(self, launched: tuple[torch.cuda.Event, torch.Tensor]) -> np.ndarray:
-        done, answers = launched
-        done.synchronize()
-        return answers.numpy()
+    #the answers are copied out only now: the gpu's copies go one after another, so a copy queued at launch waited for
+    #its batch and held the next batch's boards behind it, and the lanes never ran at once
+    def collect(self, launched: tuple[Lane, int, int]) -> np.ndarray:
+        lane, size, count = launched
+        with torch.cuda.stream(lane.stream):
+            lane.answers_host[:count].copy_(lane.answers[size][:count])
+        return lane.answers_host[:count].numpy()
 
 #GraphedBatches' interface without a gpu (and in the tests): launch does the work
 class ImmediateBatches:

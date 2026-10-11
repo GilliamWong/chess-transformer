@@ -66,6 +66,29 @@ def test_graphs_keep_their_model_alive():
     assert np.allclose(answers, expected, atol=1e-3)
 
 
+#two batches out at once in two lanes come back with the bits each gets alone: lanes recorded on one stream into one
+#memory pool wrote over each other's activations. A model big enough that the two batches overlap
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_batches_in_flight_together_answer_as_alone():
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=256, num_layers=4, n_heads=4).cuda().eval()
+    random = np.random.default_rng(0)
+    board, boards = chess.Board(), []
+    while len(boards) < 512:
+        board = chess.Board() if board.is_game_over() else board
+        board.push(random.choice(list(board.legal_moves)))
+        boards.append(encode_board(board))
+    batches = np.array(boards, dtype=np.uint8).reshape(2, 256, -1)
+
+    alone = GraphedBatches(model, [256], in_flight=1)
+    expected = [alone.collect(alone.launch(batch)).copy() for batch in batches]
+    together = GraphedBatches(model, [256])
+    for _ in range(20):
+        launched = [together.launch(batch) for batch in batches]
+        answers = [together.collect(batch_launched).copy() for batch_launched in launched]
+        assert all(np.array_equal(answer, expected_answer) for answer, expected_answer in zip(answers, expected))
+
+
 #the d512_selfplay_sf12_10pass run's residual stream passes fp16's 65,504 on the en-passant token: every board came back
 #NaN and the engine's search put all its visits on one arbitrary move
 #an RMSNorm squaring that stream in fp16 would overflow the same way
