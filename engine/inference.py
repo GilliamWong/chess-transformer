@@ -170,6 +170,14 @@ class ExactSizeCompiled(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return (self.exact if len(boards) == self.exact_size else self.dynamic)(boards)
 
+#fp16_model with every block but the last in int8 (model/int8_blocks.py), its weights rounded once per checkpoint
+#(engine/quantization.py): needs an sm_80 gpu or newer
+def int8_model(checkpoint_path: Path) -> nn.Module:
+    from model.int8_blocks import quantize_blocks
+    from engine.quantization import int8_weights
+    weights = int8_weights(checkpoint_path)
+    return quantize_blocks(fp16_model(checkpoint_path), weights, FP16_RESIDUAL_SCALE)
+
 #bf16 autocast, as train.py trains: targets as good as tf32's, and ~150k positions/s instead of 110k (d128, compiled)
 class Bf16(nn.Module):
     def __init__(self, model: nn.Module):
