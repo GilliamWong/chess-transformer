@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
+from triton.language.extra.cuda import gdc_wait
 
 from model.model import NUM_SQUARES, ChessTransformer, TransformerBlock
 
@@ -25,10 +26,26 @@ BIAS_PAIRS = 64
 BIAS_POSITIONS = 32
 
 
+#programmatic dependent launch (sm_90 and newer): a kernel starts as the blocks of the one before it finish and waits
+#for that one before touching memory. No early trigger: kernels launched early slowed small batches
+@triton.jit
+def dependent_launch_wait(PDL: tl.constexpr):
+    if PDL:
+        gdc_wait()
+
+
+#the launch keywords of a kernel that starts with dependent_launch_wait: griddepcontrol is sm_90 ptx
+def dependent_launch(device: torch.device) -> dict:
+    supported = torch.cuda.get_device_capability(device) >= (9, 0)
+    return {"PDL": supported, "launch_pdl": supported}
+
+
 #bias[(b, h), i] = c[(b, h), i] @ templates[:, i] for each query square i, on tensor cores (in the attention it was slow)
 @triton.jit
 def template_bias_kernel(c_ptr, templates_ptr, bias_ptr, pairs_count, stride_b, stride_t,
-                         HEADS: tl.constexpr, TEMPLATES: tl.constexpr, BLOCK_TEMPLATES: tl.constexpr, PAIRS: tl.constexpr):
+                         HEADS: tl.constexpr, TEMPLATES: tl.constexpr, BLOCK_TEMPLATES: tl.constexpr, PAIRS: tl.constexpr,
+                         PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
     i, p = tl.program_id(0), tl.program_id(1)
     pairs = p * PAIRS + tl.arange(0, PAIRS)
     pair_ok = pairs < pairs_count
@@ -49,7 +66,8 @@ def template_attention_kernel(q_ptr, k_ptr, v_ptr, bias_ptr, q_gain_ptr, k_gain_
                               stride_b, stride_t, out_stride_b, out_stride_t, eps, scale,
                               T: tl.constexpr, HEADS: tl.constexpr, HEADS_PER_KV: tl.constexpr, DQ: tl.constexpr, DV: tl.constexpr,
                               FIRST_ROW: tl.constexpr, ROWS_PER_HEAD: tl.constexpr, BLOCK_ROWS: tl.constexpr, BLOCK_META: tl.constexpr,
-                              BLOCK_DQ: tl.constexpr):
+                              BLOCK_DQ: tl.constexpr, PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
     #all the query heads of key/value head g at once, so its keys and values are read and normalised once
     g, b = tl.program_id(0), tl.program_id(1)
     r = tl.arange(0, BLOCK_ROWS)
@@ -105,6 +123,7 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
     if square_warps > MAX_WARPS:
         raise ValueError(f"template_attention takes at most {MAX_WARPS // SQUARE_WARPS} query heads a key/value head, not {heads_per_kv}")
     shapes = dict(T=T, HEADS=heads, HEADS_PER_KV=heads_per_kv, DQ=dq, DV=dv, BLOCK_META=block_meta, BLOCK_DQ=max(16, triton.next_power_of_2(dq)))
+    launch = dependent_launch(projected.device)
     scalars = (projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
     for start in range(0, B, BIAS_POSITIONS):
         positions = slice(start, min(B, start + BIAS_POSITIONS))
@@ -112,12 +131,12 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
         template_bias_kernel[(NUM_SQUARES, triton.cdiv(count * heads, BIAS_PAIRS))](c[positions], templates, bias, count * heads, projected.stride(0),
                                                                                  projected.stride(1), HEADS=heads, TEMPLATES=templates_count,
                                                                                  BLOCK_TEMPLATES=max(16, triton.next_power_of_2(templates_count)),
-                                                                                 PAIRS=BIAS_PAIRS)
+                                                                                 PAIRS=BIAS_PAIRS, **launch)
         template_attention_kernel[(kv_heads, count)](q[positions], k[positions], v[positions], bias, q_gain, k_gain, out[positions], *scalars, FIRST_ROW=0,
                                                      ROWS_PER_HEAD=NUM_SQUARES, BLOCK_ROWS=square_rows,
-                                                     num_warps=square_warps, **shapes)
+                                                     num_warps=square_warps, **shapes, **launch)
     template_attention_kernel[(kv_heads, B)](q, k, v, bias, q_gain, k_gain, out, *scalars, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
-                                             BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes)
+                                             BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes, **launch)
     return out
 
 
@@ -174,7 +193,9 @@ def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, original_
 @triton.jit
 def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride_w,
                   HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, ACC_TYPE: tl.constexpr,
-                  BLOCK_M: tl.constexpr, EXTRA_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+                  BLOCK_M: tl.constexpr, EXTRA_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+                  PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
     pid = tl.program_id(0)
     TILE_M: tl.constexpr = BLOCK_M + EXTRA_M
     grid_m, grid_n = tl.cdiv(M, TILE_M), tl.cdiv(N, BLOCK_N)
@@ -242,7 +263,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = No
     grid = (triton.cdiv(M, LINEAR_ROWS + extra) * triton.cdiv(N, columns),)
     linear_kernel[grid](x, weight, bias_, residual_, out, M, N, K, weight.stride(0), HAS_BIAS=bias is not None, HAS_RESIDUAL=residual is not None,
                         GATED=gated, ACC_TYPE=acc_type, BLOCK_M=LINEAR_ROWS, EXTRA_M=extra, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M,
-                        num_warps=LINEAR_WARPS, num_stages=LINEAR_STAGES)
+                        num_warps=LINEAR_WARPS, num_stages=LINEAR_STAGES, **dependent_launch(x.device))
     return out
 
 
@@ -290,7 +311,8 @@ EMBEDDING_TOKENS, EMBEDDING_COLUMNS = 8, 256
 #the input embedding in one kernel, so that every block reads one buffer: inductor recomputed or copied it for each
 @triton.jit
 def input_embedding_kernel(boards_ptr, rows_ptr, embed_ptr, position_ptr, table_ptr, out_ptr, tokens, D, T: tl.constexpr, SQUARES: tl.constexpr,
-                           FEATURES: tl.constexpr, BLOCK_TOKENS: tl.constexpr, BLOCK_D: tl.constexpr):
+                           FEATURES: tl.constexpr, BLOCK_TOKENS: tl.constexpr, BLOCK_D: tl.constexpr, PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
     token = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     board, place = token // T, token % T
@@ -318,7 +340,7 @@ def input_embedding(boards: torch.Tensor, rows: torch.Tensor, embed: torch.Tenso
     out = table.new_empty(B, T, D)
     grid = (triton.cdiv(B * T, EMBEDDING_TOKENS), triton.cdiv(D, EMBEDDING_COLUMNS))
     input_embedding_kernel[grid](boards, rows, embed.contiguous(), position.contiguous(), table.contiguous(), out, B * T, D, T=T, SQUARES=NUM_SQUARES,
-                                 FEATURES=rows.shape[-1], BLOCK_TOKENS=EMBEDDING_TOKENS, BLOCK_D=EMBEDDING_COLUMNS)
+                                 FEATURES=rows.shape[-1], BLOCK_TOKENS=EMBEDDING_TOKENS, BLOCK_D=EMBEDDING_COLUMNS, **dependent_launch(boards.device))
     return out
 
 

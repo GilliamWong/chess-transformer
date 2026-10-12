@@ -222,6 +222,29 @@ def test_the_input_embedding_is_the_models(dtype):
     assert found.dtype == dtype and torch.allclose(found, expected, rtol=rtol, atol=atol)
 
 
+#programmatic dependent launch only from sm_90: a kernel built for older gpus (hyak's A100s and A40s) with griddepcontrol
+#does not compile
+@pytest.mark.parametrize("capability", [(8, 6), (9, 0)])
+def test_dependent_launch_only_from_sm_90(monkeypatch, capability):
+    import triton
+    import triton.language as tl
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from model.fused_blocks import dependent_launch, dependent_launch_wait
+
+    @triton.jit
+    def copy_kernel(x_ptr, out_ptr, PDL: tl.constexpr):
+        dependent_launch_wait(PDL)
+        tl.store(out_ptr, tl.load(x_ptr))
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    launch = dependent_launch(torch.device("cuda"))
+    source = ASTSource(fn=copy_kernel, signature={"x_ptr": "*fp32", "out_ptr": "*fp32", "PDL": "constexpr"}, constexprs={"PDL": launch["PDL"]})
+    ptx = triton.compile(source, target=GPUTarget("cuda", 10 * capability[0] + capability[1], 32)).asm["ptx"]
+
+    assert launch["PDL"] == launch["launch_pdl"] == (capability >= (9, 0)) == ("griddepcontrol" in ptx)
+
+
 #fused_blocks.FusedBlock must compute what model.TransformerBlock does, InputEmbedding what the model's embedding does
 #and FusedTransformer's one matmul what the heads do: with random templates and square features (zeros at init would
 #hide them), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel), and the

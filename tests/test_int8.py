@@ -4,6 +4,7 @@ import copy
 import shutil
 
 import chess
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -189,6 +190,29 @@ def test_down_mixes_the_next_blocks_input_to_the_bit(tmp_path, small_calibration
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
     assert linked == [False, True] and all(torch.equal(found, expected) for found, expected in zip(mixed_in_down, mixed_by_each))
+
+
+#programmatic dependent launch changes no bits: the int8 model (every kernel of fused_blocks and int8_blocks) recorded as
+#cuda graphs with it answers as without it
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), reason="no sm_90 gpu")
+def test_dependent_launch_changes_no_bits(tmp_path, small_calibration, monkeypatch):
+    from engine.inference import GraphedBatches, int8_model
+    from model import fused_blocks, int8_blocks
+    _, boards = small_checkpoint(tmp_path)
+    boards = boards.numpy().astype("uint8")
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        int8 = int8_model(tmp_path / "model.pt")
+        dependent = GraphedBatches(int8, [len(boards)], in_flight=1)
+        answers = dependent.collect(dependent.launch(boards)).copy()
+        for module in (fused_blocks, int8_blocks):
+            monkeypatch.setattr(module, "dependent_launch", lambda device: {"PDL": False, "launch_pdl": False})
+        one_after_another = GraphedBatches(int8, [len(boards)], in_flight=1)
+        expected = one_after_another.collect(one_after_another.launch(boards))
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert np.array_equal(answers, expected)
 
 
 #engine_network in int8: the int8 model compiled and recorded as cuda graphs answers as it does uncompiled

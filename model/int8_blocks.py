@@ -5,7 +5,7 @@ import triton.language as tl
 from torch import nn
 from triton.language.extra import libdevice
 
-from model.fused_blocks import GROUP_M, FusedBlock, linear, linear_epilogue, template_attention
+from model.fused_blocks import GROUP_M, FusedBlock, dependent_launch, dependent_launch_wait, linear, linear_epilogue, template_attention
 
 #the mlp's hidden is rotated in blocks of this many to spread its outlier channels, down's weights to match (H H^T = 32 I)
 HADAMARD_BLOCK = 32
@@ -37,7 +37,9 @@ def down_inputs(hidden: int) -> int:
 @triton.jit
 def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr,
                        M, N, K, HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, MIX: tl.constexpr,
-                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+                       BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
+                       PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
     pid = tl.program_id(0)
     grid_m, grid_n = tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N)
     in_group = GROUP_M * grid_n
@@ -92,7 +94,7 @@ def int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, we
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
     int8_linear_kernel[grid](x, x_scale, weight, weight_scale, bias_, residual_, *mix_, out, M, N, K, HAS_BIAS=bias is not None,
                              HAS_RESIDUAL=residual is not None, GATED=gated, MIX=mix, BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-                             GROUP_M=GROUP_M, num_warps=warps, num_stages=stages)
+                             GROUP_M=GROUP_M, num_warps=warps, num_stages=stages, **dependent_launch(x.device))
     return out
 
 
@@ -104,7 +106,8 @@ def _(x, x_scale, weight, weight_scale, bias, residual, gated, tile, original=No
 #rows RMS-normalised (with gain) and rounded to int8, a row's scale its absmax / 127; MIX first mixes in the block's input
 @triton.jit
 def norm_quant_kernel(x_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, gain_ptr, mixed_ptr, q_ptr, scale_ptr, M, D, eps,
-                      MIX: tl.constexpr, ROWS: tl.constexpr, BLOCK_D: tl.constexpr):
+                      MIX: tl.constexpr, ROWS: tl.constexpr, BLOCK_D: tl.constexpr, PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     d = tl.arange(0, BLOCK_D)
     row_ok = rows < M
@@ -131,7 +134,7 @@ def launch_norm_quant(x, original, residual_scale, input_scale, gain, mixed, eps
     mix = original is not None
     norm_quant_kernel[(triton.cdiv(M, NORM_ROWS),)](x, original if mix else x, residual_scale if mix else gain, input_scale if mix else gain, gain,
                                                     mixed if mix else x, q, scale, M, D, eps, MIX=mix, ROWS=NORM_ROWS,
-                                                    BLOCK_D=triton.next_power_of_2(D), num_warps=NORM_WARPS)
+                                                    BLOCK_D=triton.next_power_of_2(D), num_warps=NORM_WARPS, **dependent_launch(x.device))
     return q, scale
 
 
@@ -163,7 +166,8 @@ def _(x, original, residual_scale, input_scale, gain, eps):
 #h's rows times the block-diagonal Hadamard matrix, rounded to int8 WIDTH wide; read as rows of BLOCK for one matmul
 @triton.jit
 def rotate_quant_kernel(h_ptr, hadamard_ptr, q_ptr, scale_ptr, M, N, WIDTH: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr,
-                        SLOTS: tl.constexpr):
+                        SLOTS: tl.constexpr, PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
     r = tl.arange(0, ROWS * SLOTS)
     tokens = tl.program_id(0) * ROWS + r // SLOTS
     i = tl.arange(0, BLOCK)
@@ -187,7 +191,7 @@ def rotate_quant(h: torch.Tensor, hadamard_signs: torch.Tensor, width: int) -> t
     scale = torch.empty(h.shape[:-1], device=h.device, dtype=torch.float32)
     block = hadamard_signs.shape[0]
     rotate_quant_kernel[(triton.cdiv(M, ROTATE_ROWS),)](h, hadamard_signs, q, scale, M, N, WIDTH=width, ROWS=ROTATE_ROWS, BLOCK=block,
-                                                        SLOTS=triton.next_power_of_2(width // block), num_warps=4)
+                                                        SLOTS=triton.next_power_of_2(width // block), num_warps=4, **dependent_launch(h.device))
     return q, scale
 
 
