@@ -171,6 +171,26 @@ def test_the_int8_model_computes_what_the_model_does(tmp_path, small_calibration
     assert torch.allclose(expected_score(values.float()), expected_score(expected_values), atol=5e-3)
 
 
+#an int8 block's down mixing the next int8 block's input gives the bits the next block's own mix gives
+@gpu
+def test_down_mixes_the_next_blocks_input_to_the_bit(tmp_path, small_calibration):
+    from engine.inference import int8_model
+    _, boards = small_checkpoint(tmp_path)
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        with torch.no_grad():
+            int8 = int8_model(tmp_path / "model.pt")
+            mixed_in_down = int8(boards.cuda())
+            linked = [block.input_mixed for block in int8.encoder[:2]]
+            for block in int8.encoder[:2]:
+                block.next_scales, block.input_mixed = None, False
+            mixed_by_each = int8(boards.cuda())
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert linked == [False, True] and all(torch.equal(found, expected) for found, expected in zip(mixed_in_down, mixed_by_each))
+
+
 #engine_network in int8: the int8 model compiled and recorded as cuda graphs answers as it does uncompiled
 @gpu
 def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):

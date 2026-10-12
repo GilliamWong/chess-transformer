@@ -146,10 +146,11 @@ def linear_extra_rows(M: int, column_tiles: int, multiprocessors: int) -> int:
     return min((0, 16, 32, 64), key=cost)
 
 
-#a tile's bias, silu(gate) * up and residual, in fp32, and its store
+#a tile's bias, silu(gate) * up and residual, in fp32, and its store. MIX stores the next block's input instead: the
+#stream as stored, mixed with the input embedding (original) as TransformerBlock mixes it
 @triton.jit
-def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr,
-                    HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr):
+def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr,
+                    HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, MIX: tl.constexpr):
     row_ok, col_ok = rows < M, cols < N
     out = acc.to(tl.float32)
     if HAS_BIAS:
@@ -157,9 +158,14 @@ def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr,
     if GATED:
         out = out * tl.sigmoid(out) * up.to(tl.float32)
     offsets = rows[:, None] * N + cols[None, :]
+    mask = row_ok[:, None] & col_ok[None, :]
     if HAS_RESIDUAL:
-        out += tl.load(residual_ptr + offsets, mask=row_ok[:, None] & col_ok[None, :], other=0.0).to(tl.float32)
-    tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None] & col_ok[None, :])
+        out += tl.load(residual_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    if MIX:
+        stream = out.to(out_ptr.dtype.element_ty).to(tl.float32)
+        original = tl.load(original_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        out = tl.load(residual_scale_ptr).to(tl.float32) * stream + tl.load(input_scale_ptr).to(tl.float32) * original
+    tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 #out = x @ w (w is in_features x out_features), then in the same kernel the bias, silu(gate) * up (gated: w's first
@@ -209,9 +215,10 @@ def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride
         x_ptrs += BLOCK_K
         w_ptrs += BLOCK_K * stride_w
 
-    linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL, GATED)
+    linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, out_ptr, out_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL, GATED, False)
     if EXTRA_M > 0:
-        linear_epilogue(extra_acc, extra_up, extra_rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL, GATED)
+        linear_epilogue(extra_acc, extra_up, extra_rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, out_ptr, out_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL,
+                        GATED, False)
 
 
 #an opaque op for torch.compile, as template_attention. fp16 inputs accumulate in fp16 and give fp16, or with

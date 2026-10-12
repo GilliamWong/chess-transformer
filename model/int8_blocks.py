@@ -35,8 +35,8 @@ def down_inputs(hidden: int) -> int:
 
 #x @ w^T (x M x K, w N x K, gated: the gate's rows then up's) dequantised, then linear_epilogue; loads past the end wrap
 @triton.jit
-def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K,
-                       HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr,
+def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr,
+                       M, N, K, HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, MIX: tl.constexpr,
                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
     pid = tl.program_id(0)
     grid_m, grid_n = tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N)
@@ -66,13 +66,16 @@ def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residua
     up_out = out
     if GATED:
         up_out = up.to(tl.float32) * x_scale * tl.load(w_scale_ptr + N + cols, mask=col_ok, other=0.0)[None, :]
-    linear_epilogue(out, up_out, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL, GATED)
+    linear_epilogue(out, up_out, rows, cols, M, N, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr, HAS_BIAS,
+                    HAS_RESIDUAL, GATED, MIX)
 
 
-#an opaque op for torch.compile, as fused_blocks.linear; gives fp16. tile is one of the *_TILE above
+#an opaque op for torch.compile, as fused_blocks.linear; gives fp16. tile is one of the *_TILE above. With original (the
+#input embedding) and the next block's residual_scale and input_scale it gives the next block's input (linear_epilogue)
 @torch.library.custom_op("chess::int8_linear", mutates_args=())
 def int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias: torch.Tensor | None,
-                residual: torch.Tensor | None, gated: bool, tile: list[int]) -> torch.Tensor:
+                residual: torch.Tensor | None, gated: bool, tile: list[int], original: torch.Tensor | None = None,
+                residual_scale: torch.Tensor | None = None, input_scale: torch.Tensor | None = None) -> torch.Tensor:
     block_m, block_n, block_k, warps, stages = tile
     rows, K = weight.shape
     N = rows // 2 if gated else rows
@@ -81,18 +84,20 @@ def int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, we
     x = x.contiguous()
     M = x.numel() // K
     out = torch.empty(*x.shape[:-1], N, device=x.device, dtype=torch.float16)
+    mix = original is not None
     #the pointers of unused inputs are never read
     bias_ = bias if bias is not None else out
     residual_ = residual.contiguous() if residual is not None else out
+    mix_ = (original.contiguous(), residual_scale, input_scale) if mix else (out, out, out)
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
-    int8_linear_kernel[grid](x, x_scale, weight, weight_scale, bias_, residual_, out, M, N, K, HAS_BIAS=bias is not None,
-                             HAS_RESIDUAL=residual is not None, GATED=gated, BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, GROUP_M=GROUP_M,
-                             num_warps=warps, num_stages=stages)
+    int8_linear_kernel[grid](x, x_scale, weight, weight_scale, bias_, residual_, *mix_, out, M, N, K, HAS_BIAS=bias is not None,
+                             HAS_RESIDUAL=residual is not None, GATED=gated, MIX=mix, BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+                             GROUP_M=GROUP_M, num_warps=warps, num_stages=stages)
     return out
 
 
 @int8_linear.register_fake
-def _(x, x_scale, weight, weight_scale, bias, residual, gated, tile):
+def _(x, x_scale, weight, weight_scale, bias, residual, gated, tile, original=None, residual_scale=None, input_scale=None):
     return x.new_empty(*x.shape[:-1], weight.shape[0] // 2 if gated else weight.shape[0], dtype=torch.float16)
 
 
@@ -207,9 +212,16 @@ class Int8Block(nn.Module):
             self.register_buffer(name, integers.to(device).contiguous())
             self.register_buffer(f"{name}_scale", (scale * output_scale if name == "down" else scale).to(device, torch.float32).contiguous())
         self.register_buffer("hadamard_signs", hadamard(HADAMARD_BLOCK).to(device, torch.float16))
+        #set by quantize_blocks: the next block's (residual_scale, input_scale) when down mixes its input, and whether this
+        #block's input comes mixed
+        self.next_scales: tuple[nn.Parameter, nn.Parameter] | None = None
+        self.input_mixed = False
 
     def forward(self, x: torch.Tensor, templates: torch.Tensor, original_board_embed: torch.Tensor) -> torch.Tensor:
-        x, normed, scale = mix_norm_quant(x, original_board_embed, self.residual_scale, self.input_scale, self.ln1.weight, self.ln1.eps)
+        if self.input_mixed:
+            normed, scale = norm_quant(x, self.ln1.weight, self.ln1.eps)
+        else:
+            x, normed, scale = mix_norm_quant(x, original_board_embed, self.residual_scale, self.input_scale, self.ln1.weight, self.ln1.eps)
         projected = int8_linear(normed, scale, self.projection, self.projection_scale, self.projection_bias, None, False, PROJECTION_TILE)
         attended = template_attention(projected, templates, self.q_gain, self.k_gain, self.heads, self.kv_heads, self.dq, self.dv, self.templates_count,
                                       self.eps)
@@ -217,11 +229,17 @@ class Int8Block(nn.Module):
         normed, scale = norm_quant(x, self.ln2.weight, self.ln2.eps)
         hidden = int8_linear(normed, scale, self.gate_up, self.gate_up_scale, None, None, True, GATE_UP_TILE)
         rotated, scale = rotate_quant(hidden, self.hadamard_signs, self.down.shape[1])
-        return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, DOWN_TILE)
+        if self.next_scales is None:
+            return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, DOWN_TILE)
+        return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, DOWN_TILE, original_board_embed, *self.next_scales)
 
 
-#the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks
+#the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks, each one's down
+#mixing the input of an Int8Block after it
 def quantize_blocks(model: nn.Module, weights: dict[int, dict], output_scale: float) -> nn.Module:
-    model.encoder = nn.ModuleList(Int8Block(block, weights[layer], output_scale) if layer in weights else block
-                                  for layer, block in enumerate(model.encoder))
+    blocks = [Int8Block(block, weights[layer], output_scale) if layer in weights else block for layer, block in enumerate(model.encoder)]
+    for block, following in zip(blocks, blocks[1:]):
+        if isinstance(block, Int8Block) and isinstance(following, Int8Block):
+            block.next_scales, following.input_mixed = (following.residual_scale, following.input_scale), True
+    model.encoder = nn.ModuleList(blocks)
     return model
