@@ -331,6 +331,46 @@ def test_template_attention_in_fp16(heads, kv_heads, dq):
     assert torch.allclose(out.float(), expected, atol=1e-2)
 
 
+#template_attention recorded in cuda graphs makes the next chunk's bias on a second stream: it must wait until the square
+#rows two chunks back have read its buffer, the square rows until their bias is made, and the graph for both streams.
+#Two graphs at the d768's shapes, of more positions than the two buffers take, replayed at once on their own streams
+#give the bits of one chunk, as eager calls in chunks do
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_template_attention_in_cuda_graphs(monkeypatch):
+    from model import fused_blocks
+    from model.fused_blocks import GRAPHED_BIAS_POSITIONS, template_attention
+    torch.manual_seed(0)
+    heads, kv_heads, dq, dv, templates_count, eps = 24, 12, 24, 32, 8, 1e-5
+    B = 2 * GRAPHED_BIAS_POSITIONS + 5
+    projected = torch.randn(B, TOKENS_PER_BOARD, heads * dq + kv_heads * dq + kv_heads * dv + heads * templates_count, device="cuda").half()
+    templates = (torch.randn(templates_count, NUM_SQUARES, NUM_SQUARES, device="cuda") / 2).half()
+    q_gain, k_gain = (1 + torch.randn(2, dq, device="cuda") / 10).half()
+    attend = lambda: template_attention(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_count, eps)
+    in_chunks = attend()
+    with monkeypatch.context() as patch:
+        patch.setattr(fused_blocks, "BIAS_POSITIONS", B)
+        expected = attend()
+
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    graphs, answers = [], []
+    for stream in streams:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            answers.append(attend())
+        graphs.append(graph)
+    mismatches = torch.zeros(len(streams), dtype=torch.int64, device="cuda")
+    torch.cuda.synchronize()
+    #no wait between replays, so that the two graphs overlap in every way
+    for _ in range(200):
+        for lane, (graph, stream, answer) in enumerate(zip(graphs, streams, answers)):
+            with torch.cuda.stream(stream):
+                graph.replay()
+                mismatches[lane] += (answer != expected).any()
+    torch.cuda.synchronize()
+
+    assert torch.equal(in_chunks, expected) and mismatches.tolist() == [0, 0]
+
+
 #fused_blocks.linear in fp16 as the engine runs it, accumulating in fp16, with the bias and residual added (the
 #attention's output projection) or silu(gate) * up (the mlp), on rows and columns that leave part of a tile empty
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")

@@ -24,6 +24,8 @@ MAX_WARPS = 32
 BIAS_PAIRS = 64
 #positions whose template bias is made and read at a time: a buffer that stays in L2
 BIAS_POSITIONS = 32
+#in a cuda graph, half as many into two buffers: the next chunk's bias is made on a second stream as one is attended
+GRAPHED_BIAS_POSITIONS = 16
 
 
 #programmatic dependent launch (sm_90 and newer): a kernel starts as the blocks of the one before it finish and waits
@@ -108,6 +110,10 @@ def template_attention_kernel(q_ptr, k_ptr, v_ptr, bias_ptr, q_gain_ptr, k_gain_
              mask=row_ok[:, None])
 
 
+#template_attention's second stream for each stream a cuda graph is captured on
+SIDE_STREAMS: dict[torch.cuda.Stream, torch.cuda.Stream] = {}
+
+
 #an opaque op for torch.compile: compiling through the kernel call made it ~15x slower
 @torch.library.custom_op("chess::template_attention", mutates_args=())
 def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain: torch.Tensor, k_gain: torch.Tensor, heads: int, kv_heads: int,
@@ -116,7 +122,6 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
     B, T, _ = projected.shape
     q, k, v, c = projected.split([heads * dq, kv_heads * dq, kv_heads * dv, heads * templates_count], dim=-1)
     out = torch.empty(B, T, heads * dv, device=projected.device, dtype=projected.dtype)
-    bias = torch.empty(min(B, BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
     heads_per_kv, block_meta = heads // kv_heads, max(16, triton.next_power_of_2(T - NUM_SQUARES))
     square_rows = triton.next_power_of_2(heads_per_kv * NUM_SQUARES)
     square_warps = SQUARE_WARPS * square_rows // NUM_SQUARES
@@ -125,18 +130,59 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
     shapes = dict(T=T, HEADS=heads, HEADS_PER_KV=heads_per_kv, DQ=dq, DV=dv, BLOCK_META=block_meta, BLOCK_DQ=max(16, triton.next_power_of_2(dq)))
     launch = dependent_launch(projected.device)
     scalars = (projected.stride(0), projected.stride(1), out.stride(0), out.stride(1), eps, 1 / math.sqrt(dq))
-    for start in range(0, B, BIAS_POSITIONS):
-        positions = slice(start, min(B, start + BIAS_POSITIONS))
-        count = positions.stop - start
+
+    def make_bias(positions: slice, bias: torch.Tensor) -> None:
+        count = positions.stop - positions.start
         template_bias_kernel[(NUM_SQUARES, triton.cdiv(count * heads, BIAS_PAIRS))](c[positions], templates, bias, count * heads, projected.stride(0),
                                                                                  projected.stride(1), HEADS=heads, TEMPLATES=templates_count,
                                                                                  BLOCK_TEMPLATES=max(16, triton.next_power_of_2(templates_count)),
                                                                                  PAIRS=BIAS_PAIRS, **launch)
-        template_attention_kernel[(kv_heads, count)](q[positions], k[positions], v[positions], bias, q_gain, k_gain, out[positions], *scalars, FIRST_ROW=0,
-                                                     ROWS_PER_HEAD=NUM_SQUARES, BLOCK_ROWS=square_rows,
-                                                     num_warps=square_warps, **shapes, **launch)
-    template_attention_kernel[(kv_heads, B)](q, k, v, bias, q_gain, k_gain, out, *scalars, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
-                                             BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes, **launch)
+
+    def attend_squares(positions: slice, bias: torch.Tensor) -> None:
+        template_attention_kernel[(kv_heads, positions.stop - positions.start)](q[positions], k[positions], v[positions], bias, q_gain, k_gain,
+                                                                                out[positions], *scalars, FIRST_ROW=0, ROWS_PER_HEAD=NUM_SQUARES,
+                                                                                BLOCK_ROWS=square_rows, num_warps=square_warps, **shapes, **launch)
+
+    #the metadata rows read no bias
+    def attend_metadata(bias: torch.Tensor) -> None:
+        template_attention_kernel[(kv_heads, B)](q, k, v, bias, q_gain, k_gain, out, *scalars, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
+                                                 BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes, **launch)
+
+    #uncaptured, a second stream's waits and twice the launches halved the speed of callers without cuda graphs
+    if not torch.cuda.is_current_stream_capturing():
+        bias = torch.empty(min(B, BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
+        for start in range(0, B, BIAS_POSITIONS):
+            positions = slice(start, min(B, start + BIAS_POSITIONS))
+            make_bias(positions, bias)
+            attend_squares(positions, bias)
+        attend_metadata(bias)
+        return out
+
+    chunks = [slice(start, min(B, start + GRAPHED_BIAS_POSITIONS)) for start in range(0, B, GRAPHED_BIAS_POSITIONS)]
+    biases = [torch.empty(min(B, GRAPHED_BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
+              for _ in range(min(2, len(chunks)))]
+    main = torch.cuda.current_stream(projected.device)
+    if main not in SIDE_STREAMS:
+        SIDE_STREAMS[main] = torch.cuda.Stream(projected.device)
+    side = SIDE_STREAMS[main]
+    side.wait_stream(main)
+    make_bias(chunks[0], biases[0])
+    for index, positions in enumerate(chunks):
+        if index + 1 < len(chunks):
+            with torch.cuda.stream(side):
+                #the buffer chunk index - 1's square rows read
+                if index > 0:
+                    side.wait_event(read)
+                make_bias(chunks[index + 1], biases[(index + 1) % 2])
+            made = side.record_event()
+        attend_squares(positions, biases[index % 2])
+        if index + 2 < len(chunks):
+            read = main.record_event()
+        if index + 1 < len(chunks):
+            main.wait_event(made)
+    with torch.cuda.stream(side):
+        attend_metadata(biases[0])
+    main.wait_stream(side)
     return out
 
 
