@@ -67,12 +67,13 @@ def parse_changes(text: str, settings: dict) -> dict:
         changes[name] = kind(float(value))
     return changes
 
-#int8 is not yet judged in games, and its answers depend on the rest of the batch: not for self-play or labels
+#int8 is the engine's, not for self-play or labels: its answers depend on the rest of the batch
 PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
+ENGINE_PRECISION = "int8"
 
 
 #the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out
-def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = "fp16"):
+def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION):
     model = PRECISIONS[precision](checkpoint_path)
     sizes = small_graph_sizes(max_batch)
     #one board a round (mcts.py's search) never fills the largest graph

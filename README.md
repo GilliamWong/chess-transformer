@@ -199,7 +199,7 @@ uv run python -m engine.uci artifacts/runs/<run>/model.pt --select mcts --gpu
 ```
 
 The search (`engine/engine_search.py`) runs in Rust and gathers 64 leaves for each network call, as lc0 does, with
-the next round gathered while one is on the GPU; the network runs in fp16 as CUDA graphs, a cache answers positions
+the next round gathered while one is on the GPU; the network runs in int8 as CUDA graphs, a cache answers positions
 reached again by another order of moves, and the tree is kept for the next move. The d512 does ~27k simulations a
 second on the 5070 Ti in one search, lc0 with BT4 ~6k nodes. Smart pruning stops a search once the simulations left
 cannot change its move (at 1 s a move 3 searches in 4 stop early, a quarter of the time saved), and on a clock the
@@ -207,11 +207,13 @@ time saved goes to the moves that are not decided. `--leaves 1` is `engine/mcts.
 after an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to
 answer `isready`, so start the engine once by hand before a match.
 
-`--precision int8` runs every block but the last with its matmuls on normalised inputs (Q, K, V, the template mix, the
-mlp's gate and up) and the mlp's down in int8 (`model/int8_blocks.py`): on the 5070 Ti the network answers ~1.3x the
-positions a second at 64 boards and the search does ~1.36x the nodes at 1 s a move (1.30x at 800 nodes), with priors
-further from fp32's (policy total variation 0.0030, fp16's 0.0011). It is not yet judged in games, so fp16 stays the
-default. Its weights are rounded once per checkpoint (GPTQ, ~1 min) and kept in `~/.cache/chess_transformer/int8`;
+The network runs every block but the last with its matmuls on normalised inputs (Q, K, V, the template mix, the mlp's
+gate and up) and the mlp's down in int8 (`model/int8_blocks.py`): on the 5070 Ti it answers ~1.35x fp16's positions a
+second at 64 boards and the search does ~1.4x the nodes at 1 s a move (1.33x at 800 nodes), and an A100, A40 and L40S
+answer 1.09-1.3x fp16's positions. Its priors are further from fp32's (policy total variation 0.0030, fp16's 0.0011),
+but at equal nodes it plays as fp16 does: -0.2 [-8.4, +8.0] Elo over 3,663 games on Hyak. `--precision fp16` runs the
+network in fp16. Self-play and labels stay in fp16: int8's answers depend on the rest of the batch. The int8 weights are
+rounded once per checkpoint (GPTQ, ~1 min) and kept in `~/.cache/chess_transformer/int8`;
 `python -m engine.quantization <model.pt>` rounds them ahead of a match, which `isready` would not wait for.
 
 ## Self-play (expert iteration)

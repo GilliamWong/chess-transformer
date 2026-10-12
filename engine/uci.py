@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
-from engine.engine_search import LEAVES, PRECISIONS, EngineSearch, engine_network, engine_search_settings, parse_changes
+from engine.engine_search import ENGINE_PRECISION, LEAVES, PRECISIONS, EngineSearch, engine_network, engine_search_settings, parse_changes
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES
@@ -147,7 +147,7 @@ def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, t
 def main(checkpoint_path: Path | None = None, random_mover: bool = False, selection: str = "argmax",
          temperature: float = TEMPERATURE, sample_plies: int = SAMPLE_PLIES, simulations: int = SIMULATIONS,
          gpu: bool = False, leaves: int = LEAVES, tablebase: bool = False, search_log: Path | None = None, search_options: dict | None = None,
-         precision: str = "fp16"):
+         precision: str = ENGINE_PRECISION):
     torch.set_num_threads(1)
     search_options = search_options or {}
     player = None
@@ -216,8 +216,8 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", action="store_true", help="run the model on the gpu: faster for one search, slower when many games share it")
     parser.add_argument("--leaves", type=int, default=LEAVES,
                         help="for --select mcts --gpu: leaves gathered for each network call, default %(default)s; 1 is mcts.py's search")
-    parser.add_argument("--precision", choices=PRECISIONS, default="fp16",
-                        help="for --select mcts --gpu: the network's precision (engine_search.PRECISIONS), default %(default)s")
+    parser.add_argument("--precision", choices=PRECISIONS,
+                        help=f"for --select mcts --gpu: the network's precision (engine_search.PRECISIONS), default {ENGINE_PRECISION}")
     parser.add_argument("--tablebase", action="store_true", help="for --select mcts: positions of at most --tablebase-pieces pieces from the syzygy tables")
     parser.add_argument("--tablebase-pieces", type=int, choices=[table_set.pieces for table_set in TABLE_SETS], default=TABLEBASE_PIECES,
                         help="for --tablebase: the most pieces, default %(default)s; 6 needs python -m tools.tablebase --pieces 6, and without "
@@ -230,7 +230,7 @@ if __name__ == "__main__":
     arguments = parser.parse_args()
     if arguments.tablebase_pieces != TABLEBASE_PIECES and not arguments.tablebase:
         parser.error("--tablebase-pieces needs --tablebase")
-    if arguments.precision != "fp16" and not (arguments.select == "mcts" and arguments.gpu):
+    if arguments.precision is not None and not (arguments.select == "mcts" and arguments.gpu):
         parser.error("--precision needs --select mcts --gpu")
     if arguments.checkpoint == "random":
         main(random_mover=True)
@@ -238,6 +238,6 @@ if __name__ == "__main__":
         main(Path(arguments.checkpoint) if arguments.checkpoint else latest_checkpoint(),
              selection=arguments.select, temperature=arguments.temperature, sample_plies=arguments.sample_plies,
              simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
-             search_log=arguments.search_log, precision=arguments.precision,
+             search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION,
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase))})

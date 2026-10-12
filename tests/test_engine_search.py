@@ -2,6 +2,7 @@
 #deadline and node limit, smart pruning, the tree kept for the next move, the engine's own settings, and uci.py's go
 #limits and clock
 import io
+import runpy
 import subprocess
 import sys
 import time
@@ -362,12 +363,25 @@ def test_the_engine_takes_a_precision(monkeypatch, tmp_path):
     save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
     built = []
     monkeypatch.setattr(uci, "engine_network", lambda checkpoint, leaves, precision: built.append(precision) or cpu_batches(BoardModel()))
-    search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {}, "int8")
-    refused = subprocess.run([sys.executable, "-m", "engine.uci", str(tmp_path / "model.pt"), "--select", "mcts", "--precision", "int8"],
+    search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {}, "fp16")
+    refused = subprocess.run([sys.executable, "-m", "engine.uci", str(tmp_path / "model.pt"), "--select", "mcts", "--precision", "fp16"],
                              cwd=REPOSITORY, capture_output=True, text=True, input="")
 
-    assert built == ["int8"] and search.search(chess.Board(), simulations=20).simulations == 20
+    assert built == ["fp16"] and search.search(chess.Board(), simulations=20).simulations == 20
     assert refused.returncode == 2 and "--precision needs --select mcts --gpu" in refused.stderr
+
+
+#uci.py started without --precision builds the engine's network in int8 (self-play and labels stay fp16: they never
+#build it)
+@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
+    built = []
+    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision: built.append(precision) or cpu_batches(BoardModel()))
+    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
+    runpy.run_module("engine.uci", run_name="__main__")
+
+    assert built == ["int8"]
 
 
 #the engine as a gui drives it: a move within go movetime, go nodes' simulations (in a new game: a kept tree's visits
