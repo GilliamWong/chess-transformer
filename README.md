@@ -208,10 +208,10 @@ after an update compiles the network (~25 s, then ~7 s from torch's cache) and c
 answer `isready`, so start the engine once by hand before a match.
 
 `--precision int8` runs every block but the last with its matmuls on normalised inputs (Q, K, V, the template mix, the
-mlp's gate and up) and the mlp's down in int8 (`model/int8_blocks.py`): on the 5070 Ti the network answers 1.34x the
-positions a second at 64 boards and the search does 1.37x the nodes at 1 s a move, with priors further from fp32's
-(policy total variation 0.0030, fp16's 0.0012). It is not yet judged in games, so fp16 stays the default. Its weights
-are rounded once per checkpoint (GPTQ, ~1 min) and kept in `~/.cache/chess_transformer/int8`;
+mlp's gate and up) and the mlp's down in int8 (`model/int8_blocks.py`): on the 5070 Ti the network answers ~1.3x the
+positions a second at 64 boards and the search does ~1.36x the nodes at 1 s a move (1.30x at 800 nodes), with priors
+further from fp32's (policy total variation 0.0030, fp16's 0.0011). It is not yet judged in games, so fp16 stays the
+default. Its weights are rounded once per checkpoint (GPTQ, ~1 min) and kept in `~/.cache/chess_transformer/int8`;
 `python -m engine.quantization <model.pt>` rounds them ahead of a match, which `isready` would not wait for.
 
 ## Self-play (expert iteration)
