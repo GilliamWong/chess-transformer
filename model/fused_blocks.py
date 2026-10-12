@@ -4,7 +4,7 @@
 #the queries and keys (QK-norm), adds the template bias (made by a kernel of its own), takes the softmax and mixes the
 #values without writing the scores or any transposed copy to memory, and reads each key/value head once for all the
 #query heads of its group instead of a copy for each (repeat_interleave). The matmuls are a Triton kernel too, with
-#the bias, the mlp's silu(gate) * up and the residual add in the same kernel
+#the bias, the mlp's silu(gate) * up, the residual add and the next block's input mix in the same kernel
 import math
 
 import torch
