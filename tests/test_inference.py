@@ -245,6 +245,28 @@ def test_dependent_launch_only_from_sm_90(monkeypatch, capability):
     assert launch["PDL"] == launch["launch_pdl"] == (capability >= (9, 0)) == ("griddepcontrol" in ptx)
 
 
+#a block's down mixes the next block's input only when both are of one kind, and linking again (quantize_blocks after
+#FusedTransformer) clears the old links: a block left expecting a mixed input would skip its mix
+def test_downs_mix_the_inputs_of_neighbours_of_one_kind():
+    from model.fused_blocks import link_input_mixes
+
+    class Fp16Block:
+        def __init__(self):
+            self.residual_scale, self.input_scale = object(), object()
+
+    class Int8Block(Fp16Block):
+        pass
+
+    blocks = [Fp16Block() for _ in range(4)]
+    link_input_mixes(blocks)
+    blocks[:2] = [Int8Block(), Int8Block()]
+    link_input_mixes(blocks)
+
+    assert [block.input_mixed for block in blocks] == [False, True, False, True]
+    assert [block.next_scales for block in blocks] == [(blocks[1].residual_scale, blocks[1].input_scale), None,
+                                                       (blocks[3].residual_scale, blocks[3].input_scale), None]
+
+
 #fused_blocks.FusedBlock must compute what model.TransformerBlock does, InputEmbedding what the model's embedding does
 #and FusedTransformer's one matmul what the heads do: with random templates and square features (zeros at init would
 #hide them), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel), and the

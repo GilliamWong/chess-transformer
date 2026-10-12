@@ -5,7 +5,8 @@ import triton.language as tl
 from torch import nn
 from triton.language.extra import libdevice
 
-from model.fused_blocks import GROUP_M, FusedBlock, dependent_launch, dependent_launch_wait, linear, linear_epilogue, template_attention
+from model.fused_blocks import (GROUP_M, FusedBlock, dependent_launch, dependent_launch_wait, linear, linear_epilogue, link_input_mixes,
+                                template_attention)
 
 #the mlp's hidden is rotated in blocks of this many to spread its outlier channels, down's weights to match (H H^T = 32 I)
 HADAMARD_BLOCK = 32
@@ -216,7 +217,7 @@ class Int8Block(nn.Module):
             self.register_buffer(name, integers.to(device).contiguous())
             self.register_buffer(f"{name}_scale", (scale * output_scale if name == "down" else scale).to(device, torch.float32).contiguous())
         self.register_buffer("hadamard_signs", hadamard(HADAMARD_BLOCK).to(device, torch.float16))
-        #set by quantize_blocks: the next block's (residual_scale, input_scale) when down mixes its input, and whether this
+        #set by link_input_mixes: the next block's (residual_scale, input_scale) when down mixes its input, and whether this
         #block's input comes mixed
         self.next_scales: tuple[nn.Parameter, nn.Parameter] | None = None
         self.input_mixed = False
@@ -238,12 +239,9 @@ class Int8Block(nn.Module):
         return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, DOWN_TILE, original_board_embed, *self.next_scales)
 
 
-#the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks, each one's down
-#mixing the input of an Int8Block after it
+#the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks
 def quantize_blocks(model: nn.Module, weights: dict[int, dict], output_scale: float) -> nn.Module:
     blocks = [Int8Block(block, weights[layer], output_scale) if layer in weights else block for layer, block in enumerate(model.encoder)]
-    for block, following in zip(blocks, blocks[1:]):
-        if isinstance(block, Int8Block) and isinstance(following, Int8Block):
-            block.next_scales, following.input_mixed = (following.residual_scale, following.input_scale), True
+    link_input_mixes(blocks)
     model.encoder = nn.ModuleList(blocks)
     return model

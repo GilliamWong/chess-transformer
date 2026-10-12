@@ -191,8 +191,8 @@ def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, original_
 #half of columns is the gate, the second up) and the residual added. ACC_TYPE is the accumulators' type: fp16 for the
 #blocks, as cuBLAS did with allow_fp16_accumulation (twice fp32 accumulation's speed on a geforce card)
 @triton.jit
-def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride_w,
-                  HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, ACC_TYPE: tl.constexpr,
+def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr, M, N, K, stride_w,
+                  HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, MIX: tl.constexpr, ACC_TYPE: tl.constexpr,
                   BLOCK_M: tl.constexpr, EXTRA_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
                   PDL: tl.constexpr):
     dependent_launch_wait(PDL)
@@ -236,17 +236,20 @@ def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, out_ptr, M, N, K, stride
         x_ptrs += BLOCK_K
         w_ptrs += BLOCK_K * stride_w
 
-    linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, out_ptr, out_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL, GATED, False)
+    linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr, HAS_BIAS,
+                    HAS_RESIDUAL, GATED, MIX)
     if EXTRA_M > 0:
-        linear_epilogue(extra_acc, extra_up, extra_rows, cols, M, N, bias_ptr, residual_ptr, out_ptr, out_ptr, out_ptr, out_ptr, HAS_BIAS, HAS_RESIDUAL,
-                        GATED, False)
+        linear_epilogue(extra_acc, extra_up, extra_rows, cols, M, N, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr,
+                        HAS_BIAS, HAS_RESIDUAL, GATED, MIX)
 
 
 #an opaque op for torch.compile, as template_attention. fp16 inputs accumulate in fp16 and give fp16, or with
-#accumulate_fp32 accumulate in fp32 and give fp32; fp32 inputs accumulate in fp32 (tf32 products)
+#accumulate_fp32 accumulate in fp32 and give fp32; fp32 inputs accumulate in fp32 (tf32 products). With original (the
+#input embedding) and the next block's residual_scale and input_scale it gives the next block's input (linear_epilogue)
 @torch.library.custom_op("chess::linear", mutates_args=())
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, residual: torch.Tensor | None = None,
-           gated: bool = False, accumulate_fp32: bool = False) -> torch.Tensor:
+           gated: bool = False, accumulate_fp32: bool = False, original: torch.Tensor | None = None, residual_scale: torch.Tensor | None = None,
+           input_scale: torch.Tensor | None = None) -> torch.Tensor:
     K, width = weight.shape
     N = width // 2 if gated else width
     if K % LINEAR_DEPTH != 0:
@@ -260,15 +263,17 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = No
     #the pointers of unused inputs are never read
     bias_ = bias if bias is not None else weight
     residual_ = residual.contiguous() if residual is not None else out
+    mix = original is not None
+    mix_ = (original.contiguous(), residual_scale, input_scale) if mix else (out, out, out)
     grid = (triton.cdiv(M, LINEAR_ROWS + extra) * triton.cdiv(N, columns),)
-    linear_kernel[grid](x, weight, bias_, residual_, out, M, N, K, weight.stride(0), HAS_BIAS=bias is not None, HAS_RESIDUAL=residual is not None,
-                        GATED=gated, ACC_TYPE=acc_type, BLOCK_M=LINEAR_ROWS, EXTRA_M=extra, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M,
+    linear_kernel[grid](x, weight, bias_, residual_, *mix_, out, M, N, K, weight.stride(0), HAS_BIAS=bias is not None, HAS_RESIDUAL=residual is not None,
+                        GATED=gated, MIX=mix, ACC_TYPE=acc_type, BLOCK_M=LINEAR_ROWS, EXTRA_M=extra, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M,
                         num_warps=LINEAR_WARPS, num_stages=LINEAR_STAGES, **dependent_launch(x.device))
     return out
 
 
 @linear.register_fake
-def _(x, weight, bias=None, residual=None, gated=False, accumulate_fp32=False):
+def _(x, weight, bias=None, residual=None, gated=False, accumulate_fp32=False, original=None, residual_scale=None, input_scale=None):
     return x.new_empty(*x.shape[:-1], weight.shape[1] // 2 if gated else weight.shape[1], dtype=torch.float32 if accumulate_fp32 else x.dtype)
 
 
@@ -295,13 +300,30 @@ class FusedBlock(nn.Module):
         self.combine_heads_bias = block.combine_heads.bias
         self.gate_up = transposed(torch.cat([mlp.gate_projection.weight, mlp.up_projection.weight]))
         self.down = transposed(mlp.down_projection.weight)
+        #set by link_input_mixes
+        self.next_scales: tuple[nn.Parameter, nn.Parameter] | None = None
+        self.input_mixed = False
 
     def forward(self, x: torch.Tensor, templates: torch.Tensor, original_board_embed: torch.Tensor) -> torch.Tensor:
-        x = self.residual_scale * x + self.input_scale * original_board_embed
+        if not self.input_mixed:
+            x = self.residual_scale * x + self.input_scale * original_board_embed
         attended = template_attention(linear(self.ln1(x), self.projection, self.projection_bias), templates, self.q_gain, self.k_gain, self.heads,
                                       self.kv_heads, self.dq, self.dv, self.templates_count, self.eps)
         x = linear(attended, self.combine_heads, self.combine_heads_bias, residual=x)
-        return linear(linear(self.ln2(x), self.gate_up, gated=True), self.down, residual=x)
+        hidden = linear(self.ln2(x), self.gate_up, gated=True)
+        if self.next_scales is None:
+            return linear(hidden, self.down, residual=x)
+        return linear(hidden, self.down, residual=x, original=original_board_embed, residual_scale=self.next_scales[0], input_scale=self.next_scales[1])
+
+
+#each block's down mixes the input of the block after it (next_scales, input_mixed) when both are of one kind: the last
+#int8 block leaves the fp16 last block's input to that block, which rounds it as before
+def link_input_mixes(blocks: list[nn.Module]) -> None:
+    for block in blocks:
+        block.next_scales, block.input_mixed = None, False
+    for block, following in zip(blocks, blocks[1:]):
+        if type(block) is type(following):
+            block.next_scales, following.input_mixed = (following.residual_scale, following.input_scale), True
 
 
 #tokens and columns a program of input_embedding_kernel takes: whole rows in one program were slower
@@ -380,6 +402,7 @@ class FusedTransformer(nn.Module):
         self.input_embedding = InputEmbedding(model)
         self.templates, self.ln, self.loops = model.templates, model.ln, model.loops
         self.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
+        link_input_mixes(list(self.encoder))
         self.board_down_activation, self.eval_head = model.board_down_project[1], model.eval_head
         for name in ("from_squares", "to_squares", "promotion_move_ids", "promotion_to_squares", "promotion_pieces"):
             self.register_buffer(name, getattr(model, name))
