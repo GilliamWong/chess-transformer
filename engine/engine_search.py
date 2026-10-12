@@ -44,8 +44,7 @@ CACHE_POSITIONS = 5_000_000
 #30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
 #towards narrow search. value_sharpness 3: the value labels' human scale is ~3x flatter than stockfish's win rate, and
 #the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11)
-#dedupe_in_flight changes the search: as self-play's
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "dedupe_in_flight": False}
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0}
 
 
 #search.rs sharpen: the value's logit times sharpness; 1 / sharpness undoes it, and 1 leaves the score exactly as it was

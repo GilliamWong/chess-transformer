@@ -16,8 +16,7 @@ pub struct SearchSettings {
     pub fpu_reduction: f64,
     pub draw: f64,
     pub repetitions_for_a_draw: usize,
-    pub value_sharpness: f64,   //the network's value through sharpen; 1 is mcts.py's search
-    pub dedupe_in_flight: bool, //a leaf whose position is already waiting for the network waits for that answer (gather)
+    pub value_sharpness: f64, //the network's value through sharpen; 1 is mcts.py's search
 }
 
 //mcts.Node's numbers, in one vector per tree with the root first. An expanded node's moves (its edges) are contiguous
@@ -148,9 +147,6 @@ pub struct Tree {
     priors: Vec<f64>,
     children: Vec<u32>,
     pending: VecDeque<PendingLeaf>, //oldest first, the order the network's answers come back in
-    //with dedupe_in_flight, by each pending leaf's key and number of moves: its position's leaves reached by other moves
-    twins: HashMap<(u64, usize), Vec<PendingLeaf>>,
-    twin_count: usize,
     logits: Vec<f32>,
 }
 
@@ -166,8 +162,6 @@ impl Tree {
             priors: Vec::new(),
             children: Vec::new(),
             pending: VecDeque::new(),
-            twins: HashMap::new(),
-            twin_count: 0,
             logits: Vec::new(),
         }
     }
@@ -192,7 +186,7 @@ impl Tree {
 
     //simulations waiting for the network
     pub fn pending(&self) -> usize {
-        self.pending.len() + self.twin_count
+        self.pending.len()
     }
 
     //the visits of the root's two most visited moves, 0 for a move it does not have
@@ -268,7 +262,7 @@ impl Tree {
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         while gathered < round.leaves
             && simulations < round.simulations
-            && self.root().visit_count as usize + self.pending() < round.visit_limit as usize
+            && self.root().visit_count as usize + self.pending.len() < round.visit_limit as usize
         {
             let mut board = self.board.clone();
             let root_keys = self.keys.len();
@@ -318,24 +312,10 @@ impl Tree {
                     self.backup(&path, f64::from(answer.value), 0);
                 }
                 None => {
+                    encode_board(&board, boards);
                     self.add_in_flight(&path);
-                    let leaf = PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() };
-                    let position = (leaf_key, leaf.moves.len());
-                    //the network sees no history, so a leaf whose position is already waiting can take its answer
-                    match self.twins.get_mut(&position) {
-                        Some(twins) => {
-                            twins.push(leaf);
-                            self.twin_count += 1;
-                        }
-                        None => {
-                            if settings.dedupe_in_flight {
-                                self.twins.insert(position, Vec::new());
-                            }
-                            encode_board(&board, boards);
-                            self.pending.push_back(leaf);
-                            gathered += 1;
-                        }
-                    }
+                    self.pending.push_back(PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() });
+                    gathered += 1;
                 }
             }
         }
@@ -347,8 +327,7 @@ impl Tree {
         Ok(gathered)
     }
 
-    //mcts.finish for the oldest waiting leaf and its twins; answer is the move logits, then the expected score. The cache
-    //keeps it, sharpened
+    //mcts.finish for the oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it, sharpened
     pub fn finish_leaf(
         &mut self,
         answer: impl Fn(usize) -> f32,
@@ -367,13 +346,6 @@ impl Tree {
         let priors = std::mem::take(&mut self.logits);
         self.expand(node, &leaf.moves, &priors);
         self.backup(&leaf.path, f64::from(value), 1);
-        if let Some(twins) = self.twins.remove(&(leaf.key, leaf.moves.len())) {
-            for twin in twins {
-                self.twin_count -= 1;
-                self.expand(*twin.path.last().expect("the root at least"), &twin.moves, &priors);
-                self.backup(&twin.path, f64::from(value), 1);
-            }
-        }
         match cache {
             Some(cache) => cache.insert(leaf.key, Answer { priors: priors.into_boxed_slice(), value }),
             None => self.logits = priors,
