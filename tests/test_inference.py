@@ -193,7 +193,36 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
     assert torch.allclose(expected_score(value_logits.float()), expected_score(expected_value_logits), atol=0.01)
 
 
-#fused_blocks.FusedBlock must compute what model.TransformerBlock does, SummedSquareFeatures what SquareFeatures does
+#the input embedding that every fused block reads, made by one kernel, is the model's: each token's embedding and
+#position rows, and the sum of the squares' feature rows in the table's precision (the metadata tokens have none). A
+#width that fills no power of two, more tokens than a program takes
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_the_input_embedding_is_the_models(dtype):
+    from model.fused_blocks import InputEmbedding
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=96, num_layers=1, n_heads=4).cuda().eval()
+    with torch.no_grad():
+        model.square_features.table.normal_()
+    board, boards = chess.Board(), []
+    for san in "e4 Nf6 e5 d5".split():
+        board.push_san(san)
+        boards.append(encode_board(board))
+    boards = torch.tensor(boards).cuda()
+    model.half_except_heads(dtype)
+
+    with torch.no_grad():
+        found = InputEmbedding(model)(boards)
+        features = F.pad(model.square_features.table.double()[model.square_features.indices(boards) + model.square_features.row_offsets].sum(-2),
+                         (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
+        expected = (model.embed.weight.double()[boards] + model.position_embed.double() + features.to(dtype).double()).to(dtype)
+
+    #fp16: a feature sum's rounding may differ by a step from fp64's
+    rtol, atol = (1e-3, 1e-2) if dtype == torch.float16 else (1e-6, 1e-5)
+    assert found.dtype == dtype and torch.allclose(found, expected, rtol=rtol, atol=atol)
+
+
+#fused_blocks.FusedBlock must compute what model.TransformerBlock does, InputEmbedding what the model's embedding does
 #and FusedTransformer's one matmul what the heads do: with random templates and square features (zeros at init would
 #hide them), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel), and the
 #input skip away from its start. In fp32, and in fp16 as the engine runs it (fp16_model)

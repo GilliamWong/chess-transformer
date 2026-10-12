@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 from torch import nn
 
-from model.model import NUM_SQUARES, TOKENS_PER_BOARD, ChessTransformer, SquareFeatures, TransformerBlock
+from model.model import NUM_SQUARES, ChessTransformer, TransformerBlock
 
 #warps an attention instance has for each 64 of its square rows, and for its metadata rows
 SQUARE_WARPS, META_WARPS = 2, 2
@@ -276,48 +276,59 @@ class FusedBlock(nn.Module):
         return linear(linear(self.ln2(x), self.gate_up, gated=True), self.down, residual=x)
 
 
-#squares a program of feature_sum_kernel sums
-FEATURE_SQUARES = 8
+#tokens and columns a program of input_embedding_kernel takes: whole rows in one program were slower
+EMBEDDING_TOKENS, EMBEDDING_COLUMNS = 8, 256
 
 
-#embedding_bag's sum of each square's feature rows, in fp32 and in the same order, as one kernel: torch's took 62 us
-#of a 1.6 ms batch of 64, torch.compile's gather and sum 71 us
+#the input embedding in one kernel, so that every block reads one buffer: inductor recomputed or copied it for each
 @triton.jit
-def feature_sum_kernel(rows_ptr, table_ptr, out_ptr, squares, D, FEATURES: tl.constexpr, BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr):
-    square = tl.program_id(0) * BLOCK_S + tl.arange(0, BLOCK_S)
-    d = tl.arange(0, BLOCK_D)
-    square_ok, d_ok = square < squares, d < D
-    total = tl.zeros((BLOCK_S, BLOCK_D), dtype=tl.float32)
+def input_embedding_kernel(boards_ptr, rows_ptr, embed_ptr, position_ptr, table_ptr, out_ptr, tokens, D, T: tl.constexpr, SQUARES: tl.constexpr,
+                           FEATURES: tl.constexpr, BLOCK_TOKENS: tl.constexpr, BLOCK_D: tl.constexpr):
+    token = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    board, place = token // T, token % T
+    token_ok, d_ok = token < tokens, d < D
+    square_ok = token_ok & (place < SQUARES)
+    features = tl.zeros((BLOCK_TOKENS, BLOCK_D), dtype=tl.float32)
     for feature in range(FEATURES):
-        row = tl.load(rows_ptr + square * FEATURES + feature, mask=square_ok, other=0)
-        total += tl.load(table_ptr + row[:, None] * D + d[None, :], mask=square_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
-    tl.store(out_ptr + square[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=square_ok[:, None] & d_ok[None, :])
+        row = tl.load(rows_ptr + (board * SQUARES + place) * FEATURES + feature, mask=square_ok, other=0)
+        features += tl.load(table_ptr + row[:, None] * D + d[None, :], mask=square_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    code = tl.load(boards_ptr + token, mask=token_ok, other=0)
+    mask = token_ok[:, None] & d_ok[None, :]
+    total = tl.load(embed_ptr + code[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
+    total += tl.load(position_ptr + place[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
+    #the features' sum in the table's precision, as SquareFeatures gives it
+    total += features.to(out_ptr.dtype.element_ty).to(tl.float32)
+    tl.store(out_ptr + token[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-@torch.library.custom_op("chess::feature_sum", mutates_args=())
-def feature_sum(rows: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
-    rows, table = rows.contiguous(), table.contiguous()
-    features, D = rows.shape[-1], table.shape[1]
-    out = table.new_empty(*rows.shape[:-1], D)
-    squares = rows.numel() // features
-    feature_sum_kernel[(triton.cdiv(squares, FEATURE_SQUARES),)](rows, table, out, squares, D, FEATURES=features, BLOCK_S=FEATURE_SQUARES,
-                                                                  BLOCK_D=triton.next_power_of_2(D))
+#boards B x T, rows B x 64 x features (each square's rows in the feature table): B x T x D
+@torch.library.custom_op("chess::input_embedding", mutates_args=())
+def input_embedding(boards: torch.Tensor, rows: torch.Tensor, embed: torch.Tensor, position: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    boards, rows = boards.contiguous(), rows.contiguous()
+    B, T = boards.shape
+    D = table.shape[1]
+    out = table.new_empty(B, T, D)
+    grid = (triton.cdiv(B * T, EMBEDDING_TOKENS), triton.cdiv(D, EMBEDDING_COLUMNS))
+    input_embedding_kernel[grid](boards, rows, embed.contiguous(), position.contiguous(), table.contiguous(), out, B * T, D, T=T, SQUARES=NUM_SQUARES,
+                                 FEATURES=rows.shape[-1], BLOCK_TOKENS=EMBEDDING_TOKENS, BLOCK_D=EMBEDDING_COLUMNS)
     return out
 
 
-@feature_sum.register_fake
-def _(rows, table):
-    return table.new_empty(*rows.shape[:-1], table.shape[1])
+@input_embedding.register_fake
+def _(boards, rows, embed, position, table):
+    return table.new_empty(*boards.shape, table.shape[1])
 
 
-#model.SquareFeatures with its rows summed by feature_sum_kernel
-class SummedSquareFeatures(nn.Module):
-    def __init__(self, features: SquareFeatures):
+#ChessTransformer's input embedding (embed, position_embed and the square features) by input_embedding_kernel
+class InputEmbedding(nn.Module):
+    def __init__(self, model: ChessTransformer):
         super().__init__()
-        self.features = features
+        self.embed, self.position_embed, self.features = model.embed, model.position_embed, model.square_features
 
     def forward(self, board_state: torch.Tensor) -> torch.Tensor:
-        return feature_sum(self.features.indices(board_state) + self.features.row_offsets, self.features.table)
+        rows = self.features.indices(board_state) + self.features.row_offsets
+        return input_embedding(board_state, rows, self.embed.weight, self.position_embed, self.features.table)
 
 
 #logits[i, j] = (W_f x_i + b_f) . (W_t x_j + b_t) / sqrt(d) = a_i . x_j + s_i: from and to as one d x d matmul (a)
@@ -337,8 +348,8 @@ def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, t
 class FusedTransformer(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
-        self.embed, self.position_embed, self.templates, self.ln, self.loops = model.embed, model.position_embed, model.templates, model.ln, model.loops
-        self.square_features = SummedSquareFeatures(model.square_features)
+        self.input_embedding = InputEmbedding(model)
+        self.templates, self.ln, self.loops = model.templates, model.ln, model.loops
         self.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
         self.board_down_activation, self.eval_head = model.board_down_project[1], model.eval_head
         for name in ("from_squares", "to_squares", "promotion_move_ids", "promotion_to_squares", "promotion_pieces"):
@@ -348,8 +359,7 @@ class FusedTransformer(nn.Module):
         self.promotion_columns, self.down_columns = slice(1, 1 + promotions), slice(1 + promotions, None)
 
     def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        embed_state = self.embed(board_state) + self.position_embed
-        embed_state = embed_state + F.pad(self.square_features(board_state), (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
+        embed_state = self.input_embedding(board_state)
         original_board_embed = embed_state
         for _ in range(self.loops):
             for block in self.encoder:
