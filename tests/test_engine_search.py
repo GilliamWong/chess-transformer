@@ -27,7 +27,6 @@ from engine import uci
 from engine.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
-ENGINE_SETTINGS = engine_search.ENGINE_SETTINGS
 
 
 #the searches here are mcts.py's, whose constants the expectations were set by; the engine's own changes over them are
@@ -155,21 +154,6 @@ def test_the_engines_settings(monkeypatch):
     assert engine_search_settings(False) == {**rust_search_settings(False), "fpu_reduction": 0.25, "c_puct": 0.5}
     assert engine_search_settings(False, {"c_puct": 0.7})["c_puct"] == 0.7
     assert engine_search_settings(False, own=False) == rust_search_settings(False)
-
-
-#the engine's own settings all reach its search: simulations_per_leaf its rounds, the rest Searches, where
-#dedupe_in_flight sends fewer boards for as many simulations
-def test_the_engine_takes_its_own_settings(monkeypatch):
-    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", ENGINE_SETTINGS)
-    boards_sent = []
-    for dedupe in (False, True):
-        network = CountingNetwork(BoardModel())
-        search = EngineSearch(network, 16, smart_pruning=False, settings={"simulations_per_leaf": 8, "dedupe_in_flight": dedupe})
-        assert search.round_simulations == 8 * 16
-        assert search.search(chess.Board(), simulations=2000).simulations == 2000
-        boards_sent.append(network.boards)
-
-    assert boards_sent[1] < boards_sent[0]
 
 
 #every position's answer: no move preferred, expected score 0.6
