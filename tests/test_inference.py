@@ -361,7 +361,7 @@ def test_template_attention_in_cuda_graphs(monkeypatch):
     mismatches = torch.zeros(len(streams), dtype=torch.int64, device="cuda")
     torch.cuda.synchronize()
     #no wait between replays, so that the two graphs overlap in every way
-    for _ in range(200):
+    for _ in range(1000):
         for lane, (graph, stream, answer) in enumerate(zip(graphs, streams, answers)):
             with torch.cuda.stream(stream):
                 graph.replay()
