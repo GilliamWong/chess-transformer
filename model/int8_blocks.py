@@ -12,13 +12,21 @@ from model.fused_blocks import (GROUP_M, FusedBlock, dependent_launch, dependent
 HADAMARD_BLOCK = 32
 #the down matmul reads its inputs (the mlp's hidden width, padded with zeros) BLOCK_K at a time
 DOWN_INPUT_MULTIPLE = 128
-#int8 matmul tiles (rows, columns, depth, warps, stages), each within the 99 KB of shared memory of an sm_86/89/120 block
-PROJECTION_TILE = (128, 128, 64, 8, 3)
-GATE_UP_TILE = (128, 64, 64, 4, 2)
-DOWN_TILE = (128, 128, 64, 8, 3)
+#int8 matmul tiles (rows, columns, depth, warps, stages[, registers a thread may use]) by compute capability, the
+#fastest at 32 to 128 boards on an A100, A40, L40S and RTX 5070 Ti within 99 KB of shared memory; a tile changes only
+#the speed (the int32 sums are exact). Only sm_120's down is capped (timed there): two blocks share a multiprocessor
+INT8_TILES = {(12, 0): {"projection": (128, 128, 64, 8, 3), "gate_up": (128, 64, 64, 4, 2), "down": (128, 128, 64, 8, 3, 128)},
+              (8, 9): {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (128, 64, 128, 4, 3)},
+              (8, 6): {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (64, 128, 128, 4, 3)},
+              (8, 0): {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 32, 64, 4, 3), "down": (128, 64, 128, 4, 3)}}
 #the rows a program of norm_quant_kernel takes and its warps, and the rows a program of rotate_quant_kernel takes
 NORM_ROWS, NORM_WARPS = 1, 2
 ROTATE_ROWS = 8
+
+
+#the tiles for the gpu's compute capability, sm_120's for one not timed
+def int8_tiles(device: torch.device) -> dict[str, tuple[int, ...]]:
+    return INT8_TILES.get(torch.cuda.get_device_capability(device), INT8_TILES[(12, 0)])
 
 
 #Sylvester's Hadamard matrix of +-1, size a power of two: symmetric, and its square is size times the identity
@@ -73,13 +81,13 @@ def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residua
                     HAS_RESIDUAL, GATED, MIX)
 
 
-#an opaque op for torch.compile, as fused_blocks.linear; gives fp16. tile is one of the *_TILE above. With original (the
+#an opaque op for torch.compile, as fused_blocks.linear; gives fp16. tile is one of INT8_TILES'. With original (the
 #input embedding) and the next block's residual_scale and input_scale it gives the next block's input (linear_epilogue)
 @torch.library.custom_op("chess::int8_linear", mutates_args=())
 def int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias: torch.Tensor | None,
                 residual: torch.Tensor | None, gated: bool, tile: list[int], original: torch.Tensor | None = None,
                 residual_scale: torch.Tensor | None = None, input_scale: torch.Tensor | None = None) -> torch.Tensor:
-    block_m, block_n, block_k, warps, stages = tile
+    block_m, block_n, block_k, warps, stages, *registers = tile
     rows, K = weight.shape
     N = rows // 2 if gated else rows
     if K % block_k != 0:
@@ -95,7 +103,8 @@ def int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, we
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
     int8_linear_kernel[grid](x, x_scale, weight, weight_scale, bias_, residual_, *mix_, out, M, N, K, HAS_BIAS=bias is not None,
                              HAS_RESIDUAL=residual is not None, GATED=gated, MIX=mix, BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-                             GROUP_M=GROUP_M, num_warps=warps, num_stages=stages, **dependent_launch(x.device))
+                             GROUP_M=GROUP_M, num_warps=warps, num_stages=stages, **({"maxnreg": registers[0]} if registers else {}),
+                             **dependent_launch(x.device))
     return out
 
 
@@ -217,6 +226,7 @@ class Int8Block(nn.Module):
             self.register_buffer(name, integers.to(device).contiguous())
             self.register_buffer(f"{name}_scale", (scale * output_scale if name == "down" else scale).to(device, torch.float32).contiguous())
         self.register_buffer("hadamard_signs", hadamard(HADAMARD_BLOCK).to(device, torch.float16))
+        self.tiles = int8_tiles(device)
         #set by link_input_mixes: the next block's (residual_scale, input_scale) when down mixes its input, and whether this
         #block's input comes mixed
         self.next_scales: tuple[nn.Parameter, nn.Parameter] | None = None
@@ -227,16 +237,16 @@ class Int8Block(nn.Module):
             normed, scale = norm_quant(x, self.ln1.weight, self.ln1.eps)
         else:
             x, normed, scale = mix_norm_quant(x, original_board_embed, self.residual_scale, self.input_scale, self.ln1.weight, self.ln1.eps)
-        projected = int8_linear(normed, scale, self.projection, self.projection_scale, self.projection_bias, None, False, PROJECTION_TILE)
+        projected = int8_linear(normed, scale, self.projection, self.projection_scale, self.projection_bias, None, False, self.tiles["projection"])
         attended = template_attention(projected, templates, self.q_gain, self.k_gain, self.heads, self.kv_heads, self.dq, self.dv, self.templates_count,
                                       self.eps)
         x = linear(attended, self.combine_heads, self.combine_heads_bias, residual=x)
         normed, scale = norm_quant(x, self.ln2.weight, self.ln2.eps)
-        hidden = int8_linear(normed, scale, self.gate_up, self.gate_up_scale, None, None, True, GATE_UP_TILE)
+        hidden = int8_linear(normed, scale, self.gate_up, self.gate_up_scale, None, None, True, self.tiles["gate_up"])
         rotated, scale = rotate_quant(hidden, self.hadamard_signs, self.down.shape[1])
         if self.next_scales is None:
-            return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, DOWN_TILE)
-        return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, DOWN_TILE, original_board_embed, *self.next_scales)
+            return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, self.tiles["down"])
+        return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, self.tiles["down"], original_board_embed, *self.next_scales)
 
 
 #the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks
