@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import deque
 import math
 from pathlib import Path
+import statistics
 import time
 import chess
 import numpy as np
@@ -32,6 +33,10 @@ UNLIMITED = 2**32 - 1
 GAME = 0 #the id of the search in Searches: one game at a time
 #a round's network call takes about this long before the first one is timed
 FIRST_ROUND_SECONDS = 0.01
+#the last rounds' times, whose median is the next round's: one stall (a graph's first capture, the gpu shared) is an
+#outlier the median ignores. A running mean carried it into the next searches, which then stopped after one round on
+#a clock, whose time never updated the mean (2026-10-12: streaks of 3-5 moves at 6-41 nodes in 10 of 174 games)
+ROUND_TIMES = 31
 #smart pruning stops once the most visited move leads the second by more than the simulations left / this. lc0 uses
 #1.33, betting that the second move cannot get all of them; 1 never changes the move of a search with a number of
 #simulations, and with a deadline only when the recent speed misjudges the simulations left
@@ -46,8 +51,10 @@ CACHE_POSITIONS = 5_000_000
 #a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. c_puct 0.4 won +78 elo at 4k nodes a move and +46 at
 #30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
 #towards narrow search. value_sharpness 3: the value labels' human scale is ~3x flatter than stockfish's win rate, and
-#the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11)
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0}
+#the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11). certainty: search.rs
+#SearchSettings' (with smart pruning a search whose root is proven stops); without it a mate the search had found lost
+#to a move with more visits (2026-10-13)
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True}
 
 
 #search.rs sharpen: the value's logit times sharpness; 1 / sharpness undoes it, and 1 leaves the score exactly as it was
@@ -66,7 +73,12 @@ def parse_changes(text: str, settings: dict) -> dict:
         if name not in settings:
             raise ValueError(f"{name} is not a setting, these are: {', '.join(sorted(settings))}")
         kind = type(settings[name])
-        changes[name] = kind(float(value))
+        if kind is bool:
+            if value not in ("true", "false"):
+                raise ValueError(f"{name} is true or false, not {value}")
+            changes[name] = value == "true"
+        else:
+            changes[name] = kind(float(value))
     return changes
 
 #int8 is the engine's, not for self-play or labels: its answers depend on the rest of the batch
@@ -108,7 +120,13 @@ class EngineSearch:
         self.tablebase = open_tablebase(tablebase_pieces) if use_tablebase else None
         #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
         self.ranked_pieces = ranked_pieces(tablebase_pieces) if use_tablebase else 0
+        self.certainty = search_settings.get("certainty", False)
+        self.round_times: deque = deque([FIRST_ROUND_SECONDS], maxlen=ROUND_TIMES)
         self.round_seconds = FIRST_ROUND_SECONDS
+
+    #a new game (uci's ucinewgame): its first search starts a fresh tree with an empty cache, as lc0's does
+    def new_game(self) -> None:
+        self.searches.new_game(GAME)
 
     #searches until `simulations` (counting those of a reused tree, as lc0's go nodes does) or until `seconds` have
     #passed, whichever comes first; at least one of the two
@@ -124,7 +142,8 @@ class EngineSearch:
         self.searches.start(GAME, board.root().fen(), [move.uci() for move in board.move_stack], UNLIMITED if simulations is None else simulations)
         deadline = started + seconds if seconds is not None else None
         only_move = board.legal_moves.count() == 1
-        rounds: deque = deque() #launched rounds, oldest first, None for a round without leaves
+        #launched rounds, oldest first, as (the launch, None for a round without leaves, and when it was launched)
+        rounds: deque = deque()
         gathered = stopping = False
         report, last_answers = None, None
         progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
@@ -143,19 +162,20 @@ class EngineSearch:
                     #a bytearray: torch warns about arrays it cannot write to
                     leaves = bytearray(self.searches.descend(count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count))
                     boards = np.frombuffer(leaves, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
-                    rounds.append(self.network.launch(boards) if len(boards) else None)
+                    launched_at = time.perf_counter()
+                    rounds.append((self.network.launch(boards) if len(boards) else None, launched_at))
                     gathered = True
                     continue
 
-            launched = rounds.popleft()
+            launched, launched_at = rounds.popleft()
             if launched is None:
                 answers = np.zeros((0, ANSWER_WIDTH), dtype=np.float32)
             else:
                 answers = self.network.collect(launched)
-                #rounds come back one after another while the gpu is kept busy
+                #rounds come back one after another while the gpu is kept busy; the search's first from its launch
                 now = time.perf_counter()
-                if last_answers is not None:
-                    self.round_seconds = 0.8 * self.round_seconds + 0.2 * (now - last_answers)
+                self.round_times.append(now - (launched_at if last_answers is None else last_answers))
+                self.round_seconds = statistics.median(self.round_times)
                 last_answers = now
             reports = self.searches.finish(answers)
             if reports:
@@ -164,7 +184,8 @@ class EngineSearch:
             elif report is None and self.smart_pruning and not stopping:
                 visits, most, second = self.searches.root_visits(GAME)
                 progress.append((time.perf_counter(), visits))
-                if only_move or most - second > self.simulations_left(simulations, deadline, progress) / SMART_PRUNING_FACTOR:
+                decided = most - second > self.simulations_left(simulations, deadline, progress) / SMART_PRUNING_FACTOR
+                if only_move or decided or (self.certainty and self.searches.decided(GAME)):
                     stopping = True
                     report = self.searches.stop(GAME)
 

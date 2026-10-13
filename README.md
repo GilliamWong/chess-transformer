@@ -202,7 +202,10 @@ The search (`engine/engine_search.py`) runs in Rust and gathers up to 64 leaves 
 simulations done or left as lc0 grows its batches with the tree (`--grow-leaves`; 64 from the first visit, two rounds
 out, cost ~0.001 expected score a move at 1000 nodes, +26 Elo against BT4), with the next round gathered while one is
 on the GPU once a round is full; the network runs in int8 as CUDA graphs, a cache answers positions
-reached again by another order of moves, and the tree is kept for the next move. The d512 does ~27k simulations a
+reached again by another order of moves, and the tree is kept for the next move (`ucinewgame` drops both, as lc0
+does). Certainty propagation (lc0's sticky endgames) makes mates, draws by the rules and the tables' results proven in
+the tree, plays a proven win over a move with more visits, passes over proven losses and stops a search whose move is
+proven. The d512 does ~27k simulations a
 second on the 5070 Ti in one search, lc0 with BT4 ~6k nodes. Smart pruning stops a search once the simulations left
 cannot change its move (at 1 s a move 3 searches in 4 stop early, a quarter of the time saved), and on a clock the
 time saved goes to the moves that are not decided. `--leaves 1` is `engine/mcts.py`'s search, without pruning. The first start

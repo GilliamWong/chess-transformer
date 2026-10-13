@@ -175,6 +175,8 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         elif command == "ucinewgame":
             board = chess.Board()
             clock = Clock()
+            if isinstance(player, EngineSearch):
+                player.new_game()
 
         elif command == "position":
             board = parse_position(arguments)

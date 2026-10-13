@@ -14,14 +14,15 @@ import numpy as np
 import pytest
 
 import selfplay_rs
-from model.encoding import TOKENS_PER_BOARD
+from torch import nn
+from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import BoardModel, CountingNetwork, UniformModel
 from engine.inference import ImmediateBatches, cpu_batches
 from model.model import ChessTransformer
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from tools.checkpoint import save_checkpoint
 from engine import engine_search
-from engine.engine_search import EngineSearch, engine_search_settings
+from engine.engine_search import EngineSearch, engine_search_settings, parse_changes
 from engine.player import SearchReport
 from engine import uci
 from engine.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
@@ -479,3 +480,158 @@ def test_every_game_keeps_its_tree():
         network.boards = 0
         assert searched(searches, board, 600, network.launch, search_id)[4] == 600
         assert 0 < network.boards <= 200
+
+
+#certainty propagation proves a mate in two (the defender's one reply is mated) and the engine stops once it is
+#proven: the mate's first move, scored as a certain win, long before its budget; without it the win is only likely.
+#The tree kept for the next move keeps the proof of the mate in one
+def test_certainty_proves_a_mate_and_the_search_stops():
+    board = chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1")
+    network = CountingNetwork(UniformModel())
+    search = EngineSearch(network, 16, settings={"certainty": True})
+    proven = search.search(board, simulations=20_000)
+    assert proven.line[0].uci() == "c6b6" and proven.score == 1.0 and proven.simulations < 5_000
+
+    unproven = EngineSearch(cpu_batches(UniformModel()), 16).search(board, simulations=proven.simulations)
+    assert unproven.score < 1.0
+
+    board.push_uci("c6b6")
+    board.push_uci("a8b8")
+    network.boards = 0
+    mate = search.search(board, simulations=20_000)
+    assert mate.line[0].uci() == "h1h8" and mate.score == 1.0 and network.boards <= 2 * 16
+
+
+#the search goes no further than a proven node: with the whole budget searched (no smart pruning), the simulations
+#after the proof take the proven score at once and the network sees few boards
+def test_certainty_stops_descents_at_proven_nodes():
+    network = CountingNetwork(UniformModel())
+    search = EngineSearch(network, 16, smart_pruning=False, settings={"certainty": True})
+    report = search.search(chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1"), simulations=6000)
+
+    assert report.simulations == 6000 and report.score == 1.0
+    assert network.boards < 3000
+
+
+#the uniform model, but for the moves it likes (uci, side), e^logit times more likely than any other
+class LikesMoves(nn.Module):
+    def __init__(self, moves: list[tuple[str, chess.Color]], logit: float):
+        super().__init__()
+        self.move_ids = [encode_move_to_id(chess.Move.from_uci(move), side) for move, side in moves]
+        self.logit = logit
+
+    def forward(self, boards):
+        logits, values = UniformModel()(boards)
+        logits[:, self.move_ids] = self.logit
+        return logits, values
+
+
+#a proven win is played although another move has more visits (lc0 ranks proven wins first): the network likes a king
+#move, the search finds the rook's mate
+def test_certainty_plays_a_proven_win_over_the_most_visited_move():
+    board = chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1")
+    model = LikesMoves([("g1f1", chess.WHITE)], 5.0)
+    report = EngineSearch(cpu_batches(model), 16, settings={"certainty": True}).search(board, simulations=4000)
+
+    assert report.line[0].uci() == "e1e8" and report.score == 1.0
+    assert report.root_moves[0][0].uci() == "g1f1"
+
+
+#the network all but insists on Ra2, after which Rd1 mates: the plain search spends its visits there and plays it, while
+#with certainty the proven loss is passed over and its visits go to the other moves, one of which is played
+def test_certainty_avoids_a_proven_loss_the_network_likes():
+    board = chess.Board("3r2k1/5ppp/8/8/8/8/5PPP/R5K1 w - - 0 1")
+    model = LikesMoves([("a1a2", chess.WHITE)], 8.0)
+    assert EngineSearch(cpu_batches(model), 16).search(board, simulations=4000).line[0].uci() == "a1a2"
+    report = EngineSearch(cpu_batches(model), 16, settings={"certainty": True}).search(board, simulations=4000)
+
+    assert report.line[0].uci() != "a1a2" and dict(report.root_moves)[report.line[0]] > 100
+    board.push(report.line[0])
+    for reply in list(board.legal_moves):
+        board.push(reply)
+        assert not board.is_checkmate()
+        board.pop()
+
+
+#--search-settings takes a setting's type: true or false for certainty, a number otherwise
+def test_search_settings_take_true_and_false():
+    settings = {"certainty": True, "c_puct": 0.8}
+    assert parse_changes("certainty=false,c_puct=1.5", settings) == {"certainty": False, "c_puct": 1.5}
+    with pytest.raises(ValueError):
+        parse_changes("certainty=0", settings)
+
+
+#a network whose answers come back late once, as on a cuda graph's first capture or a gpu shared with another engine,
+#on a round's given collect; it counts the boards it is asked for
+class StallsOnce:
+    def __init__(self, network, stall_seconds: float, on_collect: int):
+        self.network, self.stall_seconds, self.on_collect = network, stall_seconds, on_collect
+        self.collects = self.boards = 0
+
+    def launch(self, boards: np.ndarray):
+        self.boards += len(boards)
+        return self.network.launch(boards)
+
+    def collect(self, launched):
+        self.collects += 1
+        if self.collects == self.on_collect:
+            time.sleep(self.stall_seconds)
+        return self.network.collect(launched)
+
+
+#one slow round at the end of a search does not cut the next searches on a clock short: a running mean of the round
+#times carried it on, and the next searches stopped after one round each, whose time never updated the mean
+#(2026-10-12: streaks of 3-5 moves at 6-41 nodes in 10 of 174 games). With growing rounds a cut search is one leaf
+@pytest.mark.parametrize("grow_leaves", [0, 16])
+def test_a_stalled_round_does_not_cut_the_next_searches_short(grow_leaves):
+    network = StallsOnce(cpu_batches(BoardModel()), 1.5, on_collect=2)
+    search = EngineSearch(network, 16, smart_pruning=False, grow_leaves=grow_leaves)
+    search.search(chess.Board(), seconds=0.05)
+    for fen in ["4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1", "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1", "3r2k1/5ppp/8/8/8/8/5PPP/6K1 b - - 0 1"]:
+        network.boards = 0
+        search.search(chess.Board(fen), seconds=0.3)
+        assert network.boards > 5 * 16
+
+
+#ucinewgame (new_game) drops the kept tree and the cache: the same position searched again is searched from nothing,
+#as a fresh engine searches it, where without it the kept tree already has the simulations
+def test_a_new_game_starts_a_fresh_tree():
+    board = chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1")
+    network = CountingNetwork(BoardModel())
+    search = EngineSearch(network, 16, smart_pruning=False)
+    search.search(board, simulations=300)
+    network.boards = 0
+    assert search.search(board, simulations=300).simulations == 300 and network.boards == 0
+
+    search.new_game()
+    again = search.search(board, simulations=300)
+    fresh = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False).search(board, simulations=300)
+    assert network.boards > 100
+    assert (again.line, again.root_moves, again.score) == (fresh.line, fresh.root_moves, fresh.score)
+
+
+#the knights out and back, which the network all but insists on: the search scores the start position reached again
+#inside it as a draw, most of its visits there. After Nf3 that repeat is of a position before the root, which the game
+#needs a third time for: its draws come out of the kept tree, which keeps only the few visits elsewhere (a search of
+#one simulation reports the kept tree's)
+KNIGHTS_OUT_AND_BACK = [("g1f3", chess.WHITE), ("g8f6", chess.BLACK), ("f3g1", chess.WHITE), ("f6g8", chess.BLACK)]
+
+def test_stale_draws_come_out_of_a_kept_tree():
+    search = EngineSearch(cpu_batches(LikesMoves(KNIGHTS_OUT_AND_BACK, 8.0)), 16, smart_pruning=False, grow_leaves=0)
+    board = chess.Board()
+    first = search.search(board, simulations=400)
+    assert first.root_moves[0] == (chess.Move.from_uci("g1f3"), 399)
+    board.push_uci("g1f3")
+    assert search.search(board, simulations=1).simulations < 50
+
+
+#once all four moves are played the root is the repeated start position, which the last search never expanded: a
+#search of fewer simulations than it had there still searches its moves (it reported an empty line, a rust panic)
+def test_a_root_the_last_search_never_expanded_is_searched():
+    search = EngineSearch(cpu_batches(LikesMoves(KNIGHTS_OUT_AND_BACK, 8.0)), 16, smart_pruning=False, grow_leaves=0)
+    board = chess.Board()
+    search.search(board, simulations=100)
+    for move, _ in KNIGHTS_OUT_AND_BACK:
+        board.push_uci(move)
+    report = search.search(board, simulations=50)
+    assert report.line and report.line[0] in board.legal_moves and report.simulations >= 50

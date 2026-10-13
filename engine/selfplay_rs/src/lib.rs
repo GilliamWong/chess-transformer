@@ -131,6 +131,7 @@ impl SelfPlayGames {
                     draw,
                     repetitions_for_a_draw,
                     value_sharpness: 1.0,
+                    certainty: false,
                 },
                 simulations,
                 sampled_plies,
@@ -349,7 +350,9 @@ impl Searches {
         reports
     }
 
-    //the id's kept tree carried on to the position after `moves`, when it is the same game and holds the moves played since
+    //the id's kept tree carried on to the position after `moves`, when it is the same game and holds the moves played
+    //since, without the leaves the new root makes stale (search.rs drop_stale_leaves). A root the last search never
+    //expanded (a repeat it scored as a draw) starts over: a search reports from its root's moves
     fn reused_tree(&mut self, id: u64, fen: &str, moves: &[String]) -> Option<Tree> {
         let kept = self.kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
@@ -360,17 +363,21 @@ impl Searches {
             let edge = tree.root().edges().find(|&edge| uci(tree.chess_move(edge)) == *played)?;
             tree.play(edge, true);
         }
-        Some(tree)
+        if moves.len() > kept.moves.len() {
+            tree.drop_stale_leaves(&self.settings, self.tables.as_ref()).ok()?;
+        }
+        (!tree.root().edges().is_empty()).then_some(tree)
     }
 }
 
 #[pymethods]
 impl Searches {
     //tree_reuse keeps the tree of a game's (an id's) last search for its next search; cache_positions is the size of
-    //the cache of network answers by position (search.rs Cache), 0 for none; value_sharpness see search.rs sharpen
+    //the cache of network answers by position (search.rs Cache), 0 for none; value_sharpness see search.rs sharpen,
+    //certainty search.rs SearchSettings'
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
-                        tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0))]
+                        tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -386,6 +393,7 @@ impl Searches {
         tree_reuse: bool,
         cache_positions: usize,
         value_sharpness: f64,
+        certainty: bool,
     ) -> PyResult<Searches> {
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -393,7 +401,7 @@ impl Searches {
             )));
         }
         Ok(Searches {
-            settings: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw, value_sharpness },
+            settings: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw, value_sharpness, certainty },
             move_ids: move_ids(move_id_table)?,
             answer_width,
             tables: open_tables(tablebase_folder, tablebase_pieces)?,
@@ -482,6 +490,21 @@ impl Searches {
         let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
         let (most, second) = search.tree.two_most_visits();
         Ok((search.tree.root().visit_count, most, second))
+    }
+
+    //a new game under the id (uci's ucinewgame): its first search starts a fresh tree, and the network's answers are
+    //forgotten, as lc0 forgets them
+    fn new_game(&mut self, id: u64) {
+        self.kept.remove(&id);
+        if let Some(cache) = self.cache.as_mut() {
+            cache.clear();
+        }
+    }
+
+    //a running search's root is proven (search.rs root_decided): its move is known, and searching on changes nothing
+    fn decided(&self, id: u64) -> PyResult<bool> {
+        let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+        Ok(search.tree.root_decided())
     }
 
     //the searches still running
