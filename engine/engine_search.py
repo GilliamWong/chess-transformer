@@ -25,6 +25,8 @@ LEAVES = 64
 COLLISIONS = 64
 #a round is gathered while the last one is on the gpu (+9% simulations/s), and the two run at once (GraphedBatches)
 ROUNDS_IN_FLIGHT = 2
+#a round takes a leaf per GROW_LEAVES simulations done or left, as lc0 grows its batches with the tree; 0 for fixed
+GROW_LEAVES = 16
 #as many simulations as the search can do, for a search with only a deadline
 UNLIMITED = 2**32 - 1
 GAME = 0 #the id of the search in Searches: one game at a time
@@ -88,13 +90,14 @@ class EngineSearch:
     #SmartPruningFactor=0), for matches that give both engines exactly the same time. use_tablebase: the tables of
     #positions of up to tablebase_pieces pieces. settings: changes to engine_search_settings
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
-                 tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None):
+                 tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES):
         self.network = network
         self.leaves = leaves
         batched = leaves > 1
         self.round_simulations = SIMULATIONS_PER_LEAF * leaves
         self.collisions = COLLISIONS if batched else 0
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1
+        self.grow_leaves = grow_leaves if batched else 0
         #rounds on lanes of their own (GraphedBatches') run at once
         self.rounds_at_once = batched and len(getattr(network, "lanes", ())) > 1
         self.smart_pruning = batched and smart_pruning
@@ -135,9 +138,10 @@ class EngineSearch:
                     stopping = True
                     report = self.searches.stop(GAME)
                     continue
-                if len(rounds) < self.rounds_in_flight:
+                count, in_flight = self.round_leaves(simulations)
+                if len(rounds) < in_flight:
                     #a bytearray: torch warns about arrays it cannot write to
-                    leaves = bytearray(self.searches.descend(self.leaves, self.collisions, self.round_simulations))
+                    leaves = bytearray(self.searches.descend(count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count))
                     boards = np.frombuffer(leaves, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
                     rounds.append(self.network.launch(boards) if len(boards) else None)
                     gathered = True
@@ -167,6 +171,15 @@ class EngineSearch:
         _, line, score, root_moves, visits = report
         return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
                             [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]])
+
+    #the next round's leaves, and the rounds out at once: one until a round takes all of them
+    def round_leaves(self, simulations: int | None) -> tuple[int, int]:
+        if not self.grow_leaves:
+            return self.leaves, self.rounds_in_flight
+        visits = self.searches.root_visits(GAME)[0]
+        done_or_left = visits if simulations is None else min(visits, simulations - visits)
+        count = max(1, min(self.leaves, done_or_left // self.grow_leaves))
+        return count, self.rounds_in_flight if count == self.leaves else 1
 
     #the simulations the search has left: those waiting for the network count as left, so a move is only decided if
     #they could not change it either. With a deadline, the time left at the speed of the last rounds

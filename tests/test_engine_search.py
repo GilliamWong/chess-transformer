@@ -148,6 +148,48 @@ def test_a_search_of_many_leaves_a_round_stops_at_its_simulations(carlsen_games,
     assert report.simulations == simulations and report.line[0] in board.legal_moves
 
 
+class SizesNetwork:
+    def __init__(self, model):
+        self.network = cpu_batches(model)
+        self.sizes = []
+
+    def launch(self, boards: np.ndarray) -> np.ndarray:
+        self.sizes.append(len(boards))
+        return self.network.launch(boards)
+
+    def collect(self, launched: np.ndarray) -> np.ndarray:
+        return self.network.collect(launched)
+
+
+#a fresh tree's rounds start at one leaf and grow to 64, still stopping at the simulations; fixed rounds are large at once
+def test_a_rounds_leaves_grow_with_the_search(carlsen_games):
+    board = carlsen_games[1].board()
+    for move in list(carlsen_games[1].mainline_moves())[:10]:
+        board.push(move)
+    growing, fixed = SizesNetwork(BoardModel()), SizesNetwork(BoardModel())
+    growing_search, fixed_search = EngineSearch(growing, 64, grow_leaves=16), EngineSearch(fixed, 64, grow_leaves=0)
+    growing_search.smart_pruning = fixed_search.smart_pruning = False
+
+    report = growing_search.search(board, simulations=3000)
+    fixed_search.search(board, simulations=3000)
+
+    assert report.simulations == 3000
+    assert growing.sizes[:4] == [1, 1, 1, 1] and max(growing.sizes) == 64
+    assert fixed.sizes[1] > 16 and len(growing.sizes) > len(fixed.sizes)
+
+
+#a leaf per 16 simulations done or left (the fewer), one round out until a round takes all 64
+@pytest.mark.parametrize("visits, simulations, expected", [(0, 1000, (1, 1)), (160, 1000, (10, 1)), (1024, None, (64, 2)), (995, 1000, (1, 1))])
+def test_the_leaves_of_a_round(visits, simulations, expected):
+    class Searches:
+        def root_visits(self, game):
+            return visits, 0, 0
+    search = EngineSearch(cpu_batches(BoardModel()), 64, grow_leaves=16)
+    search.searches = Searches()
+
+    assert search.round_leaves(simulations) == expected
+
+
 #a free queen, which the material count finds, and mates in one, which a flat eval finds by searching every move
 @pytest.mark.parametrize("model, fen, best", [
     (BoardModel(), "4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1", "e4d5"),
@@ -363,7 +405,7 @@ def test_the_engine_takes_a_precision(monkeypatch, tmp_path):
     save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
     built = []
     monkeypatch.setattr(uci, "engine_network", lambda checkpoint, leaves, precision: built.append(precision) or cpu_batches(BoardModel()))
-    search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {}, "fp16")
+    search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {"smart_pruning": False}, "fp16")
     refused = subprocess.run([sys.executable, "-m", "engine.uci", str(tmp_path / "model.pt"), "--select", "mcts", "--precision", "fp16"],
                              cwd=REPOSITORY, capture_output=True, text=True, input="")
 

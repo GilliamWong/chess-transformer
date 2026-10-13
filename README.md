@@ -198,8 +198,10 @@ As a UCI engine with a clock (`go movetime`, `nodes`, `wtime`/`btime`), for time
 uv run python -m engine.uci artifacts/runs/<run>/model.pt --select mcts --gpu
 ```
 
-The search (`engine/engine_search.py`) runs in Rust and gathers 64 leaves for each network call, as lc0 does, with
-the next round gathered while one is on the GPU; the network runs in int8 as CUDA graphs, a cache answers positions
+The search (`engine/engine_search.py`) runs in Rust and gathers up to 64 leaves for each network call, a leaf per 16
+simulations done or left as lc0 grows its batches with the tree (`--grow-leaves`; 64 from the first visit, two rounds
+out, cost ~0.001 expected score a move at 1000 nodes, +26 Elo against BT4), with the next round gathered while one is
+on the GPU once a round is full; the network runs in int8 as CUDA graphs, a cache answers positions
 reached again by another order of moves, and the tree is kept for the next move. The d512 does ~27k simulations a
 second on the 5070 Ti in one search, lc0 with BT4 ~6k nodes. Smart pruning stops a search once the simulations left
 cannot change its move (at 1 s a move 3 searches in 4 stop early, a quarter of the time saved), and on a clock the

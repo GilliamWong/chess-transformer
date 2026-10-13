@@ -15,7 +15,7 @@ import torch
 from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
-from engine.engine_search import ENGINE_PRECISION, LEAVES, PRECISIONS, EngineSearch, engine_network, engine_search_settings, parse_changes
+from engine.engine_search import ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS, EngineSearch, engine_network, engine_search_settings, parse_changes
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES
@@ -223,6 +223,8 @@ if __name__ == "__main__":
                         help="for --tablebase: the most pieces, default %(default)s; 6 needs python -m tools.tablebase --pieces 6, and without "
                              "the 6 piece dtz tables searches those positions rather than playing the tables' move")
     parser.add_argument("--search-log", type=Path, help="for --select mcts: a folder to add every search to, as <process id>.jsonl")
+    parser.add_argument("--grow-leaves", type=int, default=GROW_LEAVES,
+                        help="for --select mcts --gpu: about one leaf a round per this many simulations done or left, up to --leaves; 0 for --leaves every round")
     parser.add_argument("--no-smart-pruning", dest="smart_pruning", action="store_false",
                         help="for --select mcts --gpu: search all of go's movetime or nodes even once the move is decided (lc0's SmartPruningFactor=0)")
     parser.add_argument("--search-settings", default="",
@@ -239,5 +241,5 @@ if __name__ == "__main__":
              selection=arguments.select, temperature=arguments.temperature, sample_plies=arguments.sample_plies,
              simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
              search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION,
-             search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces,
+             search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase))})
