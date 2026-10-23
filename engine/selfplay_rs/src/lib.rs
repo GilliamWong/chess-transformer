@@ -186,6 +186,7 @@ impl SelfPlayGames {
                 simulations: if game.awaits_noise() { 1 } else { self.simulations_per_round },
                 collisions: 0,
                 visit_limit: self.settings.simulations.max(game.tree.root().visit_count + 1),
+                memory_limit: usize::MAX,
             };
             if game
                 .tree
@@ -282,7 +283,8 @@ impl SelfPlayGames {
     }
 }
 
-//one search of a match: mcts.search, without noise. It ends at its simulations or when stopped
+//one search of a match: mcts.search, without noise. It ends at its simulations, when stopped, or when its tree has no
+//room for more (search.rs make_room)
 struct Search {
     id: u64,
     fen: String,
@@ -294,7 +296,7 @@ struct Search {
 
 impl Search {
     fn done(&self) -> bool {
-        (self.stopped || self.tree.root().visit_count >= self.simulations) && self.tree.pending() == 0
+        (self.stopped || self.tree.root().visit_count >= self.simulations || self.tree.full) && self.tree.pending() == 0
     }
 
     //as player.search_move reports it
@@ -335,6 +337,7 @@ struct Searches {
     //by id: a new game under an id drops the last game's tree at its first search
     kept: HashMap<u64, KeptTree>,
     cache: Option<Cache>,
+    memory_limit: usize, //bytes a search's tree may take (search.rs Round), usize::MAX for no limit
 }
 
 impl Searches {
@@ -381,10 +384,13 @@ impl Searches {
 impl Searches {
     //tree_reuse keeps the tree of a game's (an id's) last search for its next search; cache_positions is the size of
     //the cache of network answers by position (search.rs Cache), 0 for none; value_sharpness see search.rs sharpen,
-    //certainty search.rs SearchSettings'
+    //certainty search.rs SearchSettings'. memory_limit_mb (lc0's RamLimitMb, 0 for none) ends a search once its tree's
+    //vectors would grow past that many megabytes; the cache comes on top, and so does the copy a kept tree's next
+    //search makes of the part it keeps
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
-                        tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false))]
+                        tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
+                        memory_limit_mb=0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -401,6 +407,7 @@ impl Searches {
         cache_positions: usize,
         value_sharpness: f64,
         certainty: bool,
+        memory_limit_mb: usize,
     ) -> PyResult<Searches> {
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -417,6 +424,7 @@ impl Searches {
             tree_reuse,
             kept: HashMap::new(),
             cache: (cache_positions > 0).then(|| Cache::new(cache_positions)),
+            memory_limit: if memory_limit_mb == 0 { usize::MAX } else { memory_limit_mb.saturating_mul(1_000_000) },
         })
     }
 
@@ -447,7 +455,13 @@ impl Searches {
         let mut boards = Vec::new();
         let mut round = Vec::new();
         for search in self.searches.iter_mut().filter(|search| !search.stopped) {
-            let limits = Round { leaves, simulations: simulations.unwrap_or(leaves), collisions, visit_limit: search.simulations };
+            let limits = Round {
+                leaves,
+                simulations: simulations.unwrap_or(leaves),
+                collisions,
+                visit_limit: search.simulations,
+                memory_limit: self.memory_limit,
+            };
             let gathered = search
                 .tree
                 .gather(&limits, &self.settings, self.tables.as_ref(), self.cache.as_ref(), &mut boards)

@@ -216,7 +216,33 @@ pub struct Round {
     pub leaves: u32,
     pub simulations: u32,
     pub collisions: u32,
-    pub visit_limit: u32, //the search's simulations, those already done and waiting included
+    pub visit_limit: u32,     //the search's simulations, those already done and waiting included
+    pub memory_limit: usize, //bytes the tree's vectors may take, a growth's copy included; usize::MAX for none
+}
+
+//the most moves a position may have room for (MoveList's capacity): a waiting leaf's expansion needs that many edges
+const MOST_MOVES: usize = 256;
+
+//whether the edges' u32 indices have room for the moves of the leaves waiting for the network and of one more
+fn edges_fit(edges: usize, waiting: usize) -> bool {
+    edges + (waiting + 1) * MOST_MOVES <= u32::MAX as usize
+}
+
+//the capacity a vector of `capacity` elements of `bytes` each grows to for `needed`: doubling, as std's vectors grow,
+//but no further than a new allocation of `spare` bytes, made while the old one is still held. None if `needed` does
+//not fit
+fn grown_capacity(capacity: usize, needed: usize, bytes: usize, spare: usize) -> Option<usize> {
+    if needed <= capacity {
+        return Some(capacity);
+    }
+    let capacity = needed.max(2 * capacity).min(spare / bytes);
+    (capacity >= needed).then_some(capacity)
+}
+
+fn reserve_to<T>(vector: &mut Vec<T>, capacity: usize) {
+    if capacity > vector.capacity() {
+        vector.reserve_exact(capacity - vector.len());
+    }
 }
 
 pub struct Tree {
@@ -232,6 +258,8 @@ pub struct Tree {
     children: Vec<u32>,
     pending: VecDeque<PendingLeaf>, //oldest first, the order the network's answers come back in
     logits: Vec<f32>,
+    //no room for another simulation (make_room): the search ends as at its simulations, until a move is played
+    pub full: bool,
 }
 
 impl Tree {
@@ -248,7 +276,47 @@ impl Tree {
             children: Vec::new(),
             pending: VecDeque::new(),
             logits: Vec::new(),
+            full: false,
         }
+    }
+
+    //room for one more simulation: its node, and the moves of every leaf that may be expanded before the next look
+    //(those waiting for the network and this one), within the edges' u32 indices and the memory limit. Under a limit
+    //the vectors are grown here (grown_capacity), so that no push grows them past it
+    fn make_room(&mut self, memory_limit: usize) -> bool {
+        if !edges_fit(self.moves.len(), self.pending.len()) {
+            return false;
+        }
+        if memory_limit == usize::MAX {
+            return true;
+        }
+        let spare = memory_limit.saturating_sub(self.allocated_bytes());
+        let node_bytes = size_of::<Node>() + size_of::<u64>();
+        let Some(nodes) = grown_capacity(self.nodes.capacity().min(self.node_keys.capacity()), self.nodes.len() + 1, node_bytes, spare)
+        else {
+            return false;
+        };
+        reserve_to(&mut self.nodes, nodes);
+        reserve_to(&mut self.node_keys, nodes);
+        let spare = memory_limit.saturating_sub(self.allocated_bytes());
+        let edge_bytes = size_of::<Move>() + size_of::<f32>() + size_of::<u32>();
+        let capacity = self.moves.capacity().min(self.priors.capacity()).min(self.children.capacity());
+        let Some(edges) = grown_capacity(capacity, self.moves.len() + (self.pending.len() + 1) * MOST_MOVES, edge_bytes, spare) else {
+            return false;
+        };
+        reserve_to(&mut self.moves, edges);
+        reserve_to(&mut self.priors, edges);
+        reserve_to(&mut self.children, edges);
+        true
+    }
+
+    //the bytes the tree's node and edge vectors have allocated
+    pub fn allocated_bytes(&self) -> usize {
+        self.nodes.capacity() * size_of::<Node>()
+            + self.node_keys.capacity() * size_of::<u64>()
+            + self.moves.capacity() * size_of::<Move>()
+            + self.priors.capacity() * size_of::<f32>()
+            + self.children.capacity() * size_of::<u32>()
     }
 
     pub fn root(&self) -> &Node {
@@ -364,6 +432,11 @@ impl Tree {
             && simulations < round.simulations
             && self.root().visit_count as usize + self.pending.len() < round.visit_limit as usize
         {
+            //the root's own evaluation always fits, so that a full search still has moves to report
+            if self.root().edge_count > 0 && !self.make_room(round.memory_limit) {
+                self.full = true;
+                break;
+            }
             let mut board = self.board.clone();
             let root_keys = self.keys.len();
             path.clear();
@@ -726,6 +799,7 @@ impl Tree {
             (self.nodes, self.moves, self.priors, self.children) = (vec![Node::new()], Vec::new(), Vec::new(), Vec::new());
             self.node_keys = vec![*self.keys.last().expect("the root's key")];
             self.noised_priors.clear();
+            self.full = false;
         }
     }
 
@@ -751,8 +825,9 @@ impl Tree {
     //own is dropped, as a root is never proven (root_decided reads its moves'). Returns the old tree's nodes and edges
     #[allow(clippy::type_complexity)]
     fn keep_subtree(&mut self, node: usize) -> (Vec<Node>, Vec<u64>, Vec<Move>, Vec<f32>, Vec<u32>) {
-        //the new root's priors are its own, without the old root's noise
+        //the new root's priors are its own, without the old root's noise; whether it has room is for gather to see
         self.noised_priors.clear();
+        self.full = false;
         //room for the whole tree, so the copy never regrows (that took twice the time); unwritten room takes no memory
         let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
         let mut nodes = Vec::with_capacity(node_room);

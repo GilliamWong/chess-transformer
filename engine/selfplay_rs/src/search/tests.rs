@@ -59,13 +59,13 @@ impl Network {
     }
 }
 
-//engine_search.py's rounds until the root has its simulations: a leaf per 16 simulations up to 64, as many collisions,
-//three simulations a leaf
-fn search(tree: &mut Tree, simulations: u32, settings: &SearchSettings, tables: Option<&Tables>, network: &mut Network) {
+//engine_search.py's rounds until the root has its simulations or the tree is full: a leaf per 16 simulations up to 64, as
+//many collisions, three simulations a leaf
+fn search(tree: &mut Tree, simulations: u32, memory_limit: usize, settings: &SearchSettings, tables: Option<&Tables>, network: &mut Network) {
     let mut boards = Vec::new();
-    while tree.root().visit_count < simulations {
+    while tree.root().visit_count < simulations && !(tree.full && tree.pending.is_empty()) {
         let leaves = (tree.root().visit_count / 16).clamp(1, 64);
-        let round = Round { leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: simulations };
+        let round = Round { leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: simulations, memory_limit };
         boards.clear();
         tree.gather(&round, settings, tables, Some(&network.cache), &mut boards).expect("the tables");
         for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
@@ -99,6 +99,7 @@ fn copied(tree: &Tree) -> Tree {
         children: tree.children.clone(),
         pending: VecDeque::new(),
         logits: Vec::new(),
+        full: tree.full,
     }
 }
 
@@ -256,7 +257,7 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
     for (fen, moves, simulations, certainty, tables) in cases {
         let settings = settings(certainty);
         let mut tree = tree_after(fen, moves);
-        search(&mut tree, simulations, &settings, tables, &mut Network::new());
+        search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
         for line in reusable_lines(&tree) {
             let mut old = copied(&tree);
             let line_moves: Vec<Move> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
@@ -295,4 +296,35 @@ fn the_cache_keeps_two_generations_and_turns_one_over_at_once() {
     assert_eq!(found(3 * generation), Some((priors(7), 7.0)));
     assert_eq!(found(2 * generation - 1), None);
     assert!(slowest_turnover.as_millis() < 20, "a turnover took {slowest_turnover:?}");
+}
+
+//the edges' u32 indices: gathering stops while the moves of the leaves waiting and of one more might not fit
+#[test]
+fn the_edges_stop_short_of_their_u32_indices() {
+    let most = u32::MAX as usize;
+    assert!(edges_fit(most - 2 * MOST_MOVES, 1));
+    assert!(!edges_fit(most - 2 * MOST_MOVES + 1, 1));
+    assert!(!edges_fit(most, 0));
+    assert_eq!(grown_capacity(8, 9, 13, usize::MAX), Some(16));
+    assert_eq!(grown_capacity(8, 40, 13, usize::MAX), Some(40));
+    assert_eq!(grown_capacity(8, 9, 13, 13 * 12), Some(12));
+    assert_eq!(grown_capacity(8, 9, 13, 13 * 8), None);
+}
+
+//a search under a memory limit ends once its tree has no room left, its vectors within the limit (a growth's copy
+//included, which leaves the vectors half to two thirds of it), and until then it is the search without a limit, node
+//for node
+#[test]
+fn a_search_ends_at_its_memory_limit_as_the_same_search() {
+    let memory_limit = 4_000_000;
+    let settings = settings(true);
+    let mut limited = tree_after("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", &[]);
+    search(&mut limited, 1_000_000, memory_limit, &settings, None, &mut Network::new());
+    let reached = limited.root().visit_count;
+    assert!(limited.full && reached < 1_000_000 && limited.allocated_bytes() <= memory_limit, "{reached} {}", limited.allocated_bytes());
+
+    let mut unlimited = tree_after("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", &[]);
+    search(&mut unlimited, reached, usize::MAX, &settings, None, &mut Network::new());
+    assert_same_trees(&unlimited, &limited);
+    assert!(!unlimited.full && limited.allocated_bytes() > memory_limit / 3);
 }

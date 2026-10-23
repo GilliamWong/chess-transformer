@@ -681,3 +681,19 @@ def test_the_engine_plays_on_in_a_draw_left_to_be_claimed(fen, moves, leaves):
 
     report = EngineSearch(cpu_batches(BoardModel()), leaves).search(board, simulations=200)
     assert report.line[0] in board.legal_moves and report.simulations > 1
+
+
+#a search whose tree reaches Searches' memory_limit_mb ends there with its report, as at its simulations (the engine's
+#rounds too, which would otherwise wait on a search that gathers nothing); one that stays below its limit is the search
+#without a limit
+def test_a_search_ends_at_its_memory_limit():
+    evaluate = cpu_batches(BoardModel()).evaluate_boards
+    reports = {limit: searched(selfplay_rs.Searches(**rust_search_settings(False), memory_limit_mb=limit), chess.Board(), 3000, evaluate)
+               for limit in (0, 1, 1000)}
+    assert reports[1000] == reports[0] and reports[0][4] == 3000
+    assert 100 < reports[1][4] < 3000
+
+    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False)
+    search.searches = selfplay_rs.Searches(**engine_search_settings(False), tree_reuse=True, memory_limit_mb=1)
+    report = search.search(chess.Board(), simulations=100_000)
+    assert 100 < report.simulations < 3000 and report.line[0] in chess.Board().legal_moves
