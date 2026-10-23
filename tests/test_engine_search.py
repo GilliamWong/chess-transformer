@@ -901,3 +901,50 @@ def test_a_search_ends_at_its_memory_limit():
     search.searches = selfplay_rs.Searches(**engine_search_settings(False), tree_reuse=True, memory_limit_mb=1)
     report = search.search(chess.Board(), simulations=100_000)
     assert 100 < report.simulations < 3000 and report.line[0] in chess.Board().legal_moves
+
+
+#a position the search could not start from leaves the last one, and the gui is told why (each of these ended the
+#engine, the last two at go); in a game that is over go answers with the null move
+def test_a_bad_position_leaves_the_last_one(monkeypatch):
+    searched = []
+    class Player:
+        def search(self, board, nodes, seconds, extension, stop=None):
+            searched.append(board.fen())
+            return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
+    bad = ["startpos moves e2e4 e7e4", "startpos moves e2e4 e7", "fen not a fen", "fen 8/8/8/8/8/8/8/8 w - - 0 1", "", "kiwipete",
+           "startpos moves e2e4 0000", "fen 4k3/8/8/8/8/8/PPPPPPPP/QQ2K3 w - - 0 1"]
+    script = ["position startpos moves e2e4", *(f"position {position}" for position in bad), "go nodes 10",
+              "position fen 4R1k1/5ppp/8/8/8/8/5PPP/6K1 b - - 1 1", "go nodes 10", "quit"]
+    sent = []
+    monkeypatch.setattr(uci, "load_player", lambda *arguments: Player())
+    monkeypatch.setattr(uci, "send", sent.append)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(script)))
+    uci.main(Path("unused.pt"), selection="mcts")
+
+    after_e4 = chess.Board()
+    after_e4.push_uci("e2e4")
+    assert searched == [after_e4.fen()]
+    assert len([line for line in sent if line.startswith("info string") and line.endswith("the last position stays")]) == len(bad)
+    assert [line for line in sent if line.startswith("bestmove")][1] == "bestmove 0000"
+
+#the fens parse_position refuses are those the rust search refuses (python-chess's status, and shakmaty's promoted
+#material, which that leaves out); a fen whose castling rights or en passant square python-chess cleans both take
+@pytest.mark.parametrize("fen", [
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBN1 w KQkq - 0 1", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq e3 0 1",
+    "4k3/8/8/8/8/8/8/8 w - - 0 1", "4k3/8/8/8/8/8/8/K3K3 w - - 0 1", "4k3/8/8/8/8/8/8/4R1K1 w - - 0 1", "P3k3/8/8/8/8/8/8/4K3 w - - 0 1",
+    "4k3/8/8/8/8/P7/PPPPPPPP/4K3 w - - 0 1", "4k3/8/5N2/1B6/8/8/8/4R1K1 b - - 0 1", "4k3/8/8/8/1NNNNNNN/8/PPPPPPPP/RNB1K3 w - - 0 1",
+    "4k3/8/8/8/8/8/PPPPPPPP/QQ2K3 w - - 0 1", "4k3/8/8/8/8/8/1PPPPPPP/QQ2K3 w - - 0 1", "4k3/8/8/8/8/8/PPPPPPPP/B1B1K3 w - - 0 1",
+    "4k3/8/8/8/8/8/PPPPPPPP/BB2K3 w - - 0 1", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -"
+])
+def test_the_positions_refused_are_the_searchs(fen):
+    try:
+        uci.parse_position(["fen", *fen.split()])
+        refused = False
+    except ValueError:
+        refused = True
+    try:
+        selfplay_rs.Searches(**rust_search_settings(False)).start(0, chess.Board(fen).root().fen(), [], 10)
+        searched = True
+    except ValueError:
+        searched = False
+    assert refused != searched

@@ -57,7 +57,18 @@ def send(line: str) -> None:
     #flushed: the gui reads a pipe, not a terminal
     print(line, flush=True)
 
-#"startpos moves e2e4 e7e5" or "fen <6 fen fields> moves ..."
+#shakmaty's (the rust search's) check of a fen that python-chess's status leaves out: a side's pawns and its pieces
+#beyond the start's (a bishop of each colour) are at most 8
+def standard_material(board: chess.Board, color: chess.Color) -> bool:
+    ours = board.occupied_co[color]
+    at_the_start = ((board.queens, 1), (board.rooks, 2), (board.knights, 2), (board.bishops & chess.BB_LIGHT_SQUARES, 1),
+                    (board.bishops & chess.BB_DARK_SQUARES, 1))
+    promoted = sum(max(0, chess.popcount(pieces & ours) - start) for pieces, start in at_the_start)
+    return chess.popcount(board.pawns & ours) + promoted <= 8
+
+#"startpos moves e2e4 e7e5" or "fen <6 fen fields> moves ..."; a ValueError for one the search could not start from: a
+#bad fen, a board the rust search refuses (its castling rights and en passant square python-chess cleans in fen()),
+#an illegal or a null move
 def parse_position(arguments: list[str]) -> chess.Board:
     if "moves" in arguments:
         moves_index = arguments.index("moves")
@@ -65,15 +76,21 @@ def parse_position(arguments: list[str]) -> chess.Board:
     else:
         setup, moves = arguments, []
 
-    if setup[0] == "startpos":
+    if setup[:1] == ["startpos"]:
         board = chess.Board()
-    elif setup[0] == "fen":
+    elif setup[:1] == ["fen"]:
         board = chess.Board(" ".join(setup[1:]))
+        refused = board.status() & ~(chess.STATUS_BAD_CASTLING_RIGHTS | chess.STATUS_INVALID_EP_SQUARE)
+        if refused or not all(standard_material(board, color) for color in chess.COLORS):
+            raise ValueError(f"not a position the search can play: {board.fen()}")
     else:
         raise ValueError(f"unknown position: {' '.join(arguments)}")
 
     for uci_move in moves:
-        board.push_uci(uci_move)
+        move = board.parse_uci(uci_move)
+        if not move:
+            raise ValueError(f"a null move ({uci_move}) in {board.fen()}")
+        board.push(move)
 
     return board
 
@@ -227,11 +244,18 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
                 player.new_game()
 
         elif command == "position":
-            board = parse_position(arguments)
+            try:
+                board = parse_position(arguments)
+            except ValueError as error:
+                send(f"info string {error}: the last position stays")
 
         elif command == "go":
             #timed from the go command, as the gui times it
             started = time.perf_counter()
+            if not any(board.legal_moves):
+                send("info string the game is over, there is no move to play")
+                send("bestmove 0000")
+                continue
             if random_mover:
                 move = choose_random_move(board)
             else:
