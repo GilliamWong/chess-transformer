@@ -1,14 +1,19 @@
-#the model as a uci engine, for cutechess-cli matches and the cute chess gui. Only the commands a gui needs to play:
-#uci, isready, ucinewgame, position, go and quit. The search (--select mcts) keeps to go's movetime, nodes and
-#wtime/btime; a go without them (go infinite, as cutechess sends for tc=inf) runs --simulations. The other selections
-#ignore the clock
+#the model as a uci engine, for cutechess-cli matches, tournament managers and the cute chess gui: uci, isready,
+#ucinewgame, position, go, stop, ponderhit and quit, read on a thread of their own (Commands) so that stop, isready
+#and quit reach a running search. The search (--select mcts) keeps to go's movetime, nodes and wtime/btime; a go
+#without them runs --simulations, go infinite too (cutechess sends it for tc=inf) unless --infinite-until-stop. go
+#ponder searches until ponderhit, then as the go asks; its searchmoves, depth and mate are ignored. The other
+#selections ignore the clock
 #   python -m engine.uci [model.pt | random] [--select mcts --gpu]
 import argparse
+from collections.abc import Iterable
 import json
 import os
 from pathlib import Path
+import queue
 import random
 import sys
+import threading
 import time
 import chess
 import torch
@@ -53,9 +58,13 @@ MOST_BOOK_PLIES = 12
 def phase_weight(men: int) -> float:
     return next((weight for fewest, most, weight in PHASE_WEIGHTS if fewest <= men <= most), 1.0)
 
+#print writes the line and its newline apart, and the reader thread answers isready while a search sends its lines
+SENDING = threading.Lock()
+
 def send(line: str) -> None:
     #flushed: the gui reads a pipe, not a terminal
-    print(line, flush=True)
+    with SENDING:
+        print(line, flush=True)
 
 #shakmaty's (the rust search's) check of a fen that python-chess's status leaves out: a side's pawns and its pieces
 #beyond the start's (a bishop of each colour) are at most 8
@@ -208,23 +217,137 @@ def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, t
         return load_engine_search(checkpoint_path, gpu, leaves, tablebase, search_options, precision)
     return load_engine_model(checkpoint_path, gpu)
 
+
+#a go as the reader saw it: its arguments and when it came (the gui times the move from then). stop is set at stop or
+#quit, or at the end of the input for a go that waits for a stop: go infinite with --infinite-until-stop (until_stop)
+#and go ponder, which searches until pondered is set (stop or ponderhit, whose time is kept)
+class Go:
+    def __init__(self, arguments: list[str], received: float, until_stop: bool):
+        self.arguments, self.received, self.until_stop = arguments, received, until_stop
+        self.ponder = "ponder" in arguments
+        self.stop, self.pondered = threading.Event(), threading.Event()
+        self.ponderhit: float | None = None
+
+    def end(self) -> None:
+        self.stop.set()
+        self.pondered.set()
+
+    def hit(self, received: float) -> None:
+        if self.ponder and not self.pondered.is_set():
+            self.ponderhit = received
+            self.pondered.set()
+
+#stdin read on a thread of its own, so that stop, isready and quit reach the engine while it searches. The main thread
+#takes the other commands in order (next; None once the input ends) and keeps every search's state. While the command
+#queued last is a go the main thread has not finished, the reader answers isready itself (UCI: at once, the search
+#going on); stop and quit end the unfinished gos, ponderhit ends their pondering, and the end of the input the gos that
+#wait for a stop
+class Commands:
+    def __init__(self, lines: Iterable[str], infinite_until_stop: bool):
+        self.infinite_until_stop = infinite_until_stop
+        self.lock = threading.Lock()
+        self.unfinished: list[Go] = []
+        self.last_go: Go | None = None #the command queued last, if it was a go
+        self.queued: queue.Queue = queue.Queue()
+        threading.Thread(target=self.read, args=(lines,), daemon=True).start()
+
+    def read(self, lines: Iterable[str]) -> None:
+        try:
+            for line in lines:
+                self.receive(line.split(), time.perf_counter())
+        finally:
+            with self.lock:
+                for go in self.unfinished:
+                    if go.until_stop or go.ponder:
+                        go.end()
+            self.queued.put(None)
+
+    def receive(self, words: list[str], received: float) -> None:
+        if not words:
+            return
+        command, arguments = words[0], words[1:]
+        with self.lock:
+            if command == "isready" and self.last_go in self.unfinished:
+                send("readyok")
+            elif command == "stop":
+                for go in self.unfinished:
+                    go.end()
+            elif command == "ponderhit":
+                for go in self.unfinished:
+                    go.hit(received)
+            else:
+                self.last_go = Go(arguments, received, self.infinite_until_stop and "infinite" in arguments) if command == "go" else None
+                if self.last_go is not None:
+                    self.unfinished.append(self.last_go)
+                if command == "quit":
+                    for go in self.unfinished:
+                        go.end()
+                self.queued.put((command, arguments, self.last_go))
+
+    #(command, arguments, its Go for a go), None once the input has ended
+    def next(self) -> tuple[str, list[str], Go | None] | None:
+        return self.queued.get()
+
+    #the main thread is done with the go, its bestmove sent
+    def finished(self, go: Go) -> None:
+        with self.lock:
+            self.unfinished.remove(go)
+
+
 def main(checkpoint_path: Path | None = None, random_mover: bool = False, selection: str = "argmax",
          temperature: float = TEMPERATURE, sample_plies: int = SAMPLE_PLIES, simulations: int = SIMULATIONS,
          gpu: bool = False, leaves: int = LEAVES, tablebase: bool = False, search_log: Path | None = None, search_options: dict | None = None,
-         precision: str = ENGINE_PRECISION, clock_options: dict | None = None):
+         precision: str = ENGINE_PRECISION, clock_options: dict | None = None, infinite_until_stop: bool = False):
     torch.set_num_threads(1)
     search_options = search_options or {}
     clock_options = clock_options or {}
+    searching = selection == "mcts" and not random_mover
     player = None
     board = chess.Board()
     clock = Clock(**clock_options)
+    commands = Commands(sys.stdin, infinite_until_stop)
 
-    for line in sys.stdin:
-        words = line.split()
-        if len(words) == 0:
-            continue
+    def load() -> nn.Module | EngineSearch:
+        return load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options, precision)
 
-        command, arguments = words[0], words[1:]
+    #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by
+    #itself (a proven or only move), as UCI asks; a go ponder searches the opponent's time until ponderhit, then on as
+    #the go asks (the tree kept) with its time from the ponderhit, or until stop, for a move the gui throws away
+    def move_for(go: Go) -> chess.Move | None:
+        nonlocal player
+        #timed from when the go came, as the gui times it
+        started = go.received
+        if not any(board.legal_moves):
+            send("info string the game is over, there is no move to play")
+            return None
+        if player is None and not random_mover:
+            player = load()
+        if go.ponder:
+            pondered = player.search(board, stop=go.pondered) if searching else None
+            go.pondered.wait()
+            if go.ponderhit is None:
+                return pondered.line[0] if pondered else next(iter(board.legal_moves))
+            started = go.ponderhit
+        if random_mover:
+            move = choose_random_move(board)
+        elif searching:
+            nodes, seconds = clock.limits(go.arguments, board, simulations)
+            if go.until_stop:
+                nodes = seconds = None
+            report = player.search(board, nodes, seconds, clock.extension, go.stop)
+            clock.searched(time.perf_counter() - started, score_to_centipawns(report.score))
+            move = report.line[0]
+            send(info_line(report, time.perf_counter() - started))
+            if search_log is not None:
+                log_search(search_log, board, move, report)
+        else:
+            move = choose_move(player, board, DEVICE, selection, temperature, sample_plies)
+        if go.until_stop:
+            go.stop.wait()
+        return move
+
+    while (received := commands.next()) is not None:
+        command, arguments, go = received
 
         if command == "uci":
             send(f"id name {'RandomMover' if random_mover else ENGINE_NAME}")
@@ -234,7 +357,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         elif command == "isready":
             #loaded here, not at startup, so "uci" is answered at once
             if player is None and not random_mover:
-                player = load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options, precision)
+                player = load()
             send("readyok")
 
         elif command == "ucinewgame":
@@ -250,34 +373,17 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
                 send(f"info string {error}: the last position stays")
 
         elif command == "go":
-            #timed from the go command, as the gui times it
-            started = time.perf_counter()
-            if not any(board.legal_moves):
-                send("info string the game is over, there is no move to play")
-                send("bestmove 0000")
-                continue
-            if random_mover:
-                move = choose_random_move(board)
-            else:
-                if player is None:
-                    player = load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options, precision)
-                if selection == "mcts":
-                    nodes, seconds = clock.limits(arguments, board, simulations)
-                    report = player.search(board, nodes, seconds, clock.extension)
-                    clock.searched(time.perf_counter() - started, score_to_centipawns(report.score))
-                    move = report.line[0]
-                    send(info_line(report, time.perf_counter() - started))
-                    if search_log is not None:
-                        log_search(search_log, board, move, report)
-                else:
-                    move = choose_move(player, board, DEVICE, selection, temperature, sample_plies)
-            send(f"bestmove {move.uci()}")
-            advance_after(player, board, move)
+            move = move_for(go)
+            send(f"bestmove {move.uci() if move is not None else '0000'}")
+            #not after a ponder miss, whose move is not played
+            if move is not None and not (go.ponder and go.ponderhit is None):
+                advance_after(player, board, move)
+            commands.finished(go)
 
         elif command == "quit":
             break
 
-        #anything else (setoption, stop, ...) is ignored, as UCI allows
+        #anything else (setoption, debug, ...) is ignored, as UCI allows
 
 
 if __name__ == "__main__":
@@ -316,6 +422,9 @@ if __name__ == "__main__":
     parser.add_argument("--book-ply-bonus", type=float, default=BOOK_PLY_BONUS, help="for --first-move-bonus, default %(default)s; lc0's 0.25")
     parser.add_argument("--search-settings", default="",
                         help="for --select mcts: changes to the search's settings (engine_search.py), e.g. c_puct=0.6")
+    parser.add_argument("--infinite-until-stop", action="store_true",
+                        help="go infinite searches until stop, as UCI and analysis guis ask; without it it runs --simulations, which "
+                             "cutechess-cli's tc=inf games need")
     arguments = parser.parse_args()
     if arguments.tablebase_pieces != TABLEBASE_PIECES and not arguments.tablebase:
         parser.error("--tablebase-pieces needs --tablebase")
@@ -324,12 +433,12 @@ if __name__ == "__main__":
     if arguments.smart_pruning_factor <= 0:
         parser.error("--smart-pruning-factor is positive; --no-smart-pruning for none")
     if arguments.checkpoint == "random":
-        main(random_mover=True)
+        main(random_mover=True, infinite_until_stop=arguments.infinite_until_stop)
     else:
         main(Path(arguments.checkpoint) if arguments.checkpoint else latest_checkpoint(),
              selection=arguments.select, temperature=arguments.temperature, sample_plies=arguments.sample_plies,
              simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
-             search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION,
+             search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION, infinite_until_stop=arguments.infinite_until_stop,
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
                              "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,

@@ -1,12 +1,13 @@
 #one search at a time as fast as the network allows, for the uci engine: the search runs in rust (selfplay_rs.Searches)
 #and gathers many leaves a round for one network call, as lc0 does, while the round before is on the gpu. It stops at
-#a number of simulations or at a deadline, or earlier once its move is decided (smart pruning), and keeps its tree for
-#the game's next move and the network's answers for positions reached again
+#a number of simulations, at a deadline or when told to (uci's stop), or earlier once its move is decided (smart
+#pruning), and keeps its tree for the game's next move and the network's answers for positions reached again
 from __future__ import annotations
 from collections import deque
 import math
 from pathlib import Path
 import statistics
+import threading
 import time
 import chess
 import numpy as np
@@ -150,13 +151,14 @@ class EngineSearch:
     def advance(self, board: chess.Board) -> bool:
         return self.leaves > 1 and self.searches.advance(GAME, board.root().fen(), [move.uci() for move in board.move_stack])
 
-    #searches until `simulations` (counting those of a reused tree, as lc0's go nodes does) or until `seconds` have
-    #passed, whichever comes first; at least one of the two. extension: (the last search's score in centipawns, the
-    #seconds this one may add) for a search on the clock whose score falls (FALL_START_CP)
+    #searches until `simulations` (counting those of a reused tree, as lc0's go nodes does), until `seconds` have
+    #passed or until `stop` is set (uci's reader thread sets it), whichever comes first; at least one of the three.
+    #extension: (the last search's score in centipawns, the seconds this one may add) for a search on the clock whose
+    #score falls (FALL_START_CP)
     def search(self, board: chess.Board, simulations: int | None = None, seconds: float | None = None,
-               extension: tuple[int, float] | None = None) -> SearchReport:
-        if simulations is None and seconds is None:
-            raise ValueError("a search needs a number of simulations or a time")
+               extension: tuple[int, float] | None = None, stop: threading.Event | None = None) -> SearchReport:
+        if simulations is None and seconds is None and stop is None:
+            raise ValueError("a search needs a number of simulations, a time or a stop")
         started = time.perf_counter()
         #the tables know the result and the best move
         if self.tablebase is not None and covers(board, self.ranked_pieces):
@@ -180,9 +182,10 @@ class EngineSearch:
                 #the round gathered now would come back after those on the gpu: stop if that is past the deadline. Rounds
                 #on lanes of their own run at once and come back about together, so it comes a round time after the newest
                 round_times = max(len(rounds), 1) if self.rounds_at_once else len(rounds) + 1
-                if gathered and deadline is not None and time.perf_counter() + round_times * self.round_seconds >= deadline:
-                    #once: a search whose score has fallen runs on
-                    if extension is not None:
+                told_to_stop = stop is not None and stop.is_set()
+                if gathered and (told_to_stop or deadline is not None and time.perf_counter() + round_times * self.round_seconds >= deadline):
+                    #once: a search whose score has fallen runs on, unless told to stop
+                    if extension is not None and not told_to_stop:
                         deadline += self.extra_for_fall(extension)
                         extension = None
                         continue

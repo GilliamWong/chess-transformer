@@ -1,10 +1,12 @@
 #the uci engine's search (engine/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
 #deadline and node limit, smart pruning, the tree kept for the next move, the engine's own settings, and uci.py's go
-#limits and clock
+#limits and clock, the commands it takes while it searches and the positions it refuses
 import io
+import queue
 import runpy
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -345,7 +347,7 @@ def test_a_clocks_plan_and_cap_can_be_set():
 def test_a_new_game_starts_a_fresh_clock(monkeypatch):
     given = []
     class Player:
-        def search(self, board, nodes, seconds, extension):
+        def search(self, board, nodes, seconds, extension, stop):
             given.append((seconds, extension))
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     go = ["position startpos", "go wtime 60000 btime 60000 winc 600 binc 600"]
@@ -591,7 +593,7 @@ def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
 @pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
 def test_the_engine_takes_lc0s_time_options(monkeypatch):
     given = []
-    def search(self, board, nodes, seconds, extension):
+    def search(self, board, nodes, seconds, extension, stop):
         given.append((seconds, self.smart_pruning_factor, self.smart_pruning_wait, self.stop_at_one_move_left))
         return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision: cpu_batches(BoardModel()))
@@ -902,6 +904,155 @@ def test_a_search_ends_at_its_memory_limit():
     report = search.search(chess.Board(), simulations=100_000)
     assert 100 < report.simulations < 3000 and report.line[0] in chess.Board().legal_moves
 
+
+#a gui driving uci.main on a thread of its own: the lines told are the engine's stdin, and the lines it sends are kept
+#with when it sent them. load_player makes its player with make_player (unless None): on the engine's thread, as
+#Searches must be used on the thread that made it; main_arguments are main's
+class Gui:
+    def __init__(self, monkeypatch, make_player, checkpoint: Path = Path("unused.pt"), **main_arguments):
+        self.lines: queue.Queue = queue.Queue()
+        self.sent: list[tuple[float, str]] = []
+        self.errors: list[BaseException] = []
+        monkeypatch.setattr(sys, "stdin", iter(self.lines.get, None))
+        monkeypatch.setattr(uci, "send", lambda line: self.sent.append((time.perf_counter(), line)))
+        if make_player is not None:
+            monkeypatch.setattr(uci, "load_player", lambda *arguments: make_player())
+        self.engine = threading.Thread(target=self.run, args=(checkpoint,), kwargs={"selection": "mcts", **main_arguments}, daemon=True)
+        self.engine.start()
+
+    def run(self, checkpoint: Path, **main_arguments) -> None:
+        try:
+            uci.main(checkpoint, **main_arguments)
+        except BaseException as error:
+            self.errors.append(error)
+
+    #when the line was told
+    def tell(self, line: str) -> float:
+        told = time.perf_counter()
+        self.lines.put(line + "\n")
+        return told
+
+    #when the engine sent its first line starting with `start` since `since`, waiting up to `seconds` for one; None if none
+    def sent_at(self, start: str, since: float = 0.0, seconds: float = 0.0) -> float | None:
+        give_up = time.perf_counter() + seconds
+        while True:
+            found = [at for at, line in list(self.sent) if at >= since and line.startswith(start)]
+            if found or time.perf_counter() > give_up:
+                return found[0] if found else None
+            time.sleep(0.005)
+
+    def lines_sent(self, start: str) -> list[str]:
+        return [line for _, line in list(self.sent) if line.startswith(start)]
+
+    #a number of the last info line, e.g. its nodes
+    def last_info(self, name: str) -> int:
+        words = self.lines_sent("info depth")[-1].split()
+        return int(words[words.index(name) + 1])
+
+    #the input ends after `last`; the engine must then be done within `seconds`
+    def close(self, last: str | None = "quit", seconds: float = 5.0) -> None:
+        if last is not None:
+            self.tell(last)
+        self.lines.put(None)
+        self.engine.join(seconds)
+        assert not self.engine.is_alive() and not self.errors, self.errors
+
+def board_search() -> EngineSearch:
+    return EngineSearch(cpu_batches(BoardModel()), 16)
+
+#stop ends a running search as its deadline would (10 s here), and the engine answers with its move at once (stop was
+#read only once the search had ended)
+def test_stop_ends_a_running_search(monkeypatch):
+    gui = Gui(monkeypatch, board_search)
+    gui.tell("position startpos")
+    gui.tell("go movetime 10000")
+    time.sleep(0.3)
+    stopped = gui.tell("stop")
+    answered = gui.sent_at("bestmove", seconds=3)
+    assert answered is not None and stopped < answered < stopped + 1 and gui.last_info("nodes") > 16
+    gui.close()
+
+#isready during a search is answered at once, the search going on (UCI); one after a command the engine has not taken
+#yet waits for it, so that readyok still means all before it is done
+def test_isready_is_answered_while_the_engine_searches(monkeypatch):
+    gui = Gui(monkeypatch, board_search)
+    gui.tell("go movetime 10000")
+    time.sleep(0.3)
+    asked = gui.tell("isready")
+    ready = gui.sent_at("readyok", seconds=1)
+    assert ready is not None and ready < asked + 0.5 and gui.sent_at("bestmove") is None
+
+    gui.tell("position startpos moves e2e4")
+    asked = gui.tell("isready")
+    time.sleep(0.3)
+    assert gui.sent_at("readyok", since=asked) is None
+    gui.tell("stop")
+    answered, ready = gui.sent_at("bestmove", seconds=3), gui.sent_at("readyok", since=asked, seconds=3)
+    assert answered is not None and ready is not None and answered < ready
+    gui.close()
+
+#quit during a search ends it, and the engine
+def test_quit_ends_a_running_search(monkeypatch):
+    gui = Gui(monkeypatch, board_search)
+    gui.tell("go movetime 10000")
+    time.sleep(0.3)
+    gui.tell("quit")
+    gui.engine.join(2)
+    assert not gui.engine.is_alive() and not gui.errors
+    gui.close(last=None)
+
+#with --infinite-until-stop go infinite searches past --simulations until stop, and answers only then, also once its
+#search has ended by itself (an only move); the end of the input ends one too
+@pytest.mark.parametrize("fen", [chess.STARTING_FEN, "7k/8/8/8/8/8/8/K5R1 b - - 0 1"])
+def test_go_infinite_searches_until_stop(monkeypatch, fen):
+    gui = Gui(monkeypatch, board_search, simulations=50, infinite_until_stop=True)
+    gui.tell(f"position fen {fen}")
+    gui.tell("go infinite")
+    time.sleep(0.5)
+    assert gui.sent_at("bestmove") is None
+    stopped = gui.tell("stop")
+    assert gui.sent_at("bestmove", since=stopped, seconds=2) is not None
+    assert gui.last_info("nodes") > 50 or chess.Board(fen).legal_moves.count() == 1
+
+    gui.tell("go infinite")
+    time.sleep(0.2)
+    gui.close(last=None)
+    assert len(gui.lines_sent("bestmove")) == 2
+
+#without it go infinite runs --simulations, as cutechess-cli's tc=inf games need
+def test_go_infinite_runs_the_simulations_by_default(monkeypatch):
+    gui = Gui(monkeypatch, lambda: EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False), simulations=300)
+    gui.tell("go infinite")
+    assert gui.sent_at("bestmove", seconds=10) is not None and gui.last_info("nodes") == 300
+    gui.close()
+
+#go ponder searches the opponent's time until ponderhit, then searches as the go asks with its time counted from the
+#ponderhit; at stop it answers at once, a move the gui throws away, and the clock never hears of it (it answered at
+#its move's time, before ponderhit)
+def test_go_ponder_searches_until_ponderhit(monkeypatch):
+    limits = []
+    class Recorded(EngineSearch):
+        def search(self, board, simulations=None, seconds=None, extension=None, stop=None):
+            limits.append((simulations, seconds))
+            return super().search(board, simulations, seconds, extension, stop)
+    gui = Gui(monkeypatch, lambda: Recorded(cpu_batches(BoardModel()), 16))
+    board = chess.Board()
+    board.push_uci("e2e4")
+    gui.tell("position startpos moves e2e4")
+    go = "go ponder wtime 10000 btime 10000"
+    gui.tell(go)
+    time.sleep(0.5)
+    assert gui.sent_at("bestmove") is None
+    hit = gui.tell("ponderhit")
+    answered = gui.sent_at("bestmove", seconds=3)
+    assert answered is not None and gui.last_info("time") < (answered - hit) * 1000 + 50
+    assert limits == [(None, None), (None, pytest.approx(Clock().limits(go.split()[1:], board, 200)[1]))]
+
+    gui.tell(go)
+    time.sleep(0.3)
+    stopped = gui.tell("stop")
+    assert gui.sent_at("bestmove", since=stopped, seconds=2) is not None and len(limits) == 3
+    gui.close()
 
 #a position the search could not start from leaves the last one, and the gui is told why (each of these ended the
 #engine, the last two at go); in a game that is over go answers with the null move
