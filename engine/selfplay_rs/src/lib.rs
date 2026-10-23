@@ -10,7 +10,10 @@ use pyo3::buffer::{PyBuffer, ReadOnlyCell};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use rules::{MOVE_ID_TABLE_LENGTH, MoveIds, Tables, encode_board, final_result, game_result, legal_moves_in_python_order, position_key};
+use rules::{
+    MOVE_ID_TABLE_LENGTH, MoveIds, TOKENS_PER_BOARD, Tables, encode_board, final_result, game_result, legal_moves_in_python_order,
+    position_key,
+};
 use search::{BatchCounts, Cache, Round, SearchSettings, Tree};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
@@ -408,6 +411,64 @@ struct Searches {
     state: Mutex<State>,
 }
 
+//root_visits': (the root's visits, the visits of its two most visited moves)
+type RootNumbers = (u32, u32, u32);
+
+//root_visits' numbers of search id, None when it is not running
+fn root_numbers(state: &State, id: u64) -> Option<RootNumbers> {
+    let search = state.searches.iter().find(|search| search.id == id)?;
+    let (most, second) = search.tree.two_most_visits();
+    Some((search.tree.root().visit_count, most, second))
+}
+
+//descend_into's array of boards: one byte a token, or an int64 (the engine's lanes keep their boards as int64s)
+enum BoardsBuffer {
+    Bytes(PyBuffer<u8>),
+    Wide(PyBuffer<i64>),
+}
+
+impl BoardsBuffer {
+    fn get(boards: &Bound<'_, PyAny>) -> PyResult<BoardsBuffer> {
+        let target = match PyBuffer::<i64>::get(boards) {
+            Ok(wide) => BoardsBuffer::Wide(wide),
+            Err(_) => BoardsBuffer::Bytes(PyBuffer::<u8>::get(boards)?),
+        };
+        let (readonly, contiguous) = match &target {
+            BoardsBuffer::Bytes(buffer) => (buffer.readonly(), buffer.is_c_contiguous()),
+            BoardsBuffer::Wide(buffer) => (buffer.readonly(), buffer.is_c_contiguous()),
+        };
+        if readonly || !contiguous {
+            return Err(PyValueError::new_err("the boards must go into one writable contiguous array"));
+        }
+        Ok(target)
+    }
+
+    //the boards it has room for
+    fn boards(&self) -> usize {
+        match self {
+            BoardsBuffer::Bytes(buffer) => buffer.item_count() / TOKENS_PER_BOARD,
+            BoardsBuffer::Wide(buffer) => buffer.item_count() / TOKENS_PER_BOARD,
+        }
+    }
+
+    fn write(&self, py: Python<'_>, tokens: &[u8]) -> PyResult<()> {
+        let unwritable = || PyValueError::new_err("the boards must go into one writable contiguous array");
+        match self {
+            BoardsBuffer::Bytes(buffer) => {
+                for (cell, &token) in buffer.as_mut_slice(py).ok_or_else(unwritable)?.iter().zip(tokens) {
+                    cell.set(token);
+                }
+            }
+            BoardsBuffer::Wide(buffer) => {
+                for (cell, &token) in buffer.as_mut_slice(py).ok_or_else(unwritable)?.iter().zip(tokens) {
+                    cell.set(i64::from(token));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 //the network's answers read without the gil: the caller leaves their array alone until finish returns
 struct Answers<'a>(&'a [ReadOnlyCell<f32>]);
 
@@ -424,6 +485,80 @@ impl<'a> Answers<'a> {
 impl Searches {
     fn lock(&self) -> PyResult<MutexGuard<'_, State>> {
         self.state.lock().map_err(|_| PyRuntimeError::new_err("a call to these searches panicked, which may have left them broken"))
+    }
+
+    //descend's round, its boards added to boards
+    fn descend_round(
+        &self,
+        state: &mut State,
+        leaves: u32,
+        collisions: u32,
+        simulations: Option<u32>,
+        round: Option<u64>,
+        boards: &mut Vec<u8>,
+    ) -> PyResult<()> {
+        if let Some(name) = round
+            && state.rounds.iter().any(|out| out.name == Some(name))
+        {
+            return Err(PyValueError::new_err(format!("round {name} is still waiting for its answers")));
+        }
+        let number = state.rounds_descended;
+        state.rounds_descended += 1;
+        let mut round_leaves = Vec::new();
+        for search in state.searches.iter_mut().filter(|search| !search.stopped) {
+            let limits = Round {
+                id: number,
+                leaves,
+                simulations: simulations.unwrap_or(leaves),
+                collisions,
+                visit_limit: search.simulations,
+                memory_limit: self.memory_limit,
+            };
+            let (tables, cache) = (self.tables.as_ref(), state.cache.as_ref());
+            let gathered = match &self.workers {
+                Some(workers) => {
+                    search.tree.gather_batch(&limits, &self.settings, tables, cache, boards, workers, u32::MAX, &mut state.batch_counts)
+                }
+                None => search.tree.gather(&limits, &self.settings, tables, cache, boards),
+            }
+            .map_err(tablebase_error)?;
+            if gathered > 0 {
+                round_leaves.push((search.id, gathered));
+            }
+        }
+        state.rounds.push_back(RoundOut { number, name: round, leaves: round_leaves });
+        Ok(())
+    }
+
+    //finish's round
+    fn finish_round(&self, state: &mut State, answers: &[ReadOnlyCell<f32>], round: Option<u64>) -> PyResult<Vec<SearchReport>> {
+        let index = match round {
+            None => (!state.rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers")),
+            Some(name) => state
+                .rounds
+                .iter()
+                .position(|out| out.name == Some(name))
+                .ok_or_else(|| PyRuntimeError::new_err(format!("round {name} is not waiting for its answers"))),
+        }?;
+        let boards = state.rounds[index].leaves.iter().map(|&(_, leaves)| leaves as usize).sum();
+        let answers = answers_for(answers, boards, self.answer_width)?;
+        let out = state.rounds.remove(index).expect("the round");
+        let index_of: HashMap<u64, usize> = state.searches.iter().enumerate().map(|(index, search)| (search.id, index)).collect();
+        let mut rows = answers.chunks_exact(self.answer_width);
+        for (id, leaves) in out.leaves {
+            let tree = &mut state.searches[index_of[&id]].tree;
+            for answer in rows.by_ref().take(leaves as usize) {
+                tree.finish_leaf(
+                    out.number,
+                    |column| answer[column].get(),
+                    self.answer_width,
+                    &self.move_ids,
+                    state.cache.as_mut(),
+                    &self.settings,
+                );
+            }
+        }
+        Ok(self.take_reports(state))
     }
 
     //removes the searches that are done, the reports of those that were searched
@@ -580,50 +715,45 @@ impl Searches {
         simulations: Option<u32>,
         round: Option<u64>,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let boards = py.detach(|| {
-            let mut guard = self.lock()?;
-            let state = &mut *guard;
-            if let Some(name) = round
-                && state.rounds.iter().any(|out| out.name == Some(name))
-            {
-                return Err(PyValueError::new_err(format!("round {name} is still waiting for its answers")));
-            }
-            let number = state.rounds_descended;
-            state.rounds_descended += 1;
+        let boards = py.detach(|| -> PyResult<Vec<u8>> {
             let mut boards = Vec::new();
-            let mut round_leaves = Vec::new();
-            for search in state.searches.iter_mut().filter(|search| !search.stopped) {
-                let limits = Round {
-                    id: number,
-                    leaves,
-                    simulations: simulations.unwrap_or(leaves),
-                    collisions,
-                    visit_limit: search.simulations,
-                    memory_limit: self.memory_limit,
-                };
-                let (tables, cache) = (self.tables.as_ref(), state.cache.as_ref());
-                let gathered = match &self.workers {
-                    Some(workers) => search.tree.gather_batch(
-                        &limits,
-                        &self.settings,
-                        tables,
-                        cache,
-                        &mut boards,
-                        workers,
-                        u32::MAX,
-                        &mut state.batch_counts,
-                    ),
-                    None => search.tree.gather(&limits, &self.settings, tables, cache, &mut boards),
-                }
-                .map_err(tablebase_error)?;
-                if gathered > 0 {
-                    round_leaves.push((search.id, gathered));
-                }
-            }
-            state.rounds.push_back(RoundOut { number, name: round, leaves: round_leaves });
+            self.descend_round(&mut *self.lock()?, leaves, collisions, simulations, round, &mut boards)?;
             Ok(boards)
         })?;
         Ok(PyBytes::new(py, &boards))
+    }
+
+    //descend with the boards written into `boards` (a writable array of bytes or int64s, such as a lane's pinned buffer,
+    //with room for `leaves` boards of every search running) rather than returned, and root_visits' numbers of search
+    //`root_of` after the round, so that a caller needs no call of its own for them: (the boards written, those numbers,
+    //None for no root_of or a search not running)
+    #[pyo3(signature = (boards, leaves=1, collisions=0, simulations=None, *, round=None, root_of=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn descend_into(
+        &self,
+        py: Python<'_>,
+        boards: &Bound<'_, PyAny>,
+        leaves: u32,
+        collisions: u32,
+        simulations: Option<u32>,
+        round: Option<u64>,
+        root_of: Option<u64>,
+    ) -> PyResult<(usize, Option<RootNumbers>)> {
+        let target = BoardsBuffer::get(boards)?;
+        let room = target.boards();
+        let (tokens, root) = py.detach(|| {
+            let mut guard = self.lock()?;
+            let state = &mut *guard;
+            let searching = state.searches.iter().filter(|search| !search.stopped).count();
+            if leaves as usize * searching > room {
+                return Err(PyValueError::new_err(format!("room for {room} boards, not {leaves} for each of {searching} searches")));
+            }
+            let mut tokens = Vec::new();
+            self.descend_round(state, leaves, collisions, simulations, round, &mut tokens)?;
+            Ok((tokens, root_of.and_then(|id| root_numbers(state, id))))
+        })?;
+        target.write(py, &tokens)?;
+        Ok((tokens.len() / TOKENS_PER_BOARD, root))
     }
 
     //finishes a round with the network's answers, the one descend named `round` or else the oldest, and returns the
@@ -631,38 +761,23 @@ impl Searches {
     #[pyo3(signature = (answers, round=None))]
     fn finish(&self, py: Python<'_>, answers: PyBuffer<f32>, round: Option<u64>) -> PyResult<Vec<SearchReport>> {
         let answers = Answers(answer_numbers(py, &answers)?);
+        py.detach(move || self.finish_round(&mut *self.lock()?, answers.numbers(), round))
+    }
+
+    //finish, with root_visits' numbers of search `root_of` after it as well (None once the search is done)
+    #[pyo3(signature = (answers, round=None, *, root_of))]
+    fn finish_with_root(
+        &self,
+        py: Python<'_>,
+        answers: PyBuffer<f32>,
+        round: Option<u64>,
+        root_of: u64,
+    ) -> PyResult<(Vec<SearchReport>, Option<RootNumbers>)> {
+        let answers = Answers(answer_numbers(py, &answers)?);
         py.detach(move || {
             let mut guard = self.lock()?;
-            let state = &mut *guard;
-            let index = match round {
-                None => {
-                    (!state.rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers"))
-                }
-                Some(name) => state
-                    .rounds
-                    .iter()
-                    .position(|out| out.name == Some(name))
-                    .ok_or_else(|| PyRuntimeError::new_err(format!("round {name} is not waiting for its answers"))),
-            }?;
-            let boards = state.rounds[index].leaves.iter().map(|&(_, leaves)| leaves as usize).sum();
-            let answers = answers_for(answers.numbers(), boards, self.answer_width)?;
-            let out = state.rounds.remove(index).expect("the round");
-            let index_of: HashMap<u64, usize> = state.searches.iter().enumerate().map(|(index, search)| (search.id, index)).collect();
-            let mut rows = answers.chunks_exact(self.answer_width);
-            for (id, leaves) in out.leaves {
-                let tree = &mut state.searches[index_of[&id]].tree;
-                for answer in rows.by_ref().take(leaves as usize) {
-                    tree.finish_leaf(
-                        out.number,
-                        |column| answer[column].get(),
-                        self.answer_width,
-                        &self.move_ids,
-                        state.cache.as_mut(),
-                        &self.settings,
-                    );
-                }
-            }
-            Ok(self.take_reports(state))
+            let reports = self.finish_round(&mut guard, answers.numbers(), round)?;
+            Ok((reports, root_numbers(&guard, root_of)))
         })
     }
 
@@ -684,14 +799,8 @@ impl Searches {
 
     //(the root's visits, the visits of its two most visited moves) of a running search, for smart pruning: the most
     //visited move is decided once the simulations left cannot close the gap
-    fn root_visits(&self, py: Python<'_>, id: u64) -> PyResult<(u32, u32, u32)> {
-        py.detach(|| {
-            let state = self.lock()?;
-            let search =
-                state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-            let (most, second) = search.tree.two_most_visits();
-            Ok((search.tree.root().visit_count, most, second))
-        })
+    fn root_visits(&self, py: Python<'_>, id: u64) -> PyResult<RootNumbers> {
+        py.detach(|| root_numbers(&*self.lock()?, id).ok_or_else(|| PyValueError::new_err(format!("no search {id}"))))
     }
 
     //the score a running search would report now (report's), for a clock that compares it with the last search's

@@ -98,6 +98,40 @@ def test_rounds_are_finished_by_name_in_any_order():
     assert found[0] == found[1] and found[0][0] == [8, 8, 8, 8] and found[0][2][4] == 300
 
 
+#descend_into writes descend's boards into an array of bytes or of int64s (a lane's) and gives root_visits' numbers after
+#the round; finish_with_root gives finish's reports and the numbers after it, None once the search is done
+@pytest.mark.parametrize("dtype", [np.uint8, np.int64])
+def test_descend_into_writes_descends_boards(dtype):
+    evaluate = cpu_batches(BoardModel()).evaluate_boards
+    plain, into = (selfplay_rs.Searches(**rust_search_settings(False), cache_positions=1000) for _ in range(2))
+    for searches in (plain, into):
+        searches.start(0, chess.STARTING_FEN, [], 600)
+    boards, reports, rounds = np.full((16, TOKENS_PER_BOARD), 99, dtype=dtype), [], 0
+    while not reports:
+        expected = leaf_boards(plain.descend(16, 16, 48))
+        written, root = into.descend_into(boards, 16, 16, 48, root_of=0)
+        assert written == len(expected) and (boards[:written] == expected).all() and root == into.root_visits(0) == plain.root_visits(0)
+        answers = evaluate(expected) if written else np.zeros((0, ANSWER_WIDTH), dtype=np.float32)
+        reports, root = into.finish_with_root(answers, root_of=0)
+        assert reports == plain.finish(answers)
+        assert root is None if reports else root == into.root_visits(0)
+        rounds += 1
+    assert rounds > 10 and reports[0][4] == 600
+
+
+#descend_into refuses an array without room for a round's boards, or one it cannot write, before it descends
+def test_descend_into_wants_room_to_write():
+    searches = selfplay_rs.Searches(**rust_search_settings(False))
+    searches.start(0, chess.STARTING_FEN, [], 600)
+    with pytest.raises(ValueError):
+        searches.descend_into(np.zeros((8, TOKENS_PER_BOARD), dtype=np.uint8), 16, 16, 48)
+    unwritable = np.zeros((16, TOKENS_PER_BOARD), dtype=np.uint8)
+    unwritable.flags.writeable = False
+    with pytest.raises((ValueError, BufferError)):
+        searches.descend_into(unwritable, 16, 16, 48)
+    assert searches.descend_into(np.zeros((16, TOKENS_PER_BOARD), dtype=np.uint8), 16, 16, 48, root_of=0) == (1, (0, 0, 0))
+
+
 #Searches' calls release the gil while they work, so that a thread driving another gpu runs meanwhile: a python thread
 #counts on through a long descend (a round of 400 searches), where it stood still while the call held the gil
 def test_searches_let_other_threads_run():
@@ -364,13 +398,13 @@ class CountingRounds:
     def __getattr__(self, name):
         return getattr(self.searches, name)
 
-    def descend(self, *arguments, **keywords):
-        boards = self.searches.descend(*arguments, **keywords)
-        if len(boards):
+    def descend_into(self, *arguments, **keywords):
+        written, root = self.searches.descend_into(*arguments, **keywords)
+        if written:
             self.with_leaves += 1
         else:
             self.empty += 1
-        return boards
+        return written, root
 
 
 #a network whose round finds no leaves, every descent ending on a leaf already out (all of a fresh tree's), waits for
@@ -720,12 +754,13 @@ class ScriptedSearches:
     def start(self, game, fen, moves, simulations):
         pass
 
-    def descend(self, count, collisions, simulations, round=None):
-        return bytes(TOKENS_PER_BOARD * count)
+    def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None):
+        boards[:count] = 0
+        return count, self.root
 
-    def finish(self, answers, round=None):
+    def finish_with_root(self, answers, round=None, root_of=None):
         self.finishes += 1
-        return [self.report()] if self.finishes == 30 and self.stopped_at is None else []
+        return [self.report()] if self.finishes == 30 and self.stopped_at is None else [], self.root
 
     def stop(self, game):
         self.stopped_at = time.perf_counter()
@@ -1479,9 +1514,10 @@ class CollisionsRecorded:
     def __init__(self, searches: selfplay_rs.Searches):
         self.searches, self.collisions = searches, []
 
-    def descend(self, leaves: int, collisions: int, simulations: int, round: int | None = None) -> bytes:
+    def descend_into(self, boards: np.ndarray, leaves: int, collisions: int, simulations: int, round: int | None = None,
+                     root_of: int | None = None) -> tuple:
         self.collisions.append(collisions)
-        return self.searches.descend(leaves, collisions, simulations, round=round)
+        return self.searches.descend_into(boards, leaves, collisions, simulations, round=round, root_of=root_of)
 
     def __getattr__(self, name: str):
         return getattr(self.searches, name)

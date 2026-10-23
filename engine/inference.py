@@ -98,6 +98,8 @@ class Lane:
         #recorded on real boards: zero boards once hit a device-side assert
         self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
         self.boards_host = torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, pin_memory=True)
+        #boards_host's memory as an array, which Searches.descend_into writes a round's boards into
+        self.boards_array = self.boards_host.numpy()
         self.answers_host = torch.zeros(largest, ANSWER_WIDTH, dtype=torch.float32, pin_memory=True)
         #recorded after each batch for GraphedBatches' blocking_wait
         self.done = torch.cuda.Event(blocking=True)
@@ -134,13 +136,21 @@ class GraphedBatches:
         self.blocking_wait = blocking_wait
 
     def launch(self, boards: np.ndarray) -> tuple[Lane, int, int]:
-        count = len(boards)
-        size = next(size for size in self.sizes if size >= count)
+        lane = self.free_lane()
+        lane.boards_host[:len(boards)] = torch.from_numpy(boards)
+        return self.launch_filled(lane, len(boards))
+
+    #the lane the next launch takes, whose boards_array a caller may fill for launch_filled
+    def free_lane(self) -> Lane:
         lane = next((lane for lane in self.lanes if not lane.pending), None)
         if lane is None:
             raise RuntimeError("more batches in flight than lanes")
+        return lane
+
+    #launch of the count boards already in free_lane's boards_array
+    def launch_filled(self, lane: Lane, count: int) -> tuple[Lane, int, int]:
+        size = next(size for size in self.sizes if size >= count)
         lane.pending = True
-        lane.boards_host[:count] = torch.from_numpy(boards)
         with torch.cuda.stream(lane.stream):
             lane.boards[:count].copy_(lane.boards_host[:count], non_blocking=True)
             lane.graphs[size].replay()

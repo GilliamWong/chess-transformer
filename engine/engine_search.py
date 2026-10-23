@@ -140,7 +140,8 @@ def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: st
 #or the search stops
 class SearchRun:
     def __init__(self, simulations: int | None, deadline: float | None, extension: tuple[int, float] | None, only_move: bool,
-                 told: threading.Event | None, info: Callable[[SearchReport], None] | None, next_info: float):
+                 told: threading.Event | None, info: Callable[[SearchReport], None] | None, next_info: float,
+                 root: tuple[int, int, int]):
         self.simulations, self.deadline, self.extension, self.only_move = simulations, deadline, extension, only_move
         self.told = told #set to stop the search (uci's stop)
         self.info, self.next_info = info, next_info #EngineSearch.search's, and when its next report is due
@@ -155,6 +156,13 @@ class SearchRun:
         self.next_round = 0 #the next round's name in Searches
         self.progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
         self.first_answers = None #when the search's first round came back
+        #Searches.root_visits' numbers as the newest descend or finish left them, so that no thread asks for them
+        self.root = root
+
+    #numbers a descend or finish gave (None once the search is done): visits only grow, so the most is the newest
+    def seen(self, root: tuple[int, int, int] | None) -> None:
+        if root is not None and root[0] >= self.root[0]:
+            self.root = root
 
     #the search stops gathering; its report, or None while its leaves are out (the finish of the last of them has it)
     def stop(self, report) -> None:
@@ -244,7 +252,7 @@ class EngineSearch:
         self.searches.start(GAME, board.root().fen(), [move.uci() for move in board.move_stack], UNLIMITED if simulations is None else simulations)
         deadline = started + seconds if seconds is not None else None
         run = SearchRun(simulations, deadline, extension if deadline is not None else None, board.legal_moves.count() == 1, stop, info,
-                        started + INFO_SECONDS)
+                        started + INFO_SECONDS, self.searches.root_visits(GAME))
         driven = [self.threads.submit(self.drive, network, run) for network in self.networks[1:]] if self.threads else []
         try:
             self.drive(self.networks[0], run)
@@ -276,10 +284,15 @@ class EngineSearch:
         #was launched)
         rounds: deque = deque()
         last_answers = None
+        #the root's numbers after this network's last descend, for run once its lock is held
+        seen = None
         #the rounds left once the report is in have no leaves, but Searches still expects their finish
         while True:
             name = None
             with run.changed:
+                if seen is not None:
+                    run.seen(seen)
+                    seen = None
                 while run.report is None and not run.stopping:
                     #the round gathered now would come back after those on the gpu: stop if that is past the deadline.
                     #Rounds on lanes of their own run at once and come back about together, so it comes a round time
@@ -295,7 +308,8 @@ class EngineSearch:
                             continue
                         run.stop(self.searches.stop(GAME))
                         break
-                    count, in_flight = self.round_leaves(run.simulations)
+                    visits = run.root[0]
+                    count, in_flight = self.round_leaves(run.simulations, visits)
                     blocked = run.starved == run.rounds_answered and run.rounds_out > len(rounds)
                     if run.rounds_out < in_flight and len(rounds) < self.rounds_in_flight and not blocked:
                         name, run.next_round = run.next_round, run.next_round + 1
@@ -310,14 +324,16 @@ class EngineSearch:
                 if name is None and not rounds:
                     return
             if name is not None:
-                #a bytearray: torch warns about arrays it cannot write to
-                collisions = self.round_collisions(count, run.simulations)
-                leaves = bytearray(self.searches.descend(count, collisions, SIMULATIONS_PER_LEAF * count, round=name))
-                boards = np.frombuffer(leaves, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
-                if not len(boards):
+                collisions = self.round_collisions(count, run.simulations, visits)
+                #the boards go straight into the lane's pinned buffer (GraphedBatches'), or else an array of their own
+                lane = network.free_lane() if hasattr(network, "free_lane") else None
+                boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.boards_array
+                written, seen = self.searches.descend_into(boards, count, collisions, SIMULATIONS_PER_LEAF * count, round=name, root_of=GAME)
+                if not written:
                     run.starved = answered
                 launched_at = time.perf_counter()
-                rounds.append((name, network.launch(boards) if len(boards) else None, launched_at))
+                launched = None if not written else network.launch(boards[:written]) if lane is None else network.launch_filled(lane, written)
+                rounds.append((name, launched, launched_at))
                 continue
 
             name, launched, launched_at = rounds.popleft()
@@ -325,7 +341,8 @@ class EngineSearch:
             answered = time.perf_counter()
             with run.changed:
                 #under the lock, so that no thread finds the search gone from Searches (done) before its report is in
-                reports = self.searches.finish(answers, round=name)
+                reports, root = self.searches.finish_with_root(answers, round=name, root_of=GAME)
+                run.seen(root)
                 run.rounds_out -= 1
                 if launched is not None:
                     run.rounds_answered += 1
@@ -342,7 +359,7 @@ class EngineSearch:
                     run.report = reports[0]
                 #a round without leaves counts too: all its simulations may have ended the game (a mate found)
                 elif run.report is None and self.smart_pruning and not run.stopping:
-                    visits, most, second = self.searches.root_visits(GAME)
+                    visits, most, second = run.root
                     now = time.perf_counter()
                     run.progress.append((now, visits))
                     run.first_answers = now if run.first_answers is None else run.first_answers
@@ -369,12 +386,12 @@ class EngineSearch:
         return share * seconds
 
     #the next round's leaves, and the rounds out at once over all the networks: one until a round takes all of them, and
-    #with a cap (visits_per_leaf_out) as many as the root's visits allow, one at least
-    def round_leaves(self, simulations: int | None) -> tuple[int, int]:
+    #with a cap (visits_per_leaf_out) as many as the root's visits allow, one at least. visits: the root's, if known
+    def round_leaves(self, simulations: int | None, visits: int | None = None) -> tuple[int, int]:
         count, rounds = self.leaves, self.rounds_in_flight * len(self.networks)
         if not self.grow_leaves and not self.visits_per_leaf_out:
             return count, rounds
-        visits = self.searches.root_visits(GAME)[0]
+        visits = self.searches.root_visits(GAME)[0] if visits is None else visits
         if self.grow_leaves:
             done_or_left = visits if simulations is None else min(visits, simulations - visits)
             count = max(1, min(self.leaves, done_or_left // self.grow_leaves))
@@ -384,11 +401,11 @@ class EngineSearch:
         return count, rounds
 
     #the collisions a round of count leaves may have: collision_cap's, COLLISIONS' at most its leaves, or with
-    #collision_scaling lc0's CalculateCollisionsLeft
-    def round_collisions(self, count: int, simulations: int | None) -> int:
+    #collision_scaling lc0's CalculateCollisionsLeft. visits: the root's, if known
+    def round_collisions(self, count: int, simulations: int | None, visits: int | None = None) -> int:
         if not self.collision_scaling:
             return self.collision_cap or min(self.collisions, count)
-        visits = self.searches.root_visits(GAME)[0]
+        visits = self.searches.root_visits(GAME)[0] if visits is None else visits
         done_or_left = visits if simulations is None else min(visits, simulations - visits)
         if done_or_left <= COLLISION_SCALING_START:
             collisions = 1

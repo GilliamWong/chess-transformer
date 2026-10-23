@@ -10,8 +10,11 @@ import torch
 import torch.nn.functional as F
 
 from model.encoding import EN_PASSANT_TOKEN_OFFSET, NUM_SQUARES, TOKENS_PER_BOARD, encode_board
+import selfplay_rs
 from engine import inference
-from engine.inference import ExactSizeCompiled, GraphedBatches, answer_rows, fp16_model, graph_sizes, small_graph_sizes
+from engine.inference import ExactSizeCompiled, GraphedBatches, answer_rows, cpu_batches, fp16_model, graph_sizes, small_graph_sizes
+from engine.selfplay import rust_search_settings
+from fake_models import BoardModel
 from model.model import VALUE_BINS, ChessTransformer, expected_score
 from tools.checkpoint import save_checkpoint
 from engine.player import CudaGraphModel
@@ -173,6 +176,25 @@ def test_blocking_wait_sleeps_through_the_batch():
 
     assert np.array_equal(answers, expected)
     assert waited > 0.05 and cpu < 0.25 * waited
+
+
+#boards a search wrote into the free lane's boards_array (Searches.descend_into) answer as launch's copy of them does, on
+#either lane
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_boards_written_into_the_lane_answer_as_launched():
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    searches = selfplay_rs.Searches(**rust_search_settings(False))
+    searches.start(0, chess.STARTING_FEN, [], 100)
+    searches.finish(cpu_batches(BoardModel()).evaluate_boards(np.frombuffer(searches.descend(), dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)))
+    copied, written = GraphedBatches(model, [8, 16], in_flight=2), GraphedBatches(model, [8, 16], in_flight=2)
+    for _ in range(2):
+        boards = np.frombuffer(searches.descend(12, 12, 36), dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
+        lane = written.free_lane()
+        lane.boards_array[:len(boards)] = boards
+        expected = copied.collect(copied.launch(boards)).copy()
+        answers = written.collect(written.launch_filled(lane, len(boards)))
+        assert len(boards) == 12 and np.array_equal(answers, expected)
+        searches.finish(expected)
 
 
 #two batches out at once in two lanes come back with the bits each gets alone: lanes recorded on one stream into one
