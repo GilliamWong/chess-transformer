@@ -15,7 +15,8 @@ import torch
 from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
-from engine.engine_search import ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS, EngineSearch, engine_network, engine_search_settings, parse_changes
+from engine.engine_search import (ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, EngineSearch, engine_network,
+                                  engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES
@@ -277,6 +278,12 @@ if __name__ == "__main__":
                         help="for --select mcts --gpu: about one leaf a round per this many simulations done or left, up to --leaves; 0 for --leaves every round")
     parser.add_argument("--no-smart-pruning", dest="smart_pruning", action="store_false",
                         help="for --select mcts --gpu: search all of go's movetime or nodes even once the move is decided (lc0's SmartPruningFactor=0)")
+    parser.add_argument("--smart-pruning-factor", type=float, default=SMART_PRUNING_FACTOR,
+                        help="for --select mcts --gpu: smart pruning stops once the most visited move leads by more than the simulations left / "
+                             "this, default %(default)s; lc0's 1.33 bets that the second move cannot get all of them")
+    parser.add_argument("--smart-pruning-wait", type=float, default=SMART_PRUNING_WAIT,
+                        help="for --select mcts --gpu: no smart pruning stop on the visits until this many seconds after a search's first answers, "
+                             "default %(default)s; lc0's 0.2")
     parser.add_argument("--first-move-bonus", type=float, default=FIRST_MOVE_BONUS,
                         help="for --select mcts on a clock: the game's first search gets 1 + this + --book-ply-bonus x its ply (at most "
                              f"{MOST_BOOK_PLIES}) times its share, default %(default)s; lc0's 1.8")
@@ -288,6 +295,8 @@ if __name__ == "__main__":
         parser.error("--tablebase-pieces needs --tablebase")
     if arguments.precision is not None and not (arguments.select == "mcts" and arguments.gpu):
         parser.error("--precision needs --select mcts --gpu")
+    if arguments.smart_pruning_factor <= 0:
+        parser.error("--smart-pruning-factor is positive; --no-smart-pruning for none")
     if arguments.checkpoint == "random":
         main(random_mover=True)
     else:
@@ -296,5 +305,6 @@ if __name__ == "__main__":
              simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
              search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION,
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
-                             "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase))},
+                             "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
+                             "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait},
              clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

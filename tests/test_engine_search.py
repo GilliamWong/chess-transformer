@@ -463,6 +463,75 @@ def test_pruning_never_changes_the_move(carlsen_games):
     assert len(positions) > 20 and stopped_early > 5
 
 
+#Searches as smart pruning sees them, scripted: after every round the root has `visits`, its two most visited moves
+#`most` and `second`, and is proven or not; the search is done after 30 rounds unless stopped first, when it notes the
+#time
+class ScriptedSearches:
+    def __init__(self, visits: int, most: int, second: int, proven: bool = False):
+        self.root, self.proven = (visits, most, second), proven
+        self.finishes, self.stopped_at = 0, None
+
+    def start(self, game, fen, moves, simulations):
+        pass
+
+    def descend(self, count, collisions, simulations):
+        return bytes(TOKENS_PER_BOARD * count)
+
+    def finish(self, answers):
+        self.finishes += 1
+        return [self.report()] if self.finishes == 30 and self.stopped_at is None else []
+
+    def stop(self, game):
+        self.stopped_at = time.perf_counter()
+        return self.report()
+
+    def root_visits(self, game):
+        return self.root
+
+    def decided(self, game):
+        return self.proven
+
+    def report(self):
+        return engine_search.GAME, ["a1a2"], 0.5, [], self.root[0]
+
+
+#lc0's factor 1.33: a search of 1,000 simulations with 600 done stops once the most visited move leads by more than
+#400 / 1.33 = 300.75, where 1 waits for a lead of more than 400
+@pytest.mark.parametrize("factor, lead, stops", [(1.0, 400, False), (1.0, 401, True), (1.33, 300, False), (1.33, 301, True)])
+def test_smart_prunings_factor(factor, lead, stops):
+    search = EngineSearch(ImmediateBatches(answers_of_0_6), 16, grow_leaves=0, smart_pruning_factor=factor)
+    search.searches = ScriptedSearches(600, 500, 500 - lead)
+    search.search(chess.Board(), simulations=1000)
+    assert (search.searches.stopped_at is not None) == stops
+
+
+#a network whose every round takes 1/16 s of the test's clock
+class SixteenthsNetwork:
+    def __init__(self, now: list[float]):
+        self.now = now
+
+    def launch(self, boards: np.ndarray) -> np.ndarray:
+        return boards
+
+    def collect(self, boards: np.ndarray) -> np.ndarray:
+        self.now[0] += 1 / 16
+        return answers_of_0_6(boards)
+
+
+#smart pruning stops a decided search no sooner than smart_pruning_wait after its first answers, at the first round
+#since (lc0's 0.2 s; 0.25 is a round exactly); one legal move and a proven root stop at the first answers all the same
+@pytest.mark.parametrize("fen, proven, wait, stopped_at", [
+    (chess.STARTING_FEN, False, 0.0, 1 / 16), (chess.STARTING_FEN, False, 0.2, 5 / 16), (chess.STARTING_FEN, False, 0.25, 5 / 16),
+    (chess.STARTING_FEN, True, 0.2, 1 / 16), ("k7/8/8/8/8/8/r7/K1q5 w - - 0 1", False, 0.2, 1 / 16)])
+def test_smart_pruning_waits_after_the_first_answers(monkeypatch, fen, proven, wait, stopped_at):
+    now = [0.0]
+    monkeypatch.setattr(engine_search.time, "perf_counter", lambda: now[0])
+    search = EngineSearch(SixteenthsNetwork(now), 16, grow_leaves=0, smart_pruning_wait=wait, settings={"certainty": True})
+    search.searches = ScriptedSearches(600, 600, 0, proven)
+    search.search(chess.Board(fen), simulations=1000)
+    assert search.searches.stopped_at == stopped_at
+
+
 #uci.py's --search-settings reach the search: the same search of the same network finds another line and score with
 #c_puct 0.1 than with 10
 def test_the_engine_takes_search_settings(tmp_path):
@@ -507,24 +576,29 @@ def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
     assert built == ["int8"]
 
 
-#uci.py's --first-move-bonus and --book-ply-bonus reach the clock: each game's first move gets the bonus, no other
+#uci.py's lc0 time options reach the clock and the search: the first move bonus on each game's first move, smart
+#pruning's factor and wait; a factor of 0 or less is refused
 @pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
 def test_the_engine_takes_lc0s_time_options(monkeypatch):
     given = []
     def search(self, board, nodes, seconds, extension):
-        given.append(seconds)
+        given.append((seconds, self.smart_pruning_factor, self.smart_pruning_wait))
         return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision: cpu_batches(BoardModel()))
     monkeypatch.setattr(EngineSearch, "search", search)
     go = "go " + " ".join(CLOCK_60)
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(["isready", "position startpos", go, "position startpos moves e2e4 e7e5", go,
                                                                "ucinewgame", "position startpos", go, "quit"])))
-    options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25"]
+    options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25", "--smart-pruning-factor", "1.33", "--smart-pruning-wait", "0.2"]
     monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *options])
     runpy.run_module("engine.uci", run_name="__main__")
 
     first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
-    assert given[0] == first and given[1] != first and given[2] == given[0]
+    assert given[0] == (first, 1.33, 0.2) and given[1][0] != first and given[2] == given[0]
+    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", "--smart-pruning-factor", "0"])
+    with pytest.raises(SystemExit) as refused:
+        runpy.run_module("engine.uci", run_name="__main__")
+    assert refused.value.code == 2
 
 
 #the engine as a gui drives it: a move within go movetime, go nodes' simulations (in a new game: a kept tree's visits
