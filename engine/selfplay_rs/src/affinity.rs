@@ -1,12 +1,16 @@
 //the logical cpus as the os numbers them (core_affinity's ids), grouped as the hardware shares them: by L3 cache (a ccd
 //on zen) and by physical core (smt siblings); and a thread pinned to one of them
 use core_affinity::CoreId;
+use std::path::Path;
 use std::sync::OnceLock;
 
 pub struct Topology {
     pub l3s: Vec<(u64, Vec<usize>)>, //each L3's bytes and cpus
     pub cores: Vec<Vec<usize>>,      //each physical core's cpus
 }
+
+//the os's L3s (bytes, cpus) and physical cores as it lists them, cpus the process may not run on among them
+type Groups = (Vec<(u64, Vec<usize>)>, Vec<Vec<usize>>);
 
 //the cpus the process may run on, read once before any pin: on linux they are the calling thread's own
 pub fn allowed() -> &'static [usize] {
@@ -21,8 +25,10 @@ pub fn pin_current(cpu: usize) -> bool {
 
 //the groups of allowed()'s cpus, each by its lowest cpu; None where the os does not say
 pub fn topology() -> Option<Topology> {
-    let (l3s, cores) = os::groups()?;
-    let allowed = allowed();
+    grouped(os::groups()?, allowed())
+}
+
+fn grouped((l3s, cores): Groups, allowed: &[usize]) -> Option<Topology> {
     let kept = |cpus: Vec<usize>| -> Vec<usize> {
         let mut kept: Vec<usize> = cpus.into_iter().filter(|cpu| allowed.contains(cpu)).collect();
         kept.sort_unstable();
@@ -60,6 +66,25 @@ pub fn cache_bytes(text: &str) -> Option<u64> {
         _ => return None,
     };
     Some(number.parse::<u64>().ok()? * scale)
+}
+
+//the groups sysfs's cpu folder (linux's /sys/devices/system/cpu) gives these cpus: their cores' smt siblings
+//(topology/thread_siblings_list) and their L3s (the cache/index* of level 3)
+pub fn sysfs_groups(folder: &Path, cpus: &[usize]) -> Option<Groups> {
+    let read = |path: &Path| std::fs::read_to_string(path).ok();
+    let (mut l3s, mut cores) = (Vec::new(), Vec::new());
+    for &cpu in cpus {
+        let folder = folder.join(format!("cpu{cpu}"));
+        cores.push(cpu_list(&read(&folder.join("topology/thread_siblings_list"))?)?);
+        for index in 0.. {
+            let cache = folder.join(format!("cache/index{index}"));
+            let Some(level) = read(&cache.join("level")) else { break };
+            if level.trim() == "3" {
+                l3s.push((cache_bytes(&read(&cache.join("size"))?)?, cpu_list(&read(&cache.join("shared_cpu_list"))?)?));
+            }
+        }
+    }
+    Some((l3s, cores))
 }
 
 #[cfg(windows)]
@@ -101,7 +126,7 @@ mod os {
         Some(if group == 0 { (0..64).filter(|cpu| mask >> cpu & 1 == 1).collect() } else { Vec::new() })
     }
 
-    pub fn groups() -> Option<(Vec<(u64, Vec<usize>)>, Vec<Vec<usize>>)> {
+    pub fn groups() -> Option<super::Groups> {
         //PROCESSOR_RELATIONSHIP: Flags, EfficiencyClass, Reserved[20], GroupCount, then its GROUP_AFFINITY at 24
         let cores = records(RELATION_PROCESSOR_CORE)?.iter().map(|body| group_cpus(body, 24)).collect::<Option<_>>()?;
         //CACHE_RELATIONSHIP: Level, Associativity, LineSize, CacheSize (u32 at 4), Type, Reserved[18], GroupCount, then
@@ -117,33 +142,14 @@ mod os {
 
 #[cfg(target_os = "linux")]
 mod os {
-    use std::fs;
-
-    fn read(path: &str) -> Option<String> {
-        fs::read_to_string(path).ok()
-    }
-
-    pub fn groups() -> Option<(Vec<(u64, Vec<usize>)>, Vec<Vec<usize>>)> {
-        let (mut l3s, mut cores) = (Vec::new(), Vec::new());
-        for &cpu in super::allowed() {
-            let folder = format!("/sys/devices/system/cpu/cpu{cpu}");
-            cores.push(super::cpu_list(&read(&format!("{folder}/topology/thread_siblings_list"))?)?);
-            for index in 0.. {
-                let cache = format!("{folder}/cache/index{index}");
-                let Some(level) = read(&format!("{cache}/level")) else { break };
-                if level.trim() == "3" {
-                    let bytes = super::cache_bytes(&read(&format!("{cache}/size"))?)?;
-                    l3s.push((bytes, super::cpu_list(&read(&format!("{cache}/shared_cpu_list"))?)?));
-                }
-            }
-        }
-        Some((l3s, cores))
+    pub fn groups() -> Option<super::Groups> {
+        super::sysfs_groups(std::path::Path::new("/sys/devices/system/cpu"), super::allowed())
     }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod os {
-    pub fn groups() -> Option<(Vec<(u64, Vec<usize>)>, Vec<Vec<usize>>)> {
+    pub fn groups() -> Option<super::Groups> {
         None
     }
 }
@@ -183,6 +189,53 @@ mod tests {
         assert_eq!(cache_bytes("32768K\n"), Some(32 << 20));
         assert_eq!(cache_bytes("96M"), Some(96 << 20));
         assert_eq!(cache_bytes("12Q"), None);
+    }
+
+    //a cpu's folder of a fake sysfs: its smt siblings, its L1s and L2 with them, and its L3 (size, shared_cpu_list)
+    fn write_cpu(root: &Path, cpu: usize, siblings: &str, (l3_size, l3_cpus): (&str, &str)) {
+        let folder = root.join(format!("cpu{cpu}"));
+        std::fs::create_dir_all(folder.join("topology")).expect("the fake sysfs");
+        std::fs::write(folder.join("topology/thread_siblings_list"), format!("{siblings}\n")).expect("the fake sysfs");
+        let caches = [(0, 1, "48K", siblings), (1, 1, "32K", siblings), (2, 2, "1024K", siblings), (3, 3, l3_size, l3_cpus)];
+        for (index, level, size, shared) in caches {
+            let cache = folder.join(format!("cache/index{index}"));
+            std::fs::create_dir_all(&cache).expect("the fake sysfs");
+            for (name, text) in [("level", level.to_string()), ("size", size.to_string()), ("shared_cpu_list", shared.to_string())] {
+                std::fs::write(cache.join(name), format!("{text}\n")).expect("the fake sysfs");
+            }
+        }
+    }
+
+    //sysfs as linux gives a 2 x EPYC 9175F (a core's siblings k and k + 32, one 32 MB L3 a core) to a process held to
+    //socket 0 (numactl --cpunodebind=0), and this 9950X3D (siblings k and k + 16, ccds 0-7 and 8-15); without the
+    //caches' folders there is no topology
+    #[test]
+    fn sysfs_gives_the_topology() {
+        let root = std::env::temp_dir().join(format!("selfplay_rs_sysfs_{}", std::process::id()));
+        let epyc = root.join("epyc");
+        for cpu in 0..64 {
+            let pair = format!("{},{}", cpu % 32, cpu % 32 + 32);
+            write_cpu(&epyc, cpu, &pair, ("32768K", &pair));
+        }
+        let socket: Vec<usize> = (0..16).chain(32..48).collect();
+        let topology = grouped(sysfs_groups(&epyc, &socket).expect("the fake sysfs"), &socket).expect("a topology");
+        assert_eq!(topology.cores, (0..16).map(|core| vec![core, core + 32]).collect::<Vec<_>>());
+        assert_eq!(topology.l3s, (0..16).map(|core| (32 << 20, vec![core, core + 32])).collect::<Vec<_>>());
+        let zen = root.join("zen");
+        for cpu in 0..32 {
+            let ccd = if cpu % 16 < 8 { ("98304K", "0-7,16-23") } else { ("32768K", "8-15,24-31") };
+            write_cpu(&zen, cpu, &format!("{},{}", cpu % 16, cpu % 16 + 16), ccd);
+        }
+        let all: Vec<usize> = (0..32).collect();
+        let topology = grouped(sysfs_groups(&zen, &all).expect("the fake sysfs"), &all).expect("a topology");
+        let ccd = |halves: [std::ops::Range<usize>; 2]| halves.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(topology.l3s, vec![(96 << 20, ccd([0..8, 16..24])), (32 << 20, ccd([8..16, 24..32]))]);
+        assert_eq!(topology.cores, (0..16).map(|core| vec![core, core + 16]).collect::<Vec<_>>());
+        for cpu in 0..32 {
+            std::fs::remove_dir_all(zen.join(format!("cpu{cpu}/cache"))).expect("the fake sysfs");
+        }
+        assert!(sysfs_groups(&zen, &all).and_then(|groups| grouped(groups, &all)).is_none());
+        std::fs::remove_dir_all(&root).expect("the fake sysfs");
     }
 
     //every cpu the process may run on is in one physical core and one L3, and a core's cpus share its L3
