@@ -324,7 +324,7 @@ def test_the_weights_without_fp16_blocks_are_cached_by_their_count(tmp_path, sma
 @gpu
 @pytest.mark.parametrize("outlier", [2, 3])
 def test_the_block_whose_int8_costs_most_stays_in_fp16(tmp_path, small_calibration, outlier):
-    from engine.inference import int8_model
+    from engine.inference import answer_rows, int8_model
     model, boards = outlier_checkpoint(tmp_path, outlier)
     boards = boards.cuda()
     flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
@@ -332,8 +332,8 @@ def test_the_block_whose_int8_costs_most_stays_in_fp16(tmp_path, small_calibrati
         errors = quantization.block_errors(tmp_path / "model.pt", quantization.int8_weights(tmp_path / "model.pt", 0))
         with torch.no_grad():
             expected_logits, _ = model.cuda()(boards)
-            kept_logits, _ = int8_model(tmp_path / "model.pt", 1)(boards)
-            all_int8_logits, _ = int8_model(tmp_path / "model.pt", 0)(boards)
+            kept_logits = answer_rows(int8_model(tmp_path / "model.pt", 1)(boards))[:, :-1]
+            all_int8_logits = answer_rows(int8_model(tmp_path / "model.pt", 0)(boards))[:, :-1]
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
@@ -349,7 +349,7 @@ def test_the_block_whose_int8_costs_most_stays_in_fp16(tmp_path, small_calibrati
 @gpu
 def test_fp16_blocks_between_int8_blocks_compute_as_the_fp16_models(tmp_path, small_calibration):
     from torch import nn
-    from engine.inference import fp16_model, int8_model
+    from engine.inference import answer_rows, fp16_model, int8_model
     from model.fused_blocks import FusedBlock
     from model.int8_blocks import Int8Block
     _, boards = outlier_checkpoint(tmp_path, 2)
@@ -358,15 +358,15 @@ def test_fp16_blocks_between_int8_blocks_compute_as_the_fp16_models(tmp_path, sm
     try:
         with torch.no_grad():
             kept = int8_model(tmp_path / "model.pt", 1)
-            answers = kept(boards)
+            answers = answer_rows(kept(boards))
             all_int8, one_by_one = int8_model(tmp_path / "model.pt", 0), fp16_model(tmp_path / "model.pt")
             blocks = [one_by_one.encoder[layer] if layer in (2, 4) else all_int8.encoder[layer] for layer in range(5)]
             for block in blocks:
                 block.next_scales, block.input_mixed = None, False
             one_by_one.encoder = nn.ModuleList(blocks)
-            expected = one_by_one(boards)
+            expected = answer_rows(one_by_one(boards))
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
     assert [type(block) for block in kept.encoder] == [Int8Block, Int8Block, FusedBlock, Int8Block, FusedBlock]
-    assert all(torch.equal(found, wanted) for found, wanted in zip(answers, expected))
+    assert torch.equal(answers, expected)
