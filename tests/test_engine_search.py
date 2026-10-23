@@ -1507,3 +1507,28 @@ def test_a_collision_cap_lets_rounds_collide_more():
     #collisions per leaf for the network
     (_, counts), (_, capped) = recorded[0], recorded[1000]
     assert capped[7] / capped[4] > counts[7] / counts[4]
+
+
+#with collision_scaling a round's collisions follow lc0's CalculateCollisionsLeft on the visits done or left (the
+#fewer), at most collision_cap's; without, collision_cap's or COLLISIONS' at most the round's leaves
+@pytest.mark.parametrize("scaling, cap, visits, simulations, expected", [
+    (False, 0, 1000, None, 40), (False, 300, 1000, None, 300), (True, 0, 28, None, 1), (True, 0, 1000, None, 154),
+    (True, 0, 10_000, None, 2819), (True, 0, 145_000, None, 80_000), (True, 1024, 10_000, None, 1024), (True, 0, 10_000, 10_100, 6)])
+def test_the_collisions_of_a_round(scaling, cap, visits, simulations, expected):
+    class Searches:
+        def root_visits(self, game):
+            return visits, 0, 0
+    search = EngineSearch(cpu_batches(BoardModel()), 64, collision_cap=cap, collision_scaling=scaling)
+    search.searches = Searches()
+
+    assert search.round_collisions(40, simulations) == expected
+
+
+#a search with collision_scaling gives its rounds few collisions while the tree is small and more as it grows
+def test_collision_scaling_grows_the_collisions_with_the_tree():
+    search = EngineSearch(cpu_batches(PeakedModel()), 64, smart_pruning=False, collision_scaling=True, gather_workers=1)
+    search.searches = CollisionsRecorded(search.searches)
+
+    assert search.search(chess.Board(), simulations=6000).simulations == 6000
+    collisions = search.searches.collisions
+    assert collisions[0] == 1 and max(collisions) > 64

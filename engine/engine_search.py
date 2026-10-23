@@ -30,6 +30,11 @@ LEAVES = 64
 COLLISIONS = 64
 #a round's collisions as they are, not COLLISIONS and at most its leaves, 0 for those
 COLLISION_CAP = 0
+#with collision_scaling a round's collisions grow with the visits done or left (the fewer) as lc0's do: 1 up to the
+#start, MAX_COLLISION_VISITS from the end, along the power between; at most COLLISION_CAP's if it is set
+COLLISION_SCALING = False
+COLLISION_SCALING_START, COLLISION_SCALING_END, COLLISION_SCALING_POWER = 28, 145_000, 1.25
+MAX_COLLISION_VISITS = 80_000
 #rounds gathered by search/batch.rs gather_batch on this many threads (a different search), 0 for gather; they spin
 #this long for the next round before they sleep
 GATHER_WORKERS = 0
@@ -173,7 +178,8 @@ class EngineSearch:
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT,
-                 collision_cap: int = COLLISION_CAP, gather_workers: int = GATHER_WORKERS, gather_spin_us: int = GATHER_SPIN_US):
+                 collision_cap: int = COLLISION_CAP, gather_workers: int = GATHER_WORKERS, gather_spin_us: int = GATHER_SPIN_US,
+                 collision_scaling: bool = COLLISION_SCALING):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched = leaves > 1
@@ -182,6 +188,7 @@ class EngineSearch:
         self.round_simulations = SIMULATIONS_PER_LEAF * leaves
         self.collisions = COLLISIONS if batched else 0
         self.collision_cap = collision_cap if batched else 0
+        self.collision_scaling = batched and collision_scaling
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1 #on each network
         self.grow_leaves = grow_leaves if batched else 0
         self.visits_per_leaf_out = visits_per_leaf_out if batched else 0
@@ -304,7 +311,7 @@ class EngineSearch:
                     return
             if name is not None:
                 #a bytearray: torch warns about arrays it cannot write to
-                collisions = self.collision_cap or min(self.collisions, count)
+                collisions = self.round_collisions(count, run.simulations)
                 leaves = bytearray(self.searches.descend(count, collisions, SIMULATIONS_PER_LEAF * count, round=name))
                 boards = np.frombuffer(leaves, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
                 if not len(boards):
@@ -375,6 +382,22 @@ class EngineSearch:
         if self.visits_per_leaf_out:
             rounds = max(1, min(rounds, visits // (self.visits_per_leaf_out * count)))
         return count, rounds
+
+    #the collisions a round of count leaves may have: collision_cap's, COLLISIONS' at most its leaves, or with
+    #collision_scaling lc0's CalculateCollisionsLeft
+    def round_collisions(self, count: int, simulations: int | None) -> int:
+        if not self.collision_scaling:
+            return self.collision_cap or min(self.collisions, count)
+        visits = self.searches.root_visits(GAME)[0]
+        done_or_left = visits if simulations is None else min(visits, simulations - visits)
+        if done_or_left <= COLLISION_SCALING_START:
+            collisions = 1
+        elif done_or_left >= COLLISION_SCALING_END:
+            collisions = MAX_COLLISION_VISITS
+        else:
+            share = (done_or_left - COLLISION_SCALING_START) / (COLLISION_SCALING_END - COLLISION_SCALING_START)
+            collisions = int(1 + (MAX_COLLISION_VISITS - 1) * share ** COLLISION_SCALING_POWER)
+        return min(collisions, self.collision_cap) if self.collision_cap else collisions
 
     #the simulations the search has left: those waiting for the network count as left, so a move is only decided if
     #they could not change it either. With a deadline, the time left at the speed of the last rounds
