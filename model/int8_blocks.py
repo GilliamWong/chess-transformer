@@ -9,6 +9,7 @@ from triton.language.extra import libdevice
 
 from model.fused_blocks import (GROUP_M, FusedBlock, dependent_launch, dependent_launch_wait, linear, linear_epilogue, link_input_mixes,
                                 template_attention, tile_for)
+from model.int8_cuda import small_int8_linear
 
 #the mlp's hidden is rotated in blocks of this many to spread its outlier channels, down's weights to match (H H^T = 32 I)
 HADAMARD_BLOCK = 32
@@ -135,11 +136,14 @@ def launch_int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Ten
 
 #an opaque op for torch.compile, as fused_blocks.linear; gives fp16. matmul names its INT8_TILES (projection, gate_up
 #or down). With original (the input embedding) and the next block's residual_scale and input_scale it gives the next
-#block's input (linear_epilogue)
+#block's input (linear_epilogue). A small batch on a gpu int8_cuda was timed on takes its CUDA kernel instead (the same
+#bits)
 @torch.library.custom_op("chess::int8_linear", mutates_args=())
 def int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias: torch.Tensor | None,
                 residual: torch.Tensor | None, gated: bool, matmul: str, original: torch.Tensor | None = None,
                 residual_scale: torch.Tensor | None = None, input_scale: torch.Tensor | None = None) -> torch.Tensor:
+    if (small := small_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, original, residual_scale, input_scale)) is not None:
+        return small
     tile = int8_tile(x.device, matmul, x.numel() // weight.shape[1])
     return launch_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, original, residual_scale, input_scale, tile)
 
