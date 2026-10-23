@@ -444,6 +444,73 @@ def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):
     assert abs(answers - expected).max() < 0.05
 
 
+#a network's answers to boards at each of its graph sizes on each of its lanes, a lean lane's for some columns
+def answers_by_lane_and_size(network, boards: np.ndarray) -> list[np.ndarray]:
+    from engine.selfplay import ANSWER_WIDTH
+    from model.encoding import TOKENS_PER_BOARD
+    from selfplay_rs import LEAN_COLUMNS
+    columns = np.random.default_rng(0).integers(0, ANSWER_WIDTH, size=(len(boards), LEAN_COLUMNS)).astype("<u2")
+    answers = []
+    for lane in network.lanes:
+        for size in network.sizes:
+            if lane.lean:
+                lane.rows_array[:size, :TOKENS_PER_BOARD] = boards[:size]
+                lane.rows_array[:size, TOKENS_PER_BOARD:] = columns[:size].view(np.uint8)
+            else:
+                lane.boards_array[:size] = boards[:size]
+            answers.append(network.collect(network.launch_filled(lane, size)).copy())
+    return answers
+
+
+#a network's lanes after its first record their graphs without warming the model up, its first's warmup having compiled
+#and loaded every kernel: the engine's network answers to the bit as with every lane warmed up, at every size on both lanes
+@gpu
+@pytest.mark.parametrize("lean", [False, True])
+def test_later_lanes_answer_as_warmed_up_lanes(tmp_path, small_calibration, monkeypatch, lean):
+    from engine import inference
+    from engine.engine_search import engine_network
+    _, boards = small_checkpoint(tmp_path)
+    boards = np.resize(boards.numpy().astype("uint8"), (8, boards.shape[1]))
+    lane = inference.Lane
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        found = answers_by_lane_and_size(engine_network(tmp_path / "model.pt", 8, "int8", lean=lean), boards)
+        monkeypatch.setattr(inference, "Lane", lambda model, sizes, chunk, lean, warm_up: lane(model, sizes, chunk, lean, warm_up=True))
+        expected = answers_by_lane_and_size(engine_network(tmp_path / "model.pt", 8, "int8", lean=lean), boards)
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert len(found) == len(expected) > 2 and all(np.array_equal(answer, expected_answer) for answer, expected_answer in zip(found, expected))
+
+
+#the engine's compile traces its network once a size: with its floats (the norms' eps) symbols, dynamo traced the whole
+#network, made them constants and traced it again
+@gpu
+def test_the_engines_compile_traces_each_size_once(tmp_path, small_calibration):
+    import logging
+    from engine.inference import ExactSizeCompiled, int8_model
+    _, boards = small_checkpoint(tmp_path)
+    log, messages = logging.getLogger("torch._dynamo.convert_frame"), []
+    handler, level = logging.Handler(), log.level
+    handler.emit = lambda record: messages.append(record.getMessage())
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        #a fresh start: dynamo keeps the floats it made constant for the rest of the process
+        torch._dynamo.reset()
+        model = ExactSizeCompiled(int8_model(tmp_path / "model.pt", 1), 4)
+        with torch.no_grad():
+            for size in (1, 2, 4):
+                model(boards[:size].cuda())
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(level)
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert not [message for message in messages if message.startswith("Restarting analysis")]
+
+
 #the int8 model in cuda graphs on two lanes answers to the bit as without the small-batch CUDA kernels, with configs for
 #the small model's depths (128, and down's 384) up to 2 boards: the 4-board graph runs Triton beside them
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), reason="no sm_90 gpu")
