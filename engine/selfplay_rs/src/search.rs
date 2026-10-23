@@ -130,11 +130,11 @@ pub fn sharpen(value: f32, sharpness: f64) -> f32 {
 }
 
 //a simulation waiting for the network: its nodes from the root down, and its leaf's position and legal moves
-struct PendingLeaf {
-    path: Vec<usize>,
-    key: u64,
-    moves: MoveList,
-    turn: Color,
+pub struct PendingLeaf {
+    pub path: Vec<usize>,
+    pub key: u64,
+    pub moves: MoveList,
+    pub turn: Color,
 }
 
 //the network's answer for a position: its legal moves' priors in python-chess's order, and its expected score
@@ -1323,6 +1323,8 @@ fn each_in_parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -
 
 mod batch;
 pub use batch::BatchCounts;
+mod shared;
+pub use shared::{SharedCache, SharedTree};
 
 #[cfg(test)]
 mod tests;

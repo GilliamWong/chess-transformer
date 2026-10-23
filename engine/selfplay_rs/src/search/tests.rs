@@ -439,3 +439,5 @@ fn a_search_ends_at_its_memory_limit_as_the_same_search() {
 }
 
 mod batch;
+
+mod shared;

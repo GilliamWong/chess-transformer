@@ -6,15 +6,15 @@ use rand::SeedableRng;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-const OPENING: &[&str] = &["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6", "c1g5", "f8e7", "e2e3", "e8g8", "g1f3", "b8d7"];
-const ROOKS: &str = "8/8/4k3/8/8/4K3/R7/7r w - - 0 1";
-const LOCKED_PAWNS: &str = "4k3/8/8/1p1p1p1p/1P1P1P1P/8/8/4K3 w - - 0 1";
-const MATE_IN_TWO: &str = "k7/8/2K5/8/8/8/8/7R w - - 0 1";
-const PAWNS_AND_ROOKS: &str = "8/8/4k3/3p4/3P4/4K3/R7/7r w - - 0 1";
+pub(super) const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+pub(super) const OPENING: &[&str] = &["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6", "c1g5", "f8e7", "e2e3", "e8g8", "g1f3", "b8d7"];
+pub(super) const ROOKS: &str = "8/8/4k3/8/8/4K3/R7/7r w - - 0 1";
+pub(super) const LOCKED_PAWNS: &str = "4k3/8/8/1p1p1p1p/1P1P1P1P/8/8/4K3 w - - 0 1";
+pub(super) const MATE_IN_TWO: &str = "k7/8/2K5/8/8/8/8/7R w - - 0 1";
+pub(super) const PAWNS_AND_ROOKS: &str = "8/8/4k3/3p4/3P4/4K3/R7/7r w - - 0 1";
 
 //the positions of the reuse test: a middlegame, endings with repeats, a mate certainty proves, and the tables' ending
-fn cases(tables: &Option<Tables>) -> Vec<(&'static str, &'static [&'static str], u32, bool, Option<&Tables>)> {
+pub(super) fn cases(tables: &Option<Tables>) -> Vec<(&'static str, &'static [&'static str], u32, bool, Option<&Tables>)> {
     let mut cases = vec![
         (START, OPENING, 6_000, true, None),
         (ROOKS, &[][..], 4_000, true, None),
@@ -32,7 +32,7 @@ fn cases(tables: &Option<Tables>) -> Vec<(&'static str, &'static [&'static str],
 }
 
 //search's rounds, up to in_flight waiting, oldest finished first (finish_batch on finishers); every round's boards
-fn search_in_flight(
+pub(super) fn search_in_flight(
     tree: &mut Tree,
     simulations: u32,
     in_flight: usize,
