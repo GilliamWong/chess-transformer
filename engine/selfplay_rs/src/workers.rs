@@ -1,4 +1,5 @@
 //threads that run a job with the caller (worker 0) until all are done, so it may borrow; idle ones spin, then sleep
+use crate::affinity;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,9 +25,10 @@ pub struct Workers {
 }
 
 impl Workers {
-    //count workers in all, the caller one of them
-    pub fn new(count: usize, spin: Duration) -> Workers {
+    //count workers in all, the caller one of them; cpus: none, or one for each of the others to be pinned to
+    pub fn new(count: usize, spin: Duration, cpus: &[usize]) -> Workers {
         assert!(count >= 1, "at least the caller");
+        assert!(cpus.is_empty() || cpus.len() == count - 1, "a cpu for each worker but the caller");
         let shared = Arc::new(Shared {
             job: AtomicPtr::new(std::ptr::null_mut()),
             sleep: Mutex::new(()),
@@ -40,9 +42,16 @@ impl Workers {
         let threads = (1..count)
             .map(|worker| {
                 let shared = Arc::clone(&shared);
+                let cpu = cpus.get(worker - 1).copied();
                 std::thread::Builder::new()
                     .name(format!("gather worker {worker}"))
-                    .spawn(move || work(&shared, worker))
+                    .spawn(move || {
+                        //pinning only moves the thread, so a cpu the os refuses leaves it where it is
+                        if let Some(cpu) = cpu {
+                            affinity::pin_current(cpu);
+                        }
+                        work(&shared, worker)
+                    })
                     .expect("a worker thread")
             })
             .collect();

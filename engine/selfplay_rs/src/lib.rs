@@ -1,5 +1,6 @@
 //mcts.py's search for many trees at once while python runs the network: self play games (SelfPlayGames) and match
 //searches (Searches). A round is descend (the leaves that need the network come back as boards), then finish
+mod affinity;
 mod games;
 mod rounds;
 mod rules;
@@ -754,11 +755,12 @@ impl Searches {
     //vectors would grow past that many megabytes; the cache comes on top, and so does advance's copy of the part of the
     //tree it keeps. advance_threads: the threads advance walks and copies a kept tree on, off the clock. gather_workers
     //n > 0 gathers by search/batch.rs gather_batch on n workers (a different search), each spinning gather_spin_us
-    //microseconds for the next round before it sleeps
+    //microseconds for the next round before it sleeps; gather_cpus: none, or the cpus (cpu_topology's) of the n - 1
+    //workers besides the caller, each pinned to its own
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0, advance_threads=4, gather_workers=0, gather_spin_us=50))]
+                        memory_limit_mb=0, advance_threads=4, gather_workers=0, gather_spin_us=50, gather_cpus=Vec::new()))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -779,11 +781,18 @@ impl Searches {
         advance_threads: usize,
         gather_workers: usize,
         gather_spin_us: u64,
+        gather_cpus: Vec<usize>,
     ) -> PyResult<Searches> {
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
                 "value_sharpness multiplies the value's logit, it must be positive, not {value_sharpness}"
             )));
+        }
+        if !gather_cpus.is_empty() && gather_cpus.len() + 1 != gather_workers.max(1) {
+            return Err(PyValueError::new_err(format!("{gather_workers} gather workers take a cpu for each but the caller, not {gather_cpus:?}")));
+        }
+        if let Some(cpu) = gather_cpus.iter().find(|cpu| !affinity::allowed().contains(cpu)) {
+            return Err(PyValueError::new_err(format!("cpu {cpu} is not one this process may run on: {:?}", affinity::allowed())));
         }
         Ok(Searches {
             settings: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw, value_sharpness, certainty },
@@ -793,7 +802,7 @@ impl Searches {
             tree_reuse,
             memory_limit: if memory_limit_mb == 0 { usize::MAX } else { memory_limit_mb.saturating_mul(1_000_000) },
             advance_threads: advance_threads.max(1),
-            workers: (gather_workers > 0).then(|| Workers::new(gather_workers, Duration::from_micros(gather_spin_us))),
+            workers: (gather_workers > 0).then(|| Workers::new(gather_workers, Duration::from_micros(gather_spin_us), &gather_cpus)),
             state: Mutex::new(State {
                 searches: Vec::new(),
                 rounds: VecDeque::new(),
@@ -1067,12 +1076,27 @@ fn softmax(logits: Vec<f32>) -> Vec<f32> {
     priors
 }
 
+//the cpus this process may run on as the hardware groups them (affinity.rs), for pinning threads to: each L3's bytes
+//and cpus, and each physical core's cpus (its smt siblings); None where the os does not say
+#[pyfunction]
+fn cpu_topology() -> Option<(Vec<(u64, Vec<usize>)>, Vec<Vec<usize>>)> {
+    affinity::topology().map(|topology| (topology.l3s, topology.cores))
+}
+
+//pins the calling thread (a python thread's own) to the cpu, one of cpu_topology's; false if it may not run there
+#[pyfunction]
+fn pin_thread(cpu: usize) -> bool {
+    affinity::pin_current(cpu)
+}
+
 #[pymodule]
 fn selfplay_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SelfPlayGames>()?;
     module.add_class::<Searches>()?;
     module.add_function(wrap_pyfunction!(softmax, module)?)?;
     module.add_class::<rounds::RoundLoop>()?;
+    module.add_function(wrap_pyfunction!(cpu_topology, module)?)?;
+    module.add_function(wrap_pyfunction!(pin_thread, module)?)?;
     module.add("LEAN_COLUMNS", LEAN_COLUMNS)?;
     module.add("LEAN_ROW", LEAN_ROW)?;
     Ok(())

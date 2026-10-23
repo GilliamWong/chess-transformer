@@ -1,6 +1,7 @@
 //cargo test --release bench_ -- --ignored --nocapture --test-threads 1: gather_batch against gather (stand-in network)
 //environment: BENCH_VISITS ROUNDS IN_FLIGHT WORKERS REPEATS FIRST POSITIONS SPIN_US COLLISIONS (0: the round's leaves)
-//FENS (a json list), FINISH_BATCH (0: finish_leaf), and the stand-in's VALUE_NOISE (logit sd) and PRIOR_SCALE
+//FENS (a json list), FINISH_BATCH (0: finish_leaf), CPUS (the caller's cpu, then its workers'), and the stand-in's
+//VALUE_NOISE (logit sd) and PRIOR_SCALE
 use super::*;
 use crate::search::batch::{BatchCounts, Split};
 use std::time::Instant;
@@ -185,12 +186,17 @@ fn bench_gather_batch() {
     let stand_in = StandIn::from_environment();
     let all_tables = tables();
     let settings = settings(true);
-    let single = Workers::new(1, spin);
-    let workers: Vec<Workers> = worker_counts.iter().map(|&count| Workers::new(count, spin)).collect();
+    let cpus = if std::env::var("BENCH_CPUS").is_ok() { settings_list("BENCH_CPUS", "") } else { Vec::new() };
+    if let Some(&cpu) = cpus.first() {
+        assert!(crate::affinity::pin_current(cpu), "the caller pinned to cpu {cpu}");
+    }
+    let single = Workers::new(1, spin, &[]);
+    let workers: Vec<Workers> =
+        worker_counts.iter().map(|&count| Workers::new(count, spin, cpus.get(1..count).unwrap_or_default())).collect();
     let mut methods = vec![("gather".to_string(), Method::Gather), ("counted".to_string(), Method::Counted(&single))];
     methods.extend(worker_counts.iter().zip(&workers).map(|(count, workers)| (format!("batch {count}"), Method::Batch(workers))));
     println!(
-        "visits {visits}, {timed} rounds, {repeats} repeats, spin {spin:?}, collisions {collisions}, prior scale {}, value noise {}",
+        "visits {visits}, {timed} rounds, {repeats} repeats, spin {spin:?}, collisions {collisions}, prior scale {}, value noise {}, cpus {cpus:?}",
         stand_in.prior_scale, stand_in.value_noise
     );
     for &(fen, moves, with_tables) in &POSITIONS[first..first + positions] {
@@ -283,7 +289,7 @@ fn bench_search_differences() {
     let visits = setting("BENCH_VISITS", 20_000u32);
     let stand_in = StandIn::from_environment();
     let settings = settings(true);
-    let (single, workers) = (Workers::new(1, Duration::ZERO), Workers::new(4, Duration::from_micros(50)));
+    let (single, workers) = (Workers::new(1, Duration::ZERO, &[]), Workers::new(4, Duration::from_micros(50), &[]));
     let methods = [
         ("gather 2", Method::Counted(&single), 2, 0),
         ("gather 3", Method::Counted(&single), 3, 0),
@@ -378,7 +384,7 @@ fn bench_worker_latency() {
     };
     for count in [2, 4, 8] {
         for spin_us in [0, 50, 500] {
-            let workers = Workers::new(count, Duration::from_micros(spin_us));
+            let workers = Workers::new(count, Duration::from_micros(spin_us), &[]);
             for gap_us in [0, 30, 300] {
                 let mut times = Vec::new();
                 for _ in 0..2_000 {

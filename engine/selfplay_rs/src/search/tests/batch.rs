@@ -110,7 +110,7 @@ fn search_moving_on(
 #[test]
 fn passes_of_one_visit_are_gathers_search() {
     let tables = tables();
-    let workers = Workers::new(1, Duration::ZERO);
+    let workers = Workers::new(1, Duration::ZERO, &[]);
     let mut moved = 0;
     for (fen, moves, simulations, certainty, tables) in cases(&tables) {
         let settings = settings(certainty);
@@ -245,7 +245,7 @@ fn a_leafs_visits_after_its_first_are_collisions() {
     let round = Round { id: 0, leaves: 64, simulations: 64, collisions: 0, visit_limit: u32::MAX, memory_limit: usize::MAX };
     let mut counts = BatchCounts::default();
     let gathered =
-        tree.gather_batch(&round, &settings, None, None, &mut Vec::new(), &Workers::new(1, Duration::ZERO), u32::MAX, &mut counts);
+        tree.gather_batch(&round, &settings, None, None, &mut Vec::new(), &Workers::new(1, Duration::ZERO, &[]), u32::MAX, &mut counts);
     let leaf_lines: Vec<Vec<u32>> = tree
         .pending
         .iter()
@@ -264,7 +264,8 @@ fn a_leafs_visits_after_its_first_are_collisions() {
     assert!(counts.passes == 1 && counts.collisions == 0 && in_flight == 2 * lines.len(), "{counts:?}");
 }
 
-//a round's leaves and the search are the same for any number of workers (collisions, cache hits, proofs, passes)
+//a round's leaves and the search are the same for any number of workers (collisions, cache hits, proofs, passes),
+//pinned to cpus or not
 #[test]
 fn a_rounds_leaves_are_the_same_for_any_number_of_workers() {
     let tables = tables();
@@ -273,8 +274,10 @@ fn a_rounds_leaves_are_the_same_for_any_number_of_workers() {
         let settings = settings(certainty);
         for in_flight in [1, 4] {
             let mut reference: Option<(Vec<Vec<u8>>, Tree)> = None;
-            for (count, spin) in [(1, 0), (2, 0), (3, 50), (8, 50)] {
-                let workers = Workers::new(count, Duration::from_micros(spin));
+            for (count, spin, pinned) in [(1, 0, false), (2, 0, false), (3, 50, false), (3, 50, true), (8, 50, false)] {
+                let cpus: Vec<usize> =
+                    if pinned { crate::affinity::allowed().iter().rev().take(count - 1).copied().collect() } else { Vec::new() };
+                let workers = Workers::new(count, Duration::from_micros(spin), &cpus);
                 let mut tree = tree_after(fen, moves);
                 let mut counts = BatchCounts::default();
                 let rounds =
@@ -314,7 +317,7 @@ fn finish_batch_finishes_as_finish_leaf_does() {
         let old_rounds = search_in_flight(&mut old, simulations, 3, &settings, &mut Network::new(), None, gather);
         for count in [1, 3] {
             let mut new = tree_after(fen, moves);
-            let workers = Workers::new(count, Duration::ZERO);
+            let workers = Workers::new(count, Duration::ZERO, &[]);
             let new_rounds = search_in_flight(&mut new, simulations, 3, &settings, &mut Network::new(), Some(&workers), gather);
             assert!(old_rounds == new_rounds, "{fen}, {count} workers: the rounds' leaves");
             assert_same_trees(&old, &new);
@@ -326,7 +329,7 @@ fn finish_batch_finishes_as_finish_leaf_does() {
 #[test]
 fn the_workers_run_each_job_once_on_each() {
     for spin in [0, 200] {
-        let workers = Workers::new(4, Duration::from_micros(spin));
+        let workers = Workers::new(4, Duration::from_micros(spin), &[]);
         let calls: Vec<std::sync::atomic::AtomicU32> = (0..4).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
         for job in 0..2_000 {
             if job % 500 == 0 {
