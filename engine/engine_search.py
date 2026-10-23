@@ -28,6 +28,12 @@ from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_table
 #judging 2,000 positions)
 LEAVES = 64
 COLLISIONS = 64
+#a round's collisions as they are, not COLLISIONS and at most its leaves, 0 for those
+COLLISION_CAP = 0
+#rounds gathered by search/batch.rs gather_batch on this many threads (a different search), 0 for gather; they spin
+#this long for the next round before they sleep
+GATHER_WORKERS = 0
+GATHER_SPIN_US = 50
 #a round is gathered while the last one is on the gpu (+9% simulations/s), and the two run at once (GraphedBatches)
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per GROW_LEAVES simulations done or left, as lc0 grows its batches with the tree; 0 for fixed
@@ -161,7 +167,8 @@ class EngineSearch:
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
-                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT):
+                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT,
+                 collision_cap: int = COLLISION_CAP, gather_workers: int = GATHER_WORKERS, gather_spin_us: int = GATHER_SPIN_US):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched = leaves > 1
@@ -169,6 +176,7 @@ class EngineSearch:
             raise ValueError("one leaf a round is mcts.py's search, which runs on one network")
         self.round_simulations = SIMULATIONS_PER_LEAF * leaves
         self.collisions = COLLISIONS if batched else 0
+        self.collision_cap = collision_cap if batched else 0
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1 #on each network
         self.grow_leaves = grow_leaves if batched else 0
         self.visits_per_leaf_out = visits_per_leaf_out if batched else 0
@@ -179,7 +187,8 @@ class EngineSearch:
         self.stop_at_one_move_left = stop_at_one_move_left
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
-                                             advance_threads=advance_threads)
+                                             advance_threads=advance_threads, gather_workers=gather_workers if batched else 0,
+                                             gather_spin_us=gather_spin_us)
         #reports give the score on the network's own scale, as a gui showed and adjudicated it before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
@@ -290,7 +299,8 @@ class EngineSearch:
                     return
             if name is not None:
                 #a bytearray: torch warns about arrays it cannot write to
-                leaves = bytearray(self.searches.descend(count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count, round=name))
+                collisions = self.collision_cap or min(self.collisions, count)
+                leaves = bytearray(self.searches.descend(count, collisions, SIMULATIONS_PER_LEAF * count, round=name))
                 boards = np.frombuffer(leaves, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
                 if not len(boards):
                     run.starved = answered

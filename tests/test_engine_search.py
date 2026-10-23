@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 import selfplay_rs
+import torch
 from torch import nn
 from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import BoardModel, CountingNetwork, UniformModel
@@ -1455,8 +1456,7 @@ def test_a_long_search_tells_the_gui_how_it_stands(monkeypatch):
 def test_gather_workers_make_the_same_search_for_any_number():
     reports, counts = [], []
     for workers in (1, 3):
-        search = EngineSearch(cpu_batches(BoardModel()), 64, smart_pruning=False)
-        search.searches = selfplay_rs.Searches(**engine_search_settings(False), tree_reuse=True, cache_positions=100_000, gather_workers=workers)
+        search = EngineSearch(cpu_batches(BoardModel()), 64, smart_pruning=False, gather_workers=workers)
         board = chess.Board()
         first = search.search(board, simulations=3000)
         board.push(first.line[0])
@@ -1467,3 +1467,38 @@ def test_gather_workers_make_the_same_search_for_any_number():
     #all but the items, which the workers share a pass's picks out in
     rounds, passes, _, picks, leaves, cached = counts[0][:6]
     assert counts[0][:2] + counts[0][3:] == counts[1][:2] + counts[1][3:] and passes > rounds and picks >= leaves > 0 and cached > 0
+
+
+#Searches with the collisions of every round it descends
+class CollisionsRecorded:
+    def __init__(self, searches: selfplay_rs.Searches):
+        self.searches, self.collisions = searches, []
+
+    def descend(self, leaves: int, collisions: int, simulations: int, round: int | None = None) -> bytes:
+        self.collisions.append(collisions)
+        return self.searches.descend(leaves, collisions, simulations, round=round)
+
+    def __getattr__(self, name: str):
+        return getattr(self.searches, name)
+
+
+#BoardModel with five times its logits: priors peaked enough for a round's leaves to collide
+class PeakedModel(BoardModel):
+    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        logits, values = super().forward(boards)
+        return 5 * logits, values
+
+
+#EngineSearch's collision_cap gives every round that many collisions, more than its leaves; 0 keeps COLLISIONS, at
+#most the round's leaves. gather_batch then counts more of them
+def test_a_collision_cap_lets_rounds_collide_more():
+    recorded = {}
+    for cap in (0, 1000):
+        search = EngineSearch(cpu_batches(PeakedModel()), 64, smart_pruning=False, collision_cap=cap, gather_workers=1)
+        search.searches = CollisionsRecorded(search.searches)
+        assert search.search(chess.Board(), simulations=3000).simulations == 3000
+        recorded[cap] = (search.searches.collisions, search.searches.gather_counts())
+    assert max(recorded[0][0]) == 64 and set(recorded[1000][0]) == {1000}
+    #collisions per leaf for the network
+    (_, counts), (_, capped) = recorded[0], recorded[1000]
+    assert capped[7] / capped[4] > counts[7] / counts[4]
