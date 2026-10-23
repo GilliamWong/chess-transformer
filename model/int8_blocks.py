@@ -1,4 +1,6 @@
 #the engine's blocks with their matmuls in int8 but combine_heads: weights scaled per output channel, inputs per token
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -19,14 +21,27 @@ INT8_TILES = {(12, 0): {"projection": (128, 128, 64, 8, 3), "gate_up": (128, 64,
               (8, 9): {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (128, 64, 128, 4, 3)},
               (8, 6): {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (64, 128, 128, 4, 3)},
               (8, 0): {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 32, 64, 4, 3), "down": (128, 64, 128, 4, 3)}}
-#the rows a program of norm_quant_kernel takes and its warps, and the rows a program of rotate_quant_kernel takes
+#the rows a program of norm_quant_kernel takes and its warps
 NORM_ROWS, NORM_WARPS = 1, 2
-ROTATE_ROWS = 8
+#the rows a program of rotate_quant_kernel takes by compute capability, [(the most rows a multiprocessor's share may be,
+#rows), ...]: fewer at a few boards on sm_120 (timed on an RTX 5070 Ti and 5090), UNTIMED_ROTATE_ROWS on other gpus.
+#Any rows give the same bits
+ROTATE_ROWS = {(12, 0): [(4, 2), (math.inf, 8)]}
+UNTIMED_ROTATE_ROWS = 8
 
 
 #the tiles for the gpu's compute capability, sm_120's for one not timed
 def int8_tiles(device: torch.device) -> dict[str, tuple[int, ...]]:
     return INT8_TILES.get(torch.cuda.get_device_capability(device), INT8_TILES[(12, 0)])
+
+
+#rotate_quant_kernel's rows a program for M rows on the gpu
+def rotate_rows(device: torch.device, M: int) -> int:
+    shares = ROTATE_ROWS.get(torch.cuda.get_device_capability(device))
+    if shares is None:
+        return UNTIMED_ROTATE_ROWS
+    share = M / torch.cuda.get_device_properties(device).multi_processor_count
+    return next(rows for most, rows in shares if share <= most)
 
 
 #Sylvester's Hadamard matrix of +-1, size a power of two: symmetric, and its square is size times the identity
@@ -200,8 +215,9 @@ def rotate_quant(h: torch.Tensor, hadamard_signs: torch.Tensor, width: int) -> t
     q = torch.empty(*h.shape[:-1], width, device=h.device, dtype=torch.int8)
     scale = torch.empty(h.shape[:-1], device=h.device, dtype=torch.float32)
     block = hadamard_signs.shape[0]
-    rotate_quant_kernel[(triton.cdiv(M, ROTATE_ROWS),)](h, hadamard_signs, q, scale, M, N, WIDTH=width, ROWS=ROTATE_ROWS, BLOCK=block,
-                                                        SLOTS=triton.next_power_of_2(width // block), num_warps=4, **dependent_launch(h.device))
+    rows = rotate_rows(h.device, M)
+    rotate_quant_kernel[(triton.cdiv(M, rows),)](h, hadamard_signs, q, scale, M, N, WIDTH=width, ROWS=rows, BLOCK=block,
+                                                 SLOTS=triton.next_power_of_2(width // block), num_warps=4, **dependent_launch(h.device))
     return q, scale
 
 

@@ -2,6 +2,7 @@
 #rounding, the weights' cache, and the int8 model against the fp32 one
 import copy
 import shutil
+from types import SimpleNamespace
 
 import chess
 import numpy as np
@@ -126,7 +127,37 @@ def test_rotate_quant_rounds_the_rotated_rows(hidden, width):
     assert ((integers.float() * scale[..., None] - rotated).abs() <= 0.501 * step[..., None]).all()
 
 
-SMALL_SETTINGS = {"d_model": 128, "num_layers": 3, "n_heads": 4, "kv_heads": 2, "qk_ratio": [0.25, 0.5, 0.75], "mlp_hidden": 320, "value_bins": 16}
+#rotate_quant's rows a program change no bits, with rows that leave its last program part empty
+@gpu
+def test_rotate_quant_rows_change_no_bits(monkeypatch):
+    from model import int8_blocks
+    from model.int8_blocks import HADAMARD_BLOCK, hadamard, rotate_quant
+    torch.manual_seed(0)
+    h = torch.randn(5, 70, 992, device="cuda").half()
+    signs = hadamard(HADAMARD_BLOCK).cuda().half()
+
+    found = []
+    for rows in (1, 2, 4, 8, 16):
+        monkeypatch.setattr(int8_blocks, "rotate_rows", lambda device, M, rows=rows: rows)
+        found.append(rotate_quant(h, signs, 1024))
+
+    assert all(torch.equal(integers, found[0][0]) and torch.equal(scale, found[0][1]) for integers, scale in found[1:])
+
+
+#rotate_quant's rows a program: sm_120's fewer at up to 4 rows a multiprocessor, and the untimed gpus' (sm_80, sm_86 and
+#sm_89: an A100, A40 and L40S) today's 8 at any batch
+@pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (12, 0)])
+def test_rotate_rows_by_compute_capability(monkeypatch, capability):
+    from model import int8_blocks
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: SimpleNamespace(multi_processor_count=70))
+
+    rows = [int8_blocks.rotate_rows(torch.device("cuda"), boards * 70) for boards in (1, 4, 8, 64)]
+
+    assert rows == ([2, 2, 8, 8] if capability == (12, 0) else [8, 8, 8, 8])
+
+
+SMALL_SETTINGS ={"d_model": 128, "num_layers": 3, "n_heads": 4, "kv_heads": 2, "qk_ratio": [0.25, 0.5, 0.75], "mlp_hidden": 320, "value_bins": 16}
 
 
 #a small model saved in tmp_path, its input skip mixed in, and real positions to check it on
