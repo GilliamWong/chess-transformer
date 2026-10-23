@@ -49,7 +49,7 @@ def dequantised(integers: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 #int8_linear's output is the dequantised operands' matmul (exact in int32) with each block matmul's tiles of every gpu
 #and epilogue (the projection's bias, gate_up's silu(gate) * up, down's residual over its 1,024 inputs, and the next
 #block's input mixed in), to fp16's rounding: on one board's rows (less than a tile) and three boards', and on columns
-#that leave part of a tile empty
+#that leave part of a tile empty, by its Triton kernel (launch_int8_linear)
 @gpu
 @pytest.mark.parametrize("matmul", ["projection", "gate_up", "down", "mixing down"])
 @pytest.mark.parametrize("boards", [1, 3])
@@ -82,6 +82,135 @@ def test_int8_linear_is_the_dequantised_matmul(matmul, boards):
         out = launch_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, *(mix or (None, None, None)), tile)
         assert out.dtype == torch.float16 and out.shape == (boards, 70, width)
         assert torch.allclose(out.reshape(-1, width).double(), expected, atol=1e-3, rtol=2e-3), tile
+
+
+#a block matmul's operands at the d768's depths: (x, x_scale, weight, weight_scale, bias, residual, gated, mix)
+def int8_operands(matmul: str, rows: int, width: int = 196) -> tuple:
+    torch.manual_seed(rows)
+    down, gated = matmul.endswith("down"), matmul == "gate_up"
+    depth = 1024 if down else 768
+    x = torch.randint(-127, 128, (rows, depth), device="cuda", dtype=torch.int8)
+    x_scale = torch.rand(rows, device="cuda") / 100
+    weight = torch.randint(-127, 128, (2 * width if gated else width, depth), device="cuda", dtype=torch.int8)
+    weight_scale = torch.rand(len(weight), device="cuda") / 100
+    bias = torch.randn(width, device="cuda").half() if matmul == "projection" else None
+    residual = torch.randn(rows, width, device="cuda").half() if down else None
+    mix = (torch.randn(rows, width, device="cuda").half(), torch.tensor([0.9], device="cuda").half(),
+           torch.tensor([0.3], device="cuda").half()) if matmul == "mixing down" else ()
+    return x, x_scale, weight, weight_scale, bias, residual, gated, mix
+
+
+def triton_int8_linear(monkeypatch, matmul: str, operands: tuple) -> torch.Tensor:
+    from model import int8_cuda
+    from model.int8_blocks import int8_linear
+    x, x_scale, weight, weight_scale, bias, residual, gated, mix = operands
+    with monkeypatch.context() as patch:
+        patch.setattr(int8_cuda, "ENABLED", False)
+        return int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, "down" if matmul.endswith("down") else matmul, *mix)
+
+
+#this gpu's key in int8_cuda.CONFIGS
+def gpu_key() -> tuple[int, int, int]:
+    return (*torch.cuda.get_device_capability(), torch.cuda.get_device_properties(0).multi_processor_count)
+
+
+#the (most rows, config) entries of a kind for every gpu timed with this one's compute capability (the kernels run on
+#any multiprocessor count; it only changes which is fastest)
+def configs_of_this_capability(kind: str) -> list[tuple[int, tuple]]:
+    from model import int8_cuda
+    found = [entry for key, table in int8_cuda.CONFIGS.items() if key[:2] == gpu_key()[:2] for entry in table[kind]]
+    if not found:
+        pytest.skip("no small-batch CUDA kernels timed on a gpu like this one")
+    return found
+
+
+#the small-batch CUDA kernels (model/int8_cuda.py) give int8_linear's Triton kernel's bits with every config timed on
+#this compute capability and every epilogue: on as many rows as a config takes and on fewer than one tile, columns
+#leaving part of a tile empty
+@gpu
+@pytest.mark.parametrize("matmul", ["projection", "gate_up", "down", "mixing down"])
+def test_the_small_batch_cuda_kernels_give_int8_linears_bits(matmul, monkeypatch):
+    from model import int8_cuda
+    kind = "down" if matmul.endswith("down") else matmul
+    for largest, config in configs_of_this_capability(kind):
+        monkeypatch.setattr(int8_cuda, "CONFIGS", {gpu_key(): {kind: [(largest, config)]}})
+        monkeypatch.setattr(int8_cuda, "KERNELS", {})
+        for rows in (5, largest):
+            operands = int8_operands(matmul, rows)
+            x, x_scale, weight, weight_scale, bias, residual, gated, mix = operands
+            found = int8_cuda.small_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, *(mix or (None, None, None)))
+            assert found is not None and torch.equal(found, triton_int8_linear(monkeypatch, matmul, operands)), (config, rows)
+
+
+#recorded in cuda graphs on two streams and replayed at once (the engine's two lanes), a CUDA kernel reads the graph's
+#input buffer and answers as it does outside a graph
+@gpu
+def test_the_small_batch_cuda_kernels_run_in_cuda_graphs_on_two_lanes(monkeypatch):
+    from model import int8_cuda
+    largest, config = configs_of_this_capability("down")[0]
+    monkeypatch.setattr(int8_cuda, "CONFIGS", {gpu_key(): {"down": [(largest, config)]}})
+    monkeypatch.setattr(int8_cuda, "KERNELS", {})
+    _, x_scale, weight, weight_scale, _, residual, _, _ = int8_operands("down", largest)
+    inputs = [int8_operands("down", largest)[0] for _ in range(2)]
+    inputs[1] = inputs[1].flip(0).contiguous()
+    run = lambda x: int8_cuda.small_int8_linear(x, x_scale, weight, weight_scale, None, residual, False, None, None, None)
+    expected = [run(x) for x in inputs]
+    assert all(answer is not None for answer in expected)
+    lanes, buffers, graphs, outputs = [torch.cuda.Stream() for _ in range(2)], [x.clone() for x in inputs], [], []
+    for lane, buffer in zip(lanes, buffers):
+        graphs.append(torch.cuda.CUDAGraph())
+        with torch.cuda.graph(graphs[-1], stream=lane):
+            outputs.append(run(buffer))
+    for order in (1, -1):
+        for buffer, x in zip(buffers, inputs[::order]):
+            buffer.copy_(x)
+        torch.cuda.synchronize()
+        for _ in range(20):
+            for lane, graph in zip(lanes, graphs):
+                with torch.cuda.stream(lane):
+                    graph.replay()
+        torch.cuda.synchronize()
+        assert all(torch.equal(out, answer) for out, answer in zip(outputs, expected[::order]))
+
+
+#when NVRTC fails the CUDA kernels are off with a warning and int8_linear runs its Triton kernel
+@gpu
+def test_int8_linear_falls_back_to_triton_when_the_cuda_kernels_do_not_compile(monkeypatch):
+    from model import int8_cuda
+    from model.int8_blocks import int8_linear
+    largest, config = configs_of_this_capability("projection")[0]
+
+    def failing(*arguments):
+        raise RuntimeError("NVRTC compilation failed")
+    monkeypatch.setattr(int8_cuda, "compile_cubin", failing)
+    monkeypatch.setattr(int8_cuda, "CONFIGS", {gpu_key(): {"projection": [(largest, config)]}})
+    monkeypatch.setattr(int8_cuda, "KERNELS", {})
+    operands = int8_operands("projection", largest)
+    x, x_scale, weight, weight_scale, bias, residual, gated, mix = operands
+    with pytest.warns(UserWarning, match="Triton kernel runs instead"):
+        out = int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, "projection")
+    assert torch.equal(out, triton_int8_linear(monkeypatch, "projection", operands))
+
+
+#gpus the kernels were not timed on never compile them, int8_linear runs Triton as before: sm_80 (the A100), sm_86 and
+#sm_89 with this gpu's multiprocessors, and this compute capability with another number of them
+@gpu
+@pytest.mark.parametrize("untimed", [(8, 0), (8, 6), (8, 9), "multiprocessors"])
+def test_untimed_gpus_never_use_the_cuda_kernels(untimed, monkeypatch):
+    from model import int8_cuda
+
+    def compiling(*arguments):
+        raise AssertionError("compiled")
+    monkeypatch.setattr(int8_cuda, "compile_cubin", compiling)
+    monkeypatch.setattr(int8_cuda, "KERNELS", {})
+    timed = {"projection": [(70, (5, 4, 1, 12, 1))]}
+    if untimed == "multiprocessors":
+        monkeypatch.setattr(int8_cuda, "CONFIGS", {(*gpu_key()[:2], gpu_key()[2] + 1): timed})
+    else:
+        monkeypatch.setattr(int8_cuda, "CONFIGS", {(12, 0, gpu_key()[2]): timed})
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: untimed)
+    x, x_scale, weight, weight_scale, bias, residual, gated, _ = int8_operands("projection", 70)
+    assert int8_cuda.small_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, None, None, None) is None
 
 
 #norm_quant rounds the RMSNorm (with gain) of each row to int8 steps of its absmax / 127; mix_norm_quant first mixes
@@ -311,6 +440,40 @@ def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):
 
     #fp16's rounding differs a little once compiled; a graph reading the wrong buffers is off by whole logits
     assert abs(answers - expected).max() < 0.05
+
+
+#the int8 model in cuda graphs on two lanes answers to the bit as without the small-batch CUDA kernels, with configs for
+#the small model's depths (128, and down's 384) up to 2 boards: the 4-board graph runs Triton beside them
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), reason="no sm_90 gpu")
+def test_the_int8_model_gives_the_same_bits_with_the_small_batch_cuda_kernels(tmp_path, small_calibration, monkeypatch):
+    from engine.inference import GraphedBatches, int8_model
+    from model import int8_cuda
+    _, boards = small_checkpoint(tmp_path)
+    boards = boards.numpy().astype("uint8")
+    configs = {"projection": [(140, (5, 4, 1, 2, 1))], "gate_up": [(140, (5, 1, 1, 2, 1))], "down": [(140, (3, 4, 1, 6, 1))]}
+    monkeypatch.setattr(int8_cuda, "CONFIGS", {gpu_key(): configs})
+    monkeypatch.setattr(int8_cuda, "KERNELS", {})
+    launched_kinds = set()
+    launch = int8_cuda.Kernels.launch
+
+    def counting(self, config, epilogue, *arguments):
+        launched_kinds.add(epilogue)
+        return launch(self, config, epilogue, *arguments)
+    monkeypatch.setattr(int8_cuda.Kernels, "launch", counting)
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        answers = {}
+        for enabled in (True, False):
+            monkeypatch.setattr(int8_cuda, "ENABLED", enabled)
+            network = GraphedBatches(int8_model(tmp_path / "model.pt", 0), [1, 2, 4], in_flight=2)
+            pending = [network.launch(boards[:count]) for count in (1, 2)]
+            answers[enabled] = [network.collect(launched).copy() for launched in pending] + [network.collect(network.launch(boards[:3])).copy()]
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    #every epilogue ran in CUDA: the projection's, gate_up's, down's and down's with the next block's input mixed in
+    assert launched_kinds == {0, 1, 2, 3}
+    assert all(np.array_equal(found, expected) for found, expected in zip(answers[True], answers[False]))
 
 
 def failing(*arguments):
