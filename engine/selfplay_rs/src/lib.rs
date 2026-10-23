@@ -359,14 +359,21 @@ impl Searches {
             return None;
         }
         let mut tree = kept.tree;
+        //the moves played since, as the edges down to the new root
+        let (mut line, mut root) = (Vec::new(), tree.root());
         for played in &moves[kept.moves.len()..] {
-            let edge = tree.root().edges().find(|&edge| uci(tree.chess_move(edge)) == *played)?;
-            tree.play(edge, true);
+            let edge = root.edges().find(|&edge| uci(tree.chess_move(edge)) == *played)?;
+            root = tree.child(edge)?;
+            line.push(edge);
         }
-        if moves.len() > kept.moves.len() {
+        if root.edges().is_empty() {
+            return None;
+        }
+        if !line.is_empty() {
+            tree.play_line(&line);
             tree.drop_stale_leaves(&self.settings, self.tables.as_ref()).ok()?;
         }
-        (!tree.root().edges().is_empty()).then_some(tree)
+        Some(tree)
     }
 }
 

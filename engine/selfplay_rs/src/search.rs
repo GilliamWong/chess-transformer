@@ -524,19 +524,19 @@ impl Tree {
     pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) -> Result<(), SyzygyError> {
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut stale = Vec::new();
-        let board = self.board.clone();
-        self.find_stale_leaves(&board, &mut vec![0], settings, tables, root_covered, &mut stale)?;
+        self.find_stale_leaves(&mut vec![0], &mut Vec::new(), settings, tables, root_covered, &mut stale)?;
         for path in stale {
             self.take_out(&path);
         }
         Ok(())
     }
 
-    //the paths to the stale leaves under the path's last node, whose position is board; self.keys has the path's keys
+    //the paths to the stale leaves under the path's last node, which the line's moves (its edges) reach from the root;
+    //self.keys has the path's keys. Only a leaf's position is played out: one for every node took half the walk's time
     fn find_stale_leaves(
         &mut self,
-        board: &Chess,
         path: &mut Vec<usize>,
+        line: &mut Vec<usize>,
         settings: &SearchSettings,
         tables: Option<&Tables>,
         root_covered: bool,
@@ -547,9 +547,13 @@ impl Tree {
         if edges.is_empty() {
             if node != 0 && self.nodes[node].visit_count > 0 {
                 //as gather scores a leaf
+                let mut board = self.board.clone();
+                for &edge in line.iter() {
+                    board.play_unchecked(self.moves[edge]);
+                }
                 let legal_moves = board.legal_moves();
                 let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
-                let over = game_result(board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?;
+                let over = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?;
                 let (&leaf_key, path_keys) = self.keys[self.keys.len() - path.len()..].split_last().expect("the leaf's key");
                 if over.is_none() && !path_keys.contains(&leaf_key) {
                     stale.push(path.clone());
@@ -562,12 +566,12 @@ impl Tree {
             if child == NO_NODE || self.nodes[child as usize].proof.is_some() {
                 continue;
             }
-            let mut child_board = board.clone();
-            child_board.play_unchecked(self.moves[edge]);
             path.push(child as usize);
+            line.push(edge);
             self.keys.push(self.node_keys[child as usize]);
-            let found = self.find_stale_leaves(&child_board, path, settings, tables, root_covered, stale);
+            let found = self.find_stale_leaves(path, line, settings, tables, root_covered, stale);
             self.keys.pop();
+            line.pop();
             path.pop();
             found?;
         }
@@ -668,31 +672,63 @@ impl Tree {
         }
     }
 
+    //plays a line of moves from the root (edges, each of the node the last one leads to) and makes the node it ends on
+    //the root, with its subtree: the subtree is copied once, where play would copy it at every move. Every edge of the
+    //line has its node
+    pub fn play_line(&mut self, line: &[usize]) {
+        assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
+        let mut node = 0;
+        for &edge in line {
+            assert_ne!(self.children[edge], NO_NODE, "a line through the tree's nodes");
+            self.board.play_unchecked(self.moves[edge]);
+            self.keys.push(position_key(&self.board));
+            node = self.children[edge] as usize;
+        }
+        let old = self.keep_subtree(node);
+        //the old tree is freed on a thread of its own, off the move's clock (1.6 ms at 100k nodes); here if none starts
+        let _ = std::thread::Builder::new().spawn(move || drop(old));
+    }
+
     //the tree under node as a tree of its own, node its root. Its proofs still hold: a proof comes from the game's end
     //by its rules or the tables, which a new root leaves as it was (a two-fold repetition proves nothing). The root's
-    //own is dropped, as a root is never proven (root_decided reads its moves')
-    fn keep_subtree(&mut self, node: usize) {
-        let mut nodes = vec![Node { proof: None, ..self.nodes[node] }];
-        let mut node_keys = vec![self.node_keys[node]];
-        let (mut moves, mut priors, mut children) = (Vec::new(), Vec::new(), Vec::new());
+    //own is dropped, as a root is never proven (root_decided reads its moves'). Returns the old tree's nodes and edges
+    #[allow(clippy::type_complexity)]
+    fn keep_subtree(&mut self, node: usize) -> (Vec<Node>, Vec<u64>, Vec<Move>, Vec<f64>, Vec<u32>) {
+        //room for the whole tree, so the copy never regrows (that took twice the time); unwritten room takes no memory
+        let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
+        let mut nodes = Vec::with_capacity(node_room);
+        nodes.push(Node { proof: None, ..self.nodes[node] });
+        let mut node_keys = Vec::with_capacity(node_room);
+        node_keys.push(self.node_keys[node]);
+        let (mut moves, mut priors, mut children) =
+            (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
         let mut index = 0;
         while index < nodes.len() {
             let edges = nodes[index].edges();
-            nodes[index].first_edge = moves.len() as u32;
+            let first_edge = moves.len();
+            nodes[index].first_edge = first_edge as u32;
             moves.extend_from_slice(&self.moves[edges.clone()]);
             priors.extend_from_slice(&self.priors[edges.clone()]);
-            for edge in edges {
-                children.push(match self.children[edge] {
-                    NO_NODE => NO_NODE,
-                    child => {
-                        nodes.push(self.nodes[child as usize]);
-                        node_keys.push(self.node_keys[child as usize]);
-                        (nodes.len() - 1) as u32
-                    }
-                });
+            children.extend_from_slice(&self.children[edges]);
+            //the few moves with a node get theirs copied, numbered in the new tree
+            for child in &mut children[first_edge..] {
+                if *child != NO_NODE {
+                    nodes.push(self.nodes[*child as usize]);
+                    node_keys.push(self.node_keys[*child as usize]);
+                    *child = (nodes.len() - 1) as u32;
+                }
             }
             index += 1;
         }
-        (self.nodes, self.moves, self.priors, self.children, self.node_keys) = (nodes, moves, priors, children, node_keys);
+        (
+            std::mem::replace(&mut self.nodes, nodes),
+            std::mem::replace(&mut self.node_keys, node_keys),
+            std::mem::replace(&mut self.moves, moves),
+            std::mem::replace(&mut self.priors, priors),
+            std::mem::replace(&mut self.children, children),
+        )
     }
 }
+
+#[cfg(test)]
+mod tests;
