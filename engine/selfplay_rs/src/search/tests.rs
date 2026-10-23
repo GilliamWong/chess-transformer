@@ -72,14 +72,14 @@ fn search(
     network: &mut Network,
 ) {
     let mut boards = Vec::new();
-    while tree.root().visit_count < simulations && !(tree.full && tree.pending.is_empty()) {
+    while tree.root().visit_count < simulations && !(tree.full && tree.pending() == 0) {
         let leaves = (tree.root().visit_count / 16).clamp(1, 64);
-        let round = Round { leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: simulations, memory_limit };
+        let round = Round { id: 0, leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: simulations, memory_limit };
         boards.clear();
         tree.gather(&round, settings, tables, Some(&network.cache), &mut boards).expect("the tables");
         for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
             let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
-            tree.finish_leaf(|column| answer(board, seed, column), ANSWER_WIDTH, &network.move_ids, Some(&mut network.cache), settings);
+            tree.finish_leaf(0, |column| answer(board, seed, column), ANSWER_WIDTH, &network.move_ids, Some(&mut network.cache), settings);
         }
     }
 }
@@ -96,7 +96,7 @@ fn tree_after(fen: &str, moves: &[&str]) -> Tree {
 
 //a copy of a tree whose search is done (nothing waits for the network)
 fn copied(tree: &Tree) -> Tree {
-    assert!(tree.pending.is_empty());
+    assert_eq!(tree.pending(), 0);
     Tree {
         board: tree.board.clone(),
         keys: tree.keys.clone(),
@@ -107,7 +107,7 @@ fn copied(tree: &Tree) -> Tree {
         priors: tree.priors.clone(),
         noised_priors: tree.noised_priors.clone(),
         children: tree.children.clone(),
-        pending: VecDeque::new(),
+        pending: Vec::new(),
         logits: Vec::new(),
         full: tree.full,
     }

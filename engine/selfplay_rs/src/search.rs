@@ -230,6 +230,7 @@ impl Cache {
 //finished at once too: lc0's out of order evaluations), and how many of its descents may end on a leaf already waiting
 //(collisions). The simulations waiting for the network count as visits in the exploration term, so a round spreads out
 pub struct Round {
+    pub id: u64, //its leaves wait under it until finish_leaf takes them: rounds may come back in any order
     pub leaves: u32,
     pub simulations: u32,
     pub collisions: u32,
@@ -294,7 +295,9 @@ pub struct Tree {
     priors: Vec<f32>,        //as the network gives them, read as f64s
     noised_priors: Vec<f64>, //the root's once add_root_noise has mixed its noise in (no longer f32s); empty without
     children: Vec<u32>,
-    pending: VecDeque<PendingLeaf>, //oldest first, the order the network's answers come back in
+    //the simulations waiting for the network by round (Round's id), each round's in the order of its boards. A round
+    //whose leaves are all back keeps its room for a later one
+    pending: Vec<(u64, VecDeque<PendingLeaf>)>,
     logits: Vec<f32>,
     //no room for another simulation (make_room): the search ends as at its simulations, until a move is played
     pub full: bool,
@@ -313,7 +316,7 @@ impl Tree {
             priors: Vec::new(),
             noised_priors: Vec::new(),
             children: Vec::new(),
-            pending: VecDeque::new(),
+            pending: Vec::new(),
             logits: Vec::new(),
             full: false,
         }
@@ -340,7 +343,7 @@ impl Tree {
         let spare = memory_limit.saturating_sub(self.allocated_bytes());
         let edge_bytes = size_of::<Move>() + size_of::<f32>() + size_of::<u32>();
         let capacity = self.moves.capacity().min(self.priors.capacity()).min(self.children.capacity());
-        let Some(edges) = grown_capacity(capacity, self.moves.len() + (self.pending.len() + 1) * MOST_MOVES, edge_bytes, spare) else {
+        let Some(edges) = grown_capacity(capacity, self.moves.len() + (self.pending() + 1) * MOST_MOVES, edge_bytes, spare) else {
             return false;
         };
         reserve_to(&mut self.moves, edges);
@@ -392,7 +395,21 @@ impl Tree {
 
     //simulations waiting for the network
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        self.pending.iter().map(|(_, leaves)| leaves.len()).sum()
+    }
+
+    //the leaves of the round waiting for the network, in the room of a round whose leaves are all back if it has none
+    fn round_leaves(&mut self, round: u64) -> &mut VecDeque<PendingLeaf> {
+        let waiting = self.pending.iter().position(|(id, leaves)| *id == round && !leaves.is_empty());
+        let slot = match waiting.or_else(|| self.pending.iter().position(|(_, leaves)| leaves.is_empty())) {
+            Some(slot) => slot,
+            None => {
+                self.pending.push((round, VecDeque::new()));
+                self.pending.len() - 1
+            }
+        };
+        self.pending[slot].0 = round;
+        &mut self.pending[slot].1
     }
 
     //a move whose child is a proven loss for the side making it
@@ -486,7 +503,7 @@ impl Tree {
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         while gathered < round.leaves
             && simulations < round.simulations
-            && self.root().visit_count as usize + self.pending.len() < round.visit_limit as usize
+            && self.root().visit_count as usize + self.pending() < round.visit_limit as usize
         {
             //the root's own evaluation always fits, so that a full search still has moves to report
             if self.root().has_edges() && !self.make_room(round.memory_limit) {
@@ -577,7 +594,7 @@ impl Tree {
                 None => {
                     encode_board(&board, boards);
                     self.add_in_flight(&path);
-                    self.pending.push_back(PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() });
+                    self.round_leaves(round.id).push_back(PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() });
                     gathered += 1;
                 }
             }
@@ -590,16 +607,23 @@ impl Tree {
         Ok(gathered)
     }
 
-    //mcts.finish for the oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it, sharpened
+    //mcts.finish for the round's oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps
+    //it, sharpened
     pub fn finish_leaf(
         &mut self,
+        round: u64,
         answer: impl Fn(usize) -> f32,
         answer_width: usize,
         move_ids: &MoveIds,
         cache: Option<&mut Cache>,
         settings: &SearchSettings,
     ) {
-        let leaf = self.pending.pop_front().expect("a waiting simulation");
+        let leaf = self
+            .pending
+            .iter_mut()
+            .find(|(id, leaves)| *id == round && !leaves.is_empty())
+            .and_then(|(_, leaves)| leaves.pop_front())
+            .expect("a waiting simulation of the round");
         self.logits.clear();
         self.logits.extend(leaf.moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, leaf.turn))));
         softmax(&mut self.logits);
@@ -992,7 +1016,7 @@ impl Tree {
 
     //plays the root's move and makes its node the root, with its subtree (tree reuse) or without
     pub fn play(&mut self, edge: usize, keep_subtree: bool) {
-        assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
+        assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         if keep_subtree && self.children[edge] != NO_NODE {
             self.move_root(&[edge]);
             self.compact(1, None);
@@ -1021,7 +1045,7 @@ impl Tree {
     //line has its node. The new root's proof is dropped, as a root is never proven (root_decided reads its moves'), and
     //so is the old root's noise
     pub fn move_root(&mut self, line: &[usize]) {
-        assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
+        assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         for &edge in line {
             assert_ne!(self.children[edge], NO_NODE, "a line through the tree's nodes");
             self.board.play_unchecked(self.moves[edge]);

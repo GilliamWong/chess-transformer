@@ -185,6 +185,7 @@ impl SelfPlayGames {
         let mut boards = Vec::new();
         for (index, game) in self.games.iter_mut().enumerate() {
             let round = Round {
+                id: 0, //one round out at a time
                 leaves: 1,
                 simulations: if game.awaits_noise() { 1 } else { self.simulations_per_round },
                 collisions: 0,
@@ -209,6 +210,7 @@ impl SelfPlayGames {
         for (row, &index) in self.waiting.iter().enumerate() {
             let answer = &answers[row * self.answer_width..(row + 1) * self.answer_width];
             self.games[index].tree.finish_leaf(
+                0,
                 |column| answer[column].get(),
                 self.answer_width,
                 &self.move_ids,
@@ -320,6 +322,14 @@ impl Search {
 //(id, expected line in uci, the chosen move's mean score, root moves by visits, the root's visits)
 type SearchReport = (u64, Vec<String>, f64, Vec<(String, u32)>, u32);
 
+//a round whose leaves the network is evaluating: its number in the trees (search.rs Round's id), the name descend was
+//given for it, and the searches with leaves in it with how many, in board order
+struct RoundOut {
+    number: u64,
+    name: Option<u64>,
+    leaves: Vec<(u64, u32)>,
+}
+
 //the tree of a game's search that ended last, for the game's next search, at the position after `moves`
 struct KeptTree {
     fen: String,
@@ -372,8 +382,8 @@ struct Searches {
     answer_width: usize,
     tables: Option<Tables>,
     searches: Vec<Search>,
-    //the rounds whose leaves the network is evaluating, oldest first: each search's id and its leaves, in board order
-    rounds: VecDeque<Vec<(u64, u32)>>,
+    rounds: VecDeque<RoundOut>, //oldest first
+    rounds_descended: u64,
     tree_reuse: bool,
     //by id: a new game under an id drops the last game's tree at its first search
     kept: HashMap<u64, KeptTree>,
@@ -486,6 +496,7 @@ impl Searches {
             tables: open_tables(tablebase_folder, tablebase_pieces)?,
             searches: Vec::new(),
             rounds: VecDeque::new(),
+            rounds_descended: 0,
             tree_reuse,
             kept: HashMap::new(),
             cache: (cache_positions > 0).then(|| Cache::new(cache_positions)),
@@ -515,13 +526,28 @@ impl Searches {
 
     //the boards of up to `leaves` new leaves of every search for the network, in a round of at most `simulations`
     //(default `leaves`) with those finished at once (see search.rs gather). Rounds may be gathered before the last ones
-    //are finished, so that the network is never idle
-    #[pyo3(signature = (leaves=1, collisions=0, simulations=None))]
-    fn descend<'py>(&mut self, py: Python<'py>, leaves: u32, collisions: u32, simulations: Option<u32>) -> PyResult<Bound<'py, PyBytes>> {
+    //are finished, so that the network is never idle; a round given a name (`round`) may be finished by it, in any order
+    #[pyo3(signature = (leaves=1, collisions=0, simulations=None, *, round=None))]
+    fn descend<'py>(
+        &mut self,
+        py: Python<'py>,
+        leaves: u32,
+        collisions: u32,
+        simulations: Option<u32>,
+        round: Option<u64>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        if let Some(name) = round
+            && self.rounds.iter().any(|out| out.name == Some(name))
+        {
+            return Err(PyValueError::new_err(format!("round {name} is still waiting for its answers")));
+        }
+        let number = self.rounds_descended;
+        self.rounds_descended += 1;
         let mut boards = Vec::new();
-        let mut round = Vec::new();
+        let mut round_leaves = Vec::new();
         for search in self.searches.iter_mut().filter(|search| !search.stopped) {
             let limits = Round {
+                id: number,
                 leaves,
                 simulations: simulations.unwrap_or(leaves),
                 collisions,
@@ -533,24 +559,41 @@ impl Searches {
                 .gather(&limits, &self.settings, self.tables.as_ref(), self.cache.as_ref(), &mut boards)
                 .map_err(tablebase_error)?;
             if gathered > 0 {
-                round.push((search.id, gathered));
+                round_leaves.push((search.id, gathered));
             }
         }
-        self.rounds.push_back(round);
+        self.rounds.push_back(RoundOut { number, name: round, leaves: round_leaves });
         Ok(PyBytes::new(py, &boards))
     }
 
-    //finishes the oldest round with the network's answers, and returns the reports of the searches that are done
-    fn finish(&mut self, py: Python<'_>, answers: PyBuffer<f32>) -> PyResult<Vec<SearchReport>> {
-        let round = self.rounds.pop_front().ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers"))?;
-        let boards = round.iter().map(|&(_, leaves)| leaves as usize).sum();
+    //finishes a round with the network's answers, the one descend named `round` or else the oldest, and returns the
+    //reports of the searches that are done
+    #[pyo3(signature = (answers, round=None))]
+    fn finish(&mut self, py: Python<'_>, answers: PyBuffer<f32>, round: Option<u64>) -> PyResult<Vec<SearchReport>> {
+        let index = match round {
+            None => (!self.rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers")),
+            Some(name) => self
+                .rounds
+                .iter()
+                .position(|out| out.name == Some(name))
+                .ok_or_else(|| PyRuntimeError::new_err(format!("round {name} is not waiting for its answers"))),
+        }?;
+        let boards = self.rounds[index].leaves.iter().map(|&(_, leaves)| leaves as usize).sum();
         let answers = answers_for(py, &answers, boards, self.answer_width)?;
+        let out = self.rounds.remove(index).expect("the round");
         let index_of: HashMap<u64, usize> = self.searches.iter().enumerate().map(|(index, search)| (search.id, index)).collect();
         let mut rows = answers.chunks_exact(self.answer_width);
-        for (id, leaves) in round {
+        for (id, leaves) in out.leaves {
             let tree = &mut self.searches[index_of[&id]].tree;
             for answer in rows.by_ref().take(leaves as usize) {
-                tree.finish_leaf(|column| answer[column].get(), self.answer_width, &self.move_ids, self.cache.as_mut(), &self.settings);
+                tree.finish_leaf(
+                    out.number,
+                    |column| answer[column].get(),
+                    self.answer_width,
+                    &self.move_ids,
+                    self.cache.as_mut(),
+                    &self.settings,
+                );
             }
         }
         Ok(self.take_reports())

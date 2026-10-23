@@ -61,6 +61,42 @@ def test_a_round_gathers_different_leaves():
     assert len({board.tobytes() for board in np.concatenate([first, second])}) == 16
 
 
+#every move's logit drawn at random for each board, and its score a quarter, a half or three quarters: sums of quarters
+#are exact in any order
+def answers_by_board(boards: np.ndarray) -> np.ndarray:
+    answers = np.zeros((len(boards), ANSWER_WIDTH), dtype=np.float32)
+    for row, board in enumerate(boards):
+        random = np.random.default_rng(list(board))
+        answers[row, :-1] = random.normal(scale=2.0, size=ANSWER_WIDTH - 1)
+        answers[row, -1] = random.integers(1, 4) / 4
+    return answers
+
+#rounds named at descend come back in any order, as on several gpus, and each round's answers reach their own leaves:
+#four rounds out at once finished shuffled leave the tree that finishing them oldest first leaves, where the next round
+#goes and the search's report. A name already out, or one that is not, is refused
+def test_rounds_are_finished_by_name_in_any_order():
+    found = []
+    for order in ([0, 1, 2, 3], [2, 0, 3, 1]):
+        searches = selfplay_rs.Searches(**rust_search_settings(False))
+        searches.start(0, chess.STARTING_FEN, [], 300)
+        while searches.root_visits(0)[0] < 40:
+            searches.finish(answers_by_board(leaf_boards(searches.descend())))
+        out = {name: leaf_boards(searches.descend(8, 64, 24, round=name)) for name in range(4)}
+        with pytest.raises(ValueError):
+            searches.descend(8, 64, 24, round=1)
+        for name in order:
+            searches.finish(answers_by_board(out[name]), round=name)
+        with pytest.raises(RuntimeError):
+            searches.finish(answers_by_board(out[0]), round=0)
+        following = leaf_boards(searches.descend(64, 64, 192))
+        reports = searches.finish(answers_by_board(following))
+        while not reports:
+            reports = searches.finish(answers_by_board(leaf_boards(searches.descend())))
+        found.append(([len(leaves) for leaves in out.values()], following.tobytes(), reports[0]))
+
+    assert found[0] == found[1] and found[0][0] == [8, 8, 8, 8] and found[0][2][4] == 300
+
+
 #a position reached again by another order of moves takes its answer from the cache: the same search with fewer
 #network calls
 def test_the_cache_answers_transpositions_as_the_network_would():
