@@ -97,6 +97,31 @@ def test_rounds_are_finished_by_name_in_any_order():
     assert found[0] == found[1] and found[0][0] == [8, 8, 8, 8] and found[0][2][4] == 300
 
 
+#Searches' calls release the gil while they work, so that a thread driving another gpu runs meanwhile: a python thread
+#counts on through a long descend (a round of 400 searches), where it stood still while the call held the gil
+def test_searches_let_other_threads_run():
+    searches = selfplay_rs.Searches(**rust_search_settings(False))
+    for search_id in range(400):
+        searches.start(search_id, chess.STARTING_FEN, [], 1000)
+    searches.finish(answers_of_0_6(leaf_boards(searches.descend())))
+    ticks, counting = [0], threading.Event()
+
+    def count():
+        counting.set()
+        while counting.is_set():
+            ticks[0] += 1
+    counter = threading.Thread(target=count)
+    counter.start()
+    counting.wait()
+    before, started = ticks[0], time.perf_counter()
+    searches.descend(64, 64, 192)
+    seconds, during = time.perf_counter() - started, ticks[0] - before
+    counting.clear()
+    counter.join()
+
+    assert during > 1000, (seconds, during)
+
+
 #a position reached again by another order of moves takes its answer from the cache: the same search with fewer
 #network calls
 def test_the_cache_answers_transpositions_as_the_network_would():
