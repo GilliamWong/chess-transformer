@@ -210,8 +210,6 @@ class SquareFeatures(nn.Module):
         #B 64 d_model; embedding_bag sums the 23 rows without holding them all
         B = board_state.shape[0]
         rows = self.indices(board_state) + self.row_offsets
-        if torch.compiler.is_exporting(): #the onnx exporter makes embedding_bag a loop over the bags (engine/lc0_network.py)
-            return self.table[rows].sum(dim=-2)
         return F.embedding_bag(rows.reshape(B * NUM_SQUARES, -1), self.table, mode="sum").reshape(B, NUM_SQUARES, -1)
 
 
