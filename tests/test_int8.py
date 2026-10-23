@@ -140,6 +140,7 @@ def test_the_small_batch_cuda_kernels_give_int8_linears_bits(matmul, monkeypatch
             x, x_scale, weight, weight_scale, bias, residual, gated, mix = operands
             found = int8_cuda.small_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, *(mix or (None, None, None)))
             assert found is not None and torch.equal(found, triton_int8_linear(monkeypatch, matmul, operands)), (config, rows)
+            assert int8_cuda.takes_rows(x.device, (kind,), rows, x.shape[-1]) and not int8_cuda.takes_rows(x.device, (kind,), largest + 1, x.shape[-1])
 
 
 #recorded in cuda graphs on two streams and replayed at once (the engine's two lanes), a CUDA kernel reads the graph's
@@ -211,6 +212,7 @@ def test_untimed_gpus_never_use_the_cuda_kernels(untimed, monkeypatch):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: untimed)
     x, x_scale, weight, weight_scale, bias, residual, gated, _ = int8_operands("projection", 70)
     assert int8_cuda.small_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, None, None, None) is None
+    assert not int8_cuda.takes_rows(x.device, ("projection",), 70, 768)
 
 
 #norm_quant rounds the RMSNorm (with gain) of each row to int8 steps of its absmax / 127; mix_norm_quant first mixes

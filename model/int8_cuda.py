@@ -314,23 +314,32 @@ def kernels(device: torch.device) -> Kernels | None:
     return KERNELS[index]
 
 
+#the kernels and config that take a kind's matmul of M rows and depth K on this gpu, or None (Triton's then)
+def config_for(device: torch.device, kind: str, M: int, K: int) -> tuple[Kernels, tuple] | None:
+    found = kernels(device) if ENABLED and device.type == "cuda" else None
+    config = next((config for largest, config in found.configs.get(kind, ()) if M <= largest), None) if found is not None else None
+    #a config splits K exactly
+    return (found, config) if config is not None and K == config[3] * config[4] * 64 else None
+
+
+#whether one of kinds' matmuls of M rows and depth K would run here (the kernel before it may then let it launch early)
+def takes_rows(device: torch.device, kinds: tuple[str, ...], M: int, K: int) -> bool:
+    return any(config_for(device, kind, M, K) is not None for kind in kinds)
+
+
 #int8_linear's answer from a CUDA kernel, or None when none is set for this gpu, kind and number of rows
 def small_int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias: torch.Tensor | None,
                       residual: torch.Tensor | None, gated: bool, original: torch.Tensor | None, residual_scale: torch.Tensor | None,
                       input_scale: torch.Tensor | None) -> torch.Tensor | None:
-    if not ENABLED or not x.is_cuda:
-        return None
-    found = kernels(x.device)
-    if found is None:
-        return None
     rows, K = weight.shape
     N = rows // 2 if gated else rows
     M = x.numel() // K
     kind = "gate_up" if gated else "down" if residual is not None else "projection"
-    config = next((config for largest, config in found.configs.get(kind, ()) if M <= largest), None)
-    #a config splits K exactly, and the epilogue reads and writes 4 columns at once
-    if config is None or K != config[3] * config[4] * 64 or N % 4:
+    chosen = config_for(x.device, kind, M, K)
+    #the epilogue reads and writes 4 columns at once
+    if chosen is None or N % 4:
         return None
+    found, config = chosen
     out = torch.empty(*x.shape[:-1], N, device=x.device, dtype=torch.float16)
     epilogue = EPILOGUES["mixing down" if original is not None else kind]
     tensors = [x.contiguous(), x_scale.contiguous(), weight.contiguous(), weight_scale.contiguous(), bias,

@@ -6,10 +6,11 @@ import triton
 import triton.language as tl
 from torch import nn
 from triton.language.extra import libdevice
+from triton.language.extra.cuda import gdc_launch_dependents
 
 from model.fused_blocks import (GROUP_M, FusedBlock, dependent_launch, dependent_launch_wait, linear, linear_epilogue, link_input_mixes,
                                 template_attention, tile_for)
-from model.int8_cuda import small_int8_linear
+from model.int8_cuda import kernels, small_int8_linear, takes_rows
 
 #the mlp's hidden is rotated in blocks of this many to spread its outlier channels, down's weights to match (H H^T = 32 I)
 HADAMARD_BLOCK = 32
@@ -153,11 +154,20 @@ def _(x, x_scale, weight, weight_scale, bias, residual, gated, matmul, original=
     return x.new_empty(*x.shape[:-1], weight.shape[0] // 2 if gated else weight.shape[0], dtype=torch.float16)
 
 
+#dependent_launch_wait, then with EARLY the next kernel may launch: a small-batch CUDA matmul (int8_cuda) reads its
+#weights before its own wait, so it loads them while this kernel runs
+@triton.jit
+def wait_then_let_launch(PDL: tl.constexpr, EARLY: tl.constexpr):
+    dependent_launch_wait(PDL)
+    if PDL and EARLY:
+        gdc_launch_dependents()
+
+
 #rows RMS-normalised (with gain) and rounded to int8, a row's scale its absmax / 127; MIX first mixes in the block's input
 @triton.jit
 def norm_quant_kernel(x_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, gain_ptr, mixed_ptr, q_ptr, scale_ptr, M, D, eps,
-                      MIX: tl.constexpr, ROWS: tl.constexpr, BLOCK_D: tl.constexpr, PDL: tl.constexpr):
-    dependent_launch_wait(PDL)
+                      MIX: tl.constexpr, ROWS: tl.constexpr, BLOCK_D: tl.constexpr, EARLY: tl.constexpr, PDL: tl.constexpr):
+    wait_then_let_launch(PDL, EARLY)
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     d = tl.arange(0, BLOCK_D)
     row_ok = rows < M
@@ -182,9 +192,11 @@ def launch_norm_quant(x, original, residual_scale, input_scale, gain, mixed, eps
     q = torch.empty(x.shape, device=x.device, dtype=torch.int8)
     scale = torch.empty(x.shape[:-1], device=x.device, dtype=torch.float32)
     mix = original is not None
+    #the projection or gate_up after it
+    early = takes_rows(x.device, ("projection", "gate_up"), M, D)
     norm_quant_kernel[(triton.cdiv(M, NORM_ROWS),)](x, original if mix else x, residual_scale if mix else gain, input_scale if mix else gain, gain,
                                                     mixed if mix else x, q, scale, M, D, eps, MIX=mix, ROWS=NORM_ROWS,
-                                                    BLOCK_D=triton.next_power_of_2(D), num_warps=NORM_WARPS, **dependent_launch(x.device))
+                                                    BLOCK_D=triton.next_power_of_2(D), EARLY=early, num_warps=NORM_WARPS, **dependent_launch(x.device))
     return q, scale
 
 
@@ -216,8 +228,8 @@ def _(x, original, residual_scale, input_scale, gain, eps):
 #h's rows times the block-diagonal Hadamard matrix, rounded to int8 WIDTH wide; read as rows of BLOCK for one matmul
 @triton.jit
 def rotate_quant_kernel(h_ptr, hadamard_ptr, q_ptr, scale_ptr, M, N, WIDTH: tl.constexpr, ROWS: tl.constexpr, BLOCK: tl.constexpr,
-                        SLOTS: tl.constexpr, PDL: tl.constexpr):
-    dependent_launch_wait(PDL)
+                        SLOTS: tl.constexpr, EARLY: tl.constexpr, PDL: tl.constexpr):
+    wait_then_let_launch(PDL, EARLY)
     r = tl.arange(0, ROWS * SLOTS)
     tokens = tl.program_id(0) * ROWS + r // SLOTS
     i = tl.arange(0, BLOCK)
@@ -242,7 +254,8 @@ def rotate_quant(h: torch.Tensor, hadamard_signs: torch.Tensor, width: int) -> t
     block = hadamard_signs.shape[0]
     rows = rotate_rows(h.device, M)
     rotate_quant_kernel[(triton.cdiv(M, rows),)](h, hadamard_signs, q, scale, M, N, WIDTH=width, ROWS=rows, BLOCK=block,
-                                                 SLOTS=triton.next_power_of_2(width // block), num_warps=4, **dependent_launch(h.device))
+                                                 SLOTS=triton.next_power_of_2(width // block), EARLY=takes_rows(h.device, ("down",), M, width),
+                                                 num_warps=4, **dependent_launch(h.device))
     return q, scale
 
 
@@ -289,9 +302,12 @@ class Int8Block(nn.Module):
         return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, "down", original_board_embed, *self.next_scales)
 
 
-#the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks
+#the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks; the small-batch
+#CUDA kernels compiled now, not while a cuda graph records
 def quantize_blocks(model: nn.Module, weights: dict[int, dict], output_scale: float) -> nn.Module:
     blocks = [Int8Block(block, weights[layer], output_scale) if layer in weights else block for layer, block in enumerate(model.encoder)]
     link_input_mixes(blocks)
     model.encoder = nn.ModuleList(blocks)
+    if weights:
+        kernels(next(model.parameters()).device)
     return model
