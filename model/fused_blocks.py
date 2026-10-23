@@ -194,22 +194,40 @@ def _(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_c
     return projected.new_empty(B, T, heads * dv)
 
 
-#a tile of the blocks' matmuls is LINEAR_ROWS (+ linear_extra_rows()) x LINEAR_COLUMNS, LINEAR_DEPTH deep (a gated
-#matmul's is LINEAR_COLUMNS / 2 columns of the gate and the same of up), and GROUP_M row tiles go through the columns
-#together so their rows stay in L2. The fastest on an RTX 4090 at 64 positions of 32 to 128 rows, 64 to 256 columns,
-#2 to 4 stages and 4 or 8 warps; smaller tiles for smaller batches gained under 1% of a search
+#a tile of the blocks' matmuls is its rows (+ linear_extra_rows()) x its columns, LINEAR_DEPTH deep (a gated matmul's
+#is columns / 2 columns of the gate and the same of up), and GROUP_M row tiles go through the columns together so their
+#rows stay in L2. LINEAR_ROWS x LINEAR_COLUMNS with LINEAR_WARPS and LINEAR_STAGES was the fastest on an RTX 4090 at 64
+#positions of 32 to 128 rows, 64 to 256 columns, 2 to 4 stages and 4 or 8 warps
 LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_DEPTH, LINEAR_WARPS, LINEAR_STAGES, GROUP_M = 128, 128, 32, 4, 3, 8
-#a tile's extra rows each cost about this many of its LINEAR_ROWS (they are a smaller matmul of their own)
+#linear's tiles (rows, columns, warps, stages) by compute capability, as tile_for lists; a gpu not timed takes them all
+#at LINEAR_ROWS x LINEAR_COLUMNS. Any tile gives the same bits: it changes neither the depth's order nor the instructions
+UNTIMED_LINEAR_TILES = [(math.inf, (LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_WARPS, LINEAR_STAGES))]
+LINEAR_TILES = {(12, 0): UNTIMED_LINEAR_TILES}
+#a tile's extra rows each cost about this many of its rows (they are a smaller matmul of their own)
 EXTRA_ROW_COST = 1.5
 
 
-#the rows (0, 16, 32 or 64) a tile takes after its LINEAR_ROWS: a matmul runs in waves of a tile per multiprocessor,
-#and a few tiles more than a whole number of waves cost a whole wave. At 64 positions (4,480 rows) a 512 column
-#matmul has 140 tiles of 128 rows for 128 multiprocessors, or 128 tiles of 144
-def linear_extra_rows(M: int, column_tiles: int, multiprocessors: int) -> int:
+#a tile from tiles, [(the most rows a multiprocessor's share may be, tile), ...] with the last for any: a matmul runs
+#in waves of tiles over the multiprocessors, so a tile for a share times out the same on a card with more of them. On
+#a 70 multiprocessor card (RTX 5070 Ti) a board's 70 rows are one per multiprocessor
+def tile_for(tiles: list[tuple[float, tuple[int, ...]]], M: int, multiprocessors: int) -> tuple[int, ...]:
+    share = M / multiprocessors
+    return next(tile for most, tile in tiles if share <= most)
+
+
+#linear's tile for a matmul of M rows on the gpu
+def linear_tile(device: torch.device, M: int) -> tuple[int, ...]:
+    tiles = LINEAR_TILES.get(torch.cuda.get_device_capability(device), UNTIMED_LINEAR_TILES)
+    return tile_for(tiles, M, torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+#the rows (0, 16, 32 or 64) a tile of rows takes after them: a matmul runs in waves of a tile per multiprocessor, and
+#a few tiles more than a whole number of waves cost a whole wave. At 64 positions (4,480 rows) a 512 column matmul has
+#140 tiles of 128 rows for 128 multiprocessors, or 128 tiles of 144
+def linear_extra_rows(M: int, rows: int, column_tiles: int, multiprocessors: int) -> int:
     def cost(extra: int) -> float:
-        waves = triton.cdiv(triton.cdiv(M, LINEAR_ROWS + extra) * column_tiles, multiprocessors)
-        return waves * (LINEAR_ROWS + EXTRA_ROW_COST * extra)
+        waves = triton.cdiv(triton.cdiv(M, rows + extra) * column_tiles, multiprocessors)
+        return waves * (rows + EXTRA_ROW_COST * extra)
     return min((0, 16, 32, 64), key=cost)
 
 
@@ -291,13 +309,11 @@ def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, original_ptr, residual_s
                         HAS_BIAS, HAS_RESIDUAL, GATED, MIX)
 
 
-#an opaque op for torch.compile, as template_attention. fp16 inputs accumulate in fp16 and give fp16, or with
-#accumulate_fp32 accumulate in fp32 and give fp32; fp32 inputs accumulate in fp32 (tf32 products). With original (the
-#input embedding) and the next block's residual_scale and input_scale it gives the next block's input (linear_epilogue)
-@torch.library.custom_op("chess::linear", mutates_args=())
-def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, residual: torch.Tensor | None = None,
-           gated: bool = False, accumulate_fp32: bool = False, original: torch.Tensor | None = None, residual_scale: torch.Tensor | None = None,
-           input_scale: torch.Tensor | None = None) -> torch.Tensor:
+#linear with a tile of LINEAR_TILES'
+def launch_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, residual: torch.Tensor | None, gated: bool,
+                  accumulate_fp32: bool, original: torch.Tensor | None, residual_scale: torch.Tensor | None, input_scale: torch.Tensor | None,
+                  tile: tuple[int, ...]) -> torch.Tensor:
+    rows, columns, warps, stages = tile
     K, width = weight.shape
     N = width // 2 if gated else width
     if K % LINEAR_DEPTH != 0:
@@ -306,18 +322,29 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = No
     out = x.new_empty(*x.shape[:-1], N, dtype=torch.float32 if accumulate_fp32 else x.dtype)
     acc_type = tl.float16 if x.dtype == torch.float16 and not accumulate_fp32 else tl.float32
     M = x.numel() // K
-    columns = LINEAR_COLUMNS // 2 if gated else LINEAR_COLUMNS
-    extra = linear_extra_rows(M, triton.cdiv(N, columns), torch.cuda.get_device_properties(x.device).multi_processor_count)
+    columns = columns // 2 if gated else columns
+    extra = linear_extra_rows(M, rows, triton.cdiv(N, columns), torch.cuda.get_device_properties(x.device).multi_processor_count)
     #the pointers of unused inputs are never read
     bias_ = bias if bias is not None else weight
     residual_ = residual.contiguous() if residual is not None else out
     mix = original is not None
     mix_ = (original.contiguous(), residual_scale, input_scale) if mix else (out, out, out)
-    grid = (triton.cdiv(M, LINEAR_ROWS + extra) * triton.cdiv(N, columns),)
+    grid = (triton.cdiv(M, rows + extra) * triton.cdiv(N, columns),)
     linear_kernel[grid](x, weight, bias_, residual_, *mix_, out, M, N, K, weight.stride(0), HAS_BIAS=bias is not None, HAS_RESIDUAL=residual is not None,
-                        GATED=gated, MIX=mix, ACC_TYPE=acc_type, BLOCK_M=LINEAR_ROWS, EXTRA_M=extra, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M,
-                        num_warps=LINEAR_WARPS, num_stages=LINEAR_STAGES, **dependent_launch(x.device))
+                        GATED=gated, MIX=mix, ACC_TYPE=acc_type, BLOCK_M=rows, EXTRA_M=extra, BLOCK_N=columns, BLOCK_K=LINEAR_DEPTH, GROUP_M=GROUP_M,
+                        num_warps=warps, num_stages=stages, **dependent_launch(x.device))
     return out
+
+
+#an opaque op for torch.compile, as template_attention. fp16 inputs accumulate in fp16 and give fp16, or with
+#accumulate_fp32 accumulate in fp32 and give fp32; fp32 inputs accumulate in fp32 (tf32 products). With original (the
+#input embedding) and the next block's residual_scale and input_scale it gives the next block's input (linear_epilogue)
+@torch.library.custom_op("chess::linear", mutates_args=())
+def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, residual: torch.Tensor | None = None,
+           gated: bool = False, accumulate_fp32: bool = False, original: torch.Tensor | None = None, residual_scale: torch.Tensor | None = None,
+           input_scale: torch.Tensor | None = None) -> torch.Tensor:
+    tile = linear_tile(x.device, x.numel() // weight.shape[0])
+    return launch_linear(x, weight, bias, residual, gated, accumulate_fp32, original, residual_scale, input_scale, tile)
 
 
 @linear.register_fake

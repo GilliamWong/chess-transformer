@@ -54,7 +54,7 @@ def dequantised(integers: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("matmul", ["projection", "gate_up", "down", "mixing down"])
 @pytest.mark.parametrize("boards", [1, 3])
 def test_int8_linear_is_the_dequantised_matmul(matmul, boards):
-    from model.int8_blocks import INT8_TILES, int8_linear
+    from model.int8_blocks import INT8_TILES, launch_int8_linear
     torch.manual_seed(0)
     down, gated = matmul.endswith("down"), matmul == "gate_up"
     width, depth = 200, 1024 if down else 256
@@ -78,8 +78,8 @@ def test_int8_linear_is_the_dequantised_matmul(matmul, boards):
     if mix:
         original, residual_scale, input_scale = mix
         expected = residual_scale.double() * expected.half().double() + input_scale.double() * original.reshape(-1, width).double()
-    for tile in dict.fromkeys(tiles["down" if down else matmul] for tiles in INT8_TILES.values()):
-        out = int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, list(tile), *mix)
+    for tile in dict.fromkeys(tile for tiles in INT8_TILES.values() for _, tile in tiles["down" if down else matmul]):
+        out = launch_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, *(mix or (None, None, None)), tile)
         assert out.dtype == torch.float16 and out.shape == (boards, 70, width)
         assert torch.allclose(out.reshape(-1, width).double(), expected, atol=1e-3, rtol=2e-3), tile
 

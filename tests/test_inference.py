@@ -539,7 +539,7 @@ def test_extra_rows_leave_every_row_the_same(monkeypatch, gated, accumulate_fp32
 
     outs = []
     for extra in (0, 16, 32, 64):
-        monkeypatch.setattr(fused_blocks, "linear_extra_rows", lambda M, column_tiles, multiprocessors, extra=extra: extra)
+        monkeypatch.setattr(fused_blocks, "linear_extra_rows", lambda M, rows, column_tiles, multiprocessors, extra=extra: extra)
         outs.append(fused_blocks.linear(x, weight, bias, None, gated, accumulate_fp32))
 
     assert all(torch.equal(out, outs[0]) for out in outs[1:])
@@ -549,8 +549,8 @@ def test_extra_rows_leave_every_row_the_same(monkeypatch, gated, accumulate_fp32
 #multiprocessors and 128 tiles of 144 rows one; tiles that fill their waves take no extra rows
 def test_extra_rows_save_a_wave():
     fused_blocks = pytest.importorskip("model.fused_blocks")
-    assert fused_blocks.linear_extra_rows(64 * 70, 4, 128) == 16
-    assert fused_blocks.linear_extra_rows(56 * 70, 4, 128) == 0
+    assert fused_blocks.linear_extra_rows(64 * 70, 128, 4, 128) == 16
+    assert fused_blocks.linear_extra_rows(56 * 70, 128, 4, 128) == 0
 
 
 #the heads' matmul (fused_blocks.FusedTransformer): fp16 inputs accumulating in fp32 and giving fp32, as close to the
