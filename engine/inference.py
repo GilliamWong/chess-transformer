@@ -13,7 +13,7 @@ from torch import nn
 from model.encoding import TOKENS_PER_BOARD, encode_board
 from model.model import expected_score
 from engine.selfplay import ANSWER_WIDTH, set_priority, slot_arrays
-from engine.player import load_model
+from engine.player import clear_cublas_workspaces, load_model
 
 #a row of ANSWER_WIDTH numbers per board: the move logits, then the expected score
 def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
@@ -115,15 +115,6 @@ class Lane:
             with torch.cuda.graph(self.graphs[size], pool=pool, stream=self.stream), torch.no_grad():
                 self.answers[size] = chunked_answer_rows(model, self.boards[:size], chunk)
             clear_cublas_workspaces()
-
-#cublas keeps a workspace for each stream it runs on, made at its first matmul there: made while a graph records, it
-#is in that graph's pool, and calls and graphs after on the stream used it past the graph's end (cuda error 700).
-#Cleared around each recording (as inductor's cuda graph trees do), a graph records a workspace of its own in its pool
-def clear_cublas_workspaces() -> None:
-    #a private torch function, absent from some versions
-    clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
-    if clear is not None:
-        clear()
 
 #the model as cuda graphs in in_flight lanes that run their batches at once, a batch through the smallest graph that
 #holds it on the first lane free. launch returns at once and collect waits, in any order: at most in_flight batches out.

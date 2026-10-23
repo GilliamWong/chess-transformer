@@ -34,6 +34,15 @@ def load_model(checkpoint_path: Path, device: torch.device) -> ChessTransformer:
 
     return model
 
+#cublas keeps a workspace for each stream it runs on, made at its first matmul there: made while a graph records, it
+#is in that graph's pool, and calls and graphs after on the stream used it past the graph's end (cuda error 700).
+#Cleared around each recording (as inductor's cuda graph trees do), a graph records a workspace of its own in its pool
+def clear_cublas_workspaces() -> None:
+    #a private torch function, absent from some versions
+    clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+    if clear is not None:
+        clear()
+
 #one board at a time on the gpu as a replayed cuda graph: 1,700 simulations a second on the d128 against 440 on a cpu
 #thread, but processes sharing the gpu get only about 2,400 between them, so many games at once are faster on the cpu
 class CudaGraphModel(nn.Module):
@@ -50,8 +59,10 @@ class CudaGraphModel(nn.Module):
         torch.cuda.current_stream().wait_stream(side_stream)
 
         self.graph = torch.cuda.CUDAGraph()
+        clear_cublas_workspaces()
         with torch.cuda.graph(self.graph), torch.no_grad():
             self.outputs = torch.cat(model(self.boards), dim=1) #the move logits, then the eval head's
+        clear_cublas_workspaces()
 
     #boards on the cpu in, the model's two outputs on the cpu out
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
