@@ -55,6 +55,17 @@ FIRST_MOVE_BONUS = 0.0
 BOOK_PLY_BONUS = 0.0
 MOST_BOOK_PLIES = 12
 
+#go's numbers (GO_NUMBERS) by name, and those that are not whole numbers ("name value"), which are left out
+def go_numbers(arguments: list[str]) -> tuple[dict[str, int], list[str]]:
+    numbers, bad = {}, []
+    for key, value in zip(arguments, arguments[1:]):
+        if key in GO_NUMBERS:
+            try:
+                numbers[key] = int(value)
+            except ValueError:
+                bad.append(f"{key} {value}")
+    return numbers, bad
+
 def phase_weight(men: int) -> float:
     return next((weight for fewest, most, weight in PHASE_WEIGHTS if fewest <= men <= most), 1.0)
 
@@ -134,7 +145,7 @@ class Clock:
 
     #(simulations, seconds) for a search of `board`, each None when go does not set it; a go with neither runs `simulations`
     def limits(self, arguments: list[str], board: chess.Board, simulations: int) -> tuple[int | None, float | None]:
-        numbers = {key: int(value) for key, value in zip(arguments, arguments[1:]) if key in GO_NUMBERS}
+        numbers, _ = go_numbers(arguments)
         time_left, increment = ("wtime", "winc") if board.turn == chess.WHITE else ("btime", "binc")
         seconds = self.allotted = self.extension = None
         if "movetime" in numbers:
@@ -419,6 +430,8 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         if random_mover:
             move = choose_random_move(board)
         elif searching:
+            for number in go_numbers(go.arguments)[1]:
+                send(f"info string go's {number} is not a whole number: left out")
             nodes, seconds = clock.limits(go.arguments, board, simulations)
             if go.until_stop:
                 nodes = seconds = None

@@ -296,6 +296,15 @@ def test_go_nodes_0_plays_at_once(monkeypatch):
     assert given == [(1, None), (1, None), (7, None)] and len([line for line in sent if line.startswith("bestmove")]) == 3
 
 
+#a go number that is not a whole number is left out, the gui told so (int() raised, which ended the engine): that go is
+#searched as if it had not come with it
+def test_go_leaves_out_numbers_that_are_not_whole(monkeypatch):
+    given, sent = searched_gos(monkeypatch, ["go nodes x", "go movetime 1.5 nodes 30", "go wtime 1000.5 btime 1000"])
+    assert given == [(800, None), (30, None), (800, None)] and len([line for line in sent if line.startswith("bestmove")]) == 3
+    told = [line for line in sent if line.startswith("info string")]
+    assert told == [f"info string go's {number} is not a whole number: left out" for number in ("nodes x", "movetime 1.5", "wtime 1000.5")]
+
+
 #the start position with pieces taken off, the kings kept, until `men` are left
 def board_with_men(men: int) -> chess.Board:
     board = chess.Board()
