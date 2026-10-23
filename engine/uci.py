@@ -20,8 +20,8 @@ import torch
 from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
-from engine.engine_search import (CACHE_POSITIONS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, EngineSearch,
-                                  engine_network, engine_search_settings, parse_changes)
+from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT,
+                                  EngineSearch, engine_network, engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
@@ -308,10 +308,10 @@ class Commands:
 
 #setoption's whole number options, (lowest, highest): the tables' most pieces, MoveOverhead in ms, RamLimitMb in MB
 SPIN_OPTIONS = {"SyzygyProbeLimit": (min(table_set.pieces for table_set in TABLE_SETS), max(table_set.pieces for table_set in TABLE_SETS)),
-                "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000)}
+                "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000), "AdvanceThreads": (1, 256)}
 #the options the search is built with (at isready or the first go): set later, they take effect when the engine
 #restarts, not at a new game (Searches takes them when it is made)
-BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb")
+BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb", "AdvanceThreads")
 
 #setoption's "name <name> value <value>", each of any number of words (a path may hold spaces)
 def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
@@ -321,7 +321,8 @@ def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
 #the search's uci options, the command line's choices their defaults. SyzygyPath: folders of syzygy tables, os.pathsep
 #between them, or <empty> for the command line's (--tablebase, else none); SyzygyProbeLimit: their most pieces;
 #CachePositions: the network's answers the search keeps (engine_search.CACHE_POSITIONS); RamLimitMb: the MB (10^6
-#bytes) the search's tree may take, 0 for no limit (Searches' memory_limit_mb, without the cache or a kept tree's copy)
+#bytes) the search's tree may take, 0 for no limit (Searches' memory_limit_mb, without the cache or a kept tree's copy);
+#AdvanceThreads: the threads the kept tree is carried on to the next move on (engine_search.ADVANCE_THREADS)
 class Options:
     def __init__(self, tablebase: bool, tablebase_pieces: int):
         self.tablebase, self.default_pieces = tablebase, tablebase_pieces
@@ -330,11 +331,12 @@ class Options:
         self.move_overhead_seconds = MOVE_OVERHEAD_SECONDS
         self.cache_positions = CACHE_POSITIONS
         self.ram_limit_mb = 0
+        self.advance_threads = ADVANCE_THREADS
 
     #the uci reply's lines
     def lines(self) -> list[str]:
         defaults = {"SyzygyProbeLimit": self.default_pieces, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": CACHE_POSITIONS,
-                    "RamLimitMb": 0}
+                    "RamLimitMb": 0, "AdvanceThreads": ADVANCE_THREADS}
         return (["option name SyzygyPath type string default <empty>"]
                 + [f"option name {name} type spin default {defaults[name]} min {lowest} max {highest}" for name, (lowest, highest) in SPIN_OPTIONS.items()])
 
@@ -368,8 +370,10 @@ class Options:
             self.move_overhead_seconds = number / 1000
         elif name == "CachePositions":
             self.cache_positions = number
-        else:
+        elif name == "RamLimitMb":
             self.ram_limit_mb = number
+        else:
+            self.advance_threads = number
         return None
 
     #why the search could not open the tables of `path` (None for the command line's) up to `pieces`, None if it can
@@ -387,7 +391,7 @@ class Options:
     def search(self) -> tuple[bool, dict]:
         return (self.tablebase or self.syzygy_path is not None,
                 {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": self.cache_positions,
-                 "memory_limit_mb": self.ram_limit_mb})
+                 "memory_limit_mb": self.ram_limit_mb, "advance_threads": self.advance_threads})
 
 
 def main(checkpoint_path: Path | None = None, random_mover: bool = False, selection: str = "argmax",

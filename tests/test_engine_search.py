@@ -1093,6 +1093,7 @@ def test_the_options_reach_the_search(monkeypatch):
             given.append(seconds)
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     script = ["uci", "setoption name cachepositions value 1000", "setoption name RamLimitMb value 64", "setoption name SyzygyProbeLimit value 6",
+              "setoption name AdvanceThreads value 12", "setoption name AdvanceThreads value 0",
               "setoption name MoveOverhead value 500", "setoption name MoveOverhead value -1", "setoption name SyzygyProbeLimit value 7",
               "setoption name Hash value 16", "isready", "setoption name CachePositions value 5", "go movetime 1000",
               "setoption name MoveOverhead value 100", "go movetime 1000", "ucinewgame", "go movetime 1000", "quit"]
@@ -1103,21 +1104,24 @@ def test_the_options_reach_the_search(monkeypatch):
     uci.main(Path("unused.pt"), selection="mcts", search_options={"smart_pruning": False})
 
     assert [line.split()[2] for line in sent if line.startswith("option name")] == ["SyzygyPath", "SyzygyProbeLimit", "MoveOverhead", "CachePositions",
-                                                                                     "RamLimitMb"]
+                                                                                     "RamLimitMb", "AdvanceThreads"]
     assert len(built) == 1 and built[0][4] is False
-    assert built[0][5] == {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64}
+    assert built[0][5] == {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64,
+                           "advance_threads": 12}
     assert given == [pytest.approx(0.5), pytest.approx(0.9), pytest.approx(0.9)]
     told = [line for line in sent if line.startswith("info string")]
-    assert len(told) == 4 and "-1" in told[0] and "7" in told[1] and "Hash" in told[2] and "CachePositions" in told[3]
+    assert len(told) == 5 and "AdvanceThreads" in told[0] and "-1" in told[1] and "7" in told[2] and "Hash" in told[3] and "CachePositions" in told[4]
 
-#EngineSearch makes its Searches with the cache size and memory limit it is given, and a search ends at the limit
-def test_the_search_takes_its_cache_size_and_memory_limit(monkeypatch):
+#EngineSearch makes its Searches with the cache size, memory limit and advance threads it is given, and a search ends at
+#the limit
+def test_the_search_takes_its_cache_size_memory_limit_and_advance_threads(monkeypatch):
     made = []
     searches = selfplay_rs.Searches
     monkeypatch.setattr(selfplay_rs, "Searches", lambda **settings: made.append(settings) or searches(**settings))
     EngineSearch(cpu_batches(BoardModel()), 16)
-    limited = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, cache_positions=1000, memory_limit_mb=1)
-    assert [(settings["cache_positions"], settings["memory_limit_mb"]) for settings in made] == [(engine_search.CACHE_POSITIONS, 0), (1000, 1)]
+    limited = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, cache_positions=1000, memory_limit_mb=1, advance_threads=12)
+    assert ([(settings["cache_positions"], settings["memory_limit_mb"], settings["advance_threads"]) for settings in made]
+            == [(engine_search.CACHE_POSITIONS, 0, engine_search.ADVANCE_THREADS), (1000, 1, 12)])
     assert 100 < limited.search(chess.Board(), simulations=100_000).simulations < 3000
 
 #a SyzygyPath the gui sets reaches the search: the root takes the tables' move (no simulations) from its folders. A

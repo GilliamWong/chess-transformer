@@ -61,6 +61,8 @@ INFO_SECONDS = 1.0
 #rather than self-play's 500k gave 18% more nodes a search on the mean (3.5% on the median) from as many network
 #calls. The engine's own: every self-play worker has a selfplay.CACHE_POSITIONS cache
 CACHE_POSITIONS = 5_000_000
+#the threads advance walks and copies the kept tree on after a move, while the opponent thinks (Searches' advance_threads)
+ADVANCE_THREADS = 4
 #the engine's own changes to mcts.py's search, which self-play keeps (tools/play/variant_match.py tunes them). One leaf
 #a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. c_puct 0.4 won +78 elo at 4k nodes a move and +46 at
 #30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
@@ -119,12 +121,12 @@ class EngineSearch:
     #STOP_AT_ONE_MOVE_LEFT's. use_tablebase: the tables of positions of up to tablebase_pieces pieces, from the folders
     #of syzygy_path (a SyzygyPath) rather than the downloaded ones if it is given. settings: changes to
     #engine_search_settings. cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0
-    #for none
+    #for none; advance_threads: ADVANCE_THREADS'
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
-                 memory_limit_mb: int = 0):
+                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS):
         self.network = network
         self.leaves = leaves
         batched = leaves > 1
@@ -138,7 +140,8 @@ class EngineSearch:
         self.smart_pruning_factor, self.smart_pruning_wait = smart_pruning_factor, smart_pruning_wait
         self.stop_at_one_move_left = stop_at_one_move_left
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
-        self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb)
+        self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
+                                             advance_threads=advance_threads)
         #reports give the score on the network's own scale, as a gui showed and adjudicated it before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
