@@ -3,6 +3,7 @@ from pathlib import Path
 import shutil
 
 import chess
+import chess.syzygy
 import numpy as np
 import pytest
 import torch
@@ -18,7 +19,7 @@ from tools.label_with_stockfish import NO_EVAL, NO_MOVE
 from tools.label_with_tablebase import TABLEBASE_WIN_EVAL, label_position
 from engine.engine_search import EngineSearch
 from engine.player import choose_move
-from tools.tablebase import TABLE_SETS, TableSet, covers, open_tablebase, ranked_moves, ranked_pieces
+from tools.tablebase import TABLE_SETS, TableSet, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces
 
 CPU = torch.device("cpu")
 TOP_MOVES = 4
@@ -124,6 +125,46 @@ def test_which_tables_open(tmp_path, monkeypatch, five, six, ranked):
     else:
         open_tablebase(6).close()
         assert ranked_pieces(6) == ranked
+
+#empty files named for every table of up to 6 pieces but those left out, the 3-5 piece ones in one folder and the 6
+#piece ones in another, as a SyzygyPath
+def fake_syzygy_path(folder: Path, left_out: tuple[str, ...] = ()) -> str:
+    names = list(chess.syzygy.tablenames(piece_count=6))
+    #as many as the downloaded sets have
+    assert [sum(len(name) - 1 in sizes for name in names) for sizes in ((3, 4, 5), (6,))] == [table_set.tables_per_half for table_set in TABLE_SETS]
+    folders = [folder / "345", folder / "6"]
+    for size_folder in folders:
+        size_folder.mkdir()
+    for name in names:
+        for extension in ("rtbw", "rtbz"):
+            if f"{name}.{extension}" not in left_out:
+                (folders[len(name) - 1 == 6] / f"{name}.{extension}").touch()
+    return os.pathsep.join(str(size_folder) for size_folder in folders)
+
+#a SyzygyPath's folders (uci's option) are checked as the downloaded sets are, by the tables' names across them: every
+#wdl table, every dtz table up to 5 pieces, the 6 piece dtz tables all or none (then 6 pieces are searched, not ranked)
+@pytest.mark.parametrize("left_out, ranked", [((), 6), (tuple(f"{name}.rtbz" for name in chess.syzygy.tablenames(piece_count=6) if len(name) == 7), 5),
+                                              (("KRPvKRP.rtbz",), None), (("KRPvKRP.rtbw",), None), (("KQvKR.rtbz",), None)])
+def test_which_tables_open_from_a_syzygy_path(tmp_path, left_out, ranked):
+    path = fake_syzygy_path(tmp_path, left_out)
+
+    if ranked is None:
+        with pytest.raises(FileNotFoundError):
+            open_tablebase_path(path, 6)
+    else:
+        tables, ranked_by_path = open_tablebase_path(path, 6)
+        tables.close()
+        assert ranked_by_path == ranked
+
+#5 pieces need nothing of the 6 piece folder; a folder that is not there is refused
+def test_a_syzygy_path_of_5_pieces(tmp_path):
+    path = fake_syzygy_path(tmp_path)
+
+    tables, ranked = open_tablebase_path(path.split(os.pathsep)[0], 5)
+    tables.close()
+    assert ranked == 5
+    with pytest.raises(FileNotFoundError):
+        open_tablebase_path(str(tmp_path / "nowhere"), 5)
 
 #the default, 5 pieces, neither needs nor probes the 6 piece folder
 def test_the_default_tables_are_the_5_piece_ones(tmp_path, monkeypatch):
