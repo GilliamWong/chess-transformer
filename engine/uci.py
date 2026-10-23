@@ -149,7 +149,8 @@ class Clock:
                                                             chess.popcount(board.occupied), bonus)
             if self.last_score is not None:
                 self.extension = (self.last_score, self.extra_seconds(seconds_left))
-        nodes = numbers.get("nodes")
+        #go nodes 0 plays at once, the root's one simulation (or a kept tree's move), as lc0 answers at once
+        nodes = None if "nodes" not in numbers else max(1, numbers["nodes"])
         if nodes is None and seconds is None:
             nodes = simulations
         return nodes, seconds

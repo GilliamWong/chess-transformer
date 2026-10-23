@@ -276,6 +276,26 @@ def test_go_limits():
     assert 0.5 < seconds < 30 - RESERVE_SECONDS
 
 
+#the (nodes, seconds) each of the gos from the start position gave a search, and the lines the engine sent
+def searched_gos(monkeypatch, gos: list[str]) -> tuple[list, list[str]]:
+    given, sent = [], []
+    class Player:
+        def search(self, board, nodes, seconds, extension, stop=None):
+            given.append((nodes, seconds))
+            return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
+    monkeypatch.setattr(uci, "load_player", lambda *arguments: Player())
+    monkeypatch.setattr(uci, "send", sent.append)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(["position startpos", *gos, "quit"])))
+    uci.main(Path("unused.pt"), selection="mcts", simulations=800)
+    return given, sent
+
+#go nodes 0 (or less) plays at once, a search of one simulation, as lc0 answers at once (Searches refused 0, which
+#ended the engine)
+def test_go_nodes_0_plays_at_once(monkeypatch):
+    given, sent = searched_gos(monkeypatch, ["go nodes 0", "go nodes -5", "go nodes 7"])
+    assert given == [(1, None), (1, None), (7, None)] and len([line for line in sent if line.startswith("bestmove")]) == 3
+
+
 #the start position with pieces taken off, the kings kept, until `men` are left
 def board_with_men(men: int) -> chess.Board:
     board = chess.Board()
