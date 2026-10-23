@@ -2,7 +2,7 @@
 //environment: BENCH_VISITS ROUNDS IN_FLIGHT WORKERS REPEATS FIRST POSITIONS SPIN_US COLLISIONS (0: the round's leaves)
 //FENS (a json list), FINISH_BATCH (0: finish_leaf), and the stand-in's VALUE_NOISE (logit sd) and PRIOR_SCALE
 use super::*;
-use crate::search::batch::BatchCounts;
+use crate::search::batch::{BatchCounts, Split};
 use std::time::Instant;
 
 //four middlegames of the kit's positions, the opening's, and a rook and pawn ending the tables score
@@ -325,6 +325,44 @@ fn bench_search_differences() {
             leaves as f64 / rounds as f64,
             rounds as f64 / fens.len() as f64
         );
+    }
+}
+
+//share_visits at the busiest node of at least 20 moves of BENCH_VISITS trees, warm: ns per call and per visit
+#[test]
+#[ignore]
+fn bench_node_share() {
+    let visits = setting("BENCH_VISITS", 750_000u32);
+    let settings = settings(true);
+    for &(fen, moves, _) in &POSITIONS[..4] {
+        let (mut tree, mut cache) = (tree_after(fen, moves), Cache::new(5_000_000));
+        rounds(
+            &mut tree,
+            &mut cache,
+            Method::Gather,
+            (usize::MAX, visits),
+            2,
+            0,
+            StandIn::from_environment(),
+            &settings,
+            None,
+            &Network::new().move_ids,
+        );
+        let node =
+            (0..tree.nodes.len()).filter(|&node| tree.nodes[node].edges().len() >= 20).max_by_key(|&node| tree.nodes[node].visit_count);
+        let Some(node) = node else { continue };
+        println!("{fen}: node {node}, {} visits, {} moves", tree.nodes[node].visit_count, tree.nodes[node].edges().len());
+        for share in [1u32, 2, 8, 16, 64, 256] {
+            let (mut split, mut shares) = (Split::default(), Vec::new());
+            let calls = 20_000;
+            let started = Instant::now();
+            for _ in 0..calls {
+                shares.clear();
+                tree.share_visits(node, share, &settings, &mut split, &mut shares);
+            }
+            let ns = started.elapsed().as_secs_f64() * 1e9 / f64::from(calls);
+            println!("SHARE	visits {share}	ns {ns:.0}	ns/visit {:.1}	moves given {}", ns / f64::from(share), shares.len());
+        }
     }
 }
 

@@ -69,7 +69,7 @@ impl Ord for Candidate {
 
 //select_edge's numbers for a node's moves while its visits are shared out
 #[derive(Default)]
-struct Split {
+pub(super) struct Split {
     exploration: Vec<f64>, //c_puct x prior
     q: Vec<f64>,
     started: Vec<u32>, //visits, those in flight and those given in the pass
@@ -132,7 +132,14 @@ impl Tree {
     }
 
     //the visits as that many descents' select_edge would share them, nothing backed up between: (edge, visits)
-    fn share_visits(&self, node: usize, visits: u32, settings: &SearchSettings, split: &mut Split, shares: &mut Vec<(u32, u32)>) {
+    pub(super) fn share_visits(
+        &self,
+        node: usize,
+        visits: u32,
+        settings: &SearchSettings,
+        split: &mut Split,
+        shares: &mut Vec<(u32, u32)>,
+    ) {
         if visits == 1 {
             shares.push((self.select_edge(node, settings) as u32, 1));
             return;
@@ -148,6 +155,56 @@ impl Tree {
         let u = |exploration: f64, q: f64, started: u32| q + (exploration * (sqrt_children_visits / f64::from(1 + started)));
 
         let noised = node == self.root_index() && !self.noised_priors.is_empty();
+        //select_edge's numbers for a move: c_puct x prior, q, started visits, and false for a proven loss it passes over
+        let numbers = |index: usize, prior: f32, child: u32| {
+            let exploration = c_puct * if noised { self.noised_priors[index] } else { f64::from(prior) };
+            match child {
+                NO_NODE => (exploration, first_play_urgency, 0, true),
+                child => {
+                    let child = &self.nodes[child as usize];
+                    let lost = child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss);
+                    let q = if child.visit_count > 0 { child.mean_score() } else { first_play_urgency };
+                    (exploration, q, child.visit_count + child.in_flight, !lost)
+                }
+            }
+        };
+        let moves = || self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate();
+
+        //mostly one move keeps them all (a busy node's trunk): one scan finds select_edge's move and the best u before it
+        //(which wins a tie) and after it
+        let (mut best, mut best_numbers, mut best_u) = (None, (0.0, 0.0, 0), f64::NEG_INFINITY);
+        let (mut before, mut after) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (index, (&prior, &child)) in moves() {
+            let (exploration, child_q, child_started, open) = numbers(index, prior, child);
+            if !open {
+                continue;
+            }
+            let child_u = u(exploration, child_q, child_started);
+            //the old best's u is the highest before the new one
+            if child_u > best_u {
+                (before, after) = (best_u, f64::NEG_INFINITY);
+                (best, best_numbers, best_u) = (Some(index), (exploration, child_q, child_started), child_u);
+            } else {
+                after = after.max(child_u);
+            }
+        }
+        let keeps_all = |(exploration, q, started): (f64, f64, u32)| {
+            let last_u = u(exploration, q, started + visits - 1);
+            last_u > before && last_u >= after
+        };
+        match best {
+            //every move a proven loss: select_edge's first move
+            None => {
+                shares.push((edges.start as u32, visits));
+                return;
+            }
+            Some(index) if keeps_all(best_numbers) => {
+                shares.push(((edges.start + index) as u32, visits));
+                return;
+            }
+            Some(_) => {}
+        }
+
         let Split { exploration, q, started, given, candidates } = split;
         for column in [&mut *exploration, &mut *q] {
             column.clear();
@@ -156,23 +213,14 @@ impl Tree {
         given.clear();
         let mut open_moves = std::mem::take(candidates).into_vec();
         open_moves.clear();
-        for (index, (&prior, &child)) in self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate() {
-            let prior = if noised { self.noised_priors[index] } else { f64::from(prior) };
-            let (child_q, child_started, open) = match child {
-                NO_NODE => (first_play_urgency, 0, true),
-                child => {
-                    let child = &self.nodes[child as usize];
-                    let lost = child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss);
-                    let child_q = if child.visit_count > 0 { child.mean_score() } else { first_play_urgency };
-                    (child_q, child.visit_count + child.in_flight, !lost)
-                }
-            };
-            let child_u = u(c_puct * prior, child_q, child_started);
+        for (index, (&prior, &child)) in moves() {
+            let (child_exploration, child_q, child_started, open) = numbers(index, prior, child);
+            let child_u = u(child_exploration, child_q, child_started);
             //a NaN never beats select_edge's best
             if open && !child_u.is_nan() {
                 open_moves.push(Candidate { u: child_u, index: index as u32 });
             }
-            exploration.push(c_puct * prior);
+            exploration.push(child_exploration);
             q.push(child_q);
             started.push(child_started);
             given.push(0);
