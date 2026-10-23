@@ -44,6 +44,9 @@ SMART_PRUNING_FACTOR = 1.0
 #smart pruning stops no search on the visits before this many seconds after its first answers, lc0's 0.2: its other
 #stops (one move, a proven root) stay at once
 SMART_PRUNING_WAIT = 0.0
+#with certainty, smart pruning stops at once when the proofs leave one root move not lost, as lc0 does (the move choice
+#puts the losses last)
+STOP_AT_ONE_MOVE_LEFT = False
 #a search on the clock whose score has fallen more than FALL_START_CP below the last search's runs on when it would
 #stop, by all the time its clock lets it add at a fall of FALL_FULL_CP: our mistakes cluster after our eval falls
 FALL_START_CP = 10
@@ -106,12 +109,14 @@ class EngineSearch:
     #network has GraphedBatches' launch and collect (inference.ImmediateBatches on the cpu). One leaf a round is
     #mcts.py's search: its settings (without ENGINE_SETTINGS), a fresh tree every move, no second round on the
     #network and no smart pruning. smart_pruning False searches the whole budget even once the move is decided (lc0's
-    #SmartPruningFactor=0), for matches that give both engines exactly the same time; smart_pruning_factor and
-    #smart_pruning_wait are SMART_PRUNING_FACTOR's and SMART_PRUNING_WAIT's. use_tablebase: the tables of positions of up
-    #to tablebase_pieces pieces. settings: changes to engine_search_settings
+    #SmartPruningFactor=0), for matches that give both engines exactly the same time; smart_pruning_factor,
+    #smart_pruning_wait and stop_at_one_move_left are SMART_PRUNING_FACTOR's, SMART_PRUNING_WAIT's and
+    #STOP_AT_ONE_MOVE_LEFT's. use_tablebase: the tables of positions of up to tablebase_pieces pieces. settings: changes
+    #to engine_search_settings
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
-                 smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT):
+                 smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
+                 stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT):
         self.network = network
         self.leaves = leaves
         batched = leaves > 1
@@ -123,6 +128,7 @@ class EngineSearch:
         self.rounds_at_once = batched and len(getattr(network, "lanes", ())) > 1
         self.smart_pruning = batched and smart_pruning
         self.smart_pruning_factor, self.smart_pruning_wait = smart_pruning_factor, smart_pruning_wait
+        self.stop_at_one_move_left = stop_at_one_move_left
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces)
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=CACHE_POSITIONS)
         #reports give the score on the network's own scale, as a gui showed and adjudicated it before sharpening
@@ -214,7 +220,7 @@ class EngineSearch:
                 first_answers = now if first_answers is None else first_answers
                 decided = (most - second > self.simulations_left(simulations, deadline, progress) / self.smart_pruning_factor
                            and now - first_answers >= self.smart_pruning_wait)
-                proven = self.certainty and self.searches.decided(GAME)
+                proven = self.certainty and (self.searches.decided(GAME) or self.stop_at_one_move_left and self.searches.moves_not_lost(GAME) <= 1)
                 #once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
                 extra = 0.0
                 if decided and not (only_move or proven) and extension is not None:

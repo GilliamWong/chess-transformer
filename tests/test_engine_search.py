@@ -532,6 +532,16 @@ def test_smart_pruning_waits_after_the_first_answers(monkeypatch, fen, proven, w
     assert search.searches.stopped_at == stopped_at
 
 
+#with certainty, a search whose proofs leave one root move not lost stops at once (lc0's), where smart pruning waits for
+#the move's lead: every white move here but Rxf7 lets black mate at once
+def test_a_search_with_one_move_left_stops():
+    board = chess.Board("8/4Rq2/7K/5P2/5Prk/8/8/8 w - - 0 1")
+    searched = {stop: EngineSearch(cpu_batches(UniformModel()), 16, settings={"certainty": True}, stop_at_one_move_left=stop).search(board, simulations=20_000)
+                for stop in (False, True)}
+    assert searched[True].line[0].uci() == searched[False].line[0].uci() == "e7f7"
+    assert searched[True].simulations < 1000 and searched[False].simulations > 5000
+
+
 #uci.py's --search-settings reach the search: the same search of the same network finds another line and score with
 #c_puct 0.1 than with 10
 def test_the_engine_takes_search_settings(tmp_path):
@@ -577,24 +587,25 @@ def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
 
 
 #uci.py's lc0 time options reach the clock and the search: the first move bonus on each game's first move, smart
-#pruning's factor and wait; a factor of 0 or less is refused
+#pruning's factor, wait and one-move-left stop; a factor of 0 or less is refused
 @pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
 def test_the_engine_takes_lc0s_time_options(monkeypatch):
     given = []
     def search(self, board, nodes, seconds, extension):
-        given.append((seconds, self.smart_pruning_factor, self.smart_pruning_wait))
+        given.append((seconds, self.smart_pruning_factor, self.smart_pruning_wait, self.stop_at_one_move_left))
         return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision: cpu_batches(BoardModel()))
     monkeypatch.setattr(EngineSearch, "search", search)
     go = "go " + " ".join(CLOCK_60)
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(["isready", "position startpos", go, "position startpos moves e2e4 e7e5", go,
                                                                "ucinewgame", "position startpos", go, "quit"])))
-    options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25", "--smart-pruning-factor", "1.33", "--smart-pruning-wait", "0.2"]
+    options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25", "--smart-pruning-factor", "1.33", "--smart-pruning-wait", "0.2",
+               "--stop-at-one-move-left"]
     monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *options])
     runpy.run_module("engine.uci", run_name="__main__")
 
     first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
-    assert given[0] == (first, 1.33, 0.2) and given[1][0] != first and given[2] == given[0]
+    assert given[0] == (first, 1.33, 0.2, True) and given[1][0] != first and given[2] == given[0]
     monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", "--smart-pruning-factor", "0"])
     with pytest.raises(SystemExit) as refused:
         runpy.run_module("engine.uci", run_name="__main__")

@@ -365,12 +365,16 @@ impl Tree {
         self.pending.len()
     }
 
+    //a move whose child is a proven loss for the side making it
+    fn proven_lost(&self, edge: usize) -> bool {
+        self.child(edge).and_then(|child| child.proof).is_some_and(|proof| proof.outcome == Outcome::Loss)
+    }
+
     //the visits of the root's two most visited moves, 0 for a move it does not have. A proven loss is left out: the
     //move choice puts it last whatever its visits (most_visited_edge)
     pub fn two_most_visits(&self) -> (u32, u32) {
         let (mut most, mut second) = (0, 0);
-        let lost = |edge: usize| self.child(edge).and_then(|child| child.proof).is_some_and(|proof| proof.outcome == Outcome::Loss);
-        for visits in self.root().edges().filter(|&edge| !lost(edge)).map(|edge| self.visits(edge)) {
+        for visits in self.root().edges().filter(|&edge| !self.proven_lost(edge)).map(|edge| self.visits(edge)) {
             if visits > most {
                 (most, second) = (visits, most);
             } else if visits > second {
@@ -378,6 +382,11 @@ impl Tree {
             }
         }
         (most, second)
+    }
+
+    //the root's moves not proven lost: with one left the move choice is known (most_visited_edge puts losses last)
+    pub fn moves_not_lost(&self) -> usize {
+        self.root().edges().filter(|&edge| !self.proven_lost(edge)).count()
     }
 
     //mcts.select_child, with the simulations under a child that wait for the network counted in its visits for the

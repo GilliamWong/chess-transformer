@@ -622,6 +622,12 @@ impl Searches {
         Ok(search.tree.root_decided())
     }
 
+    //a running search's root moves not proven lost (search.rs moves_not_lost), for smart pruning to stop at one, as lc0 does
+    fn moves_not_lost(&self, id: u64) -> PyResult<usize> {
+        let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+        Ok(search.tree.moves_not_lost())
+    }
+
     //the searches still running
     fn __len__(&self) -> usize {
         self.searches.len()

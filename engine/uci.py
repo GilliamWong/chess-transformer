@@ -284,6 +284,8 @@ if __name__ == "__main__":
     parser.add_argument("--smart-pruning-wait", type=float, default=SMART_PRUNING_WAIT,
                         help="for --select mcts --gpu: no smart pruning stop on the visits until this many seconds after a search's first answers, "
                              "default %(default)s; lc0's 0.2")
+    parser.add_argument("--stop-at-one-move-left", action="store_true",
+                        help="for --select mcts --gpu: stop at once when certainty's proofs leave one root move not lost, as lc0 does")
     parser.add_argument("--first-move-bonus", type=float, default=FIRST_MOVE_BONUS,
                         help="for --select mcts on a clock: the game's first search gets 1 + this + --book-ply-bonus x its ply (at most "
                              f"{MOST_BOOK_PLIES}) times its share, default %(default)s; lc0's 1.8")
@@ -306,5 +308,6 @@ if __name__ == "__main__":
              search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION,
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
-                             "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait},
+                             "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
+                             "stop_at_one_move_left": arguments.stop_at_one_move_left},
              clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})
