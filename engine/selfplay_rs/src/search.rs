@@ -461,9 +461,9 @@ impl Tree {
         let noised = node == self.root && !self.noised_priors.is_empty();
         for (index, (&prior, &child)) in self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate() {
             let prior = if noised { self.noised_priors[index] } else { f64::from(prior) };
-            let u = match child {
+            let (u, child_edges) = match child {
                 //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
-                NO_NODE => first_play_urgency + (c_puct * prior * sqrt_children_visits),
+                NO_NODE => (first_play_urgency + (c_puct * prior * sqrt_children_visits), 0),
                 child => {
                     let child = &self.nodes[child as usize];
                     if child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss) {
@@ -471,14 +471,34 @@ impl Tree {
                     }
                     let q = if child.visit_count > 0 { child.mean_score() } else { first_play_urgency };
                     let started = child.visit_count + child.in_flight;
-                    q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started)))
+                    (q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started))), child.edges_at)
                 }
             };
             if u > best_u {
                 (best, best_u) = (index, u);
+                //the descent goes on through the best child's moves: their cache lines are asked for while the scan
+                //goes on, rather than missed after it
+                if child_edges & 255 > 0 {
+                    self.prefetch_edges((child_edges >> 8) as usize);
+                }
             }
         }
         edges.start + best
+    }
+
+    //asks for the cache lines of the moves' priors and children from the edge on, a hint that never faults. One line
+    //each: two each were slower with four gather workers
+    #[inline(always)]
+    fn prefetch_edges(&self, first: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            //SAFETY: sse is part of x86_64, and a prefetch reads nothing the program sees
+            unsafe {
+                _mm_prefetch::<_MM_HINT_T0>(self.priors.as_ptr().wrapping_add(first).cast());
+                _mm_prefetch::<_MM_HINT_T0>(self.children.as_ptr().wrapping_add(first).cast());
+            }
+        }
     }
 
     //the edge's node, made if the edge has none yet; board is the node's position
