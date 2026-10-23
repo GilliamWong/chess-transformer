@@ -221,7 +221,7 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
     flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
     try:
         with torch.no_grad():
-            rows = fp16_model(tmp_path / "model.pt")(boards)
+            rows = answer_rows(fp16_model(tmp_path / "model.pt")(boards))
             expected_logits, expected_value_logits = model.cuda()(boards)
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
@@ -261,12 +261,13 @@ def test_the_input_embedding_is_the_models(dtype):
     assert found.dtype == dtype and torch.allclose(found, expected, rtol=rtol, atol=atol)
 
 
-#input_embedding_kernel finds each square's 23 feature rows itself, as SquareFeatures.indices does: on positions of a
-#random game and ones with promoted pieces, several queens, en passant and kings in corners, with tables of whole
-#numbers, whose sums are exact in any order, so that no wrong row can hide
+#board_embedding_kernel (fused_blocks.InputEmbedding where fused_ends) finds each square's 23 feature rows itself, as
+#SquareFeatures.indices does: on positions of a random game and ones with promoted pieces, several queens, en passant and
+#kings in corners, with tables of whole numbers, whose sums are exact in any order, so that no wrong row can hide
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
-def test_the_input_embedding_finds_the_feature_rows_of_square_features():
-    from model.fused_blocks import InputEmbedding
+def test_the_board_embedding_finds_the_feature_rows_of_square_features(monkeypatch):
+    from model import fused_blocks
+    monkeypatch.setattr(fused_blocks, "fused_ends", lambda device: True)
     torch.manual_seed(0)
     model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
     with torch.no_grad():
@@ -282,23 +283,25 @@ def test_the_input_embedding_finds_the_feature_rows_of_square_features():
     boards = torch.tensor([encode_board(chess.Board(fen)) for fen in fens]).cuda()
 
     with torch.no_grad():
-        found = InputEmbedding(model)(boards)
+        found = fused_blocks.InputEmbedding(model)(boards)
         features = F.pad(model.square_features(boards), (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
         expected = model.embed(boards) + model.position_embed + features
 
     assert torch.equal(found, expected)
 
 
-#fused_blocks.heads, the heads after the last block in three kernels, give the model's heads on the stream to fp32's
-#rounding when fp16 holds the weights of their one fp16 matmul exactly (fused_blocks.head_weights; their rounding is the
-#only other error): the move logits with the promotions' and the expected score, of 16 bins and of the older head's
-#one. On one board, a few and more than a program of the eval head takes (an odd number, its matmul's programs taking
-#two boards), with each width of the matmul's tiles
+#fused_blocks.heads, the heads after the last block in three kernels (FusedTransformer's where fused_ends), give the
+#model's heads on the stream to fp32's rounding when fp16 holds the weights of their one fp16 matmul exactly
+#(fused_blocks.fused_head_weights; their rounding is the only other error): the move logits with the promotions' and the
+#expected score, of 16 bins and of the older head's one. On one board, a few and more than a program of the eval head
+#takes, with each width of the matmul's tiles
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 @pytest.mark.parametrize("value_bins", [16, 1])
 @pytest.mark.parametrize("boards", [1, 5, 71])
-def test_the_fused_heads_compute_the_models_heads(value_bins, boards):
+def test_the_fused_heads_compute_the_models_heads(monkeypatch, value_bins, boards):
+    from model import fused_blocks
     from model.fused_blocks import FusedTransformer
+    monkeypatch.setattr(fused_blocks, "fused_ends", lambda device: True)
     torch.manual_seed(0)
     d = 64
     model = ChessTransformer(d_model=d, num_layers=1, n_heads=2, value_bins=value_bins).cuda().eval()
@@ -325,6 +328,28 @@ def test_the_fused_heads_compute_the_models_heads(value_bins, boards):
     assert rows.shape == (boards, logits.shape[1] + 1)
     assert torch.allclose(rows[:, :-1].double(), logits, rtol=1e-5, atol=1e-5)
     assert torch.allclose(rows[:, -1], expected_score(value_logits), rtol=1e-5, atol=1e-6)
+
+
+#the board embedding and the fused heads only where they were timed (fused_ends): an A100, A40 or L40S (sm_80, 86, 89)
+#keeps today's kernels and outputs, the model's logits and value logits, which answer as the model does
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (12, 0)])
+def test_the_fused_ends_only_on_the_gpus_they_were_timed_on(monkeypatch, capability):
+    from model.fused_blocks import FusedTransformer
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=64, num_layers=1, n_heads=2, value_bins=16).cuda().eval()
+    boards = torch.tensor([encode_board(chess.Board())] * 3).cuda()
+    with torch.no_grad():
+        expected = answer_rows(model(boards))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    fused = FusedTransformer(model.half_except_heads(torch.float16))
+    with torch.no_grad():
+        outputs = fused(boards)
+
+    timed = capability == (12, 0)
+    assert fused.fused_heads == fused.input_embedding.from_boards == timed
+    assert isinstance(outputs, torch.Tensor) == timed
+    assert torch.allclose(answer_rows(outputs), expected, atol=1e-2)
 
 
 #programmatic dependent launch only from sm_90: a kernel built for older gpus (hyak's A100s and A40s) with griddepcontrol
@@ -400,7 +425,7 @@ def test_fused_blocks_compute_what_the_model_does(tmp_path, fp16):
         with torch.no_grad():
             logits, value_logits = model(boards)
             fused = fp16_model(tmp_path / "model.pt") if fp16 else FusedTransformer(copy.deepcopy(model))
-            rows = fused(boards)
+            rows = answer_rows(fused(boards))
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 

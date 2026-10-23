@@ -375,7 +375,61 @@ def link_input_mixes(blocks: list[nn.Module]) -> None:
             block.next_scales, following.input_mixed = (following.residual_scale, following.input_scale), True
 
 
-#tokens and columns a program of input_embedding_kernel takes, by the batch's tokens: more programs for one or two boards
+#tokens and columns a program of input_embedding_kernel takes: whole rows in one program were slower
+EMBEDDING_TOKENS, EMBEDDING_COLUMNS = 8, 256
+
+
+#the input embedding in one kernel, so that every block reads one buffer: inductor recomputed or copied it for each
+@triton.jit
+def input_embedding_kernel(boards_ptr, rows_ptr, embed_ptr, position_ptr, table_ptr, out_ptr, tokens, D, T: tl.constexpr, SQUARES: tl.constexpr,
+                           FEATURES: tl.constexpr, BLOCK_TOKENS: tl.constexpr, BLOCK_D: tl.constexpr, PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
+    token = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
+    d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    board, place = token // T, token % T
+    token_ok, d_ok = token < tokens, d < D
+    square_ok = token_ok & (place < SQUARES)
+    features = tl.zeros((BLOCK_TOKENS, BLOCK_D), dtype=tl.float32)
+    for feature in range(FEATURES):
+        row = tl.load(rows_ptr + (board * SQUARES + place) * FEATURES + feature, mask=square_ok, other=0)
+        features += tl.load(table_ptr + row[:, None] * D + d[None, :], mask=square_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    code = tl.load(boards_ptr + token, mask=token_ok, other=0)
+    mask = token_ok[:, None] & d_ok[None, :]
+    total = tl.load(embed_ptr + code[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
+    total += tl.load(position_ptr + place[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
+    #the features' sum in the table's precision, as SquareFeatures gives it
+    total += features.to(out_ptr.dtype.element_ty).to(tl.float32)
+    tl.store(out_ptr + token[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+#boards B x T, rows B x 64 x features (each square's rows in the feature table): B x T x D
+@torch.library.custom_op("chess::input_embedding", mutates_args=())
+def input_embedding(boards: torch.Tensor, rows: torch.Tensor, embed: torch.Tensor, position: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    boards, rows = boards.contiguous(), rows.contiguous()
+    B, T = boards.shape
+    D = table.shape[1]
+    out = table.new_empty(B, T, D)
+    grid = (triton.cdiv(B * T, EMBEDDING_TOKENS), triton.cdiv(D, EMBEDDING_COLUMNS))
+    input_embedding_kernel[grid](boards, rows, embed.contiguous(), position.contiguous(), table.contiguous(), out, B * T, D, T=T, SQUARES=NUM_SQUARES,
+                                 FEATURES=rows.shape[-1], BLOCK_TOKENS=EMBEDDING_TOKENS, BLOCK_D=EMBEDDING_COLUMNS, **dependent_launch(boards.device))
+    return out
+
+
+@input_embedding.register_fake
+def _(boards, rows, embed, position, table):
+    return table.new_empty(*boards.shape, table.shape[1])
+
+
+#the gpus the board embedding (board_embedding_kernel) and the fused heads (heads) were timed on, an RTX 5070 Ti and a
+#5090 (sm_120, 70 and 170 multiprocessors): other gpus keep the kernels before them until timed
+FUSED_ENDS_CAPABILITIES = {(12, 0)}
+
+
+def fused_ends(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) in FUSED_ENDS_CAPABILITIES
+
+
+#tokens and columns a program of board_embedding_kernel takes, by the batch's tokens: more programs for one or two boards
 #(the fastest of 2-16 tokens and 128-1024 columns on an RTX 5070 Ti and 5090); whole rows in one program were slower
 def embedding_block(tokens: int) -> tuple[int, int]:
     return (4, 128) if tokens < 4 * TOKENS_PER_BOARD else (8, 256)
@@ -407,11 +461,11 @@ def feature_row(table_ptr, offsets_ptr, row, FEATURE: tl.constexpr, d, D, mask):
     return tl.load(table_ptr + (row + tl.load(offsets_ptr + FEATURE))[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
 
 
-#the input embedding in one kernel, so that every block reads one buffer (inductor recomputed or copied it for each):
-#each square's 23 feature rows as SquareFeatures.indices finds them (a change to it must be made here too), from rays
-#(each square's squares out along the 8 directions, nearest first, past the edge 64) and jumps (its knight jumps)
+#input_embedding_kernel finding each square's 23 feature rows itself, as SquareFeatures.indices does (a change to it must
+#be made here too), from rays (each square's squares out along the 8 directions, nearest first, past the edge 64) and
+#jumps (its knight jumps)
 @triton.jit
-def input_embedding_kernel(boards_ptr, rays_ptr, jumps_ptr, offsets_ptr, embed_ptr, position_ptr, table_ptr, out_ptr, tokens, D, T: tl.constexpr,
+def board_embedding_kernel(boards_ptr, rays_ptr, jumps_ptr, offsets_ptr, embed_ptr, position_ptr, table_ptr, out_ptr, tokens, D, T: tl.constexpr,
                            PAWN: tl.constexpr, KNIGHT: tl.constexpr, QUEEN: tl.constexpr, KING: tl.constexpr, THEIRS: tl.constexpr,
                            EDGE: tl.constexpr, NO_PIECE: tl.constexpr, BLOCK_TOKENS: tl.constexpr, BLOCK_D: tl.constexpr, PDL: tl.constexpr):
     dependent_launch_wait(PDL)
@@ -460,9 +514,9 @@ def input_embedding_kernel(boards_ptr, rays_ptr, jumps_ptr, offsets_ptr, embed_p
     tl.store(out_ptr + token[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-#boards B x T: B x T x D. rays 64 x 8 x 8 and jumps 64 x 8 (input_embedding_kernel), offsets the features' first rows
-@torch.library.custom_op("chess::input_embedding", mutates_args=())
-def input_embedding(boards: torch.Tensor, rays: torch.Tensor, jumps: torch.Tensor, offsets: torch.Tensor, embed: torch.Tensor, position: torch.Tensor,
+#boards B x T: B x T x D. rays 64 x 8 x 8 and jumps 64 x 8 (board_embedding_kernel), offsets the features' first rows
+@torch.library.custom_op("chess::board_embedding", mutates_args=())
+def board_embedding(boards: torch.Tensor, rays: torch.Tensor, jumps: torch.Tensor, offsets: torch.Tensor, embed: torch.Tensor, position: torch.Tensor,
                     table: torch.Tensor) -> torch.Tensor:
     boards = boards.contiguous()
     B, T = boards.shape
@@ -470,34 +524,41 @@ def input_embedding(boards: torch.Tensor, rays: torch.Tensor, jumps: torch.Tenso
     out = table.new_empty(B, T, D)
     block_tokens, block_d = embedding_block(B * T)
     grid = (triton.cdiv(B * T, block_tokens), triton.cdiv(D, block_d))
-    input_embedding_kernel[grid](boards, rays, jumps, offsets, embed.contiguous(), position.contiguous(), table.contiguous(), out, B * T, D, T=T, PAWN=PAWN,
+    board_embedding_kernel[grid](boards, rays, jumps, offsets, embed.contiguous(), position.contiguous(), table.contiguous(), out, B * T, D, T=T, PAWN=PAWN,
                                  KNIGHT=KNIGHT, QUEEN=QUEEN, KING=KING, THEIRS=THEIRS, EDGE=EDGE, NO_PIECE=NO_PIECE, BLOCK_TOKENS=block_tokens,
                                  BLOCK_D=block_d, **dependent_launch(boards.device))
     return out
 
 
-@input_embedding.register_fake
+@board_embedding.register_fake
 def _(boards, rays, jumps, offsets, embed, position, table):
     return table.new_empty(*boards.shape, table.shape[1])
 
 
-#ChessTransformer's input embedding (embed, position_embed and the square features) by input_embedding_kernel
+#ChessTransformer's input embedding (embed, position_embed and the square features) by board_embedding_kernel, or on gpus
+#without fused_ends by input_embedding_kernel on SquareFeatures.indices' rows
 class InputEmbedding(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
         self.embed, self.position_embed, self.features = model.embed, model.position_embed, model.square_features
-        self.register_buffer("rays", F.pad(self.features.rays, (0, 1), value=NUM_SQUARES).int().contiguous())
-        self.register_buffer("jumps", self.features.knight_jumps.int().contiguous())
+        self.from_boards = fused_ends(model.embed.weight.device)
+        if self.from_boards:
+            self.register_buffer("rays", F.pad(self.features.rays, (0, 1), value=NUM_SQUARES).int().contiguous())
+            self.register_buffer("jumps", self.features.knight_jumps.int().contiguous())
 
     def forward(self, board_state: torch.Tensor) -> torch.Tensor:
-        return input_embedding(board_state, self.rays, self.jumps, self.features.row_offsets, self.embed.weight, self.position_embed,
-                               self.features.table)
+        if self.from_boards:
+            return board_embedding(board_state, self.rays, self.jumps, self.features.row_offsets, self.embed.weight, self.position_embed,
+                                   self.features.table)
+        rows = self.features.indices(board_state) + self.features.row_offsets
+        return input_embedding(board_state, rows, self.embed.weight, self.position_embed, self.features.table)
 
 
 #the heads after the last block in three kernels, from its stream to the engine's answer rows (a board's move logits,
 #then its expected score). With x a row of the stream, r its 1 / rms and g the final norm's gain, the normed row is
-#y = r g x: the heads fold g into their weights and r into their epilogues, and read the stream as it is (head_weights).
-#Their fp32 matmuls are fp16 tensor core matmuls of numbers split in two (split), many times faster than Triton's fp32 dot
+#y = r g x: the heads fold g into their weights and r into their epilogues, and read the stream as it is
+#(fused_head_weights). Their fp32 matmuls are fp16 tensor core matmuls of numbers split in two (split), many times
+#faster than Triton's fp32 dot
 
 #the narrow matmul's columns: board_down_project's, then a square's terms (s and t, a move's terms of its from and to
 #square, and the 4 promotion logits), padded
@@ -774,10 +835,11 @@ def split_weight(weight: torch.Tensor) -> torch.Tensor:
     return torch.stack([hi, ((weight.double() - hi.double()) * LO_SCALE).half()])
 
 
-#logits[f, t] = (W_f y_f + b_f) . (W_t y_t + b_t) / sqrt(d) = r_f r_t x_f A x_t + t_t + s_f for the normed rows y = r g x,
-#A = diag(g) W_f^T W_t diag(g) / sqrt(d) in fp16. The narrow weights (d x NARROW_COLUMNS, split) give board_down_project's
-#output, s_f = y_f . W_f^T b_t / sqrt(d) + b_f . b_t / sqrt(d), t_t = y_t . W_t^T b_f / sqrt(d) and the promotion logits
-def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#the fused heads' weights: logits[f, t] = (W_f y_f + b_f) . (W_t y_t + b_t) / sqrt(d) = r_f r_t x_f A x_t + t_t + s_f
+#for the normed rows y = r g x, A = diag(g) W_f^T W_t diag(g) / sqrt(d) in fp16. The narrow weights (d x NARROW_COLUMNS,
+#split) give board_down_project's output, s_f = y_f . W_f^T b_t / sqrt(d) + b_f . b_t / sqrt(d), t_t = y_t . W_t^T b_f
+#/ sqrt(d) and the promotion logits
+def fused_head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         gain = model.ln.weight.double()
         from_weight, from_bias = model.from_projection.weight.double(), model.from_projection.bias.double()
@@ -801,35 +863,72 @@ def move_table(model: ChessTransformer) -> torch.Tensor:
     return torch.stack([model.from_squares * NUM_SQUARES + model.to_squares, promotions]).int()
 
 
-#ChessTransformer.forward with FusedBlocks and the heads' kernels, for inference: a change to it must be made here too.
-#It gives the answer rows (inference.answer_rows) rather than the model's logits
+#logits[i, j] = (W_f x_i + b_f) . (W_t x_j + b_t) / sqrt(d) = a_i . x_j + s_i: from and to as one d x d matmul (a)
+def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        from_weight, from_bias = model.from_projection.weight.double(), model.from_projection.bias.double()
+        to_weight, to_bias = model.to_projection.weight.double(), model.to_projection.bias.double()
+        promotion, down = model.promotion_projection, model.board_down_project[0]
+        scale = 1 / math.sqrt(model.d_model)
+        narrow_weight = torch.cat([(to_bias @ from_weight)[None] * scale, promotion.weight.double(), down.weight.double()])
+        narrow_bias = torch.cat([(from_bias @ to_bias)[None] * scale, promotion.bias.double(), down.bias.double()])
+        return ((from_weight.T @ to_weight * scale).half(), (to_weight.T @ from_bias * scale).float(), narrow_weight.float(),
+                narrow_bias.float())
+
+
+#ChessTransformer.forward with FusedBlocks, for inference: a change to it must be made here too. On the gpus of
+#fused_ends the heads are their kernels (heads), which give the answer rows rather than the model's logits and value
+#logits (inference.answer_rows takes either); on others head_weights' matmuls
 class FusedTransformer(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
         self.d_model = model.d_model
         self.input_embedding = InputEmbedding(model)
-        self.templates, self.loops = model.templates, model.loops
+        self.templates, self.ln, self.loops = model.templates, model.ln, model.loops
         self.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
         link_input_mixes(list(self.encoder))
-        self.eps = model.ln.eps if model.ln.eps is not None else torch.finfo(torch.float32).eps
-        a_weight, narrow, narrow_bias = head_weights(model)
-        hidden, out = model.eval_head[0], model.eval_head[2]
-        edges = value_bin_edges(out.out_features, out.weight.device)
-        buffers = {"a_weight": a_weight, "narrow": narrow, "narrow_bias": narrow_bias, "moves": move_table(model), "hidden": split_weight(hidden.weight),
-                   "hidden_bias": hidden.bias.detach(), "out": split_weight(out.weight), "out_bias": out.bias.detach(),
-                   "centres": (edges[:-1] + edges[1:]) / 2}
-        for name, tensor in buffers.items():
-            self.register_buffer(name, tensor)
+        self.fused_heads = fused_ends(model.embed.weight.device)
+        if self.fused_heads:
+            self.eps = model.ln.eps if model.ln.eps is not None else torch.finfo(torch.float32).eps
+            a_weight, narrow, narrow_bias = fused_head_weights(model)
+            hidden, out = model.eval_head[0], model.eval_head[2]
+            edges = value_bin_edges(out.out_features, out.weight.device)
+            buffers = {"a_weight": a_weight, "narrow": narrow, "narrow_bias": narrow_bias, "moves": move_table(model), "hidden": split_weight(hidden.weight),
+                       "hidden_bias": hidden.bias.detach(), "out": split_weight(out.weight), "out_bias": out.bias.detach(),
+                       "centres": (edges[:-1] + edges[1:]) / 2}
+            for name, tensor in buffers.items():
+                self.register_buffer(name, tensor)
+            return
+        self.board_down_activation, self.eval_head = model.board_down_project[1], model.eval_head
+        for name in ("from_squares", "to_squares", "promotion_move_ids", "promotion_to_squares", "promotion_pieces"):
+            self.register_buffer(name, getattr(model, name))
+        self.a_weight, self.a_bias, self.narrow_weight, self.narrow_bias = (nn.Parameter(tensor, requires_grad=False) for tensor in head_weights(model))
+        promotions = model.promotion_projection.out_features
+        self.promotion_columns, self.down_columns = slice(1, 1 + promotions), slice(1 + promotions, None)
 
-    def forward(self, board_state: torch.Tensor) -> torch.Tensor:
+    def forward(self, board_state: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         embed_state = self.input_embedding(board_state)
         original_board_embed = embed_state
         for _ in range(self.loops):
             for block in self.encoder:
                 embed_state = block(embed_state, self.templates, original_board_embed)
-        return self.answers(embed_state)
+        if self.fused_heads:
+            return self.answers(embed_state)
+        model_output = self.ln(embed_state)
 
-    #the heads on the last block's stream
+        with torch.autocast(device_type=board_state.device.type, enabled=False):
+            #on every token: the metadata tokens' a is not needed, but slicing out the squares' would copy them
+            a = linear(model_output.half(), self.a_weight, self.a_bias, accumulate_fp32=True)
+            model_output = model_output.float()
+            narrow = F.linear(model_output, self.narrow_weight, self.narrow_bias) #B T: s, the promotion logits, board_down_project's
+            squares = narrow[:, :NUM_SQUARES]
+            logits = a[:, :NUM_SQUARES] @ model_output[:, :NUM_SQUARES].transpose(1, 2) + squares[..., :1]
+            combined_logits = logits[:, self.from_squares, self.to_squares]
+            combined_logits[:, self.promotion_move_ids] += squares[..., self.promotion_columns][:, self.promotion_to_squares, self.promotion_pieces]
+            compressed_board = self.board_down_activation(narrow[..., self.down_columns]).reshape(board_state.shape[0], -1)
+            return combined_logits, self.eval_head(compressed_board)
+
+    #the fused heads on the last block's stream: the answer rows
     def answers(self, embed_state: torch.Tensor) -> torch.Tensor:
         return heads(embed_state, self.a_weight, self.narrow[0], self.narrow[1], self.narrow_bias, self.moves, self.hidden, self.hidden_bias, self.out,
                      self.out_bias, self.centres, self.eps)
