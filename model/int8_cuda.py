@@ -186,9 +186,10 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
 """
 
 #(MT, NT, WN, WK, CK) by (compute capability, multiprocessors) and kind, by the most rows each takes: the fastest of a
-#sweep at 70 to 560 rows on an RTX 5090, kept where it beat int8_linear's best Triton tile (16 to 128 rows) in the
-#network too. On the RTX 5070 Ti (70) it only matched them
-CONFIGS = {(12, 0, 170): {"projection": [(70, (3, 4, 1, 12, 1)), (140, (3, 4, 1, 12, 1))],
+#sweep at 70 to 560 rows on an RTX 5070 Ti (70) and an RTX 5090 (170), kept where it beat int8_linear's best Triton
+#tile (16 to 128 rows) in the network too
+CONFIGS = {(12, 0, 70): {"projection": [(70, (5, 4, 1, 12, 1))], "gate_up": [(70, (5, 1, 1, 12, 1))], "down": [(70, (3, 4, 1, 8, 2))]},
+           (12, 0, 170): {"projection": [(70, (3, 4, 1, 12, 1)), (140, (3, 4, 1, 12, 1))],
                           "gate_up": [(70, (3, 2, 1, 12, 1)), (140, (3, 2, 2, 6, 2))],
                           "down": [(70, (3, 3, 1, 8, 2)), (140, (3, 4, 1, 8, 2))]}}
 EPILOGUES = {"projection": 0, "gate_up": 1, "down": 2, "mixing down": 3}
