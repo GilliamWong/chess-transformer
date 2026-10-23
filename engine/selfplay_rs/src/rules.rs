@@ -159,7 +159,7 @@ pub fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
     1 + since_zeroing.iter().filter(|&key| key == current).count()
 }
 
-//the syzygy tables (tools.tablebase)
+//the syzygy tables (tools.tablebase), memory mapped: a probe's few small reads would each be a system call
 pub struct Tables {
     tablebase: Tablebase<Chess>,
     pieces: usize,
@@ -168,7 +168,8 @@ pub struct Tables {
 impl Tables {
     //folders as a SyzygyPath (tools.tablebase.tablebase_path): ';' between them on windows, ':' elsewhere
     pub fn open(folders: &str, pieces: usize) -> std::io::Result<Tables> {
-        let mut tablebase = Tablebase::new();
+        //SAFETY: the files stay unchanged while mapped; a failed page read ends the process rather than erroring
+        let mut tablebase = unsafe { Tablebase::with_mmap_filesystem() };
         for folder in std::env::split_paths(folders) {
             tablebase.add_directory(folder)?;
         }

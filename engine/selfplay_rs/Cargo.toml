@@ -13,7 +13,7 @@ rand = "0.10.3"
 rand_chacha = "0.10.0"
 rand_distr = "0.6.0"
 shakmaty = "0.30.1"
-shakmaty-syzygy = "0.28.1"
+shakmaty-syzygy = { version = "0.28.1", features = ["mmap"] }
 
 [profile.release]
 codegen-units = 1
