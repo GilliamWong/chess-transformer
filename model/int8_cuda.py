@@ -1,4 +1,4 @@
-#the int8 matmuls of small batches (the engine's 1 to 8 boards) as CUDA kernels: compiled once per process by NVRTC
+#the int8 matmuls of small batches (CONFIGS' rows: 1 and 2 boards) as CUDA kernels: compiled once per process by NVRTC
 #(the copy torch ships) and launched through the CUDA driver on torch's stream, so inside its cuda graphs too. A CTA
 #splits K over its warps and adds their int32 sums in shared memory (integer atomics: exact in any order), then runs
 #int8_linear_kernel's epilogue with the same fp32 operations: the answers are int8_linear's bits. Used only on the gpus
