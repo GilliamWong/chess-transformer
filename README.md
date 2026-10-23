@@ -215,9 +215,10 @@ answer `isready`, so start the engine once by hand before a match.
 The engine reads its input on a thread of its own, so `stop`, `quit` and `isready` reach a running search, and a
 `position` it could not play (an illegal move, a bad FEN) is refused with an `info string`, the last position kept. Its
 UCI options are `SyzygyPath` and `SyzygyProbeLimit` (the tables, as `--tablebase` and `--tablebase-pieces`),
-`MoveOverhead` (ms, default 20), `CachePositions` (the answer cache, 5M positions and ~1-1.3 GB by default) and
+`MoveOverhead` (ms, default 20), `CachePositions` (the answer cache, 5M positions and ~1-1.3 GB by default),
 `RamLimitMb` (the tree's memory, 0 for no limit: a full tree ends the search, and while a kept tree stays full the next
-searches move at once); all but `MoveOverhead` are read when the engine loads at `isready`, and need a restart after
+searches move at once) and `AdvanceThreads` (the threads that carry the kept tree on to the next move once `bestmove`
+is sent, default 4); all but `MoveOverhead` are read when the engine loads at `isready`, and need a restart after
 that. `RamLimitMb` leaves out the cache and the copy a kept tree makes when the root moves, so set it to about (the
 engine's memory - the cache) / 1.7. `go infinite` runs `--simulations`, as cutechess-cli's `tc=inf` games need; with
 `--infinite-until-stop` it searches until `stop`, as analysis GUIs expect. `go ponder` searches until `ponderhit`
@@ -231,6 +232,18 @@ but at equal nodes it plays as fp16 does: -0.2 [-8.4, +8.0] Elo over 3,663 games
 network in fp16. Self-play and labels stay in fp16: int8's answers depend on the rest of the batch. The int8 weights are
 rounded once per checkpoint (GPTQ, ~1 min) and kept in `~/.cache/chess_transformer/int8`;
 `python -m engine.quantization <model.pt>` rounds them ahead of a match, which `isready` would not wait for.
+
+On a tournament box (TCEC's: 2x EPYC 9175F, 768 GB, 8x RTX 5090), run `engine.uci <model.pt> --select mcts --gpu` with:
+
+```
+setoption name RamLimitMb value 350000        the tree's memory, ~1.7x at its peak with the kept tree's copy (~610 GB with the cache); 200000 on a shared box
+setoption name CachePositions value 50000000  ~9.5 GB, more than a move's answers (~0.25-0.5 a node): one 10x smaller halved the speed, a bigger one gains nothing
+setoption name AdvanceThreads value 16        the cores are idle while the opponent thinks, and a reply that comes before the kept tree is ready waits for it
+setoption name MoveOverhead value 200         lc0's default: 0.2 s a move is nothing at TCEC's time controls, a loss on time is the game
+setoption name SyzygyPath value <folders>     the box's syzygy tables, ':' between folders, with SyzygyProbeLimit 6 (the most the engine reads)
+```
+On the box itself before the first game, round the int8 weights (`python -m engine.quantization <model.pt>`, ~1 min) and start
+the engine once to `isready` (the graphs compile, ~25 s): both are cached, and the GUI's own `isready` then takes ~7 s.
 
 ## Self-play (expert iteration)
 
