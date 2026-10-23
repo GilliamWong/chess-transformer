@@ -17,7 +17,7 @@ from model.encoding import TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
 from engine.inference import ExactSizeCompiled, GraphedBatches, fp16_model, int8_model, small_graph_sizes
 from engine.player import ROOT_MOVES_REPORTED, SearchReport, score_to_centipawns
-from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, ranked_moves, ranked_pieces, wdl_score
+from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
 
 #leaves a round (lc0's minibatch), and its descents that may end on a leaf already waiting before it stops gathering.
 #With the d512 at 1 s a move 64 leaves do 17.3k simulations/s without the cache (128 16.8k, 32 14.8k). Against one leaf
@@ -73,8 +73,9 @@ def sharpen(score: float, sharpness: float) -> float:
     return score if sharpness == 1 or score in (0.0, 1.0) else 1 / (1 + ((1 - score) / score) ** sharpness)
 
 #Searches' settings: mcts.py's with the engine's own (own), then changes (parse_changes') over them
-def engine_search_settings(use_tablebase: bool, changes: dict | None = None, own: bool = True, tablebase_pieces: int = TABLEBASE_PIECES) -> dict:
-    return {**rust_search_settings(use_tablebase, tablebase_pieces), **(ENGINE_SETTINGS if own else {}), **(changes or {})}
+def engine_search_settings(use_tablebase: bool, changes: dict | None = None, own: bool = True, tablebase_pieces: int = TABLEBASE_PIECES,
+                           syzygy_path: str | None = None) -> dict:
+    return {**rust_search_settings(use_tablebase, tablebase_pieces, syzygy_path), **(ENGINE_SETTINGS if own else {}), **(changes or {})}
 
 #"name=value,..." as changes to settings, each value of its setting's type
 def parse_changes(text: str, settings: dict) -> dict:
@@ -112,12 +113,15 @@ class EngineSearch:
     #network and no smart pruning. smart_pruning False searches the whole budget even once the move is decided (lc0's
     #SmartPruningFactor=0), for matches that give both engines exactly the same time; smart_pruning_factor,
     #smart_pruning_wait and stop_at_one_move_left are SMART_PRUNING_FACTOR's, SMART_PRUNING_WAIT's and
-    #STOP_AT_ONE_MOVE_LEFT's. use_tablebase: the tables of positions of up to tablebase_pieces pieces. settings: changes
-    #to engine_search_settings
+    #STOP_AT_ONE_MOVE_LEFT's. use_tablebase: the tables of positions of up to tablebase_pieces pieces, from the folders
+    #of syzygy_path (a SyzygyPath) rather than the downloaded ones if it is given. settings: changes to
+    #engine_search_settings. cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0
+    #for none
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
-                 stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT):
+                 stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
+                 memory_limit_mb: int = 0):
         self.network = network
         self.leaves = leaves
         batched = leaves > 1
@@ -130,13 +134,17 @@ class EngineSearch:
         self.smart_pruning = batched and smart_pruning
         self.smart_pruning_factor, self.smart_pruning_wait = smart_pruning_factor, smart_pruning_wait
         self.stop_at_one_move_left = stop_at_one_move_left
-        search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces)
-        self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=CACHE_POSITIONS)
+        search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
+        self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb)
         #reports give the score on the network's own scale, as a gui showed and adjudicated it before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
-        self.tablebase = open_tablebase(tablebase_pieces) if use_tablebase else None
         #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
-        self.ranked_pieces = ranked_pieces(tablebase_pieces) if use_tablebase else 0
+        if not use_tablebase:
+            self.tablebase, self.ranked_pieces = None, 0
+        elif syzygy_path is None:
+            self.tablebase, self.ranked_pieces = open_tablebase(tablebase_pieces), ranked_pieces(tablebase_pieces)
+        else:
+            self.tablebase, self.ranked_pieces = open_tablebase_path(syzygy_path, tablebase_pieces)
         self.certainty = search_settings.get("certainty", False)
         self.round_times: deque = deque([FIRST_ROUND_SECONDS], maxlen=ROUND_TIMES)
         self.round_seconds = FIRST_ROUND_SECONDS

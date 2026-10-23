@@ -1,6 +1,6 @@
 #the uci engine's search (engine/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
 #deadline and node limit, smart pruning, the tree kept for the next move, the engine's own settings, and uci.py's go
-#limits and clock, the commands it takes while it searches and the positions it refuses
+#limits and clock, the commands it takes while it searches, its options and the positions it refuses
 import io
 import queue
 import runpy
@@ -23,6 +23,7 @@ from engine.inference import ImmediateBatches, cpu_batches
 from model.model import ChessTransformer
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from tools.checkpoint import save_checkpoint
+from tools.tablebase import SYZYGY_DIR
 from engine import engine_search
 from engine.engine_search import EngineSearch, engine_search_settings, parse_changes
 from engine.player import SearchReport
@@ -1052,6 +1053,58 @@ def test_go_ponder_searches_until_ponderhit(monkeypatch):
     time.sleep(0.3)
     stopped = gui.tell("stop")
     assert gui.sent_at("bestmove", since=stopped, seconds=2) is not None and len(limits) == 3
+    gui.close()
+
+#the options a gui sets reach the search when it is built (isready), MoveOverhead the next go's time. Set once the
+#search is built, or to a value it could not take, they stay as they were and the gui is told why
+def test_the_options_reach_the_search(monkeypatch):
+    built, given = [], []
+    class Player:
+        def search(self, board, nodes, seconds, extension, stop):
+            given.append(seconds)
+            return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
+    script = ["uci", "setoption name cachepositions value 1000", "setoption name RamLimitMb value 64", "setoption name SyzygyProbeLimit value 6",
+              "setoption name MoveOverhead value 500", "setoption name MoveOverhead value -1", "setoption name SyzygyProbeLimit value 7",
+              "setoption name Hash value 16", "isready", "setoption name CachePositions value 5", "go movetime 1000",
+              "setoption name MoveOverhead value 100", "go movetime 1000", "ucinewgame", "go movetime 1000", "quit"]
+    sent = []
+    monkeypatch.setattr(uci, "load_player", lambda *arguments: built.append(arguments) or Player())
+    monkeypatch.setattr(uci, "send", sent.append)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(script)))
+    uci.main(Path("unused.pt"), selection="mcts", search_options={"smart_pruning": False})
+
+    assert [line.split()[2] for line in sent if line.startswith("option name")] == ["SyzygyPath", "SyzygyProbeLimit", "MoveOverhead", "CachePositions",
+                                                                                     "RamLimitMb"]
+    assert len(built) == 1 and built[0][4] is False
+    assert built[0][5] == {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64}
+    assert given == [pytest.approx(0.5), pytest.approx(0.9), pytest.approx(0.9)]
+    told = [line for line in sent if line.startswith("info string")]
+    assert len(told) == 4 and "-1" in told[0] and "7" in told[1] and "Hash" in told[2] and "CachePositions" in told[3]
+
+#EngineSearch makes its Searches with the cache size and memory limit it is given, and a search ends at the limit
+def test_the_search_takes_its_cache_size_and_memory_limit(monkeypatch):
+    made = []
+    searches = selfplay_rs.Searches
+    monkeypatch.setattr(selfplay_rs, "Searches", lambda **settings: made.append(settings) or searches(**settings))
+    EngineSearch(cpu_batches(BoardModel()), 16)
+    limited = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, cache_positions=1000, memory_limit_mb=1)
+    assert [(settings["cache_positions"], settings["memory_limit_mb"]) for settings in made] == [(engine_search.CACHE_POSITIONS, 0), (1000, 1)]
+    assert 100 < limited.search(chess.Board(), simulations=100_000).simulations < 3000
+
+#a SyzygyPath the gui sets reaches the search: the root takes the tables' move (no simulations) from its folders. A
+#folder without the tables is refused, and the engine plays on as it was
+def test_a_syzygy_path_reaches_the_search(monkeypatch, tablebase, tmp_path):
+    settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": 16}
+    save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
+    (tmp_path / "no_tables").mkdir()
+    gui = Gui(monkeypatch, None, tmp_path / "model.pt")
+    gui.tell(f"setoption name SyzygyPath value {tmp_path / 'no_tables'}")
+    assert gui.sent_at("info string", seconds=5) is not None and gui.lines_sent("info string")[0].endswith("the tables stay as they were")
+    gui.tell(f"setoption name SyzygyPath value {SYZYGY_DIR}")
+    gui.tell("position fen k7/8/1K6/8/8/8/8/7R w - - 0 1")
+    gui.tell("go nodes 50")
+    assert gui.sent_at("bestmove", seconds=30) is not None
+    assert gui.lines_sent("bestmove") == ["bestmove h1h8"] and gui.last_info("nodes") == 0 and len(gui.lines_sent("info string")) == 1
     gui.close()
 
 #a position the search could not start from leaves the last one, and the gui is told why (each of these ended the

@@ -212,6 +212,17 @@ time saved goes to the moves that are not decided. `--leaves 1` is `engine/mcts.
 after an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to
 answer `isready`, so start the engine once by hand before a match.
 
+The engine reads its input on a thread of its own, so `stop`, `quit` and `isready` reach a running search, and a
+`position` it could not play (an illegal move, a bad FEN) is refused with an `info string`, the last position kept. Its
+UCI options are `SyzygyPath` and `SyzygyProbeLimit` (the tables, as `--tablebase` and `--tablebase-pieces`),
+`MoveOverhead` (ms, default 20), `CachePositions` (the answer cache, 5M positions and ~1-1.3 GB by default) and
+`RamLimitMb` (the tree's memory, 0 for no limit: a full tree ends the search, and while a kept tree stays full the next
+searches move at once); all but `MoveOverhead` are read when the engine loads at `isready`, and need a restart after
+that. `RamLimitMb` leaves out the cache and the copy a kept tree makes when the root moves, so set it to about (the
+engine's memory - the cache) / 1.7. `go infinite` runs `--simulations`, as cutechess-cli's `tc=inf` games need; with
+`--infinite-until-stop` it searches until `stop`, as analysis GUIs expect. `go ponder` searches until `ponderhit`
+(GUIs do not ponder with the engine, which names no ponder move), and `searchmoves` is ignored.
+
 The network runs every block but the last with its matmuls on normalised inputs (Q, K, V, the template mix, the mlp's
 gate and up) and the mlp's down in int8 (`model/int8_blocks.py`): on the 5070 Ti it answers ~1.35x fp16's positions a
 second at 64 boards and the search does ~1.4x the nodes at 1 s a move (1.33x at 800 nodes), and an A100, A40 and L40S

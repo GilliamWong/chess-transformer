@@ -1,9 +1,9 @@
 #the model as a uci engine, for cutechess-cli matches, tournament managers and the cute chess gui: uci, isready,
-#ucinewgame, position, go, stop, ponderhit and quit, read on a thread of their own (Commands) so that stop, isready
-#and quit reach a running search. The search (--select mcts) keeps to go's movetime, nodes and wtime/btime; a go
-#without them runs --simulations, go infinite too (cutechess sends it for tc=inf) unless --infinite-until-stop. go
-#ponder searches until ponderhit, then as the go asks; its searchmoves, depth and mate are ignored. The other
-#selections ignore the clock
+#setoption (Options), ucinewgame, position, go, stop, ponderhit and quit, read on a thread of their own (Commands) so
+#that stop, isready and quit reach a running search. The search (--select mcts) keeps to go's movetime, nodes and
+#wtime/btime; a go without them runs --simulations, go infinite too (cutechess sends it for tc=inf) unless
+#--infinite-until-stop. go ponder searches until ponderhit, then as the go asks; its searchmoves, depth and mate are
+#ignored. The other selections ignore the clock
 #   python -m engine.uci [model.pt | random] [--select mcts --gpu]
 import argparse
 from collections.abc import Iterable
@@ -20,17 +20,17 @@ import torch
 from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
-from engine.engine_search import (ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, EngineSearch, engine_network,
-                                  engine_search_settings, parse_changes)
+from engine.engine_search import (CACHE_POSITIONS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, EngineSearch,
+                                  engine_network, engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
-from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES
+from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
 
 ENGINE_NAME = "ChessTransformer"
 
 #one board takes a few ms on the cpu, less than starting cuda; one thread so parallel games don't fight over cores
 DEVICE = torch.device("cpu")
-#the time between the search's end and the gui reading bestmove, kept off go's time
+#the time between the search's end and the gui reading bestmove, kept off go's time (uci option MoveOverhead)
 MOVE_OVERHEAD_SECONDS = 0.02
 #go's arguments that take a number
 GO_NUMBERS = ("wtime", "btime", "winc", "binc", "movestogo", "movetime", "nodes", "depth", "mate")
@@ -119,10 +119,11 @@ def info_line(report: SearchReport, seconds: float) -> str:
 class Clock:
     def __init__(self, moves_per_man: float = MOVES_PER_MAN, least_moves_left: int = LEAST_MOVES_LEFT, reserve_seconds: float = RESERVE_SECONDS,
                  most_of_the_time_left: float = MOST_OF_THE_TIME_LEFT, first_move_bonus: float = FIRST_MOVE_BONUS,
-                 book_ply_bonus: float = BOOK_PLY_BONUS):
+                 book_ply_bonus: float = BOOK_PLY_BONUS, move_overhead_seconds: float = MOVE_OVERHEAD_SECONDS):
         self.moves_per_man, self.least_moves_left = moves_per_man, least_moves_left
         self.reserve_seconds, self.most_of_the_time_left = reserve_seconds, most_of_the_time_left
         self.first_move_bonus, self.book_ply_bonus = first_move_bonus, book_ply_bonus
+        self.move_overhead_seconds = move_overhead_seconds
         self.first_search = True #the game's first search on the clock is still to come
         self.saved = 0.0 #the seconds earlier searches were given and did not use
         self.allotted: float | None = None #the seconds the search on the clock was given
@@ -137,9 +138,9 @@ class Clock:
         time_left, increment = ("wtime", "winc") if board.turn == chess.WHITE else ("btime", "binc")
         seconds = self.allotted = self.extension = None
         if "movetime" in numbers:
-            seconds = max(0.0, numbers["movetime"] / 1000 - MOVE_OVERHEAD_SECONDS)
+            seconds = max(0.0, numbers["movetime"] / 1000 - self.move_overhead_seconds)
         elif time_left in numbers:
-            seconds_left = numbers[time_left] / 1000 - MOVE_OVERHEAD_SECONDS
+            seconds_left = numbers[time_left] / 1000 - self.move_overhead_seconds
             bonus = 1.0
             if self.first_search:
                 bonus += self.first_move_bonus + self.book_ply_bonus * min(MOST_BOOK_PLIES, board.ply())
@@ -293,6 +294,89 @@ class Commands:
         with self.lock:
             self.unfinished.remove(go)
 
+#setoption's whole number options, (lowest, highest): the tables' most pieces, MoveOverhead in ms, RamLimitMb in MB
+SPIN_OPTIONS = {"SyzygyProbeLimit": (min(table_set.pieces for table_set in TABLE_SETS), max(table_set.pieces for table_set in TABLE_SETS)),
+                "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000)}
+#the options the search is built with (at isready or the first go): set later, they take effect when the engine
+#restarts, not at a new game (Searches takes them when it is made)
+BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb")
+
+#setoption's "name <name> value <value>", each of any number of words (a path may hold spaces)
+def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
+    value_at = arguments.index("value") if "value" in arguments else len(arguments)
+    return " ".join(arguments[1:value_at]), " ".join(arguments[value_at + 1:])
+
+#the search's uci options, the command line's choices their defaults. SyzygyPath: folders of syzygy tables, os.pathsep
+#between them, or <empty> for the command line's (--tablebase, else none); SyzygyProbeLimit: their most pieces;
+#CachePositions: the network's answers the search keeps (engine_search.CACHE_POSITIONS); RamLimitMb: the MB (10^6
+#bytes) the search's tree may take, 0 for no limit (Searches' memory_limit_mb, without the cache or a kept tree's copy)
+class Options:
+    def __init__(self, tablebase: bool, tablebase_pieces: int):
+        self.tablebase, self.default_pieces = tablebase, tablebase_pieces
+        self.syzygy_path: str | None = None #None for the command line's tables
+        self.tablebase_pieces = tablebase_pieces
+        self.move_overhead_seconds = MOVE_OVERHEAD_SECONDS
+        self.cache_positions = CACHE_POSITIONS
+        self.ram_limit_mb = 0
+
+    #the uci reply's lines
+    def lines(self) -> list[str]:
+        defaults = {"SyzygyProbeLimit": self.default_pieces, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": CACHE_POSITIONS,
+                    "RamLimitMb": 0}
+        return (["option name SyzygyPath type string default <empty>"]
+                + [f"option name {name} type spin default {defaults[name]} min {lowest} max {highest}" for name, (lowest, highest) in SPIN_OPTIONS.items()])
+
+    #a setoption once the search is built or not: what to tell the gui (an info string), None if nothing. A value the
+    #search could not take (tables that are not all there, a number out of range) leaves the option as it was
+    def set(self, name: str, value: str, built: bool) -> str | None:
+        name = next((known for known in ("SyzygyPath", *SPIN_OPTIONS) if known.lower() == name.lower()), name)
+        if name not in ("SyzygyPath", *SPIN_OPTIONS):
+            return f"no option {name}"
+        if built and name in BUILD_OPTIONS:
+            return f"{name} takes effect when the engine restarts: the search is built"
+        if name == "SyzygyPath":
+            path = os.pathsep.join(filter(None, value.split(os.pathsep))) if value != "<empty>" else ""
+            problem = self.tables_problem(path or None, self.tablebase_pieces)
+            if problem is None:
+                self.syzygy_path = path or None
+            return problem
+        lowest, highest = SPIN_OPTIONS[name]
+        try:
+            number = int(value)
+        except ValueError:
+            number = None
+        if number is None or not lowest <= number <= highest:
+            return f"{name} is a whole number from {lowest} to {highest}, not {value!r}"
+        if name == "SyzygyProbeLimit":
+            problem = self.tables_problem(self.syzygy_path, number)
+            if problem is None:
+                self.tablebase_pieces = number
+            return problem
+        if name == "MoveOverhead":
+            self.move_overhead_seconds = number / 1000
+        elif name == "CachePositions":
+            self.cache_positions = number
+        else:
+            self.ram_limit_mb = number
+        return None
+
+    #why the search could not open the tables of `path` (None for the command line's) up to `pieces`, None if it can
+    def tables_problem(self, path: str | None, pieces: int) -> str | None:
+        try:
+            if path is not None:
+                open_tablebase_path(path, pieces)[0].close()
+            elif self.tablebase:
+                open_tablebase(pieces).close()
+        except (OSError, ValueError) as error:
+            return f"{error}: the tables stay as they were"
+        return None
+
+    #load_player's tablebase and the search options these set
+    def search(self) -> tuple[bool, dict]:
+        return (self.tablebase or self.syzygy_path is not None,
+                {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": self.cache_positions,
+                 "memory_limit_mb": self.ram_limit_mb})
+
 
 def main(checkpoint_path: Path | None = None, random_mover: bool = False, selection: str = "argmax",
          temperature: float = TEMPERATURE, sample_plies: int = SAMPLE_PLIES, simulations: int = SIMULATIONS,
@@ -301,14 +385,17 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
     torch.set_num_threads(1)
     search_options = search_options or {}
     clock_options = clock_options or {}
+    #the options are the search's
     searching = selection == "mcts" and not random_mover
+    options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES))
     player = None
     board = chess.Board()
     clock = Clock(**clock_options)
     commands = Commands(sys.stdin, infinite_until_stop)
 
     def load() -> nn.Module | EngineSearch:
-        return load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options, precision)
+        use_tablebase, set_options = options.search()
+        return load_player(checkpoint_path, selection, gpu, leaves, use_tablebase, {**search_options, **set_options}, precision)
 
     #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by
     #itself (a proven or only move), as UCI asks; a go ponder searches the opponent's time until ponderhit, then on as
@@ -352,6 +439,9 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         if command == "uci":
             send(f"id name {'RandomMover' if random_mover else ENGINE_NAME}")
             send("id author William Gong")
+            if searching:
+                for line in options.lines():
+                    send(line)
             send("uciok")
 
         elif command == "isready":
@@ -360,9 +450,15 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
                 player = load()
             send("readyok")
 
+        elif command == "setoption" and searching:
+            told = options.set(*option_name_and_value(arguments), built=player is not None)
+            clock.move_overhead_seconds = options.move_overhead_seconds
+            if told is not None:
+                send(f"info string {told}")
+
         elif command == "ucinewgame":
             board = chess.Board()
-            clock = Clock(**clock_options)
+            clock = Clock(**clock_options, move_overhead_seconds=options.move_overhead_seconds)
             if isinstance(player, EngineSearch):
                 player.new_game()
 
@@ -383,7 +479,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         elif command == "quit":
             break
 
-        #anything else (setoption, debug, ...) is ignored, as UCI allows
+        #anything else (debug, register, ...) is ignored, as UCI allows
 
 
 if __name__ == "__main__":
