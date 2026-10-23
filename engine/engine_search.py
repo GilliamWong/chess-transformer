@@ -1,10 +1,12 @@
 #one search at a time as fast as the network allows, for the uci engine: the search runs in rust (selfplay_rs.Searches)
 #and gathers many leaves a round for one network call, as lc0 does, while the round before is on the gpu. It stops at
 #a number of simulations, at a deadline or when told to (uci's stop), or earlier once its move is decided (smart
-#pruning), and keeps its tree for the game's next move and the network's answers for positions reached again
+#pruning), and keeps its tree for the game's next move and the network's answers for positions reached again. On
+#several gpus a thread drives each, all on the one tree, as lc0's search threads do
 from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import math
 from pathlib import Path
 import statistics
@@ -103,40 +105,66 @@ PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
 ENGINE_PRECISION = "int8"
 
 
-#the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out;
-#blocking_wait see GraphedBatches
-def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION, blocking_wait: bool = False):
-    model = PRECISIONS[precision](checkpoint_path)
-    sizes = small_graph_sizes(max_batch)
-    #one board a round (mcts.py's search) never fills the largest graph
-    compiled = ExactSizeCompiled(model, sizes[-1]) if max_batch > 1 else torch.compile(model, dynamic=True)
-    return GraphedBatches(compiled, sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1, blocking_wait)
+#the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out; on the gpu
+#numbered device, or else the current one; blocking_wait see GraphedBatches
+def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION, device: int | None = None,
+                   blocking_wait: bool = False):
+    with torch.cuda.device(device):
+        model = PRECISIONS[precision](checkpoint_path)
+        sizes = small_graph_sizes(max_batch)
+        #one board a round (mcts.py's search) never fills the largest graph
+        compiled = ExactSizeCompiled(model, sizes[-1]) if max_batch > 1 else torch.compile(model, dynamic=True)
+        return GraphedBatches(compiled, sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1, blocking_wait)
+
+
+#what the threads driving a search's networks share, behind changed's lock; changed is notified as a round comes back
+#or the search stops
+class SearchRun:
+    def __init__(self, simulations: int | None, deadline: float | None, extension: tuple[int, float] | None, only_move: bool,
+                 told: threading.Event | None, info: Callable[[SearchReport], None] | None, next_info: float):
+        self.simulations, self.deadline, self.extension, self.only_move = simulations, deadline, extension, only_move
+        self.told = told #set to stop the search (uci's stop)
+        self.info, self.next_info = info, next_info #EngineSearch.search's, and when its next report is due
+        self.changed = threading.Condition()
+        self.report = None
+        self.stopping = self.gathered = False
+        self.rounds_out = 0 #on every network
+        self.next_round = 0 #the next round's name in Searches
+        self.progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
+        self.first_answers = None #when the search's first round came back
+
+    #the search stops gathering; its report, or None while its leaves are out (the finish of the last of them has it)
+    def stop(self, report) -> None:
+        self.stopping, self.report = True, report
+        self.changed.notify_all()
 
 
 class EngineSearch:
-    #network has GraphedBatches' launch and collect (inference.ImmediateBatches on the cpu). One leaf a round is
-    #mcts.py's search: its settings (without ENGINE_SETTINGS), a fresh tree every move, no second round on the
-    #network and no smart pruning. smart_pruning False searches the whole budget even once the move is decided (lc0's
-    #SmartPruningFactor=0), for matches that give both engines exactly the same time; smart_pruning_factor,
-    #smart_pruning_wait and stop_at_one_move_left are SMART_PRUNING_FACTOR's, SMART_PRUNING_WAIT's and
-    #STOP_AT_ONE_MOVE_LEFT's. use_tablebase: the tables of positions of up to tablebase_pieces pieces, from the folders
-    #of syzygy_path (a SyzygyPath) rather than the downloaded ones if it is given. settings: changes to
-    #engine_search_settings. cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0
-    #for none; advance_threads: ADVANCE_THREADS'
+    #network has GraphedBatches' launch and collect (inference.ImmediateBatches on the cpu), or is a list of them, one a
+    #gpu, each driven by a thread of its own. One leaf a round is mcts.py's search: its settings (without
+    #ENGINE_SETTINGS), a fresh tree every move, no second round on the network and no smart pruning. smart_pruning False
+    #searches the whole budget even once the move is decided (lc0's SmartPruningFactor=0), for matches that give both
+    #engines exactly the same time; smart_pruning_factor, smart_pruning_wait and stop_at_one_move_left are
+    #SMART_PRUNING_FACTOR's, SMART_PRUNING_WAIT's and STOP_AT_ONE_MOVE_LEFT's. use_tablebase: the tables of positions of
+    #up to tablebase_pieces pieces, from the folders of syzygy_path (a SyzygyPath) rather than the downloaded ones if it
+    #is given. settings: changes to engine_search_settings. cache_positions: the answer cache's size; memory_limit_mb:
+    #Searches' (lc0's RamLimitMb), 0 for none; advance_threads: ADVANCE_THREADS'
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS):
-        self.network = network
+        self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched = leaves > 1
+        if len(self.networks) > 1 and not batched:
+            raise ValueError("one leaf a round is mcts.py's search, which runs on one network")
         self.round_simulations = SIMULATIONS_PER_LEAF * leaves
         self.collisions = COLLISIONS if batched else 0
-        self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1
+        self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1 #on each network
         self.grow_leaves = grow_leaves if batched else 0
         #rounds on lanes of their own (GraphedBatches') run at once
-        self.rounds_at_once = batched and len(getattr(network, "lanes", ())) > 1
+        self.rounds_at_once = batched and len(getattr(self.networks[0], "lanes", ())) > 1
         self.smart_pruning = batched and smart_pruning
         self.smart_pruning_factor, self.smart_pruning_wait = smart_pruning_factor, smart_pruning_wait
         self.stop_at_one_move_left = stop_at_one_move_left
@@ -155,6 +183,8 @@ class EngineSearch:
         self.certainty = search_settings.get("certainty", False)
         self.round_times: deque = deque([FIRST_ROUND_SECONDS], maxlen=ROUND_TIMES)
         self.round_seconds = FIRST_ROUND_SECONDS
+        #the threads that drive the networks after the first, which the searching thread drives itself
+        self.threads = ThreadPoolExecutor(len(self.networks) - 1) if len(self.networks) > 1 else None
 
     #a new game (uci's ucinewgame): its first search starts a fresh tree with an empty cache, as lc0's does
     def new_game(self) -> None:
@@ -183,86 +213,116 @@ class EngineSearch:
 
         self.searches.start(GAME, board.root().fen(), [move.uci() for move in board.move_stack], UNLIMITED if simulations is None else simulations)
         deadline = started + seconds if seconds is not None else None
-        if deadline is None:
-            extension = None
-        only_move = board.legal_moves.count() == 1
-        #launched rounds, oldest first, as (the launch, None for a round without leaves, and when it was launched)
-        rounds: deque = deque()
-        gathered = stopping = False
-        report, last_answers = None, None
-        progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
-        first_answers = None #when the search's first round came back
-        next_info = started + INFO_SECONDS
-        #the rounds left once the report is in have no leaves, but Searches still expects their finish
-        while report is None or rounds:
-            if report is None and not stopping:
-                #the round gathered now would come back after those on the gpu: stop if that is past the deadline. Rounds
-                #on lanes of their own run at once and come back about together, so it comes a round time after the newest
-                round_times = max(len(rounds), 1) if self.rounds_at_once else len(rounds) + 1
-                told_to_stop = stop is not None and stop.is_set()
-                if gathered and (told_to_stop or deadline is not None and time.perf_counter() + round_times * self.round_seconds >= deadline):
-                    #once: a search whose score has fallen runs on, unless told to stop
-                    if extension is not None and not told_to_stop:
-                        deadline += self.extra_for_fall(extension)
-                        extension = None
-                        continue
-                    stopping = True
-                    report = self.searches.stop(GAME)
-                    continue
-                count, in_flight = self.round_leaves(simulations)
-                if len(rounds) < in_flight:
-                    #a bytearray: torch warns about arrays it cannot write to
-                    leaves = bytearray(self.searches.descend(count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count))
-                    boards = np.frombuffer(leaves, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
-                    launched_at = time.perf_counter()
-                    rounds.append((self.network.launch(boards) if len(boards) else None, launched_at))
-                    gathered = True
-                    continue
-
-            launched, launched_at = rounds.popleft()
-            if launched is None:
-                answers = np.zeros((0, ANSWER_WIDTH), dtype=np.float32)
-            else:
-                answers = self.network.collect(launched)
-                #rounds come back one after another while the gpu is kept busy; the search's first from its launch
-                now = time.perf_counter()
-                self.round_times.append(now - (launched_at if last_answers is None else last_answers))
-                self.round_seconds = statistics.median(self.round_times)
-                last_answers = now
-            reports = self.searches.finish(answers)
-            if info is not None and not reports and report is None and time.perf_counter() >= next_info:
-                next_info = time.perf_counter() + INFO_SECONDS
-                running = self.searches.report_now(GAME)
-                if running is not None:
-                    info(self.search_report(running))
-            if reports:
-                report = reports[0]
-            #a round without leaves counts too: all its simulations may have ended the game (a mate found)
-            elif report is None and self.smart_pruning and not stopping:
-                visits, most, second = self.searches.root_visits(GAME)
-                now = time.perf_counter()
-                progress.append((now, visits))
-                first_answers = now if first_answers is None else first_answers
-                decided = (most - second > self.simulations_left(simulations, deadline, progress) / self.smart_pruning_factor
-                           and now - first_answers >= self.smart_pruning_wait)
-                proven = self.certainty and (self.searches.decided(GAME) or self.stop_at_one_move_left and self.searches.moves_not_lost(GAME) <= 1)
-                #once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
-                extra = 0.0
-                if decided and not (only_move or proven) and extension is not None:
-                    extra, extension = self.extra_for_fall(extension), None
-                if extra > 0:
-                    deadline += extra
-                elif only_move or decided or proven:
-                    stopping = True
-                    report = self.searches.stop(GAME)
-
-        return self.search_report(report)
+        run = SearchRun(simulations, deadline, extension if deadline is not None else None, board.legal_moves.count() == 1, stop, info,
+                        started + INFO_SECONDS)
+        driven = [self.threads.submit(self.drive, network, run) for network in self.networks[1:]] if self.threads else []
+        try:
+            self.drive(self.networks[0], run)
+        finally:
+            for drive in driven:
+                drive.result()
+        return self.search_report(run.report)
 
     #a report of Searches' as the engine gives it: the score on the network's own scale, the line and root moves as moves
     def search_report(self, report: tuple) -> SearchReport:
         _, line, score, root_moves, visits = report
         return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
                             [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]])
+
+    #rounds_on, a failure stopping the other networks' rounds too
+    def drive(self, network, run: SearchRun) -> None:
+        try:
+            self.rounds_on(network, run)
+        except BaseException:
+            with run.changed:
+                run.stopping = True
+                run.changed.notify_all()
+            raise
+
+    #the search's rounds on one network until the report is in and the network's rounds are back: what to do next is
+    #decided under run's lock, and the rounds are gathered, run and finished outside it
+    def rounds_on(self, network, run: SearchRun) -> None:
+        #launched rounds, oldest first, as (the round's name, the launch or None for a round without leaves, and when it
+        #was launched)
+        rounds: deque = deque()
+        last_answers = None
+        #the rounds left once the report is in have no leaves, but Searches still expects their finish
+        while True:
+            name = None
+            with run.changed:
+                while run.report is None and not run.stopping:
+                    #the round gathered now would come back after those on the gpu: stop if that is past the deadline.
+                    #Rounds on lanes of their own run at once and come back about together, so it comes a round time
+                    #after the newest
+                    round_times = max(len(rounds), 1) if self.rounds_at_once else len(rounds) + 1
+                    told_to_stop = run.told is not None and run.told.is_set()
+                    late = run.deadline is not None and time.perf_counter() + round_times * self.round_seconds >= run.deadline
+                    if run.gathered and (told_to_stop or late):
+                        #once: a search whose score has fallen runs on, unless told to stop
+                        if run.extension is not None and not told_to_stop:
+                            run.deadline += self.extra_for_fall(run.extension)
+                            run.extension = None
+                            continue
+                        run.stop(self.searches.stop(GAME))
+                        break
+                    count, in_flight = self.round_leaves(run.simulations)
+                    if run.rounds_out < in_flight and len(rounds) < self.rounds_in_flight:
+                        name, run.next_round = run.next_round, run.next_round + 1
+                        run.rounds_out += 1
+                        run.gathered = True
+                    elif not rounds:
+                        #the rounds out are other networks': one must come back first
+                        run.changed.wait()
+                        continue
+                    break
+                if name is None and not rounds:
+                    return
+            if name is not None:
+                #a bytearray: torch warns about arrays it cannot write to
+                leaves = bytearray(self.searches.descend(count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count, round=name))
+                boards = np.frombuffer(leaves, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
+                launched_at = time.perf_counter()
+                rounds.append((name, network.launch(boards) if len(boards) else None, launched_at))
+                continue
+
+            name, launched, launched_at = rounds.popleft()
+            answers = np.zeros((0, ANSWER_WIDTH), dtype=np.float32) if launched is None else network.collect(launched)
+            answered = time.perf_counter()
+            with run.changed:
+                #under the lock, so that no thread finds the search gone from Searches (done) before its report is in
+                reports = self.searches.finish(answers, round=name)
+                run.rounds_out -= 1
+                if launched is not None:
+                    #rounds come back one after another while the gpu is kept busy; the search's first from its launch
+                    self.round_times.append(answered - (launched_at if last_answers is None else last_answers))
+                    self.round_seconds = statistics.median(self.round_times)
+                    last_answers = answered
+                if run.info is not None and not reports and run.report is None and time.perf_counter() >= run.next_info:
+                    run.next_info = time.perf_counter() + INFO_SECONDS
+                    running = self.searches.report_now(GAME)
+                    if running is not None:
+                        run.info(self.search_report(running))
+                if reports:
+                    run.report = reports[0]
+                #a round without leaves counts too: all its simulations may have ended the game (a mate found)
+                elif run.report is None and self.smart_pruning and not run.stopping:
+                    visits, most, second = self.searches.root_visits(GAME)
+                    now = time.perf_counter()
+                    run.progress.append((now, visits))
+                    run.first_answers = now if run.first_answers is None else run.first_answers
+                    decided = (most - second > self.simulations_left(run.simulations, run.deadline, run.progress) / self.smart_pruning_factor
+                               and now - run.first_answers >= self.smart_pruning_wait)
+                    proven = self.certainty and (self.searches.decided(GAME)
+                                                 or self.stop_at_one_move_left and self.searches.moves_not_lost(GAME) <= 1)
+                    #once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
+                    extra = 0.0
+                    if decided and not (run.only_move or proven) and run.extension is not None:
+                        extra, run.extension = self.extra_for_fall(run.extension), None
+                    if extra > 0:
+                        run.deadline += extra
+                    elif run.only_move or decided or proven:
+                        run.stop(self.searches.stop(GAME))
+                run.changed.notify_all()
 
     #the seconds a search may run on: all of its extension's at a fall of FALL_FULL_CP below the last search's score, none
     #at FALL_START_CP or less (the score as the report gives it, on the network's own scale)
@@ -272,14 +332,15 @@ class EngineSearch:
         share = min(1.0, max(0.0, (fall - FALL_START_CP) / (FALL_FULL_CP - FALL_START_CP)))
         return share * seconds
 
-    #the next round's leaves, and the rounds out at once: one until a round takes all of them
+    #the next round's leaves, and the rounds out at once over all the networks: one until a round takes all of them
     def round_leaves(self, simulations: int | None) -> tuple[int, int]:
+        rounds = self.rounds_in_flight * len(self.networks)
         if not self.grow_leaves:
-            return self.leaves, self.rounds_in_flight
+            return self.leaves, rounds
         visits = self.searches.root_visits(GAME)[0]
         done_or_left = visits if simulations is None else min(visits, simulations - visits)
         count = max(1, min(self.leaves, done_or_left // self.grow_leaves))
-        return count, self.rounds_in_flight if count == self.leaves else 1
+        return count, rounds if count == self.leaves else 1
 
     #the simulations the search has left: those waiting for the network count as left, so a move is only decided if
     #they could not change it either. With a deadline, the time left at the speed of the last rounds
