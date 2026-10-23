@@ -168,13 +168,46 @@ def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: st
                    fp16_blocks: int = ENGINE_FP16_BLOCKS, device: int | None = None, blocking_wait: bool = False,
                    lean: bool | None = None):
     with torch.cuda.device(device):
-        model = int8_model(checkpoint_path, fp16_blocks) if precision == "int8" else PRECISIONS[precision](checkpoint_path)
-        lanes = ROUNDS_IN_FLIGHT if max_batch > 1 else 1
-        chunk = chunk_positions(model.d_model, lanes)
-        sizes = small_graph_sizes(max_batch, chunk)
-        #one board a round (mcts.py's search) never fills the largest graph
-        compiled = ExactSizeCompiled(model, min(sizes[-1], chunk)) if max_batch > 1 else torch.compile(model, dynamic=True)
-        return GraphedBatches(compiled, sizes, lanes, chunk, blocking_wait, lean_lanes() if lean is None else lean)
+        return network_graphs(network_model(checkpoint_path, precision, fp16_blocks), max_batch, blocking_wait, lean)
+
+
+#engine_network on each gpu of devices (their lanes lean by default), the int8 weights read once for all: the models
+#load at once, a thread each, as little of it holds the gil (the checkpoint's reads and copies, the small-batch
+#kernels' nvrtc compile); their graphs are recorded one network after another, as dynamo compiles one frame at a time
+#and a graph's recording forbids other threads' allocations
+def engine_networks(checkpoint_path: Path, max_batch: int, precision: str, fp16_blocks: int, devices: list[int],
+                    blocking_wait: bool) -> list[GraphedBatches]:
+    #imported here, as int8_model imports it: it needs Triton
+    from engine.quantization import int8_weights
+    #rounded on the first gpu when they are not cached, as its own engine_network would
+    with torch.cuda.device(devices[0]):
+        weights = int8_weights(checkpoint_path, fp16_blocks) if precision == "int8" else None
+
+    def load(device: int) -> torch.nn.Module:
+        with torch.cuda.device(device):
+            return network_model(checkpoint_path, precision, fp16_blocks, weights)
+    with ThreadPoolExecutor(len(devices)) as pool:
+        models = list(pool.map(load, devices))
+    networks = []
+    for model, device in zip(models, devices):
+        with torch.cuda.device(device):
+            networks.append(network_graphs(model, max_batch, blocking_wait, None))
+    return networks
+
+
+#engine_network's model on the current gpu, int8's weights (int8_weights') read unless given
+def network_model(checkpoint_path: Path, precision: str, fp16_blocks: int, weights: dict | None = None) -> torch.nn.Module:
+    return int8_model(checkpoint_path, fp16_blocks, weights) if precision == "int8" else PRECISIONS[precision](checkpoint_path)
+
+
+#engine_network's graphs of the model on the current gpu
+def network_graphs(model: torch.nn.Module, max_batch: int, blocking_wait: bool, lean: bool | None) -> GraphedBatches:
+    lanes = ROUNDS_IN_FLIGHT if max_batch > 1 else 1
+    chunk = chunk_positions(model.d_model, lanes)
+    sizes = small_graph_sizes(max_batch, chunk)
+    #one board a round (mcts.py's search) never fills the largest graph
+    compiled = ExactSizeCompiled(model, min(sizes[-1], chunk)) if max_batch > 1 else torch.compile(model, dynamic=True)
+    return GraphedBatches(compiled, sizes, lanes, chunk, blocking_wait, lean_lanes() if lean is None else lean)
 
 
 #whether the current gpu's lanes are lean by default

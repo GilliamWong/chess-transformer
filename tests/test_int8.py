@@ -462,6 +462,25 @@ def answers_by_lane_and_size(network, boards: np.ndarray) -> list[np.ndarray]:
     return answers
 
 
+#engine_networks (several gpus: the int8 weights read once, the models loaded at once on a thread each) gives each gpu
+#the network engine_network builds alone, to the bit at every graph size on both lanes; here twice on this gpu
+@gpu
+def test_the_engine_networks_answer_as_engine_networks(tmp_path, small_calibration):
+    from engine.engine_search import ENGINE_FP16_BLOCKS, engine_network, engine_networks
+    _, boards = small_checkpoint(tmp_path)
+    boards = np.resize(boards.numpy().astype("uint8"), (8, boards.shape[1]))
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        expected = answers_by_lane_and_size(engine_network(tmp_path / "model.pt", 8, "int8"), boards)
+        networks = engine_networks(tmp_path / "model.pt", 8, "int8", ENGINE_FP16_BLOCKS, [0, 0], False)
+        found = [answers_by_lane_and_size(network, boards) for network in networks]
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert len(networks) == 2 and len(expected) == 2 * len(networks[0].sizes)
+    assert all(np.array_equal(answer, expected_answer) for answers in found for answer, expected_answer in zip(answers, expected))
+
+
 #a network's lanes after its first record their graphs without warming the model up, its first's warmup having compiled
 #and loaded every kernel: the engine's network answers to the bit as with every lane warmed up, at every size on both lanes
 @gpu

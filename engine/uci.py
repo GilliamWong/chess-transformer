@@ -22,7 +22,8 @@ from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, COLLISION_CAP, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GATHER_SPIN_US,
                                   GATHER_WORKERS, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, THREAD_AFFINITIES,
-                                  THREAD_AFFINITY, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_search_settings, parse_changes)
+                                  THREAD_AFFINITY, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks, engine_search_settings,
+                                  parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
@@ -224,8 +225,8 @@ def load_engine_search(checkpoint_path: Path, gpu: bool, leaves: int, tablebase:
                        fp16_blocks: int, gpus: list[int] | None = None, blocking_wait: bool | None = None) -> EngineSearch:
     if gpu:
         wait = blocking_wait if blocking_wait is not None else gpus is not None and len(gpus) > 1
-        network = engine_network(checkpoint_path, leaves, precision, fp16_blocks, blocking_wait=wait) if gpus is None else [
-            engine_network(checkpoint_path, leaves, precision, fp16_blocks, device=device, blocking_wait=wait) for device in gpus]
+        network = engine_network(checkpoint_path, leaves, precision, fp16_blocks, blocking_wait=wait) if gpus is None else (
+            engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, wait))
         return EngineSearch(network, leaves, use_tablebase=tablebase, **options)
     return EngineSearch(cpu_batches(load_model(checkpoint_path, DEVICE)), 1, use_tablebase=tablebase, **options)
 

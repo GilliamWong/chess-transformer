@@ -1088,7 +1088,8 @@ def test_the_engine_takes_a_precision(monkeypatch, tmp_path):
 #refused without the gpu search, or with one leaf a round on several
 def test_the_engine_takes_gpus(monkeypatch, tmp_path):
     built = []
-    monkeypatch.setattr(uci, "engine_network", lambda checkpoint, leaves, precision, fp16_blocks, device=None, blocking_wait=False: built.append((fp16_blocks, device, blocking_wait)) or cpu_batches(BoardModel()))
+    monkeypatch.setattr(uci, "engine_networks", lambda checkpoint, leaves, precision, fp16_blocks, devices, blocking_wait:
+                        [built.append((fp16_blocks, device, blocking_wait)) or cpu_batches(BoardModel()) for device in devices])
     search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 2])
     refused = [subprocess.run([sys.executable, "-m", "engine.uci", "unused.pt", "--select", "mcts", *gpu, "--gpus", "0,1"], cwd=REPOSITORY,
                               capture_output=True, text=True, input="") for gpu in (["--leaves", "4"], ["--gpu", "--leaves", "1"])]
