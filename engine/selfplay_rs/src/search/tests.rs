@@ -1,12 +1,14 @@
 //tree reuse (Searches): play_line's one copy and drop_stale_leaves' walk against the moves played one at a time (play)
-//and a walk that plays out every node's position, as trees were reused before. They must give the same tree, number for
-//number, on trees the engine's rounds grow with a stand-in for the network
+//and a walk that plays out every node's position, as trees were reused before, and against advance's way (the root
+//moved in place, the stale leaves from candidates). They must give the same tree, number for number, on trees the
+//engine's rounds grow with a stand-in for the network
 use super::*;
 use crate::rules::{MOVE_ID_TABLE_LENGTH, TOKENS_PER_BOARD};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, EnPassantMode};
 use std::fmt::Debug;
+use std::sync::atomic::AtomicBool;
 
 //encoding.NUM_MOVE_IDS, and an answer's numbers: the moves' logits, then the expected score
 const MOVE_IDS: usize = 1858;
@@ -99,6 +101,7 @@ fn copied(tree: &Tree) -> Tree {
         board: tree.board.clone(),
         keys: tree.keys.clone(),
         nodes: tree.nodes.clone(),
+        root: tree.root,
         node_keys: tree.node_keys.clone(),
         moves: tree.moves.clone(),
         priors: tree.priors.clone(),
@@ -216,6 +219,43 @@ fn reusable_lines(tree: &Tree) -> Vec<Vec<usize>> {
     lines
 }
 
+//Searches' advance and the next start: the line's first move in place, the stale candidates and the copy unless
+//stopped before them, then the rest of the line in place and the candidates under it (a walk without them), compacted
+//to be compared node for node. Returns the tree and whether the candidates were found
+fn advanced(tree: &Tree, line: &[usize], stopped: Option<&str>, settings: &SearchSettings, tables: Option<&Tables>) -> (Tree, bool) {
+    let mut node = tree.root;
+    let places: Vec<u16> = line
+        .iter()
+        .map(|&edge| {
+            let place = (edge - tree.nodes[node].edges().start) as u16;
+            node = tree.children[edge] as usize;
+            place
+        })
+        .collect();
+    let mut advanced = copied(tree);
+    advanced.move_root(&line[..1]);
+    let (never, always) = (AtomicBool::new(false), AtomicBool::new(true));
+    let candidates = advanced.stale_candidates(if stopped == Some("walk") { &always } else { &never });
+    if candidates.is_some() {
+        advanced.compact(Some(if stopped == Some("copy") { &always } else { &never }));
+    }
+    let (mut rest, mut node) = (Vec::new(), advanced.root);
+    for &place in &places[1..] {
+        let edge = advanced.nodes[node].edges().start + usize::from(place);
+        rest.push(edge);
+        node = advanced.children[edge] as usize;
+    }
+    advanced.move_root(&rest);
+    assert!(advanced.nodes[advanced.root].proof.is_none(), "a root is never proven");
+    let found = candidates.is_some();
+    match candidates {
+        Some(candidates) => advanced.drop_stale_candidates(&places[1..], &candidates, settings, tables).expect("the tables"),
+        None => advanced.drop_stale_leaves(settings, tables).expect("the tables"),
+    }
+    advanced.compact(None);
+    (advanced, found)
+}
+
 //mcts.py's constants with the engine's value sharpening
 fn settings(certainty: bool) -> SearchSettings {
     SearchSettings {
@@ -252,6 +292,8 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
         (ROOKS, &[], 10_000, false, None),
         (LOCKED_PAWNS, &[], 10_000, true, None),
         ("k7/8/2K5/8/8/8/8/7R w - - 0 1", &[], 10_000, true, None),
+        ("8/8/8/4k3/8/8/8/4K2Q w - - 0 1", &[], 20_000, true, None),
+        ("8/8/8/4k3/8/8/8/4K2R w - - 0 1", &[], 20_000, true, None),
     ];
     match &tables {
         Some(tables) => {
@@ -260,7 +302,7 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
         None => eprintln!("no syzygy tables: the ending they score is left out"),
     }
 
-    let (mut lines, mut stale, mut proven) = (0, 0, 0);
+    let (mut lines, mut stale, mut proven, mut walked) = (0, 0, 0, 0);
     for (fen, moves, simulations, certainty, tables) in cases {
         let settings = settings(certainty);
         let mut tree = tree_after(fen, moves);
@@ -273,11 +315,51 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
             new.play_line(&line);
             new.drop_stale_leaves(&settings, tables).expect("the tables");
             assert_same_trees(&old, &new);
+            for stopped in [None, Some("copy"), Some("walk")] {
+                let (advanced, found) = advanced(&tree, &line, stopped, &settings, tables);
+                assert_same_trees(&new, &advanced);
+                walked += usize::from(!found);
+            }
             lines += 1;
             proven += new.nodes.iter().filter(|node| node.proof.is_some()).count();
         }
     }
-    assert!(lines >= 15 && stale > 0 && proven > 0, "{lines} lines, {stale} stale leaves, {proven} proven nodes");
+    assert!(
+        lines >= 15 && stale > 0 && proven > 0 && walked > 0,
+        "{lines} lines, {stale} stale leaves, {proven} proven nodes, {walked} walks"
+    );
+}
+
+//a proven node hides the leaves below it from the stale walk unless it is the new root, whose proof is dropped:
+//advance's candidates must leave and take out the same ones. Searches rarely leave a stale leaf below a proven node, so
+//the proofs are set by hand on a tree whose shuffles leave stale draws
+#[test]
+fn proven_nodes_hide_stale_leaves_from_advance_as_from_the_walk() {
+    let settings = settings(true);
+    let mut tree = tree_after("4k3/8/8/1p1p1p1p/1P1P1P1P/8/8/4K3 w - - 0 1", &[]);
+    search(&mut tree, 10_000, usize::MAX, &settings, None, &mut Network::new());
+    //a two-ply line under which a stale leaf lies at least two nodes down, as the walk finds it in place
+    let (line, path) = reusable_lines(&tree)
+        .into_iter()
+        .filter(|line| line.len() == 2)
+        .find_map(|line| {
+            let mut moved = copied(&tree);
+            moved.move_root(&line);
+            let mut stale = Vec::new();
+            moved.find_stale_leaves(&mut vec![moved.root], &mut Vec::new(), &settings, None, false, &mut stale).expect("no tables");
+            stale.into_iter().find(|path| path.len() >= 3).map(|path| (line, path))
+        })
+        .expect("a stale leaf two nodes below a reusable line");
+    let draw = Proof { outcome: Outcome::Draw, value: 0.5, plies: 0 };
+    for proven in [path[0], path[1]] {
+        let mut proved = copied(&tree);
+        proved.nodes[proven].proof = Some(draw);
+        let mut walked = copied(&proved);
+        walked.play_line(&line);
+        walked.drop_stale_leaves(&settings, None).expect("no tables");
+        let (advanced, _) = advanced(&proved, &line, None, &settings, None);
+        assert_same_trees(&walked, &advanced);
+    }
 }
 
 //the answer cache keeps its two latest generations and a position's latest answer, and turns a generation over without

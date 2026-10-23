@@ -106,7 +106,8 @@ impl Game {
         self.record.root_scores.push((1.0 - root.mean_score()) as f32);
         self.record.white_to_move.push(u8::from(turn == Color::White));
 
-        let chosen = if self.plies < settings.sampled_plies { self.sample_by_visits() } else { self.tree.most_visited_edge(0) };
+        let chosen =
+            if self.plies < settings.sampled_plies { self.sample_by_visits() } else { self.tree.most_visited_edge(self.tree.root_index()) };
         self.tree.play(chosen, settings.tree_reuse);
         self.plies += 1;
         self.noised = false;

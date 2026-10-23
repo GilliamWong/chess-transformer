@@ -137,6 +137,14 @@ class Clock:
             self.saved = max(0.0, self.saved + self.allotted - seconds)
         self.last_score = score
 
+#after bestmove is sent: the search's tree carried on to the game after the move, off the engine's clock, on a thread of
+#its own (EngineSearch.advance); the next position need not follow it
+def advance_after(player, board: chess.Board, move: chess.Move) -> None:
+    if isinstance(player, EngineSearch):
+        played = board.copy()
+        played.push(move)
+        player.advance(played)
+
 #a file per process, so engines playing side by side never share one. evaluate_elo writes them into the pgn
 def log_search(log_folder: Path, board: chess.Board, move: chess.Move, report: SearchReport) -> None:
     record = {
@@ -224,6 +232,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
                 else:
                     move = choose_move(player, board, DEVICE, selection, temperature, sample_plies)
             send(f"bestmove {move.uci()}")
+            advance_after(player, board, move)
 
         elif command == "quit":
             break

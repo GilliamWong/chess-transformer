@@ -683,6 +683,55 @@ def test_the_engine_plays_on_in_a_draw_left_to_be_claimed(fen, moves, leaves):
     assert report.line[0] in board.legal_moves and report.simulations > 1
 
 
+#an engine's game of `moves` searches from board, each answered by the reply its search expects (or the given replies),
+#with uci.py's advance after each move or not, or with the kept tree dropped instead (an advance to another game; the
+#cache keeps its answers): the reports, the replies, the network's boards and the advances that had a tree to carry on
+def advancing_game(model, board: chess.Board, moves: int, way: str, replies: list[str] | None = None):
+    network = CountingNetwork(model)
+    search = EngineSearch(network, 16, smart_pruning=False)
+    reports, played, advanced = [], [], 0
+    for ply in range(moves):
+        report = search.search(board, simulations=600)
+        reports.append((report.line, report.score, report.simulations, report.root_moves))
+        board.push(report.line[0])
+        if way == "advance":
+            advanced += search.advance(board)
+        elif way == "drop":
+            search.advance(chess.Board("8/8/8/8/8/8/8/K6k w - - 0 1"))
+        reply = chess.Move.from_uci(replies[ply]) if replies else report.line[1] if len(report.line) > 1 else next(iter(board.legal_moves))
+        board.push(reply)
+        played.append(reply.uci())
+    return reports, played, network.boards, advanced, search
+
+#uci.py's advance once its move is sent carries the kept tree on to the game after the move, while the opponent thinks,
+#and the next search plays on from it exactly as from the tree the last search left: the same reports move for move, in
+#a middlegame that reuses its trees (as dropping them shows) and in a game whose knights shuffle so that draws go stale.
+#A position that does not follow the move is searched afresh
+def test_advancing_the_tree_changes_no_search(carlsen_games):
+    middlegame = carlsen_games[0].board()
+    for move in list(carlsen_games[0].mainline_moves())[:16]:
+        middlegame.push(move)
+    reports, replies, boards, _, _ = advancing_game(BoardModel(), middlegame.copy(), 8, "plain")
+    advanced_reports, _, advanced_boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, "advance", replies)
+    dropped_reports = advancing_game(BoardModel(), middlegame.copy(), 8, "drop", replies)[0]
+    assert advanced_reports == reports != dropped_reports and advanced == 8 and advanced_boards == boards
+
+    shuffles = ["g8f6", "f6g8", "a7a6", "g8f6", "f6g8", "a6a5", "b8c6", "c6b8", "h7h6", "h6h5"]
+    model = LikesMoves(KNIGHTS_OUT_AND_BACK + [("b1c3", chess.WHITE), ("c3b1", chess.WHITE)], 4.0)
+    reports = advancing_game(model, chess.Board(), len(shuffles), "plain", shuffles)[0]
+    advanced_reports, _, _, advanced, search = advancing_game(model, chess.Board(), len(shuffles), "advance", shuffles)
+    assert advanced_reports == reports and advanced == len(shuffles)
+
+    board = chess.Board()
+    report = search.search(board, simulations=50)
+    played, other = board.copy(), board.copy()
+    played.push(report.line[0])
+    search.advance(played)
+    other.push(next(move for move in board.legal_moves if move != report.line[0]))
+    other.push(next(iter(other.legal_moves)))
+    assert search.search(other, simulations=50).line[0] in other.legal_moves
+
+
 #a search whose tree reaches Searches' memory_limit_mb ends there with its report, as at its simulations (the engine's
 #rounds too, which would otherwise wait on a search that gathers nothing); one that stays below its limit is the search
 #without a limit

@@ -8,6 +8,7 @@ use shakmaty_syzygy::SyzygyError;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 //mcts.py's constants
 pub struct SearchSettings {
@@ -245,10 +246,17 @@ fn reserve_to<T>(vector: &mut Vec<T>, capacity: usize) {
     }
 }
 
+//a tree's node and edge vectors, as compact returns the old ones to free
+pub type Vectors = (Vec<Node>, Vec<u64>, Vec<Move>, Vec<f32>, Vec<u32>);
+
+//nodes a walk or copy that may be stopped (an abort flag) goes through between looks at the flag
+const ABORT_CHECKS: usize = 4096;
+
 pub struct Tree {
     pub board: Chess,   //the root's position
     pub keys: Vec<u64>, //the position_key of every position of the game, the root's last
     pub nodes: Vec<Node>,
+    root: usize,         //the root's node: 0 but after move_root, until compact
     node_keys: Vec<u64>, //each node's position_key, made with the node
     //the edges: every expanded node's moves in python-chess's order with their priors, and each move's node once it
     //has one (NO_NODE before)
@@ -269,6 +277,7 @@ impl Tree {
             board,
             keys,
             nodes: vec![Node::new()],
+            root: 0,
             node_keys: vec![root_key],
             moves: Vec::new(),
             priors: Vec::new(),
@@ -320,12 +329,16 @@ impl Tree {
     }
 
     pub fn root(&self) -> &Node {
-        &self.nodes[0]
+        &self.nodes[self.root]
+    }
+
+    pub fn root_index(&self) -> usize {
+        self.root
     }
 
     //an edge's prior, a root edge's with its noise
     fn prior(&self, edge: usize) -> f64 {
-        let root = self.nodes[0].edges();
+        let root = self.root().edges();
         if !self.noised_priors.is_empty() && root.contains(&edge) {
             self.noised_priors[edge - root.start]
         } else {
@@ -381,7 +394,7 @@ impl Tree {
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
         let (mut best, mut best_u) = (0, f64::NEG_INFINITY);
-        let noised = node == 0 && !self.noised_priors.is_empty();
+        let noised = node == self.root && !self.noised_priors.is_empty();
         for (index, (&prior, &child)) in self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate() {
             let prior = if noised { self.noised_priors[index] } else { f64::from(prior) };
             let (q, started) = match child {
@@ -444,8 +457,8 @@ impl Tree {
             let mut board = self.board.clone();
             let root_keys = self.keys.len();
             path.clear();
-            path.push(0);
-            let mut node = 0;
+            path.push(self.root);
+            let mut node = self.root;
             while self.nodes[node].edge_count > 0 {
                 let edge = self.select_edge(node, settings);
                 board.play_unchecked(self.moves[edge]);
@@ -477,9 +490,9 @@ impl Tree {
             }
 
             let mut legal_moves = board.legal_moves();
-            let node_tables = tables.filter(|_| node != 0 && (!root_covered || board.halfmoves() == 0));
+            let node_tables = tables.filter(|_| node != self.root && (!root_covered || board.halfmoves() == 0));
             //the root is searched whatever the rules say of it: Searches.start refuses only a mate or stalemate
-            let game_over = if node == 0 {
+            let game_over = if node == self.root {
                 None
             } else {
                 game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?
@@ -495,7 +508,7 @@ impl Tree {
                 //the root is never proven: the rules and the tables never score it
                 if let Some(result) = game_over
                     && settings.certainty
-                    && node != 0
+                    && node != self.root
                 {
                     //the result is for the side to move, the proof for the side that moved here. A win or loss with
                     //moves left is the tables', after any mate
@@ -649,7 +662,7 @@ impl Tree {
 
     //the root's result is proven: a move wins, or every move's result is known, and searching on changes nothing
     pub fn root_decided(&self) -> bool {
-        self.proof_from_moves(0).is_some()
+        self.proof_from_moves(self.root).is_some()
     }
 
     //a kept tree under a new root (Searches' tree reuse; self-play keeps mcts.py's tree as it is): a leaf scored by a
@@ -660,7 +673,7 @@ impl Tree {
     pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) -> Result<(), SyzygyError> {
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut stale = Vec::new();
-        self.find_stale_leaves(&mut vec![0], &mut Vec::new(), settings, tables, root_covered, &mut stale)?;
+        self.find_stale_leaves(&mut vec![self.root], &mut Vec::new(), settings, tables, root_covered, &mut stale)?;
         for path in stale {
             self.take_out(&path);
         }
@@ -668,7 +681,7 @@ impl Tree {
     }
 
     //the paths to the stale leaves under the path's last node, which the line's moves (its edges) reach from the root;
-    //self.keys has the path's keys. Only a leaf's position is played out: one for every node took half the walk's time
+    //self.keys has the path's keys
     fn find_stale_leaves(
         &mut self,
         path: &mut Vec<usize>,
@@ -681,19 +694,8 @@ impl Tree {
         let node = *path.last().expect("the root at least");
         let edges = self.nodes[node].edges();
         if edges.is_empty() {
-            if node != 0 && self.nodes[node].visit_count > 0 {
-                //as gather scores a leaf
-                let mut board = self.board.clone();
-                for &edge in line.iter() {
-                    board.play_unchecked(self.moves[edge]);
-                }
-                let legal_moves = board.legal_moves();
-                let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
-                let over = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?;
-                let (&leaf_key, path_keys) = self.keys[self.keys.len() - path.len()..].split_last().expect("the leaf's key");
-                if over.is_none() && !path_keys.contains(&leaf_key) {
-                    stale.push(path.clone());
-                }
+            if node != self.root && self.nodes[node].visit_count > 0 && self.is_stale(path, line, settings, tables, root_covered)? {
+                stale.push(path.clone());
             }
             return Ok(());
         }
@@ -710,6 +712,112 @@ impl Tree {
             line.pop();
             path.pop();
             found?;
+        }
+        Ok(())
+    }
+
+    //whether the leaf at the end of path, which the line's moves (edges) reach from the root, is no longer what gather
+    //scored it as; self.keys ends with the path's keys. Only a leaf's position is played out: one for every node took
+    //half the walk's time
+    fn is_stale(
+        &self,
+        path: &[usize],
+        line: &[usize],
+        settings: &SearchSettings,
+        tables: Option<&Tables>,
+        root_covered: bool,
+    ) -> Result<bool, SyzygyError> {
+        //as gather scores a leaf
+        let mut board = self.board.clone();
+        for &edge in line {
+            board.play_unchecked(self.moves[edge]);
+        }
+        let legal_moves = board.legal_moves();
+        let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
+        let over = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?;
+        let (&leaf_key, path_keys) = self.keys[self.keys.len() - path.len()..].split_last().expect("the leaf's key");
+        Ok(over.is_none() && !path_keys.contains(&leaf_key))
+    }
+
+    //the leaves drop_stale_leaves may find stale once the root has moved further down, found before the moves are
+    //known (Searches' advance, while the opponent thinks): every leaf below the root with visits, no moves and no
+    //proof of its own, in the walk's order, each as the places of its line's moves among their nodes' moves, which hold
+    //across compact. Leaves below a node proven now are kept too, as a later root's own proof is dropped. None once
+    //abort is set
+    pub fn stale_candidates(&self, abort: &AtomicBool) -> Option<Vec<Vec<u16>>> {
+        let mut candidates = Vec::new();
+        let mut looked = 0;
+        self.find_candidates(self.root, &mut Vec::new(), &mut candidates, &mut looked, abort).then_some(candidates)
+    }
+
+    fn find_candidates(
+        &self,
+        node: usize,
+        places: &mut Vec<u16>,
+        candidates: &mut Vec<Vec<u16>>,
+        looked: &mut usize,
+        abort: &AtomicBool,
+    ) -> bool {
+        *looked += 1;
+        if looked.is_multiple_of(ABORT_CHECKS) && abort.load(Ordering::Relaxed) {
+            return false;
+        }
+        let edges = self.nodes[node].edges();
+        for edge in edges.clone() {
+            let child = self.children[edge];
+            if child == NO_NODE {
+                continue;
+            }
+            places.push((edge - edges.start) as u16);
+            let child = child as usize;
+            if self.nodes[child].edge_count > 0 {
+                if !self.find_candidates(child, places, candidates, looked, abort) {
+                    return false;
+                }
+            } else if self.nodes[child].visit_count > 0 && self.nodes[child].proof.is_none() {
+                candidates.push(places.clone());
+            }
+            places.pop();
+        }
+        true
+    }
+
+    //drop_stale_leaves from the candidates found at the root the moves at `line`'s places moved it down from: of those
+    //below the root, the leaves its walk would find stale, taken out in its order
+    pub fn drop_stale_candidates(
+        &mut self,
+        line: &[u16],
+        candidates: &[Vec<u16>],
+        settings: &SearchSettings,
+        tables: Option<&Tables>,
+    ) -> Result<(), SyzygyError> {
+        let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
+        let root_keys = self.keys.len();
+        let mut stale = Vec::new();
+        'candidates: for places in candidates.iter().filter(|places| places.len() > line.len() && places.starts_with(line)) {
+            let (mut path, mut edges) = (vec![self.root], Vec::new());
+            for &place in &places[line.len()..] {
+                let edge = self.nodes[*path.last().expect("the root at least")].edges().start + usize::from(place);
+                let child = self.children[edge] as usize;
+                //the walk passes over a proven node and what is below it
+                if self.nodes[child].proof.is_some() {
+                    continue 'candidates;
+                }
+                path.push(child);
+                edges.push(edge);
+            }
+            let leaf = *path.last().expect("a leaf below the root");
+            if self.nodes[leaf].edge_count == 0 && self.nodes[leaf].visit_count > 0 {
+                self.keys.extend(path[1..].iter().map(|&node| self.node_keys[node]));
+                let found = self.is_stale(&path, &edges, settings, tables, root_covered);
+                self.keys.truncate(root_keys);
+                if found? {
+                    stale.push(path);
+                }
+            }
+        }
+        for path in stale {
+            self.take_out(&path);
         }
         Ok(())
     }
@@ -736,11 +844,11 @@ impl Tree {
     //mcts.add_root_noise: dirichlet noise as gamma draws scaled to add up to 1, mixed in f64 as mcts.py mixes it
     pub fn add_root_noise(&mut self, random: &mut ChaCha8Rng, alpha: f64, share: f64) {
         let gamma = Gamma::new(alpha, 1.0).expect("a positive noise alpha");
-        let edges = self.nodes[0].edges();
+        let edges = self.root().edges();
         let draws: Vec<f64> = edges.clone().map(|_| gamma.sample(random)).collect();
         let total: f64 = draws.iter().sum();
         self.noised_priors = edges.zip(draws).map(|(edge, draw)| (1.0 - share) * self.prior(edge) + share * (draw / total)).collect();
-        self.refresh_visited_policy(0);
+        self.refresh_visited_policy(self.root);
     }
 
     //mcts.most_visited_move: ties to the better mean score, then the prior, then the first. Returns the edge. A proven
@@ -767,7 +875,7 @@ impl Tree {
 
     //mcts.principal_variation, as edges
     pub fn principal_variation(&self) -> Vec<usize> {
-        let (mut line, mut node) = (Vec::new(), 0);
+        let (mut line, mut node) = (Vec::new(), self.root);
         while self.nodes[node].edge_count > 0 {
             let edge = self.most_visited_edge(node);
             if !line.is_empty() && self.visits(edge) == 0 {
@@ -793,58 +901,72 @@ impl Tree {
     //plays the root's move and makes its node the root, with its subtree (tree reuse) or without
     pub fn play(&mut self, edge: usize, keep_subtree: bool) {
         assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
-        let chess_move = self.moves[edge];
-        let child = self.children[edge];
-        self.board.play_unchecked(chess_move);
-        self.keys.push(position_key(&self.board));
-        if keep_subtree && child != NO_NODE {
-            self.keep_subtree(child as usize);
+        if keep_subtree && self.children[edge] != NO_NODE {
+            self.move_root(&[edge]);
+            self.compact(None);
         } else {
+            self.board.play_unchecked(self.moves[edge]);
+            self.keys.push(position_key(&self.board));
             (self.nodes, self.moves, self.priors, self.children) = (vec![Node::new()], Vec::new(), Vec::new(), Vec::new());
             self.node_keys = vec![*self.keys.last().expect("the root's key")];
+            self.noised_priors.clear();
+            self.full = false;
+            self.root = 0;
+        }
+    }
+
+    //plays a line of moves from the root (edges, each of the node the last one leads to) and makes the node it ends on
+    //the root, with its subtree: the subtree is copied once, where play would copy it at every move
+    pub fn play_line(&mut self, line: &[usize]) {
+        self.move_root(line);
+        let old = self.compact(None);
+        //the old tree is freed on a thread of its own, off the move's clock (1.6 ms at 100k nodes); here if none starts
+        let _ = std::thread::Builder::new().spawn(move || drop(old));
+    }
+
+    //plays a line of moves from the root (edges, each of the node the last one leads to) and makes the node it ends on
+    //the root where it is, without a copy: the rest of the tree stays in the vectors until compact. Every edge of the
+    //line has its node. The new root's proof is dropped, as a root is never proven (root_decided reads its moves'), and
+    //so is the old root's noise
+    pub fn move_root(&mut self, line: &[usize]) {
+        assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
+        for &edge in line {
+            assert_ne!(self.children[edge], NO_NODE, "a line through the tree's nodes");
+            self.board.play_unchecked(self.moves[edge]);
+            self.keys.push(position_key(&self.board));
+            self.root = self.children[edge] as usize;
+        }
+        if !line.is_empty() {
+            self.nodes[self.root].proof = None;
             self.noised_priors.clear();
             self.full = false;
         }
     }
 
-    //plays a line of moves from the root (edges, each of the node the last one leads to) and makes the node it ends on
-    //the root, with its subtree: the subtree is copied once, where play would copy it at every move. Every edge of the
-    //line has its node
-    pub fn play_line(&mut self, line: &[usize]) {
-        assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
-        let mut node = 0;
-        for &edge in line {
-            assert_ne!(self.children[edge], NO_NODE, "a line through the tree's nodes");
-            self.board.play_unchecked(self.moves[edge]);
-            self.keys.push(position_key(&self.board));
-            node = self.children[edge] as usize;
-        }
-        let old = self.keep_subtree(node);
-        //the old tree is freed on a thread of its own, off the move's clock (1.6 ms at 100k nodes); here if none starts
-        let _ = std::thread::Builder::new().spawn(move || drop(old));
-    }
-
-    //the tree under node as a tree of its own, node its root. Its proofs still hold: a proof comes from the game's end
-    //by its rules or the tables, which a new root leaves as it was (a two-fold repetition proves nothing). The root's
-    //own is dropped, as a root is never proven (root_decided reads its moves'). Returns the old tree's nodes and edges
-    #[allow(clippy::type_complexity)]
-    fn keep_subtree(&mut self, node: usize) -> (Vec<Node>, Vec<u64>, Vec<Move>, Vec<f32>, Vec<u32>) {
-        //the new root's priors are its own, without the old root's noise; whether it has room is for gather to see
-        self.noised_priors.clear();
-        self.full = false;
+    //the root's part of the tree copied out of the rest (left there by move_root) as a tree of its own, the root first.
+    //Its proofs still hold: a proof comes from the game's end by its rules or the tables, which a new root leaves as it
+    //was (a two-fold repetition proves nothing). Returns the old tree's vectors to free, or None once abort is set (the
+    //tree then left as it was)
+    pub fn compact(&mut self, abort: Option<&AtomicBool>) -> Option<Vectors> {
         //room for the whole tree, so the copy never regrows (that took twice the time); unwritten room takes no memory
         let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
         let mut nodes = Vec::with_capacity(node_room);
-        nodes.push(Node { proof: None, ..self.nodes[node] });
+        nodes.push(Node { proof: None, ..self.nodes[self.root] });
         let mut node_keys = Vec::with_capacity(node_room);
-        node_keys.push(self.node_keys[node]);
+        node_keys.push(self.node_keys[self.root]);
         let (mut moves, mut priors, mut children) =
             (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
         let mut index = 0;
         while index < nodes.len() {
+            if index.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
+                return None;
+            }
             let edges = nodes[index].edges();
             let first_edge = moves.len();
-            nodes[index].first_edge = first_edge as u32;
+            //a node without moves keeps the first edge Node::new gives it
+            if !edges.is_empty() {
+                nodes[index].first_edge = first_edge as u32;
+            }
             moves.extend_from_slice(&self.moves[edges.clone()]);
             priors.extend_from_slice(&self.priors[edges.clone()]);
             children.extend_from_slice(&self.children[edges]);
@@ -858,13 +980,14 @@ impl Tree {
             }
             index += 1;
         }
-        (
+        self.root = 0;
+        Some((
             std::mem::replace(&mut self.nodes, nodes),
             std::mem::replace(&mut self.node_keys, node_keys),
             std::mem::replace(&mut self.moves, moves),
             std::mem::replace(&mut self.priors, priors),
             std::mem::replace(&mut self.children, children),
-        )
+        ))
     }
 }
 

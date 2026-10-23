@@ -132,6 +132,12 @@ class EngineSearch:
     def new_game(self) -> None:
         self.searches.new_game(GAME)
 
+    #once the engine's move is sent, while the opponent thinks: the kept tree carried on to the game after it (board) on
+    #a thread of Searches', so that the next search's start only moves its root down the reply (Searches.advance).
+    #False when there is no tree to carry on
+    def advance(self, board: chess.Board) -> bool:
+        return self.leaves > 1 and self.searches.advance(GAME, board.root().fen(), [move.uci() for move in board.move_stack])
+
     #searches until `simulations` (counting those of a reused tree, as lc0's go nodes does) or until `seconds` have
     #passed, whichever comes first; at least one of the two. extension: (the last search's score in centipawns, the
     #seconds this one may add) for a search on the clock whose score falls (FALL_START_CP)

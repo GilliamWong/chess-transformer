@@ -16,6 +16,9 @@ use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Position};
 use shakmaty_syzygy::SyzygyError;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 
 fn tablebase_error(error: SyzygyError) -> PyErr {
     PyRuntimeError::new_err(format!("syzygy tables: {error}"))
@@ -317,11 +320,39 @@ impl Search {
 //(id, expected line in uci, the chosen move's mean score, root moves by visits, the root's visits)
 type SearchReport = (u64, Vec<String>, f64, Vec<(String, u32)>, u32);
 
-//the tree of a game's search that ended last, for the game's next search
+//the tree of a game's search that ended last, for the game's next search, at the position after `moves`
 struct KeptTree {
     fen: String,
     moves: Vec<String>,
-    tree: Tree,
+    tree: Kept,
+}
+
+//a kept tree as its last search left it, or carried on by advance: on its thread, or back from it with the leaves the
+//next root may make stale (None if the thread was stopped before it found them all)
+enum Kept {
+    Searched(Tree),
+    Advancing(JoinHandle<(Tree, Option<Vec<Vec<u16>>>)>, Arc<AtomicBool>),
+    Advanced(Tree, Option<Vec<Vec<u16>>>),
+}
+
+impl Kept {
+    //the tree to search on: an advance not done yet is stopped where it is, so that it takes none of the move's time
+    fn ready(self) -> Option<Kept> {
+        match self {
+            Kept::Advancing(thread, abort) => {
+                abort.store(true, Ordering::Relaxed);
+                thread.join().ok().map(|(tree, candidates)| Kept::Advanced(tree, candidates))
+            }
+            kept => Some(kept),
+        }
+    }
+
+    //no longer wanted: an advance's thread stops at its next look and frees the tree
+    fn abandon(self) {
+        if let Kept::Advancing(_, abort) = self {
+            abort.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 #[pyclass(unsendable)]
@@ -347,37 +378,59 @@ impl Searches {
         for search in self.searches.extract_if(.., |search| search.done()) {
             reports.push(search.report());
             if self.tree_reuse {
-                self.kept.insert(search.id, KeptTree { fen: search.fen, moves: search.moves, tree: search.tree });
+                self.kept.insert(search.id, KeptTree { fen: search.fen, moves: search.moves, tree: Kept::Searched(search.tree) });
             }
         }
         reports
     }
 
     //the id's kept tree carried on to the position after `moves`, when it is the same game and holds the moves played
-    //since, without the leaves the new root makes stale (search.rs drop_stale_leaves). A root the last search never
-    //expanded (a repeat it scored as a draw) starts over: a search reports from its root's moves
+    //since, without the leaves the new root makes stale (search.rs drop_stale_leaves). A tree that advance carried on
+    //moves its root down in place, and takes out the stale leaves among the candidates advance found (or walks for
+    //them, if it was stopped first). A root the last search never expanded (a repeat it scored as a draw) starts over
     fn reused_tree(&mut self, id: u64, fen: &str, moves: &[String]) -> Option<Tree> {
         let kept = self.kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
+            kept.tree.abandon();
             return None;
         }
-        let mut tree = kept.tree;
-        //the moves played since, as the edges down to the new root
-        let (mut line, mut root) = (Vec::new(), tree.root());
-        for played in &moves[kept.moves.len()..] {
-            let edge = root.edges().find(|&edge| uci(tree.chess_move(edge)) == *played)?;
-            root = tree.child(edge)?;
-            line.push(edge);
+        let since = &moves[kept.moves.len()..];
+        let (settings, tables) = (&self.settings, self.tables.as_ref());
+        match kept.tree.ready()? {
+            Kept::Searched(mut tree) => {
+                let (line, _) = line_to(&tree, since)?;
+                if !line.is_empty() {
+                    tree.play_line(&line);
+                    tree.drop_stale_leaves(settings, tables).ok()?;
+                }
+                Some(tree)
+            }
+            Kept::Advanced(mut tree, candidates) => {
+                let (line, places) = line_to(&tree, since)?;
+                tree.move_root(&line);
+                match candidates {
+                    Some(candidates) => tree.drop_stale_candidates(&places, &candidates, settings, tables).ok()?,
+                    None => tree.drop_stale_leaves(settings, tables).ok()?,
+                }
+                Some(tree)
+            }
+            Kept::Advancing(..) => unreachable!("ready waits for the thread"),
         }
-        if root.edges().is_empty() {
-            return None;
-        }
-        if !line.is_empty() {
-            tree.play_line(&line);
-            tree.drop_stale_leaves(&self.settings, self.tables.as_ref()).ok()?;
-        }
-        Some(tree)
     }
+}
+
+//the moves since (uci) as the edges from the tree's root down to the position after them, and as their places among
+//their nodes' moves, when every move has its node and the last node has moves (a search reports from its root's)
+fn line_to(tree: &Tree, moves: &[String]) -> Option<(Vec<usize>, Vec<u16>)> {
+    let (mut line, mut places, mut root) = (Vec::new(), Vec::new(), tree.root());
+    for played in moves {
+        let edges = root.edges();
+        let edge = edges.clone().find(|&edge| uci(tree.chess_move(edge)) == *played)?;
+        root = tree.child(edge)?;
+        line.push(edge);
+        places.push((edge - edges.start) as u16);
+    }
+    (!root.edges().is_empty()).then_some((line, places))
 }
 
 #[pymethods]
@@ -520,10 +573,44 @@ impl Searches {
         })
     }
 
+    //carries the id's kept tree on to the position after `moves` (the game's, the engine's own move last), for uci.py to
+    //call once that move is sent. The root moves down in place, and on a thread of its own, while the opponent thinks,
+    //the tree finds the leaves the next root may make stale (search.rs stale_candidates) and copies the root's part out
+    //of the rest (compact). The next search's start then only moves the root down the reply; one that comes before the
+    //thread is done stops it and goes on from the tree as far as it got. False when no tree is kept for these moves
+    fn advance(&mut self, id: u64, fen: &str, moves: Vec<String>) -> PyResult<bool> {
+        if self.searches.iter().any(|search| search.id == id) {
+            return Err(PyValueError::new_err(format!("search {id} is running")));
+        }
+        let Some(kept) = self.kept.remove(&id) else { return Ok(false) };
+        if kept.fen != fen || !moves.starts_with(&kept.moves) {
+            kept.tree.abandon();
+            return Ok(false);
+        }
+        let Some(Kept::Searched(mut tree) | Kept::Advanced(mut tree, _)) = kept.tree.ready() else { return Ok(false) };
+        let Some((line, _)) = line_to(&tree, &moves[kept.moves.len()..]) else { return Ok(false) };
+        tree.move_root(&line);
+        let abort = Arc::new(AtomicBool::new(false));
+        let stop = abort.clone();
+        let carry = move || {
+            let candidates = tree.stale_candidates(&stop);
+            if candidates.is_some() {
+                drop(tree.compact(Some(&stop)));
+            }
+            (tree, candidates)
+        };
+        //without a thread the tree is not kept
+        let Ok(thread) = std::thread::Builder::new().spawn(carry) else { return Ok(false) };
+        self.kept.insert(id, KeptTree { fen: fen.to_string(), moves, tree: Kept::Advancing(thread, abort) });
+        Ok(true)
+    }
+
     //a new game under the id (uci's ucinewgame): its first search starts a fresh tree, and the network's answers are
     //forgotten, as lc0 forgets them
     fn new_game(&mut self, id: u64) {
-        self.kept.remove(&id);
+        if let Some(kept) = self.kept.remove(&id) {
+            kept.tree.abandon();
+        }
         if let Some(cache) = self.cache.as_mut() {
             cache.clear();
         }
