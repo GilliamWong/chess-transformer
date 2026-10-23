@@ -282,7 +282,10 @@ class ExactSizeCompiled(nn.Module):
         self.exact, self.dynamic = torch.compile(model, dynamic=False), torch.compile(model, dynamic=True)
 
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return (self.exact if len(boards) == self.exact_size else self.dynamic)(boards)
+        #floats (the norms' eps) constant from the start: dynamic, dynamo traced them as symbols, then started over with
+        #them constant, a second trace and compile of the whole model at startup for the same graph
+        with torch._dynamo.config.patch(specialize_float=True):
+            return (self.exact if len(boards) == self.exact_size else self.dynamic)(boards)
 
 #fp16_model with every block in int8 (model/int8_blocks.py) but the last and the fp16_blocks whose int8 costs the
 #policy most, its weights rounded once per checkpoint (engine/quantization.py): needs an sm_80 gpu or newer
