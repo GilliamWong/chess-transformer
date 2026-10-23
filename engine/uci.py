@@ -20,9 +20,9 @@ import torch
 from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
-from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS,
-                                  SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, VISITS_PER_LEAF_OUT, EngineSearch, engine_network,
-                                  engine_search_settings, parse_changes)
+from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, COLLISION_CAP, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GATHER_SPIN_US,
+                                  GATHER_WORKERS, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT,
+                                  VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
@@ -543,6 +543,16 @@ if __name__ == "__main__":
     parser.add_argument("--visits-per-leaf-out", type=int, default=VISITS_PER_LEAF_OUT,
                         help="for --select mcts --gpu: at most a leaf out on the network (the rounds out on all of --gpus) per this many "
                              "root visits; 0 for no cap, the default")
+    parser.add_argument("--gather-workers", type=int, default=GATHER_WORKERS,
+                        help="for --select mcts --gpu: gather a round's leaves in bulk on this many threads (search/batch.rs gather_batch, a "
+                             "different search, the same for any number); 0 for gather, the default")
+    parser.add_argument("--gather-spin-us", type=int, default=GATHER_SPIN_US,
+                        help="for --gather-workers: microseconds a worker spins for the next round before it sleeps, default %(default)s")
+    parser.add_argument("--collision-cap", type=int, default=COLLISION_CAP,
+                        help="for --select mcts --gpu: a round's collisions (descents ending on a leaf already out), not 64 at most its "
+                             "leaves; 0 for that, the default")
+    parser.add_argument("--collision-scaling", action="store_true",
+                        help="for --select mcts --gpu: a round's collisions grow with the tree as lc0's do, at most --collision-cap's")
     parser.add_argument("--no-smart-pruning", dest="smart_pruning", action="store_false",
                         help="for --select mcts --gpu: search all of go's movetime or nodes even once the move is decided (lc0's SmartPruningFactor=0)")
     parser.add_argument("--smart-pruning-factor", type=float, default=SMART_PRUNING_FACTOR,
@@ -592,5 +602,7 @@ if __name__ == "__main__":
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
                              "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
                              "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out,
+                             "gather_workers": arguments.gather_workers, "gather_spin_us": arguments.gather_spin_us,
+                             "collision_cap": arguments.collision_cap, "collision_scaling": arguments.collision_scaling,
                              **({"rust_rounds": True} if arguments.rust_rounds else {})},
              clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

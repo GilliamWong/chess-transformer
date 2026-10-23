@@ -984,6 +984,27 @@ def test_the_engine_takes_a_cap_on_the_leaves_out(monkeypatch, arguments, cap):
     assert built == [cap]
 
 
+#uci.py's --gather-workers, --gather-spin-us, --collision-cap and --collision-scaling reach the search, which has none of
+#them without
+@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+@pytest.mark.parametrize("arguments, expected", [([], (0, 50, 0, False)), (["--gather-workers", "4", "--gather-spin-us", "500",
+                                                                          "--collision-cap", "256", "--collision-scaling"], (4, 500, 256, True))])
+def test_the_engine_takes_the_gathers_settings(monkeypatch, arguments, expected):
+    built = []
+
+    class Recorded(EngineSearch):
+        def __init__(self, *args, gather_workers=0, gather_spin_us=50, **kwargs):
+            super().__init__(*args, gather_workers=gather_workers, gather_spin_us=gather_spin_us, **kwargs)
+            built.append((gather_workers, gather_spin_us, self.collision_cap, self.collision_scaling))
+    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision, fp16_blocks, device=None, blocking_wait=False: cpu_batches(BoardModel()))
+    monkeypatch.setattr(engine_search, "EngineSearch", Recorded)
+    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *arguments])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
+    runpy.run_module("engine.uci", run_name="__main__")
+
+    assert built == [expected]
+
+
 #uci.py started without --precision builds the engine's network in int8 with the block whose int8 costs the policy most
 #kept in fp16 besides the last, and --fp16-blocks 0 every other block in int8 (self-play and labels stay fp16: they never
 #build it), spinning while it waits for the gpu unless --blocking-wait
