@@ -269,6 +269,30 @@ def test_dependent_launch_changes_no_bits(tmp_path, small_calibration, monkeypat
     assert np.array_equal(answers, expected)
 
 
+#the tiles picked by rows (INT8_TILES, fused_blocks.LINEAR_TILES) change no answer of the int8 network: at every
+#graph size to 64 boards its graphs give the bits of graphs whose matmuls all take their tables' tiles for any rows
+@gpu
+def test_tiles_by_rows_change_no_answer(tmp_path, small_calibration, monkeypatch):
+    from engine.inference import GraphedBatches, int8_model, small_graph_sizes
+    from model import fused_blocks, int8_blocks
+    _, boards = small_checkpoint(tmp_path)
+    boards = np.resize(boards.numpy().astype("uint8"), (64, boards.shape[1]))
+    sizes = small_graph_sizes(64)
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        int8 = int8_model(tmp_path / "model.pt", 0)
+        by_rows = GraphedBatches(int8, sizes, in_flight=1)
+        answers = [by_rows.collect(by_rows.launch(boards[:size])).copy() for size in sizes]
+        for module in (fused_blocks, int8_blocks):
+            monkeypatch.setattr(module, "tile_for", lambda tiles, M, multiprocessors: tiles[-1][1])
+        any_rows = GraphedBatches(int8, sizes, in_flight=1)
+        expected = [any_rows.collect(any_rows.launch(boards[:size])).copy() for size in sizes]
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert all(np.array_equal(answer, expected_answer) for answer, expected_answer in zip(answers, expected))
+
+
 #engine_network in int8: the int8 model (with the engine's fp16 blocks) compiled and recorded as cuda graphs answers as
 #it does uncompiled
 @gpu

@@ -200,9 +200,10 @@ def _(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_c
 #positions of 32 to 128 rows, 64 to 256 columns, 2 to 4 stages and 4 or 8 warps
 LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_DEPTH, LINEAR_WARPS, LINEAR_STAGES, GROUP_M = 128, 128, 32, 4, 3, 8
 #linear's tiles (rows, columns, warps, stages) by compute capability, as tile_for lists; a gpu not timed takes them all
-#at LINEAR_ROWS x LINEAR_COLUMNS. Any tile gives the same bits: it changes neither the depth's order nor the instructions
+#at LINEAR_ROWS x LINEAR_COLUMNS. sm_120's were timed as int8_blocks.INT8_TILES' (on the int8 network's fp16 matmuls).
+#Any tile gives the same bits: it changes neither the depth's order nor the instructions
 UNTIMED_LINEAR_TILES = [(math.inf, (LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_WARPS, LINEAR_STAGES))]
-LINEAR_TILES = {(12, 0): UNTIMED_LINEAR_TILES}
+LINEAR_TILES = {(12, 0): [(2, (64, 32, 4, 5)), (8, (64, 64, 4, 4)), (12, (128, 64, 4, 3)), (16, (64, 128, 4, 3))] + UNTIMED_LINEAR_TILES}
 #a tile's extra rows each cost about this many of its rows (they are a smaller matmul of their own)
 EXTRA_ROW_COST = 1.5
 

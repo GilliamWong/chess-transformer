@@ -553,6 +553,47 @@ def test_extra_rows_save_a_wave():
     assert fused_blocks.linear_extra_rows(56 * 70, 128, 4, 128) == 0
 
 
+#every tile of linear's tables gives the bits of the others (none changes the depth's order or the instructions) in
+#plain (with the residual), gated and fp32 accumulating matmuls, on three boards' rows that leave tiles part empty
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("gated, accumulate_fp32", [(False, False), (True, False), (False, True)])
+def test_linear_tiles_give_the_same_bits(gated, accumulate_fp32):
+    from model import fused_blocks
+    torch.manual_seed(0)
+    x = torch.randn(3, 70, 512, device="cuda").half()
+    weight = (torch.randn(512, 400 if gated else 200, device="cuda") / 512**0.5).half()
+    bias = None if gated else torch.randn(200, device="cuda").half()
+    residual = None if gated or accumulate_fp32 else torch.randn(3, 70, 200, device="cuda").half()
+
+    tiles = dict.fromkeys(tile for by_rows in [*fused_blocks.LINEAR_TILES.values(), fused_blocks.UNTIMED_LINEAR_TILES] for _, tile in by_rows)
+    outs = [fused_blocks.launch_linear(x, weight, bias, residual, gated, accumulate_fp32, None, None, None, tile) for tile in tiles]
+
+    assert len(outs) > 1 and all(torch.equal(out, outs[0]) for out in outs[1:])
+
+
+#a tile is picked by the rows a multiprocessor's share of the matmul is, so a card with more of them picks as one with
+#fewer does at as many rows each: a 170 multiprocessor RTX 5090 takes the RTX 5070 Ti's (70) tile for 70/170 its rows
+def test_tiles_are_picked_by_rows_per_multiprocessor():
+    fused_blocks = pytest.importorskip("model.fused_blocks")
+    tiles = [(1, "a board each"), (8, "eight"), (math.inf, "more")]
+
+    assert [fused_blocks.tile_for(tiles, rows, 70) for rows in (70, 71, 560, 561, 10**6)] == ["a board each", "eight", "eight", "more", "more"]
+    assert [fused_blocks.tile_for(tiles, rows, 170) for rows in (170, 171, 1360, 1361)] == ["a board each", "eight", "eight", "more"]
+
+
+#a gpu whose tiles were not timed (an H100, sm_90) takes the tiles for any rows at every size, not sm_120's narrow ones
+def test_an_untimed_gpu_takes_the_tiles_for_any_rows(monkeypatch):
+    fused_blocks = pytest.importorskip("model.fused_blocks")
+    int8_blocks = pytest.importorskip("model.int8_blocks")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: SimpleNamespace(multi_processor_count=132))
+    device = torch.device("cuda")
+
+    for M in (70, 70 * 64):
+        assert fused_blocks.linear_tile(device, M) == fused_blocks.UNTIMED_LINEAR_TILES[-1][1]
+        assert all(int8_blocks.int8_tile(device, matmul, M) == tiles[-1][1] for matmul, tiles in int8_blocks.INT8_TILES[(12, 0)].items())
+
+
 #the heads' matmul (fused_blocks.FusedTransformer): fp16 inputs accumulating in fp32 and giving fp32, as close to the
 #fp32 matmul as fp16's rounding of the weights allows
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
