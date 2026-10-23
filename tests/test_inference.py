@@ -1,5 +1,6 @@
 import copy
 import math
+import sys
 import time
 from types import SimpleNamespace
 
@@ -104,7 +105,9 @@ def test_the_network_of_every_gpu_is_compiled(monkeypatch):
     compiles = []
     compile = torch.compile
     monkeypatch.setattr(torch, "compile", lambda model, dynamic: compile(model, dynamic=dynamic, backend=lambda graph, inputs: compiles.append(1) or graph.forward))
-    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    #8 gpus as the network's compile counts them: torch's own checks see the gpus there are
+    count = torch.cuda.device_count
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8 if sys._getframe(1).f_code is ExactSizeCompiled.forward.__code__ else count())
     boards = torch.ones(4, 4)
     try:
         for gpu in range(8):
