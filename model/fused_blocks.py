@@ -15,6 +15,7 @@ from torch import nn
 from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait
 
+from model.encoding import TOKENS_PER_BOARD
 from model.model import EDGE, KING, KNIGHT, NO_PIECE, NUM_SQUARES, PAWN, QUEEN, THEIRS, ChessTransformer, TransformerBlock, value_bin_edges
 
 #warps an attention instance has for each 64 of its square rows, and for its metadata rows
@@ -374,9 +375,10 @@ def link_input_mixes(blocks: list[nn.Module]) -> None:
             block.next_scales, following.input_mixed = (following.residual_scale, following.input_scale), True
 
 
-#tokens and columns a program of input_embedding_kernel takes, by the batch's tokens: whole rows in one program were slower
+#tokens and columns a program of input_embedding_kernel takes, by the batch's tokens: more programs for one or two boards
+#(the fastest of 2-16 tokens and 128-1024 columns on an RTX 5070 Ti and 5090); whole rows in one program were slower
 def embedding_block(tokens: int) -> tuple[int, int]:
-    return 8, 256
+    return (4, 128) if tokens < 4 * TOKENS_PER_BOARD else (8, 256)
 
 
 #where the square is from the first square holding the piece CODE (a second queen is rare), or NO_PIECE
@@ -495,8 +497,8 @@ class InputEmbedding(nn.Module):
 #the heads after the last block in three kernels, from its stream to the engine's answer rows (a board's move logits,
 #then its expected score). With x a row of the stream, r its 1 / rms and g the final norm's gain, the normed row is
 #y = r g x: the heads fold g into their weights and r into their epilogues, and read the stream as it is (head_weights).
-#Their fp32 matmuls are fp16 tensor core matmuls of numbers split in two (split): Triton's fp32 ones ran at a few
-#percent of the gpu's fp32 rate
+#Their fp32 matmuls are fp16 tensor core matmuls of numbers split in two (split), many times faster than Triton's fp32 dot
+
 #the narrow matmul's columns: board_down_project's, then a square's terms (s and t, a move's terms of its from and to
 #square, and the 4 promotion logits), padded
 NARROW_COLUMNS = 32
@@ -512,13 +514,10 @@ LO_SCALE = 2048.0
 META_ROWS = 16
 #the stream's columns head_matmul_kernel reads at a time
 HEAD_DEPTH = 64
-#batches from which a program of head_matmul_kernel takes two boards, and its warps by boards
-PAIRED_BOARDS = 16
-HEAD_WARPS = {1: 4, 2: 8}
 #moves a program of head_answer_kernel writes
 MOVE_BLOCK = 256
-#the eval head's hidden units a program of head_answer_kernel takes, and the inputs it reads at a time
-VALUE_UNITS, VALUE_DEPTH = 16, 64
+#the eval head's hidden units a program of head_answer_kernel takes
+VALUE_UNITS = 16
 
 
 #nn.GELU's erf form
@@ -534,118 +533,94 @@ def split(x, LO_SCALE: tl.constexpr):
     return hi, ((x - hi.to(tl.float32)) * LO_SCALE).to(tl.float16)
 
 
-#a board's part of a . x for every pair of squares from its acc (x A on the tile's columns) and its squares' sums of squares
-@triton.jit
-def head_partial(acc, squared, board_ptr, partials_ptr, ok, columns, D, eps, LO_SCALE: tl.constexpr):
-    squares = tl.arange(0, 64)
-    hi, lo = split(acc * tl.rsqrt(squared / D + eps)[:, None], LO_SCALE)
-    x = tl.trans(tl.load(board_ptr + squares[:, None] * D + columns[None, :], mask=ok, other=0.0).to(tl.float16))
-    tl.store(partials_ptr + squares[:, None] * 64 + squares[None, :], tl.dot(hi, x) + tl.dot(lo, x) * (1 / LO_SCALE), mask=ok)
-
-
 #A_COLUMNS of a = r x A on a board's squares (r from the squares' sums of squares, as they are read), and their part of
-#a . x for every pair of squares (head_partial). PAIR takes the next board too (if second_ok), on the same tiles of A
+#a . x for every pair of squares
 @triton.jit
-def head_a_tile(board_ptr, a_ptr, partials_ptr, tile, D, eps, second_ok, board_stride, partial_stride, A_COLUMNS: tl.constexpr,
-                DEPTH: tl.constexpr, LO_SCALE: tl.constexpr, PAIR: tl.constexpr):
+def head_a_tile(board_ptr, a_ptr, partials_ptr, tile, D, eps, A_COLUMNS: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
     squares = tl.arange(0, 64)
     depth = tl.arange(0, DEPTH)
     columns = tile * A_COLUMNS + tl.arange(0, A_COLUMNS)
     x_ptrs = board_ptr + squares[:, None] * D + depth[None, :]
     a_ptrs = a_ptr + depth[:, None] * D + columns[None, :]
     acc = tl.zeros((64, A_COLUMNS), dtype=tl.float32)
-    squared = tl.zeros((64,), dtype=tl.float32)
-    if PAIR:
-        second_ptrs = x_ptrs + board_stride
-        second_acc = tl.zeros((64, A_COLUMNS), dtype=tl.float32)
-        second_squared = tl.zeros((64,), dtype=tl.float32)
+    #summed across the rows once, after the loop
+    squared = tl.zeros((64, DEPTH), dtype=tl.float32)
     for _ in range(0, D, DEPTH):
-        a = tl.load(a_ptrs)
         x = tl.load(x_ptrs).to(tl.float16)
-        acc = tl.dot(x, a, acc)
-        squared += tl.sum(x.to(tl.float32) * x.to(tl.float32), 1)
-        if PAIR:
-            y = tl.load(second_ptrs, mask=second_ok, other=0.0).to(tl.float16)
-            second_acc = tl.dot(y, a, second_acc)
-            second_squared += tl.sum(y.to(tl.float32) * y.to(tl.float32), 1)
-            second_ptrs += DEPTH
+        acc = tl.dot(x, tl.load(a_ptrs), acc)
+        squared += x.to(tl.float32) * x.to(tl.float32)
         x_ptrs += DEPTH
         a_ptrs += DEPTH * D
-    head_partial(acc, squared, board_ptr, partials_ptr, True, columns, D, eps, LO_SCALE)
-    if PAIR:
-        head_partial(second_acc, second_squared, board_ptr + board_stride, partials_ptr + partial_stride, second_ok, columns, D, eps, LO_SCALE)
+    hi, lo = split(acc * tl.rsqrt(tl.sum(squared, 1) / D + eps)[:, None], LO_SCALE)
+    x = tl.trans(tl.load(board_ptr + squares[:, None] * D + columns[None, :]).to(tl.float16))
+    tl.store(partials_ptr + squares[:, None] * 64 + squares[None, :], tl.dot(hi, x) + tl.dot(lo, x) * (1 / LO_SCALE))
 
 
-#rows of the stream times the narrow weights' COLUMNS from FIRST, and the rows' r
+#ROWS rows of a board's stream from FIRST_ROW (those before T) times the narrow weights' COLUMNS from FIRST, and their r
 @triton.jit
-def narrow_rows(row_ptrs, row_ok, narrow_hi_ptr, narrow_lo_ptr, D, eps, ROWS: tl.constexpr, FIRST: tl.constexpr, COLUMNS: tl.constexpr,
-                NARROW: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
-    depth = tl.arange(0, DEPTH)
+def narrow_rows(board_ptr, narrow_hi_ptr, narrow_lo_ptr, D, eps, T: tl.constexpr, FIRST_ROW: tl.constexpr, ROWS: tl.constexpr, FIRST: tl.constexpr,
+                COLUMNS: tl.constexpr, NARROW: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
+    rows, depth = FIRST_ROW + tl.arange(0, ROWS), tl.arange(0, DEPTH)
+    row_ptrs = board_ptr + rows[:, None] * D + depth[None, :]
     weight_offsets = depth[:, None] * NARROW + FIRST + tl.arange(0, COLUMNS)[None, :]
     hi_acc, lo_acc = tl.zeros((ROWS, COLUMNS), dtype=tl.float32), tl.zeros((ROWS, COLUMNS), dtype=tl.float32)
-    squared = tl.zeros((ROWS,), dtype=tl.float32)
+    squared = tl.zeros((ROWS, DEPTH), dtype=tl.float32)
     for _ in range(0, D, DEPTH):
-        x = tl.load(row_ptrs, mask=row_ok[:, None], other=0.0).to(tl.float16)
+        x = tl.load(row_ptrs, mask=(rows < T)[:, None], other=0.0).to(tl.float16)
         hi_acc = tl.dot(x, tl.load(narrow_hi_ptr + weight_offsets), hi_acc)
         lo_acc = tl.dot(x, tl.load(narrow_lo_ptr + weight_offsets), lo_acc)
-        squared += tl.sum(x.to(tl.float32) * x.to(tl.float32), 1)
+        squared += x.to(tl.float32) * x.to(tl.float32)
         row_ptrs += DEPTH
         weight_offsets += DEPTH * NARROW
-    r = tl.rsqrt(squared / D + eps)
+    r = tl.rsqrt(tl.sum(squared, 1) / D + eps)
     return r[:, None] * (hi_acc + lo_acc * (1 / LO_SCALE)), r
 
 
-#board_down_project's output for every token of a board
+#board_down_project's output for ROWS tokens of a board from FIRST_ROW, split (hi then lo)
 @triton.jit
-def head_board_down(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, down_ptr, D, eps, T: tl.constexpr, META: tl.constexpr,
-                    NARROW: tl.constexpr, DOWN: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
-    squares, meta, columns = tl.arange(0, 64), 64 + tl.arange(0, META), tl.arange(0, DOWN)
-    depth = tl.arange(0, DEPTH)
-    bias = tl.load(narrow_bias_ptr + columns)[None, :]
-    square_down, _ = narrow_rows(board_ptr + squares[:, None] * D + depth[None, :], squares < 64, narrow_hi_ptr, narrow_lo_ptr, D, eps, 64, 0, DOWN,
-                                 NARROW, DEPTH, LO_SCALE)
-    meta_down, _ = narrow_rows(board_ptr + meta[:, None] * D + depth[None, :], meta < T, narrow_hi_ptr, narrow_lo_ptr, D, eps, META, 0, DOWN, NARROW,
-                               DEPTH, LO_SCALE)
-    tl.store(down_ptr + squares[:, None] * DOWN + columns[None, :], gelu(square_down + bias))
-    tl.store(down_ptr + meta[:, None] * DOWN + columns[None, :], gelu(meta_down + bias), mask=(meta < T)[:, None])
+def head_board_down(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, down_ptr, lo_offset, D, eps, T: tl.constexpr, FIRST_ROW: tl.constexpr,
+                    ROWS: tl.constexpr, NARROW: tl.constexpr, DOWN: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
+    rows, columns = FIRST_ROW + tl.arange(0, ROWS), tl.arange(0, DOWN)
+    down, _ = narrow_rows(board_ptr, narrow_hi_ptr, narrow_lo_ptr, D, eps, T, FIRST_ROW, ROWS, 0, DOWN, NARROW, DEPTH, LO_SCALE)
+    hi, lo = split(gelu(down + tl.load(narrow_bias_ptr + columns)[None, :]), LO_SCALE)
+    offsets = rows[:, None] * DOWN + columns[None, :]
+    tl.store(down_ptr + offsets, hi, mask=(rows < T)[:, None])
+    tl.store(down_ptr + lo_offset + offsets, lo, mask=(rows < T)[:, None])
 
 
 #a board's square terms and r
 @triton.jit
-def head_square_terms(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, terms_ptr, D, eps, NARROW: tl.constexpr, DOWN: tl.constexpr,
-                      TERMS: tl.constexpr, R_TERM: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
+def head_square_terms(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, terms_ptr, D, eps, T: tl.constexpr, NARROW: tl.constexpr,
+                      DOWN: tl.constexpr, TERMS: tl.constexpr, R_TERM: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
     squares, columns = tl.arange(0, 64), tl.arange(0, NARROW - DOWN)
-    depth = tl.arange(0, DEPTH)
-    terms, r = narrow_rows(board_ptr + squares[:, None] * D + depth[None, :], squares < 64, narrow_hi_ptr, narrow_lo_ptr, D, eps, 64, DOWN,
-                           NARROW - DOWN, NARROW, DEPTH, LO_SCALE)
+    terms, r = narrow_rows(board_ptr, narrow_hi_ptr, narrow_lo_ptr, D, eps, T, 0, 64, DOWN, NARROW - DOWN, NARROW, DEPTH, LO_SCALE)
     terms += tl.load(narrow_bias_ptr + DOWN + columns)[None, :]
     tl.store(terms_ptr + squares[:, None] * TERMS + columns[None, :], terms, mask=(columns < R_TERM)[None, :])
     tl.store(terms_ptr + squares * TERMS + R_TERM, r)
 
 
-#program (tile, p) takes boards p * BOARDS on (BOARDS 1 or 2): every tile but the last two a's columns head_a_tile does
-#(partials, summed by head_answer_kernel), the last two the narrow matmul
+#program (tile, board): every tile but the last three takes a's columns head_a_tile does (partials, summed by
+#head_answer_kernel), the last three the narrow matmul: board_down_project's output on the squares, then on the
+#metadata tokens, then the square terms
 @triton.jit
 def head_matmul_kernel(x_ptr, a_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, partials_ptr, squares_ptr, board_down_ptr, B, D, eps,
-                       T: tl.constexpr, BOARDS: tl.constexpr, A_COLUMNS: tl.constexpr, DEPTH: tl.constexpr, NARROW: tl.constexpr,
-                       DOWN: tl.constexpr, TERMS: tl.constexpr, R_TERM: tl.constexpr, META: tl.constexpr, LO_SCALE: tl.constexpr,
-                       PDL: tl.constexpr):
+                       T: tl.constexpr, A_COLUMNS: tl.constexpr, DEPTH: tl.constexpr, NARROW: tl.constexpr, DOWN: tl.constexpr,
+                       TERMS: tl.constexpr, R_TERM: tl.constexpr, META: tl.constexpr, LO_SCALE: tl.constexpr, PDL: tl.constexpr):
     dependent_launch_wait(PDL)
-    tile, b = tl.program_id(0), tl.program_id(1) * BOARDS
-    a_tiles = tl.num_programs(0) - 2
+    tile, b = tl.program_id(0), tl.program_id(1)
+    a_tiles = tl.num_programs(0) - 3
+    board_ptr = x_ptr + b * T * D
+    down_ptr = board_down_ptr + b * T * DOWN
     if tile < a_tiles:
-        head_a_tile(x_ptr + b * T * D, a_ptr, partials_ptr + (b * a_tiles + tile) * 4096, tile, D, eps, b + 1 < B, T * D, a_tiles * 4096, A_COLUMNS,
-                    DEPTH, LO_SCALE, BOARDS == 2)
+        head_a_tile(board_ptr, a_ptr, partials_ptr + (b * a_tiles + tile) * 4096, tile, D, eps, A_COLUMNS, DEPTH, LO_SCALE)
     elif tile == a_tiles:
-        for i in tl.static_range(BOARDS):
-            if b + i < B:
-                head_board_down(x_ptr + (b + i) * T * D, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, board_down_ptr + (b + i) * T * DOWN, D, eps, T,
-                                META, NARROW, DOWN, DEPTH, LO_SCALE)
+        head_board_down(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, down_ptr, B * T * DOWN, D, eps, T, 0, 64, NARROW, DOWN, DEPTH, LO_SCALE)
+    elif tile == a_tiles + 1:
+        head_board_down(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, down_ptr, B * T * DOWN, D, eps, T, 64, META, NARROW, DOWN, DEPTH,
+                        LO_SCALE)
     else:
-        for i in tl.static_range(BOARDS):
-            if b + i < B:
-                head_square_terms(x_ptr + (b + i) * T * D, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, squares_ptr + (b + i) * 64 * TERMS, D, eps,
-                                  NARROW, DOWN, TERMS, R_TERM, DEPTH, LO_SCALE)
+        head_square_terms(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, squares_ptr + b * 64 * TERMS, D, eps, T, NARROW, DOWN, TERMS, R_TERM,
+                          DEPTH, LO_SCALE)
 
 
 #BLOCK moves of a board from the first: r_t (a_f . x_t) + t_t + s_f, and the promotion's logit
@@ -666,8 +641,8 @@ def head_moves(partials_ptr, terms_ptr, moves_ptr, rows_ptr, first, A_TILES: tl.
     tl.store(rows_ptr + move, logit, mask=move_ok)
 
 
-#UNITS of the eval head's hidden layer for BOARDS boards (weights split: hidden and out, each hi then lo), and their part
-#of its output layer
+#UNITS of the eval head's hidden layer for BOARDS boards (its inputs, board_down, and weights split: each hi then lo), and
+#their part of its output layer
 @triton.jit
 def head_value_tile(board_down_ptr, hidden_ptr, hidden_bias_ptr, out_ptr, value_partials_ptr, unit_tile, board_tile, B, INPUTS: tl.constexpr,
                     HIDDEN: tl.constexpr, BINS: tl.constexpr, BLOCK_BINS: tl.constexpr, BOARDS: tl.constexpr, UNITS: tl.constexpr,
@@ -680,8 +655,9 @@ def head_value_tile(board_down_ptr, hidden_ptr, hidden_bias_ptr, out_ptr, value_
     for start in range(0, INPUTS, DEPTH):
         inputs = start + depth
         inputs_ok = inputs < INPUTS
-        down_hi, down_lo = split(tl.load(board_down_ptr + boards[:, None] * INPUTS + inputs[None, :], mask=board_ok[:, None] & inputs_ok[None, :],
-                                         other=0.0), LO_SCALE)
+        downs = board_down_ptr + boards[:, None] * INPUTS + inputs[None, :]
+        down_hi = tl.load(downs, mask=board_ok[:, None] & inputs_ok[None, :], other=0.0)
+        down_lo = tl.load(downs + B * INPUTS, mask=board_ok[:, None] & inputs_ok[None, :], other=0.0)
         weights = hidden_ptr + units[None, :] * INPUTS + inputs[:, None]
         weight_hi = tl.load(weights, mask=inputs_ok[:, None], other=0.0)
         weight_lo = tl.load(weights + HIDDEN * INPUTS, mask=inputs_ok[:, None], other=0.0)
@@ -738,12 +714,17 @@ def head_value_kernel(value_partials_ptr, out_bias_ptr, centres_ptr, rows_ptr, B
 
 
 #a's columns a program of head_matmul_kernel takes: fewer for fewer boards, so that a small batch runs on more
-#multiprocessors, more for more, so that fewer partials are written
+#multiprocessors (the fastest of 32-128 on an RTX 5090 and 5070 Ti)
 def head_a_columns(boards: int, d_model: int) -> int:
-    columns = 32 if boards <= 2 else 64 if boards <= 8 else 128
+    columns = 32 if boards <= 4 else 64
     while d_model % columns:
         columns //= 2
     return columns
+
+
+#the eval head's inputs a program of head_answer_kernel reads at a time for this many boards (the fastest of 32-128)
+def value_depth(boards: int) -> int:
+    return 32 if boards >= 64 else 128
 
 
 #an opaque op for torch.compile, as linear. The stream B x T x d (fp16, or rounded to it) in, the answer rows out;
@@ -766,20 +747,17 @@ def heads(stream: torch.Tensor, a_weight: torch.Tensor, narrow_hi: torch.Tensor,
     unit_tiles, board_tiles = hidden_units // VALUE_UNITS, triton.cdiv(B, value_boards)
     f32 = dict(device=stream.device, dtype=torch.float32)
     partials, squares = torch.empty(B, a_tiles, 64, 64, **f32), torch.empty(B, 64, SQUARE_TERMS, **f32)
-    board_down, value_partials = torch.empty(B, inputs, **f32), torch.empty(unit_tiles, B, block_bins, **f32)
+    board_down, value_partials = torch.empty(2, B, inputs, device=stream.device, dtype=torch.float16), torch.empty(unit_tiles, B, block_bins, **f32)
     rows = torch.empty(B, move_count + 1, **f32)
     launch = dependent_launch(stream.device)
-    boards_a_program = 2 if B >= PAIRED_BOARDS else 1
-    head_matmul_kernel[(a_tiles + 2, triton.cdiv(B, boards_a_program))](stream, a_weight, narrow_hi, narrow_lo, narrow_bias, partials, squares,
-                                                                        board_down, B, D, eps, T=T, BOARDS=boards_a_program, A_COLUMNS=a_columns,
-                                                                        DEPTH=depth, NARROW=NARROW_COLUMNS, DOWN=DOWN_COLUMNS, TERMS=SQUARE_TERMS,
-                                                                        R_TERM=R_TERM, META=META_ROWS, LO_SCALE=LO_SCALE,
-                                                                        num_warps=HEAD_WARPS[boards_a_program], **launch)
+    head_matmul_kernel[(a_tiles + 3, B)](stream, a_weight, narrow_hi, narrow_lo, narrow_bias, partials, squares, board_down, B, D, eps, T=T,
+                                         A_COLUMNS=a_columns, DEPTH=depth, NARROW=NARROW_COLUMNS, DOWN=DOWN_COLUMNS, TERMS=SQUARE_TERMS,
+                                         R_TERM=R_TERM, META=META_ROWS, LO_SCALE=LO_SCALE, num_warps=4, **launch)
     move_programs = triton.cdiv(move_count, MOVE_BLOCK)
     head_answer_kernel[(B * move_programs + unit_tiles * board_tiles,)](
         partials, squares, moves, board_down, hidden, hidden_bias, out, value_partials, rows, B, A_TILES=a_tiles, MOVES=move_count,
-        MOVE_BLOCK=MOVE_BLOCK, MOVE_PROGRAMS=move_programs, TERMS=SQUARE_TERMS, R_TERM=R_TERM, INPUTS=inputs, HIDDEN=hidden_units, BINS=bins, BLOCK_BINS=block_bins,
-        BOARDS=value_boards, UNITS=VALUE_UNITS, DEPTH=VALUE_DEPTH, LO_SCALE=LO_SCALE, num_warps=4, **launch)
+        MOVE_BLOCK=MOVE_BLOCK, MOVE_PROGRAMS=move_programs, TERMS=SQUARE_TERMS, R_TERM=R_TERM, INPUTS=inputs, HIDDEN=hidden_units, BINS=bins,
+        BLOCK_BINS=block_bins, BOARDS=value_boards, UNITS=VALUE_UNITS, DEPTH=value_depth(value_boards), LO_SCALE=LO_SCALE, num_warps=4, **launch)
     head_value_kernel[(B,)](value_partials, out_bias, centres, rows, B, UNIT_TILES=unit_tiles, BLOCK_TILES=triton.next_power_of_2(unit_tiles),
                             MOVES=move_count, BINS=bins, BLOCK_BINS=block_bins, num_warps=4, **launch)
     return rows
@@ -838,7 +816,8 @@ class FusedTransformer(nn.Module):
         hidden, out = model.eval_head[0], model.eval_head[2]
         edges = value_bin_edges(out.out_features, out.weight.device)
         buffers = {"a_weight": a_weight, "narrow": narrow, "narrow_bias": narrow_bias, "moves": move_table(model), "hidden": split_weight(hidden.weight),
-                   "hidden_bias": hidden.bias.detach(), "out": split_weight(out.weight), "out_bias": out.bias.detach(), "centres": (edges[:-1] + edges[1:]) / 2}
+                   "hidden_bias": hidden.bias.detach(), "out": split_weight(out.weight), "out_bias": out.bias.detach(),
+                   "centres": (edges[:-1] + edges[1:]) / 2}
         for name, tensor in buffers.items():
             self.register_buffer(name, tensor)
 
