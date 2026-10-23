@@ -435,7 +435,8 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
             nodes, seconds = clock.limits(go.arguments, board, simulations)
             if go.until_stop:
                 nodes = seconds = None
-            report = player.search(board, nodes, seconds, clock.extension, go.stop)
+            running = lambda report: send(info_line(report, time.perf_counter() - started))
+            report = player.search(board, nodes, seconds, clock.extension, go.stop, running)
             clock.searched(time.perf_counter() - started, score_to_centipawns(report.score))
             move = report.line[0]
             send(info_line(report, time.perf_counter() - started))

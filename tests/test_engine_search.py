@@ -280,7 +280,7 @@ def test_go_limits():
 def searched_gos(monkeypatch, gos: list[str]) -> tuple[list, list[str]]:
     given, sent = [], []
     class Player:
-        def search(self, board, nodes, seconds, extension, stop=None):
+        def search(self, board, nodes, seconds, extension, stop=None, info=None):
             given.append((nodes, seconds))
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     monkeypatch.setattr(uci, "load_player", lambda *arguments: Player())
@@ -377,7 +377,7 @@ def test_a_clocks_plan_and_cap_can_be_set():
 def test_a_new_game_starts_a_fresh_clock(monkeypatch):
     given = []
     class Player:
-        def search(self, board, nodes, seconds, extension, stop):
+        def search(self, board, nodes, seconds, extension, stop, info=None):
             given.append((seconds, extension))
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     go = ["position startpos", "go wtime 60000 btime 60000 winc 600 binc 600"]
@@ -623,7 +623,7 @@ def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
 @pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
 def test_the_engine_takes_lc0s_time_options(monkeypatch):
     given = []
-    def search(self, board, nodes, seconds, extension, stop):
+    def search(self, board, nodes, seconds, extension, stop, info=None):
         given.append((seconds, self.smart_pruning_factor, self.smart_pruning_wait, self.stop_at_one_move_left))
         return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision: cpu_batches(BoardModel()))
@@ -1062,9 +1062,9 @@ def test_go_infinite_runs_the_simulations_by_default(monkeypatch):
 def test_go_ponder_searches_until_ponderhit(monkeypatch):
     limits = []
     class Recorded(EngineSearch):
-        def search(self, board, simulations=None, seconds=None, extension=None, stop=None):
+        def search(self, board, simulations=None, seconds=None, extension=None, stop=None, info=None):
             limits.append((simulations, seconds))
-            return super().search(board, simulations, seconds, extension, stop)
+            return super().search(board, simulations, seconds, extension, stop, info)
     gui = Gui(monkeypatch, lambda: Recorded(cpu_batches(BoardModel()), 16))
     board = chess.Board()
     board.push_uci("e2e4")
@@ -1089,7 +1089,7 @@ def test_go_ponder_searches_until_ponderhit(monkeypatch):
 def test_the_options_reach_the_search(monkeypatch):
     built, given = [], []
     class Player:
-        def search(self, board, nodes, seconds, extension, stop):
+        def search(self, board, nodes, seconds, extension, stop, info=None):
             given.append(seconds)
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     script = ["uci", "setoption name cachepositions value 1000", "setoption name RamLimitMb value 64", "setoption name SyzygyProbeLimit value 6",
@@ -1141,7 +1141,7 @@ def test_a_syzygy_path_reaches_the_search(monkeypatch, tablebase, tmp_path):
 def test_a_bad_position_leaves_the_last_one(monkeypatch):
     searched = []
     class Player:
-        def search(self, board, nodes, seconds, extension, stop=None):
+        def search(self, board, nodes, seconds, extension, stop=None, info=None):
             searched.append(board.fen())
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     bad = ["startpos moves e2e4 e7e4", "startpos moves e2e4 e7", "fen not a fen", "fen 8/8/8/8/8/8/8/8 w - - 0 1", "", "kiwipete",
@@ -1181,3 +1181,20 @@ def test_the_positions_refused_are_the_searchs(fen):
     except ValueError:
         searched = False
     assert refused != searched
+
+
+#a search tells its report as it stands about every INFO_SECONDS while it runs, its nodes growing, and the gui gets each
+#as an info line before bestmove, as lc0 sends one a second
+def test_a_long_search_tells_the_gui_how_it_stands(monkeypatch):
+    monkeypatch.setattr(engine_search, "INFO_SECONDS", 0.05)
+    told = []
+    report = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False).search(chess.Board(), seconds=0.5, info=told.append)
+    nodes = [running.simulations for running in told]
+    assert len(told) >= 3 and nodes == sorted(nodes) and nodes[-1] <= report.simulations
+    assert all(running.line and running.line[0] in chess.Board().legal_moves for running in told)
+
+    gui = Gui(monkeypatch, lambda: EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False))
+    gui.tell("position startpos")
+    went = gui.tell("go movetime 500")
+    assert gui.sent_at("bestmove", since=went, seconds=5) is not None and len(gui.lines_sent("info depth")) >= 4
+    gui.close()

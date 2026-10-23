@@ -586,6 +586,13 @@ impl Searches {
         })
     }
 
+    //a running search's report as it would be now, for a gui's info lines while it runs; None while its root has no
+    //moves yet (its first simulation still waiting for the network)
+    fn report_now(&self, id: u64) -> PyResult<Option<SearchReport>> {
+        let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+        Ok(search.tree.root().has_edges().then(|| search.report()))
+    }
+
     //carries the id's kept tree on to the position after `moves` (the game's, the engine's own move last), for uci.py to
     //call once that move is sent. The root moves down in place, and on a thread of its own, while the opponent thinks,
     //the tree finds the leaves the next root may make stale (search.rs stale_candidates) and copies the root's part out

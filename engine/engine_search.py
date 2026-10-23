@@ -4,6 +4,7 @@
 #pruning), and keeps its tree for the game's next move and the network's answers for positions reached again
 from __future__ import annotations
 from collections import deque
+from collections.abc import Callable
 import math
 from pathlib import Path
 import statistics
@@ -54,6 +55,8 @@ FALL_START_CP = 10
 FALL_FULL_CP = 30
 #rounds whose speed estimates the simulations a deadline leaves
 SPEED_ROUNDS = 8
+#a search's info lines for the gui while it runs, one about this often (lc0 sends one a second)
+INFO_SECONDS = 1.0
 #the network's answers kept by position (search.rs Cache), ~260 bytes each (1.3 GB): replaying 6 tournament games, 4M
 #rather than self-play's 500k gave 18% more nodes a search on the mean (3.5% on the median) from as many network
 #calls. The engine's own: every self-play worker has a selfplay.CACHE_POSITIONS cache
@@ -162,9 +165,10 @@ class EngineSearch:
     #searches until `simulations` (counting those of a reused tree, as lc0's go nodes does), until `seconds` have
     #passed or until `stop` is set (uci's reader thread sets it), whichever comes first; at least one of the three.
     #extension: (the last search's score in centipawns, the seconds this one may add) for a search on the clock whose
-    #score falls (FALL_START_CP)
+    #score falls (FALL_START_CP). info gets the report as it stands about every INFO_SECONDS, for the gui's info lines
     def search(self, board: chess.Board, simulations: int | None = None, seconds: float | None = None,
-               extension: tuple[int, float] | None = None, stop: threading.Event | None = None) -> SearchReport:
+               extension: tuple[int, float] | None = None, stop: threading.Event | None = None,
+               info: Callable[[SearchReport], None] | None = None) -> SearchReport:
         if simulations is None and seconds is None and stop is None:
             raise ValueError("a search needs a number of simulations, a time or a stop")
         started = time.perf_counter()
@@ -184,6 +188,7 @@ class EngineSearch:
         report, last_answers = None, None
         progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
         first_answers = None #when the search's first round came back
+        next_info = started + INFO_SECONDS
         #the rounds left once the report is in have no leaves, but Searches still expects their finish
         while report is None or rounds:
             if report is None and not stopping:
@@ -221,6 +226,11 @@ class EngineSearch:
                 self.round_seconds = statistics.median(self.round_times)
                 last_answers = now
             reports = self.searches.finish(answers)
+            if info is not None and not reports and report is None and time.perf_counter() >= next_info:
+                next_info = time.perf_counter() + INFO_SECONDS
+                running = self.searches.report_now(GAME)
+                if running is not None:
+                    info(self.search_report(running))
             if reports:
                 report = reports[0]
             #a round without leaves counts too: all its simulations may have ended the game (a mate found)
@@ -242,6 +252,10 @@ class EngineSearch:
                     stopping = True
                     report = self.searches.stop(GAME)
 
+        return self.search_report(report)
+
+    #a report of Searches' as the engine gives it: the score on the network's own scale, the line and root moves as moves
+    def search_report(self, report: tuple) -> SearchReport:
         _, line, score, root_moves, visits = report
         return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
                             [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]])
