@@ -133,6 +133,9 @@ class SearchRun:
         self.stopping = self.gathered = False
         self.rounds_out = 0 #on every network
         self.rounds_answered = 0 #rounds with leaves finished
+        #rounds_answered when a round last found no leaves, every descent ending on a leaf already out: no network gathers
+        #again until another round is back, rather than holding Searches with empty rounds
+        self.starved = None
         self.next_round = 0 #the next round's name in Searches
         self.progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
         self.first_answers = None #when the search's first round came back
@@ -252,9 +255,6 @@ class EngineSearch:
         #was launched)
         rounds: deque = deque()
         last_answers = None
-        #run.rounds_answered when this network's last round found no leaves, every descent ending on a leaf already out:
-        #it gathers again once another network's round is back, rather than holding Searches with empty rounds
-        starved = None
         #the rounds left once the report is in have no leaves, but Searches still expects their finish
         while True:
             name = None
@@ -275,7 +275,7 @@ class EngineSearch:
                         run.stop(self.searches.stop(GAME))
                         break
                     count, in_flight = self.round_leaves(run.simulations)
-                    blocked = starved == run.rounds_answered and run.rounds_out > len(rounds)
+                    blocked = run.starved == run.rounds_answered and run.rounds_out > len(rounds)
                     if run.rounds_out < in_flight and len(rounds) < self.rounds_in_flight and not blocked:
                         name, run.next_round = run.next_round, run.next_round + 1
                         answered = run.rounds_answered
@@ -292,7 +292,8 @@ class EngineSearch:
                 #a bytearray: torch warns about arrays it cannot write to
                 leaves = bytearray(self.searches.descend(count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count, round=name))
                 boards = np.frombuffer(leaves, dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
-                starved = None if len(boards) else answered
+                if not len(boards):
+                    run.starved = answered
                 launched_at = time.perf_counter()
                 rounds.append((name, network.launch(boards) if len(boards) else None, launched_at))
                 continue
