@@ -95,6 +95,7 @@ fn copied(tree: &Tree) -> Tree {
         node_keys: tree.node_keys.clone(),
         moves: tree.moves.clone(),
         priors: tree.priors.clone(),
+        noised_priors: tree.noised_priors.clone(),
         children: tree.children.clone(),
         pending: VecDeque::new(),
         logits: Vec::new(),
@@ -184,7 +185,7 @@ fn assert_same_trees(old: &Tree, new: &Tree) {
     assert_same("nodes", &numbers(old), &numbers(new));
     assert_same("node keys", &old.node_keys, &new.node_keys);
     assert_same("moves", &old.moves, &new.moves);
-    let bits = |priors: &[f64]| -> Vec<u64> { priors.iter().map(|prior| prior.to_bits()).collect() };
+    let bits = |priors: &[f32]| -> Vec<u32> { priors.iter().map(|prior| prior.to_bits()).collect() };
     assert_same("priors", &bits(&old.priors), &bits(&new.priors));
     assert_same("children", &old.children, &new.children);
 }

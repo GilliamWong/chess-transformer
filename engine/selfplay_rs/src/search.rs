@@ -183,7 +183,8 @@ pub struct Tree {
     //the edges: every expanded node's moves in python-chess's order with their priors, and each move's node once it
     //has one (NO_NODE before)
     moves: Vec<Move>,
-    priors: Vec<f64>,
+    priors: Vec<f32>,        //as the network gives them, read as f64s
+    noised_priors: Vec<f64>, //the root's once add_root_noise has mixed its noise in (no longer f32s); empty without
     children: Vec<u32>,
     pending: VecDeque<PendingLeaf>, //oldest first, the order the network's answers come back in
     logits: Vec<f32>,
@@ -199,6 +200,7 @@ impl Tree {
             node_keys: vec![root_key],
             moves: Vec::new(),
             priors: Vec::new(),
+            noised_priors: Vec::new(),
             children: Vec::new(),
             pending: VecDeque::new(),
             logits: Vec::new(),
@@ -207,6 +209,12 @@ impl Tree {
 
     pub fn root(&self) -> &Node {
         &self.nodes[0]
+    }
+
+    //an edge's prior, a root edge's with its noise
+    fn prior(&self, edge: usize) -> f64 {
+        let root = self.nodes[0].edges();
+        if !self.noised_priors.is_empty() && root.contains(&edge) { self.noised_priors[edge - root.start] } else { f64::from(self.priors[edge]) }
     }
 
     pub fn chess_move(&self, edge: usize) -> Move {
@@ -257,7 +265,9 @@ impl Tree {
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
         let (mut best, mut best_u) = (0, f64::NEG_INFINITY);
+        let noised = node == 0 && !self.noised_priors.is_empty();
         for (index, (&prior, &child)) in self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate() {
+            let prior = if noised { self.noised_priors[index] } else { f64::from(prior) };
             let (q, started) = match child {
                 NO_NODE => (first_play_urgency, 0),
                 child => {
@@ -437,7 +447,7 @@ impl Tree {
         let first_edge = self.moves.len();
         for (&chess_move, &prior) in moves.iter().zip(priors) {
             self.moves.push(chess_move);
-            self.priors.push(f64::from(prior));
+            self.priors.push(prior);
         }
         self.children.resize(self.moves.len(), NO_NODE);
         self.nodes[node].first_edge = first_edge as u32;
@@ -599,19 +609,16 @@ impl Tree {
     fn refresh_visited_policy(&mut self, node: usize) {
         //Keep Python's summation order and compensation, including after noise on a reused root.
         let edges = self.nodes[node].edges();
-        self.nodes[node].visited_policy_sqrt = python_sum(edges.filter(|&edge| self.visits(edge) > 0).map(|edge| self.priors[edge])).sqrt();
+        self.nodes[node].visited_policy_sqrt = python_sum(edges.filter(|&edge| self.visits(edge) > 0).map(|edge| self.prior(edge))).sqrt();
     }
 
-    //mcts.add_root_noise: dirichlet noise as gamma draws scaled to add up to 1
+    //mcts.add_root_noise: dirichlet noise as gamma draws scaled to add up to 1, mixed in f64 as mcts.py mixes it
     pub fn add_root_noise(&mut self, random: &mut ChaCha8Rng, alpha: f64, share: f64) {
         let gamma = Gamma::new(alpha, 1.0).expect("a positive noise alpha");
         let edges = self.nodes[0].edges();
         let draws: Vec<f64> = edges.clone().map(|_| gamma.sample(random)).collect();
         let total: f64 = draws.iter().sum();
-        for (edge, draw) in edges.zip(draws) {
-            let prior = self.priors[edge];
-            self.priors[edge] = (1.0 - share) * prior + share * (draw / total);
-        }
+        self.noised_priors = edges.zip(draws).map(|(edge, draw)| (1.0 - share) * self.prior(edge) + share * (draw / total)).collect();
         self.refresh_visited_policy(0);
     }
 
@@ -625,7 +632,7 @@ impl Tree {
                 Some(proof) if proof.outcome != Outcome::Draw => proof_rank(&proof),
                 _ => (Outcome::Draw, 0),
             };
-            (proven, visits, mean_score, self.priors[edge])
+            (proven, visits, mean_score, self.prior(edge))
         };
         let mut edges = self.nodes[node].edges();
         let mut best = edges.next().expect("a searched node has children");
@@ -674,6 +681,7 @@ impl Tree {
         } else {
             (self.nodes, self.moves, self.priors, self.children) = (vec![Node::new()], Vec::new(), Vec::new(), Vec::new());
             self.node_keys = vec![*self.keys.last().expect("the root's key")];
+            self.noised_priors.clear();
         }
     }
 
@@ -698,7 +706,9 @@ impl Tree {
     //by its rules or the tables, which a new root leaves as it was (a two-fold repetition proves nothing). The root's
     //own is dropped, as a root is never proven (root_decided reads its moves'). Returns the old tree's nodes and edges
     #[allow(clippy::type_complexity)]
-    fn keep_subtree(&mut self, node: usize) -> (Vec<Node>, Vec<u64>, Vec<Move>, Vec<f64>, Vec<u32>) {
+    fn keep_subtree(&mut self, node: usize) -> (Vec<Node>, Vec<u64>, Vec<Move>, Vec<f32>, Vec<u32>) {
+        //the new root's priors are its own, without the old root's noise
+        self.noised_priors.clear();
         //room for the whole tree, so the copy never regrows (that took twice the time); unwritten room takes no memory
         let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
         let mut nodes = Vec::with_capacity(node_room);
