@@ -189,7 +189,7 @@ fn assert_same_trees(old: &Tree, new: &Tree) {
             .map(|node| {
                 let proof = node.proof.map(|proof| (proof.outcome, proof.value.to_bits(), proof.plies));
                 let (value_sum, visited_policy_sqrt) = (node.value_sum.to_bits(), node.visited_policy_sqrt.to_bits());
-                (node.visit_count, node.in_flight, value_sum, visited_policy_sqrt, node.first_edge, node.edge_count, proof)
+                (node.visit_count, node.in_flight, value_sum, visited_policy_sqrt, node.edges_at, proof)
             })
             .collect()
     };
@@ -214,7 +214,7 @@ fn reusable_lines(tree: &Tree) -> Vec<Vec<usize>> {
     }
     lines.retain(|line| {
         line.iter().all(|&edge| tree.children[edge] != NO_NODE)
-            && tree.nodes[tree.children[*line.last().expect("a move")] as usize].edge_count > 0
+            && tree.nodes[tree.children[*line.last().expect("a move")] as usize].has_edges()
     });
     lines
 }
@@ -387,13 +387,12 @@ fn the_cache_keeps_two_generations_and_turns_one_over_at_once() {
     assert!(slowest_turnover.as_millis() < 20, "a turnover took {slowest_turnover:?}");
 }
 
-//the edges' u32 indices: gathering stops while the moves of the leaves waiting and of one more might not fit
+//the nodes' u32 indices: gathering stops before a node would be numbered NO_NODE; a vector under a memory limit grows by
+//doubling as far as the limit lets it
 #[test]
-fn the_edges_stop_short_of_their_u32_indices() {
-    let most = u32::MAX as usize;
-    assert!(edges_fit(most - 2 * MOST_MOVES, 1));
-    assert!(!edges_fit(most - 2 * MOST_MOVES + 1, 1));
-    assert!(!edges_fit(most, 0));
+fn the_nodes_stop_short_of_their_u32_indices() {
+    assert!(node_fits(NO_NODE as usize - 1));
+    assert!(!node_fits(NO_NODE as usize));
     assert_eq!(grown_capacity(8, 9, 13, usize::MAX), Some(16));
     assert_eq!(grown_capacity(8, 40, 13, usize::MAX), Some(40));
     assert_eq!(grown_capacity(8, 9, 13, 13 * 12), Some(12));

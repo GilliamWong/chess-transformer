@@ -64,8 +64,9 @@ pub struct Node {
     in_flight: u32,
     pub value_sum: f64,
     visited_policy_sqrt: f64, //sqrt of the sum of visited children's priors, refreshed when that set or the priors change
-    first_edge: u32,
-    edge_count: u32, //0 until the node is expanded
+    //the node's first edge above the low 8 bits, its number of edges in them (a position has at most 218 moves), 0
+    //until the node is expanded: edges outnumber nodes ~37 to 1, and u32 edge indices would end at ~115M nodes
+    edges_at: u64,
     pub proof: Option<Proof>, //only with SearchSettings' certainty, and never at the root
 }
 
@@ -74,12 +75,17 @@ const NO_NODE: u32 = u32::MAX;
 
 impl Node {
     fn new() -> Node {
-        Node { visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, first_edge: 0, edge_count: 0, proof: None }
+        Node { visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, edges_at: 0, proof: None }
     }
 
     //the node's moves, as indices into the tree's edges
     pub fn edges(&self) -> Range<usize> {
-        self.first_edge as usize..(self.first_edge + self.edge_count) as usize
+        let first = (self.edges_at >> 8) as usize;
+        first..first + (self.edges_at & 255) as usize
+    }
+
+    pub fn has_edges(&self) -> bool {
+        self.edges_at & 255 > 0
     }
 
     pub fn mean_score(&self) -> f64 {
@@ -224,9 +230,9 @@ pub struct Round {
 //the most moves a position may have room for (MoveList's capacity): a waiting leaf's expansion needs that many edges
 const MOST_MOVES: usize = 256;
 
-//whether the edges' u32 indices have room for the moves of the leaves waiting for the network and of one more
-fn edges_fit(edges: usize, waiting: usize) -> bool {
-    edges + (waiting + 1) * MOST_MOVES <= u32::MAX as usize
+//whether the nodes' u32 indices (the edges' children) have room for one more, below NO_NODE
+fn node_fits(nodes: usize) -> bool {
+    nodes < NO_NODE as usize
 }
 
 //the capacity a vector of `capacity` elements of `bytes` each grows to for `needed`: doubling, as std's vectors grow,
@@ -290,10 +296,10 @@ impl Tree {
     }
 
     //room for one more simulation: its node, and the moves of every leaf that may be expanded before the next look
-    //(those waiting for the network and this one), within the edges' u32 indices and the memory limit. Under a limit
+    //(those waiting for the network and this one), within the nodes' u32 indices and the memory limit. Under a limit
     //the vectors are grown here (grown_capacity), so that no push grows them past it
     fn make_room(&mut self, memory_limit: usize) -> bool {
-        if !edges_fit(self.moves.len(), self.pending.len()) {
+        if !node_fits(self.nodes.len()) {
             return false;
         }
         if memory_limit == usize::MAX {
@@ -459,7 +465,7 @@ impl Tree {
             && self.root().visit_count as usize + self.pending.len() < round.visit_limit as usize
         {
             //the root's own evaluation always fits, so that a full search still has moves to report
-            if self.root().edge_count > 0 && !self.make_room(round.memory_limit) {
+            if self.root().has_edges() && !self.make_room(round.memory_limit) {
                 self.full = true;
                 break;
             }
@@ -468,7 +474,7 @@ impl Tree {
             path.clear();
             path.push(self.root);
             let mut node = self.root;
-            while self.nodes[node].edge_count > 0 {
+            while self.nodes[node].has_edges() {
                 let edge = self.select_edge(node, settings);
                 board.play_unchecked(self.moves[edge]);
                 //a descent never ends without a visit or a simulation waiting, so the node is needed
@@ -593,8 +599,7 @@ impl Tree {
             self.priors.push(prior);
         }
         self.children.resize(self.moves.len(), NO_NODE);
-        self.nodes[node].first_edge = first_edge as u32;
-        self.nodes[node].edge_count = (self.moves.len() - first_edge) as u32;
+        self.nodes[node].edges_at = (first_edge as u64) << 8 | (self.moves.len() - first_edge) as u64;
     }
 
     fn add_in_flight(&mut self, path: &[usize]) {
@@ -779,7 +784,7 @@ impl Tree {
             }
             places.push((edge - edges.start) as u16);
             let child = child as usize;
-            if self.nodes[child].edge_count > 0 {
+            if self.nodes[child].has_edges() {
                 if !self.find_candidates(child, places, candidates, looked, abort) {
                     return false;
                 }
@@ -816,7 +821,7 @@ impl Tree {
                 edges.push(edge);
             }
             let leaf = *path.last().expect("a leaf below the root");
-            if self.nodes[leaf].edge_count == 0 && self.nodes[leaf].visit_count > 0 {
+            if !self.nodes[leaf].has_edges() && self.nodes[leaf].visit_count > 0 {
                 self.keys.extend(path[1..].iter().map(|&node| self.node_keys[node]));
                 let found = self.is_stale(&path, &edges, settings, tables, root_covered);
                 self.keys.truncate(root_keys);
@@ -885,7 +890,7 @@ impl Tree {
     //mcts.principal_variation, as edges
     pub fn principal_variation(&self) -> Vec<usize> {
         let (mut line, mut node) = (Vec::new(), self.root);
-        while self.nodes[node].edge_count > 0 {
+        while self.nodes[node].has_edges() {
             let edge = self.most_visited_edge(node);
             if !line.is_empty() && self.visits(edge) == 0 {
                 break;
@@ -974,7 +979,7 @@ impl Tree {
             let first_edge = moves.len();
             //a node without moves keeps the first edge Node::new gives it
             if !edges.is_empty() {
-                nodes[index].first_edge = first_edge as u32;
+                nodes[index].edges_at = (first_edge as u64) << 8 | edges.len() as u64;
             }
             moves.extend_from_slice(&self.moves[edges.clone()]);
             priors.extend_from_slice(&self.priors[edges.clone()]);
