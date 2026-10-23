@@ -420,9 +420,9 @@ impl Searches {
         })
     }
 
-    //the game's moves let the search see repetitions. Like mcts.search it refuses a finished position, but it searches
-    //one the tables cover (search.rs gather). With tree reuse, the tree of this id's last search is kept when it holds
-    //the moves played since
+    //the game's moves let the search see repetitions. It refuses a mate or stalemate, but searches a position drawn only
+    //by a claim (threefold, fifty moves), which a gui may still ask a move for, and one the tables cover (search.rs
+    //gather). With tree reuse, the tree of this id's last search is kept when it holds the moves played since
     fn start(&mut self, id: u64, fen: &str, moves: Vec<String>, simulations: u32) -> PyResult<()> {
         if simulations == 0 {
             return Err(PyValueError::new_err("a search needs at least one simulation"));
@@ -431,10 +431,7 @@ impl Searches {
             return Err(PyValueError::new_err(format!("search {id} is already running")));
         }
         let (board, keys) = play_out(fen, &moves)?;
-        let settings = &self.settings;
-        let over = game_result(&board, &keys, &board.legal_moves(), settings.draw, settings.repetitions_for_a_draw, None)
-            .map_err(tablebase_error)?;
-        if over.is_some() {
+        if board.legal_moves().is_empty() {
             return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
         }
         let tree = self.reused_tree(id, fen, &moves).unwrap_or_else(|| Tree::new(board, keys));

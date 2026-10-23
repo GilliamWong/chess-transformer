@@ -666,3 +666,18 @@ def test_a_root_the_last_search_never_expanded_is_searched():
         board.push_uci(move)
     report = search.search(board, simulations=50)
     assert report.line and report.line[0] in board.legal_moves and report.simulations >= 50
+
+
+#a gui that leaves a draw to be claimed (fide's rules, lichess) asks for a move in a threefold repetition or at the fifty
+#move limit: the engine searches it and plays a move (it raised that the game was over, which ended the engine)
+@pytest.mark.parametrize("fen, moves", [(chess.STARTING_FEN, [move for move, _ in KNIGHTS_OUT_AND_BACK] * 2),
+                                         ("8/8/4k3/8/2R5/4K3/8/8 w - - 100 120", [])])
+@pytest.mark.parametrize("leaves", [1, 16])
+def test_the_engine_plays_on_in_a_draw_left_to_be_claimed(fen, moves, leaves):
+    board = chess.Board(fen)
+    for move in moves:
+        board.push_uci(move)
+    assert board.is_repetition(3) or board.is_fifty_moves()
+
+    report = EngineSearch(cpu_batches(BoardModel()), leaves).search(board, simulations=200)
+    assert report.line[0] in board.legal_moves and report.simulations > 1

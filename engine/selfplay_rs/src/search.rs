@@ -347,7 +347,12 @@ impl Tree {
 
             let mut legal_moves = board.legal_moves();
             let node_tables = tables.filter(|_| node != 0 && (!root_covered || board.halfmoves() == 0));
-            let game_over = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?;
+            //the root is searched whatever the rules say of it: Searches.start refuses only a mate or stalemate
+            let game_over = if node == 0 {
+                None
+            } else {
+                game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?
+            };
             //a repeat inside the search is a draw, but not a proven one: the game need not repeat (lc0 gives two-fold
             //draws no bounds either)
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
@@ -356,7 +361,7 @@ impl Tree {
 
             simulations += 1;
             if let Some(value) = value {
-                //the root is never proven: start refuses a root whose game is over, and the tables skip it
+                //the root is never proven: the rules and the tables never score it
                 if let Some(result) = game_over
                     && settings.certainty
                     && node != 0
