@@ -499,6 +499,16 @@ impl Searches {
         Ok((search.tree.root().visit_count, most, second))
     }
 
+    //the score a running search would report now (report's), for a clock that compares it with the last search's
+    fn root_score(&self, id: u64) -> PyResult<f64> {
+        let search = self.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+        let tree = &search.tree;
+        Ok(match tree.principal_variation().first().and_then(|&edge| tree.child(edge)) {
+            Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
+            _ => 1.0 - tree.root().mean_score(),
+        })
+    }
+
     //a new game under the id (uci's ucinewgame): its first search starts a fresh tree, and the network's answers are
     //forgotten, as lc0 forgets them
     fn new_game(&mut self, id: u64) {

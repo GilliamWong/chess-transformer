@@ -151,8 +151,9 @@ def test_common_opponent_elo():
 
 
 def test_variant_settings():
-    settings = variant_settings("c_puct=1.2,planned_moves=30,smart_pruning=0", False)
-    assert settings["c_puct"] == 1.2 and settings["planned_moves"] == 30 and type(settings["planned_moves"]) is int
+    settings = variant_settings("c_puct=1.2,least_moves_left=8,moves_per_man=1.2,smart_pruning=0", False)
+    assert settings["c_puct"] == 1.2 and settings["least_moves_left"] == 8 and type(settings["least_moves_left"]) is int
+    assert settings["moves_per_man"] == 1.2
     assert settings["smart_pruning"] == 0.0
     with pytest.raises(ValueError):
         variant_settings("cpuct=1.2", False)

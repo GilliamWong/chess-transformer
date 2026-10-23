@@ -269,78 +269,108 @@ def test_go_limits():
     assert clock.limits(["infinite"], black, 800) == (800, None)
 
     nodes, seconds = clock.limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), black, 800)
-    assert nodes is None and seconds == pytest.approx(clock.seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 1))
-    assert 0.5 < seconds < 30 * MOST_OF_THE_TIME_LEFT
+    assert nodes is None and seconds == pytest.approx(Clock().seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 32))
+    assert 0.5 < seconds < 30 - RESERVE_SECONDS
 
 
-#a search stopped early (smart pruning) leaves time on the clock, and the next moves get it; a movetime search is not
-#on the clock
-def test_time_saved_goes_to_later_moves():
+#the start position with pieces taken off, the kings kept, until `men` are left
+def board_with_men(men: int) -> chess.Board:
+    board = chess.Board()
+    for square in [square for square in chess.SQUARES if board.piece_type_at(square) not in (None, chess.KING)][:32 - men]:
+        board.remove_piece_at(square)
+    return board
+
+
+#what a search is given and does not use (smart pruning stopped it early) is banked, and the next move gets all of it;
+#a movetime search is not on the clock, and no move gets the reserve
+def test_unused_time_goes_to_the_next_move():
     clock, board = Clock(), chess.Board()
     _, first = clock.limits("wtime 60000 btime 60000".split(), board, 800)
-    clock.searched(first / 2)
-    _, later = clock.limits("wtime 59000 btime 60000".split(), board, 800)
+    clock.searched(first / 2, 0)
+    _, second = clock.limits("wtime 59000 btime 60000".split(), board, 800)
     _, without_saving = Clock().limits("wtime 59000 btime 60000".split(), board, 800)
-    assert later > 1.05 * without_saving
+    assert second == pytest.approx(clock.share + first / 2) and second > 1.4 * without_saving
 
-    clock.searched(later / 4)
-    _, after_more_saving = clock.limits("wtime 58000 btime 60000".split(), board, 800)
-    assert after_more_saving > later
+    #a search that takes all it is given leaves the bank empty
+    clock.searched(second, 0)
+    _, third = clock.limits("wtime 58000 btime 60000".split(), board, 800)
+    assert third == pytest.approx(Clock().limits("wtime 58000 btime 60000".split(), board, 800)[1])
+
+    clock.searched(third / 4, 0)
     clock.limits("movetime 1000".split(), board, 800)
-    clock.searched(0.1)
-    assert clock.limits("wtime 58000 btime 60000".split(), board, 800)[1] == pytest.approx(after_more_saving)
-    for _ in range(50):
-        clock.searched(0.0)
-    assert clock.limits("wtime 3000 btime 60000".split(), board, 800)[1] <= 3 * MOST_OF_THE_TIME_LEFT
+    clock.searched(0.1, 0)
+    assert clock.saved == pytest.approx(3 / 4 * third)
+    assert clock.limits("wtime 1500 btime 60000".split(), board, 800)[1] == pytest.approx(1.5 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS)
 
 
-#at 60+0.6 the time is planned to last to about move 50, as lc0 spends its clock, and later moves live on the
-#increment: searches that take all they are given keep the opening's pace through the middle game, have the clock low
-#by move 60 (an even share over 30 more moves still had ~11 s there) and never run it below the reserve
-def test_the_clock_is_spent_by_about_move_50_and_never_runs_out():
-    clock, board, left, spent, low = Clock(), chess.Board(), 60.0, {}, 60.0
+#a game at 60+0.6 losing material as the games against BT4 do (16 men by move 40, 10 by 60, 6 by 85), every search
+#taking all it is given: the middlegame moves get more than the opening's, the late middlegame starts with time to
+#spend, the endgame lives on the increment, and the clock never runs below the reserve
+def test_the_clock_follows_the_material_and_never_runs_out():
+    points = [(1, 32), (15, 32), (40, 16), (60, 10), (85, 6), (120, 6)]
+    men_at = lambda move: next(round(men + (later_men - men) * (move - start) / (end - start))
+                               for (start, men), (end, later_men) in zip(points, points[1:]) if start <= move <= end)
+    clock, left, spent, low, late_middlegame_left = Clock(), 60.0, {}, 60.0, None
     for move in range(1, 121):
-        board.fullmove_number = move
-        _, seconds = clock.limits(f"wtime {round(left * 1000)} btime 60000 winc 600 binc 600".split(), board, 800)
-        clock.searched(seconds)
+        men = men_at(move)
+        if men <= 15 and late_middlegame_left is None:
+            late_middlegame_left = left
+        _, seconds = clock.limits(f"wtime {round(left * 1000)} btime 60000 winc 600 binc 600".split(), board_with_men(men), 800)
+        clock.searched(seconds, 0)
         left += 0.6 - seconds - MOVE_OVERHEAD_SECONDS
-        spent[move], low = seconds, min(low, left)
-        if move == 60:
-            left_at_60 = left
-    opening, middle_game = sum(spent[m] for m in range(1, 11)) / 10, sum(spent[m] for m in range(20, 40)) / 20
-    assert middle_game > 0.9 * opening
-    assert left_at_60 < 5 and low > RESERVE_SECONDS / 2
+        spent.setdefault("opening" if men >= 26 else "middle game" if men >= 16 else "late", []).append(seconds)
+        low = min(low, left)
+    #the last 30 moves are at 6 men
+    opening, middle_game, endgame = (sum(moves) / len(moves) for moves in (spent["opening"], spent["middle game"], spent["late"][-30:]))
+    assert middle_game > 1.1 * opening and endgame < 0.7
+    assert late_middlegame_left > 12 and low > RESERVE_SECONDS / 2
 
 
-#a clock planned to last to an earlier move spends more on the moves before it, and a move's cap is the part of the
-#time left given
+#a clock planned over fewer moves a man spends more now, and a move's cap is the part of the time left given
 def test_a_clocks_plan_and_cap_can_be_set():
     board = chess.Board()
-    board.fullmove_number = 10
     arguments = "wtime 60000 btime 60000 winc 600 binc 600".split()
-    assert Clock(planned_moves=30).limits(arguments, board, 800)[1] > 1.5 * Clock().limits(arguments, board, 800)[1]
+    assert Clock(moves_per_man=1.0).limits(arguments, board, 800)[1] > 1.25 * Clock().limits(arguments, board, 800)[1]
     assert Clock(most_of_the_time_left=0.01).limits(arguments, board, 800)[1] == pytest.approx((60 - MOVE_OVERHEAD_SECONDS) * 0.01)
     #late in the game the least moves left and the reserve decide the share
-    board.fullmove_number = 70
+    board = board_with_men(4)
     arguments = "wtime 10000 btime 10000 winc 600 binc 600".split()
     assert Clock(least_moves_left=8, reserve_seconds=0.0).limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS) / 8 + 0.6)
     assert Clock().limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS) / 10 + 0.6)
 
 
-#ucinewgame starts a fresh clock: searches that used little of their time make the clock give later moves more (the
-#8th move here gets over twice the first's), but the next game's first move gets what the first game's did
+#ucinewgame starts a fresh clock: searches that used little of their time bank it for later moves (the 8th move here
+#gets over twice the first's), but the next game's first move gets what the first game's did. A search after the first
+#may run on if its score falls below the last one's
 def test_a_new_game_starts_a_fresh_clock(monkeypatch):
     given = []
     class Player:
-        def search(self, board, nodes, seconds):
-            given.append(seconds)
+        def search(self, board, nodes, seconds, extension):
+            given.append((seconds, extension))
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     go = ["position startpos", "go wtime 60000 btime 60000 winc 600 binc 600"]
     monkeypatch.setattr(uci, "load_player", lambda *arguments: Player())
     monkeypatch.setattr(uci, "send", lambda line: None)
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(["uci", "isready", *go * 8, "ucinewgame", *go, "quit"])))
     uci.main(Path("unused.pt"), selection="mcts")
-    assert given[7] > 2 * given[0] and given[8] == given[0]
+    seconds = [move_seconds for move_seconds, _ in given]
+    assert seconds[7] > 2 * seconds[0] and seconds[8] == seconds[0]
+    assert given[0][1] is None and given[8][1] is None
+    last_score, extra = given[1][1]
+    assert last_score == 0 and extra > 0
+
+
+#a search on the clock whose score has fallen FALL_FULL_CP below the last search's runs on past its deadline by all of
+#its extension's seconds, once; one whose score held stops at its deadline
+def test_a_falling_score_runs_the_search_on():
+    search = EngineSearch(cpu_batches(UniformModel()), 16)
+    timed = {}
+    for last_score in (0, engine_search.FALL_FULL_CP):
+        started = time.perf_counter()
+        search.search(chess.Board(), seconds=0.1, extension=(last_score, 0.3))
+        timed[last_score] = time.perf_counter() - started
+    assert timed[0] < 0.1 + 0.1
+    assert 0.1 + 0.25 < timed[engine_search.FALL_FULL_CP] < 0.1 + 0.3 + 0.15
 
 
 #smart pruning stops once the simulations left could not change the most visited move: a mate in one is decided when
@@ -443,20 +473,21 @@ def test_the_engine_keeps_to_gos_limits(tmp_path):
         seconds = time.perf_counter() - started
         other = chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1")
         counted = engine.play(other, chess.engine.Limit(nodes=50), info=chess.engine.INFO_BASIC)
-        #on a 10+0.1 clock the first move gets ~0.28 s and move 40 ~1 s: the time is planned to last to about move 50
+        #on a 10+0.1 clock the first move gets ~0.27 s and a 9 man endgame ~1 s: the time is planned over the moves the
+        #material has left. A game of their own (ucinewgame), so the last search's score is the first move's
         clock = chess.engine.Limit(white_clock=10, black_clock=10, white_inc=0.1, black_inc=0.1)
         started = time.perf_counter()
-        engine.play(board, clock)
+        engine.play(board, clock, game="clock")
         first_move = time.perf_counter() - started
         started = time.perf_counter()
-        engine.play(chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 40"), clock)
-        move_40 = time.perf_counter() - started
+        engine.play(chess.Board("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 40"), clock, game="clock")
+        endgame_move = time.perf_counter() - started
     finally:
         engine.quit()
 
     assert timed.move in board.legal_moves and timed.info["nodes"] > 10 and 0.3 < seconds < 0.5 + 0.1
     assert counted.info["nodes"] == 50
-    assert first_move < 0.5 and 0.8 < move_40 < 1.3
+    assert first_move < 0.5 and 0.8 < endgame_move < 1.3
 
 
 #Searches' search of board to its simulations, one leaf a round; its report (id, line, score, root moves, visits)

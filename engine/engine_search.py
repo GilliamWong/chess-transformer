@@ -15,7 +15,7 @@ import torch
 from model.encoding import TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
 from engine.inference import ExactSizeCompiled, GraphedBatches, fp16_model, int8_model, small_graph_sizes
-from engine.player import ROOT_MOVES_REPORTED, SearchReport
+from engine.player import ROOT_MOVES_REPORTED, SearchReport, score_to_centipawns
 from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, ranked_moves, ranked_pieces, wdl_score
 
 #leaves a round (lc0's minibatch), and its descents that may end on a leaf already waiting before it stops gathering.
@@ -41,6 +41,10 @@ ROUND_TIMES = 31
 #1.33, betting that the second move cannot get all of them; 1 never changes the move of a search with a number of
 #simulations, and with a deadline only when the recent speed misjudges the simulations left
 SMART_PRUNING_FACTOR = 1.0
+#a search on the clock whose score has fallen more than FALL_START_CP below the last search's runs on when it would
+#stop, by all the time its clock lets it add at a fall of FALL_FULL_CP: our mistakes cluster after our eval falls
+FALL_START_CP = 10
+FALL_FULL_CP = 30
 #rounds whose speed estimates the simulations a deadline leaves
 SPEED_ROUNDS = 8
 #the network's answers kept by position (search.rs Cache), ~260 bytes each (1.3 GB): replaying 6 tournament games, 4M
@@ -129,8 +133,10 @@ class EngineSearch:
         self.searches.new_game(GAME)
 
     #searches until `simulations` (counting those of a reused tree, as lc0's go nodes does) or until `seconds` have
-    #passed, whichever comes first; at least one of the two
-    def search(self, board: chess.Board, simulations: int | None = None, seconds: float | None = None) -> SearchReport:
+    #passed, whichever comes first; at least one of the two. extension: (the last search's score in centipawns, the
+    #seconds this one may add) for a search on the clock whose score falls (FALL_START_CP)
+    def search(self, board: chess.Board, simulations: int | None = None, seconds: float | None = None,
+               extension: tuple[int, float] | None = None) -> SearchReport:
         if simulations is None and seconds is None:
             raise ValueError("a search needs a number of simulations or a time")
         started = time.perf_counter()
@@ -141,6 +147,8 @@ class EngineSearch:
 
         self.searches.start(GAME, board.root().fen(), [move.uci() for move in board.move_stack], UNLIMITED if simulations is None else simulations)
         deadline = started + seconds if seconds is not None else None
+        if deadline is None:
+            extension = None
         only_move = board.legal_moves.count() == 1
         #launched rounds, oldest first, as (the launch, None for a round without leaves, and when it was launched)
         rounds: deque = deque()
@@ -154,6 +162,11 @@ class EngineSearch:
                 #on lanes of their own run at once and come back about together, so it comes a round time after the newest
                 round_times = max(len(rounds), 1) if self.rounds_at_once else len(rounds) + 1
                 if gathered and deadline is not None and time.perf_counter() + round_times * self.round_seconds >= deadline:
+                    #once: a search whose score has fallen runs on
+                    if extension is not None:
+                        deadline += self.extra_for_fall(extension)
+                        extension = None
+                        continue
                     stopping = True
                     report = self.searches.stop(GAME)
                     continue
@@ -185,13 +198,28 @@ class EngineSearch:
                 visits, most, second = self.searches.root_visits(GAME)
                 progress.append((time.perf_counter(), visits))
                 decided = most - second > self.simulations_left(simulations, deadline, progress) / SMART_PRUNING_FACTOR
-                if only_move or decided or (self.certainty and self.searches.decided(GAME)):
+                proven = self.certainty and self.searches.decided(GAME)
+                #once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
+                extra = 0.0
+                if decided and not (only_move or proven) and extension is not None:
+                    extra, extension = self.extra_for_fall(extension), None
+                if extra > 0:
+                    deadline += extra
+                elif only_move or decided or proven:
                     stopping = True
                     report = self.searches.stop(GAME)
 
         _, line, score, root_moves, visits = report
         return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
                             [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]])
+
+    #the seconds a search may run on: all of its extension's at a fall of FALL_FULL_CP below the last search's score, none
+    #at FALL_START_CP or less (the score as the report gives it, on the network's own scale)
+    def extra_for_fall(self, extension: tuple[int, float]) -> float:
+        last, seconds = extension
+        fall = last - score_to_centipawns(sharpen(self.searches.root_score(GAME), 1 / self.value_sharpness))
+        share = min(1.0, max(0.0, (fall - FALL_START_CP) / (FALL_FULL_CP - FALL_START_CP)))
+        return share * seconds
 
     #the next round's leaves, and the rounds out at once: one until a round takes all of them
     def round_leaves(self, simulations: int | None) -> tuple[int, int]:

@@ -28,19 +28,24 @@ DEVICE = torch.device("cpu")
 MOVE_OVERHEAD_SECONDS = 0.02
 #go's arguments that take a number
 GO_NUMBERS = ("wtime", "btime", "winc", "binc", "movestogo", "movetime", "nodes", "depth", "mate")
-#with wtime/btime and no movestogo, the time left is planned to last to about this move, and later moves live on the
-#increment: lc0's smooth time manager has its clock nearly spent by move ~55 at 60+0.6, while an even share over 30
-#more moves kept ~13 s unspent there (artifacts/bt4_tournament_match_20260928)
-PLANNED_MOVES = 50
+#with wtime/btime and no movestogo, the time left is planned over the moves the game still has, this many a man above
+#the two kings: the plan follows the material rather than a move number
+MOVES_PER_MAN = 1.5
 #the fewest moves the time left is shared over, so the last of it goes gradually
 LEAST_MOVES_LEFT = 10
+#a move's weight in the plan by the men on the board, kings included, as (fewest, most, weight): the middlegame gets more
+PHASE_WEIGHTS = ((26, 32, 0.85), (16, 25, 1.25), (10, 15, 1.0), (3, 9, 0.8))
 #kept back from the time left, for a search that runs over
 RESERVE_SECONDS = 1.0
-#a move gets at most this part of the time left
-MOST_OF_THE_TIME_LEFT = 1 / 5
-#Clock's time use: how much the last search moves it, and the least it can be
-TIME_USE_WEIGHT = 0.2
-LEAST_TIME_USE = 0.3
+#a move gets at most this part of the time left, and never the reserve: no cap, as in lc0
+MOST_OF_THE_TIME_LEFT = 1.0
+#a search whose score falls below the last one's may run on (engine_search.py FALL_START_CP) by up to this many of its
+#move's shares, never past this part of the time left
+MOST_EXTENSION = 2.0
+MOST_OF_THE_TIME_LEFT_EXTENDED = 1 / 3
+
+def phase_weight(men: int) -> float:
+    return next((weight for fewest, most, weight in PHASE_WEIGHTS if fewest <= men <= most), 1.0)
 
 def send(line: str) -> None:
     #flushed: the gui reads a pipe, not a terminal
@@ -74,44 +79,63 @@ def info_line(report: SearchReport, seconds: float) -> str:
     return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {round(report.simulations / max(seconds, 1e-3))} "
             f"score cp {score_to_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
 
-#go's limits for the search, and on a clock (wtime/btime) the time a move gets: an even share of the time left (less a
-#reserve) over the moves still to play to about move PLANNED_MOVES, plus the increment, divided by the part of their
-#time the last searches used. A search smart pruning stops early leaves time on the clock, and so it goes to the moves
-#that need it (lc0's smooth time manager does the same). The arguments are the constants above of the same names, for
+#go's limits for the search, and on a clock (wtime/btime) the time a move gets: its weighted share of the time left (less
+#the reserve and the bank) over the moves still to play, plus the increment, plus the bank: the time earlier searches
+#were given and did not use (smart pruning stops some early), as lc0's legacy time manager spends it. A search whose
+#score falls may run on (extension). The arguments are the constants above of the same names, for
 #tools/play/variant_match.py to tune
 class Clock:
-    def __init__(self, planned_moves: int = PLANNED_MOVES, least_moves_left: int = LEAST_MOVES_LEFT, reserve_seconds: float = RESERVE_SECONDS,
+    def __init__(self, moves_per_man: float = MOVES_PER_MAN, least_moves_left: int = LEAST_MOVES_LEFT, reserve_seconds: float = RESERVE_SECONDS,
                  most_of_the_time_left: float = MOST_OF_THE_TIME_LEFT):
-        self.planned_moves, self.least_moves_left = planned_moves, least_moves_left
+        self.moves_per_man, self.least_moves_left = moves_per_man, least_moves_left
         self.reserve_seconds, self.most_of_the_time_left = reserve_seconds, most_of_the_time_left
-        self.time_use = 1.0 #the searches' seconds over the seconds they were given, lately
+        self.saved = 0.0 #the seconds earlier searches were given and did not use
         self.allotted: float | None = None #the seconds the search on the clock was given
+        self.share = 0.0 #its move's share of the time left
+        self.last_score: int | None = None #the last search's score, centipawns for us
+        #(the last search's score, the seconds this search may add if its score falls below it), None off the clock
+        self.extension: tuple[int, float] | None = None
 
     #(simulations, seconds) for a search of `board`, each None when go does not set it; a go with neither runs `simulations`
     def limits(self, arguments: list[str], board: chess.Board, simulations: int) -> tuple[int | None, float | None]:
         numbers = {key: int(value) for key, value in zip(arguments, arguments[1:]) if key in GO_NUMBERS}
         time_left, increment = ("wtime", "winc") if board.turn == chess.WHITE else ("btime", "binc")
-        seconds = self.allotted = None
+        seconds = self.allotted = self.extension = None
         if "movetime" in numbers:
             seconds = max(0.0, numbers["movetime"] / 1000 - MOVE_OVERHEAD_SECONDS)
         elif time_left in numbers:
             seconds_left = numbers[time_left] / 1000 - MOVE_OVERHEAD_SECONDS
-            seconds = self.allotted = self.seconds_for_move(seconds_left, numbers.get(increment, 0) / 1000, numbers.get("movestogo"), board.fullmove_number)
+            seconds = self.allotted = self.seconds_for_move(seconds_left, numbers.get(increment, 0) / 1000, numbers.get("movestogo"),
+                                                            chess.popcount(board.occupied))
+            if self.last_score is not None:
+                self.extension = (self.last_score, self.extra_seconds(seconds_left))
         nodes = numbers.get("nodes")
         if nodes is None and seconds is None:
             nodes = simulations
         return nodes, seconds
 
-    def seconds_for_move(self, time_left: float, increment: float, moves_to_go: int | None, move_number: int) -> float:
-        moves_left = moves_to_go or max(self.least_moves_left, self.planned_moves - move_number)
-        share = max(0.0, time_left - self.reserve_seconds) / moves_left + increment
-        return max(0.0, min(share / self.time_use, time_left * self.most_of_the_time_left))
+    def seconds_for_move(self, time_left: float, increment: float, moves_to_go: int | None, men: int) -> float:
+        spare = max(0.0, time_left - self.reserve_seconds)
+        self.saved = min(self.saved, spare)
+        #the bank goes into this move, so the moves after are planned without it
+        weight = 1.0 if moves_to_go else phase_weight(men)
+        weighted_left = moves_to_go or max(self.least_moves_left * weight, sum(self.moves_per_man * phase_weight(k) for k in range(3, men + 1)))
+        share = self.share = (spare - self.saved) * weight / weighted_left + increment
+        seconds = max(0.0, min(share + self.saved, spare, time_left * self.most_of_the_time_left))
+        #the bank pays for what the move gets beyond its share
+        self.saved -= max(0.0, seconds - share)
+        return seconds
 
-    #after a search, the seconds it took
-    def searched(self, seconds: float) -> None:
+    #the seconds a search whose score falls may add: MOST_EXTENSION shares, never past MOST_OF_THE_TIME_LEFT_EXTENDED of
+    #the time left
+    def extra_seconds(self, time_left: float) -> float:
+        return max(0.0, min(MOST_EXTENSION * self.share, (time_left - self.reserve_seconds) * MOST_OF_THE_TIME_LEFT_EXTENDED - (self.allotted or 0.0)))
+
+    #after a search, the seconds it took and its score (centipawns for us); what it did not use goes to the bank
+    def searched(self, seconds: float, score: int) -> None:
         if self.allotted:
-            used = min(1.0, seconds / self.allotted)
-            self.time_use = max(LEAST_TIME_USE, (1 - TIME_USE_WEIGHT) * self.time_use + TIME_USE_WEIGHT * used)
+            self.saved = max(0.0, self.saved + self.allotted - seconds)
+        self.last_score = score
 
 #a file per process, so engines playing side by side never share one. evaluate_elo writes them into the pgn
 def log_search(log_folder: Path, board: chess.Board, move: chess.Move, report: SearchReport) -> None:
@@ -191,8 +215,8 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
                     player = load_player(checkpoint_path, selection, gpu, leaves, tablebase, search_options, precision)
                 if selection == "mcts":
                     nodes, seconds = clock.limits(arguments, board, simulations)
-                    report = player.search(board, nodes, seconds)
-                    clock.searched(time.perf_counter() - started)
+                    report = player.search(board, nodes, seconds, clock.extension)
+                    clock.searched(time.perf_counter() - started, score_to_centipawns(report.score))
                     move = report.line[0]
                     send(info_line(report, time.perf_counter() - started))
                     if search_log is not None:
