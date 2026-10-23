@@ -221,15 +221,15 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
     flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
     try:
         with torch.no_grad():
-            logits, value_logits = fp16_model(tmp_path / "model.pt")(boards)
+            rows = fp16_model(tmp_path / "model.pt")(boards)
             expected_logits, expected_value_logits = model.cuda()(boards)
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
-    assert torch.isfinite(logits).all() and torch.isfinite(value_logits).all()
-    policy_distance = 0.5 * (torch.softmax(logits.float(), dim=-1) - torch.softmax(expected_logits, dim=-1)).abs().sum(dim=-1)
+    assert torch.isfinite(rows).all()
+    policy_distance = 0.5 * (torch.softmax(rows[:, :-1], dim=-1) - torch.softmax(expected_logits, dim=-1)).abs().sum(dim=-1)
     assert policy_distance.max() < 0.01
-    assert torch.allclose(expected_score(value_logits.float()), expected_score(expected_value_logits), atol=0.01)
+    assert torch.allclose(rows[:, -1], expected_score(expected_value_logits), atol=0.01)
 
 
 #the input embedding that every fused block reads, made by one kernel, is the model's: each token's embedding and
@@ -289,6 +289,44 @@ def test_the_input_embedding_finds_the_feature_rows_of_square_features():
     assert torch.equal(found, expected)
 
 
+#fused_blocks.heads, the heads after the last block in three kernels, give the model's heads on the stream to fp32's
+#rounding when fp16 holds the weights of their one fp16 matmul exactly (fused_blocks.head_weights; their rounding is the
+#only other error): the move logits with the promotions' and the expected score, of 16 bins and of the older head's
+#one. On one board, a few and more than a program of the eval head takes (an odd number, its matmul's programs taking
+#two boards), with each width of the matmul's tiles
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("value_bins", [16, 1])
+@pytest.mark.parametrize("boards", [1, 5, 71])
+def test_the_fused_heads_compute_the_models_heads(value_bins, boards):
+    from model.fused_blocks import FusedTransformer
+    torch.manual_seed(0)
+    d = 64
+    model = ChessTransformer(d_model=d, num_layers=1, n_heads=2, value_bins=value_bins).cuda().eval()
+    with torch.no_grad():
+        #sixteenths and gains of powers of two, so that fp16 holds the matmul's weights
+        model.from_projection.weight.copy_(torch.randint(-2, 3, (d, d)) / 16)
+        model.to_projection.weight.copy_(torch.randint(-2, 3, (d, d)) / 16)
+        model.ln.weight.copy_(2.0 ** torch.randint(-1, 2, (d,)))
+    model.half_except_heads(torch.float16)
+    stream = torch.randn(boards, TOKENS_PER_BOARD, d, device="cuda").half()
+    fused = FusedTransformer(model)
+
+    with torch.no_grad():
+        rows = fused.answers(stream)
+        y = F.rms_norm(stream.double(), (d,), model.ln.weight.double(), model.ln.eps)
+        linear = lambda layer, x: F.linear(x, layer.weight.double(), layer.bias.double())
+        squares = y[:, :NUM_SQUARES]
+        logits = linear(model.from_projection, squares) @ linear(model.to_projection, squares).transpose(1, 2) / math.sqrt(d)
+        logits = logits[:, model.from_squares, model.to_squares]
+        logits[:, model.promotion_move_ids] += linear(model.promotion_projection, squares)[:, model.promotion_to_squares, model.promotion_pieces]
+        compressed = F.gelu(linear(model.board_down_project[0], y)).reshape(boards, -1)
+        value_logits = linear(model.eval_head[2], F.gelu(linear(model.eval_head[0], compressed)))
+
+    assert rows.shape == (boards, logits.shape[1] + 1)
+    assert torch.allclose(rows[:, :-1].double(), logits, rtol=1e-5, atol=1e-5)
+    assert torch.allclose(rows[:, -1], expected_score(value_logits), rtol=1e-5, atol=1e-6)
+
+
 #programmatic dependent launch only from sm_90: a kernel built for older gpus (hyak's A100s and A40s) with griddepcontrol
 #does not compile
 @pytest.mark.parametrize("capability", [(8, 6), (9, 0)])
@@ -335,9 +373,9 @@ def test_downs_mix_the_inputs_of_neighbours_of_one_kind():
 
 
 #fused_blocks.FusedBlock must compute what model.TransformerBlock does, InputEmbedding what the model's embedding does
-#and FusedTransformer's one matmul what the heads do: with random templates and square features (zeros at init would
-#hide them), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the kernel), and the
-#input skip away from its start. In fp32, and in fp16 as the engine runs it (fp16_model)
+#and FusedTransformer's heads (its answer rows) what the heads do: with random templates and square features (zeros at
+#init would hide them), grouped key/value heads and query/key widths of 8, 16 and 24 (padded to 16 and 32 in the
+#kernel), and the input skip away from its start. In fp32, and in fp16 as the engine runs it (fp16_model)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 @pytest.mark.parametrize("fp16", [False, True])
 def test_fused_blocks_compute_what_the_model_does(tmp_path, fp16):
@@ -362,13 +400,13 @@ def test_fused_blocks_compute_what_the_model_does(tmp_path, fp16):
         with torch.no_grad():
             logits, value_logits = model(boards)
             fused = fp16_model(tmp_path / "model.pt") if fp16 else FusedTransformer(copy.deepcopy(model))
-            fused_logits, fused_value_logits = fused(boards)
+            rows = fused(boards)
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
-    assert torch.allclose(fused_logits.float(), logits, atol=1e-2)
-    assert torch.equal(fused_logits.argmax(-1), logits.argmax(-1))
-    assert torch.allclose(expected_score(fused_value_logits.float()), expected_score(value_logits), atol=1e-3)
+    assert torch.allclose(rows[:, :-1], logits, atol=1e-2)
+    assert torch.equal(rows[:, :-1].argmax(-1), logits.argmax(-1))
+    assert torch.allclose(rows[:, -1], expected_score(value_logits), atol=1e-3)
 
 
 #fused_blocks.template_attention in fp16 as the engine runs it, against the attention in fp32 at the d768's shapes:

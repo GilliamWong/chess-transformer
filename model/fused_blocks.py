@@ -12,9 +12,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
+from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait
 
-from model.model import EDGE, KING, KNIGHT, NO_PIECE, NUM_SQUARES, PAWN, QUEEN, THEIRS, ChessTransformer, TransformerBlock
+from model.model import EDGE, KING, KNIGHT, NO_PIECE, NUM_SQUARES, PAWN, QUEEN, THEIRS, ChessTransformer, TransformerBlock, value_bin_edges
 
 #warps an attention instance has for each 64 of its square rows, and for its metadata rows
 SQUARE_WARPS, META_WARPS = 2, 2
@@ -491,51 +492,365 @@ class InputEmbedding(nn.Module):
                                self.features.table)
 
 
-#logits[i, j] = (W_f x_i + b_f) . (W_t x_j + b_t) / sqrt(d) = a_i . x_j + s_i: from and to as one d x d matmul (a)
-def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+#the heads after the last block in three kernels, from its stream to the engine's answer rows (a board's move logits,
+#then its expected score). With x a row of the stream, r its 1 / rms and g the final norm's gain, the normed row is
+#y = r g x: the heads fold g into their weights and r into their epilogues, and read the stream as it is (head_weights).
+#Their fp32 matmuls are fp16 tensor core matmuls of numbers split in two (split): Triton's fp32 ones ran at a few
+#percent of the gpu's fp32 rate
+#the narrow matmul's columns: board_down_project's, then a square's terms (s and t, a move's terms of its from and to
+#square, and the 4 promotion logits), padded
+NARROW_COLUMNS = 32
+DOWN_COLUMNS = 16
+#where the promotions' logits are among a square's terms, and where r is
+PROMOTION_TERM, R_TERM = 2, 6
+#per square, its terms and r, padded
+SQUARE_TERMS = 8
+#a number is split into its fp16 rounding and the rest times LO_SCALE, also fp16, which keeps the rest out of fp16's
+#subnormals: their products are exact in fp32, and the products of two rests are below fp32's rounding
+LO_SCALE = 2048.0
+#the metadata rows the narrow matmul takes after the squares, at least TOKENS_PER_BOARD - 64
+META_ROWS = 16
+#the stream's columns head_matmul_kernel reads at a time
+HEAD_DEPTH = 64
+#batches from which a program of head_matmul_kernel takes two boards, and its warps by boards
+PAIRED_BOARDS = 16
+HEAD_WARPS = {1: 4, 2: 8}
+#moves a program of head_answer_kernel writes
+MOVE_BLOCK = 256
+#the eval head's hidden units a program of head_answer_kernel takes, and the inputs it reads at a time
+VALUE_UNITS, VALUE_DEPTH = 16, 64
+
+
+#nn.GELU's erf form
+@triton.jit
+def gelu(x):
+    return 0.5 * x * (1 + libdevice.erf(x * 0.7071067811865476))
+
+
+#an fp32 tensor as fp16 hi + lo / LO_SCALE
+@triton.jit
+def split(x, LO_SCALE: tl.constexpr):
+    hi = x.to(tl.float16)
+    return hi, ((x - hi.to(tl.float32)) * LO_SCALE).to(tl.float16)
+
+
+#a board's part of a . x for every pair of squares from its acc (x A on the tile's columns) and its squares' sums of squares
+@triton.jit
+def head_partial(acc, squared, board_ptr, partials_ptr, ok, columns, D, eps, LO_SCALE: tl.constexpr):
+    squares = tl.arange(0, 64)
+    hi, lo = split(acc * tl.rsqrt(squared / D + eps)[:, None], LO_SCALE)
+    x = tl.trans(tl.load(board_ptr + squares[:, None] * D + columns[None, :], mask=ok, other=0.0).to(tl.float16))
+    tl.store(partials_ptr + squares[:, None] * 64 + squares[None, :], tl.dot(hi, x) + tl.dot(lo, x) * (1 / LO_SCALE), mask=ok)
+
+
+#A_COLUMNS of a = r x A on a board's squares (r from the squares' sums of squares, as they are read), and their part of
+#a . x for every pair of squares (head_partial). PAIR takes the next board too (if second_ok), on the same tiles of A
+@triton.jit
+def head_a_tile(board_ptr, a_ptr, partials_ptr, tile, D, eps, second_ok, board_stride, partial_stride, A_COLUMNS: tl.constexpr,
+                DEPTH: tl.constexpr, LO_SCALE: tl.constexpr, PAIR: tl.constexpr):
+    squares = tl.arange(0, 64)
+    depth = tl.arange(0, DEPTH)
+    columns = tile * A_COLUMNS + tl.arange(0, A_COLUMNS)
+    x_ptrs = board_ptr + squares[:, None] * D + depth[None, :]
+    a_ptrs = a_ptr + depth[:, None] * D + columns[None, :]
+    acc = tl.zeros((64, A_COLUMNS), dtype=tl.float32)
+    squared = tl.zeros((64,), dtype=tl.float32)
+    if PAIR:
+        second_ptrs = x_ptrs + board_stride
+        second_acc = tl.zeros((64, A_COLUMNS), dtype=tl.float32)
+        second_squared = tl.zeros((64,), dtype=tl.float32)
+    for _ in range(0, D, DEPTH):
+        a = tl.load(a_ptrs)
+        x = tl.load(x_ptrs).to(tl.float16)
+        acc = tl.dot(x, a, acc)
+        squared += tl.sum(x.to(tl.float32) * x.to(tl.float32), 1)
+        if PAIR:
+            y = tl.load(second_ptrs, mask=second_ok, other=0.0).to(tl.float16)
+            second_acc = tl.dot(y, a, second_acc)
+            second_squared += tl.sum(y.to(tl.float32) * y.to(tl.float32), 1)
+            second_ptrs += DEPTH
+        x_ptrs += DEPTH
+        a_ptrs += DEPTH * D
+    head_partial(acc, squared, board_ptr, partials_ptr, True, columns, D, eps, LO_SCALE)
+    if PAIR:
+        head_partial(second_acc, second_squared, board_ptr + board_stride, partials_ptr + partial_stride, second_ok, columns, D, eps, LO_SCALE)
+
+
+#rows of the stream times the narrow weights' COLUMNS from FIRST, and the rows' r
+@triton.jit
+def narrow_rows(row_ptrs, row_ok, narrow_hi_ptr, narrow_lo_ptr, D, eps, ROWS: tl.constexpr, FIRST: tl.constexpr, COLUMNS: tl.constexpr,
+                NARROW: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
+    depth = tl.arange(0, DEPTH)
+    weight_offsets = depth[:, None] * NARROW + FIRST + tl.arange(0, COLUMNS)[None, :]
+    hi_acc, lo_acc = tl.zeros((ROWS, COLUMNS), dtype=tl.float32), tl.zeros((ROWS, COLUMNS), dtype=tl.float32)
+    squared = tl.zeros((ROWS,), dtype=tl.float32)
+    for _ in range(0, D, DEPTH):
+        x = tl.load(row_ptrs, mask=row_ok[:, None], other=0.0).to(tl.float16)
+        hi_acc = tl.dot(x, tl.load(narrow_hi_ptr + weight_offsets), hi_acc)
+        lo_acc = tl.dot(x, tl.load(narrow_lo_ptr + weight_offsets), lo_acc)
+        squared += tl.sum(x.to(tl.float32) * x.to(tl.float32), 1)
+        row_ptrs += DEPTH
+        weight_offsets += DEPTH * NARROW
+    r = tl.rsqrt(squared / D + eps)
+    return r[:, None] * (hi_acc + lo_acc * (1 / LO_SCALE)), r
+
+
+#board_down_project's output for every token of a board
+@triton.jit
+def head_board_down(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, down_ptr, D, eps, T: tl.constexpr, META: tl.constexpr,
+                    NARROW: tl.constexpr, DOWN: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
+    squares, meta, columns = tl.arange(0, 64), 64 + tl.arange(0, META), tl.arange(0, DOWN)
+    depth = tl.arange(0, DEPTH)
+    bias = tl.load(narrow_bias_ptr + columns)[None, :]
+    square_down, _ = narrow_rows(board_ptr + squares[:, None] * D + depth[None, :], squares < 64, narrow_hi_ptr, narrow_lo_ptr, D, eps, 64, 0, DOWN,
+                                 NARROW, DEPTH, LO_SCALE)
+    meta_down, _ = narrow_rows(board_ptr + meta[:, None] * D + depth[None, :], meta < T, narrow_hi_ptr, narrow_lo_ptr, D, eps, META, 0, DOWN, NARROW,
+                               DEPTH, LO_SCALE)
+    tl.store(down_ptr + squares[:, None] * DOWN + columns[None, :], gelu(square_down + bias))
+    tl.store(down_ptr + meta[:, None] * DOWN + columns[None, :], gelu(meta_down + bias), mask=(meta < T)[:, None])
+
+
+#a board's square terms and r
+@triton.jit
+def head_square_terms(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, terms_ptr, D, eps, NARROW: tl.constexpr, DOWN: tl.constexpr,
+                      TERMS: tl.constexpr, R_TERM: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
+    squares, columns = tl.arange(0, 64), tl.arange(0, NARROW - DOWN)
+    depth = tl.arange(0, DEPTH)
+    terms, r = narrow_rows(board_ptr + squares[:, None] * D + depth[None, :], squares < 64, narrow_hi_ptr, narrow_lo_ptr, D, eps, 64, DOWN,
+                           NARROW - DOWN, NARROW, DEPTH, LO_SCALE)
+    terms += tl.load(narrow_bias_ptr + DOWN + columns)[None, :]
+    tl.store(terms_ptr + squares[:, None] * TERMS + columns[None, :], terms, mask=(columns < R_TERM)[None, :])
+    tl.store(terms_ptr + squares * TERMS + R_TERM, r)
+
+
+#program (tile, p) takes boards p * BOARDS on (BOARDS 1 or 2): every tile but the last two a's columns head_a_tile does
+#(partials, summed by head_answer_kernel), the last two the narrow matmul
+@triton.jit
+def head_matmul_kernel(x_ptr, a_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, partials_ptr, squares_ptr, board_down_ptr, B, D, eps,
+                       T: tl.constexpr, BOARDS: tl.constexpr, A_COLUMNS: tl.constexpr, DEPTH: tl.constexpr, NARROW: tl.constexpr,
+                       DOWN: tl.constexpr, TERMS: tl.constexpr, R_TERM: tl.constexpr, META: tl.constexpr, LO_SCALE: tl.constexpr,
+                       PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
+    tile, b = tl.program_id(0), tl.program_id(1) * BOARDS
+    a_tiles = tl.num_programs(0) - 2
+    if tile < a_tiles:
+        head_a_tile(x_ptr + b * T * D, a_ptr, partials_ptr + (b * a_tiles + tile) * 4096, tile, D, eps, b + 1 < B, T * D, a_tiles * 4096, A_COLUMNS,
+                    DEPTH, LO_SCALE, BOARDS == 2)
+    elif tile == a_tiles:
+        for i in tl.static_range(BOARDS):
+            if b + i < B:
+                head_board_down(x_ptr + (b + i) * T * D, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, board_down_ptr + (b + i) * T * DOWN, D, eps, T,
+                                META, NARROW, DOWN, DEPTH, LO_SCALE)
+    else:
+        for i in tl.static_range(BOARDS):
+            if b + i < B:
+                head_square_terms(x_ptr + (b + i) * T * D, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, squares_ptr + (b + i) * 64 * TERMS, D, eps,
+                                  NARROW, DOWN, TERMS, R_TERM, DEPTH, LO_SCALE)
+
+
+#BLOCK moves of a board from the first: r_t (a_f . x_t) + t_t + s_f, and the promotion's logit
+@triton.jit
+def head_moves(partials_ptr, terms_ptr, moves_ptr, rows_ptr, first, A_TILES: tl.constexpr, MOVES: tl.constexpr, BLOCK: tl.constexpr,
+               TERMS: tl.constexpr, R_TERM: tl.constexpr):
+    move = first + tl.arange(0, BLOCK)
+    move_ok = move < MOVES
+    #from * 64 + to, and the place of the promotion's logit among the board's square terms (-1 for none)
+    pair = tl.load(moves_ptr + move, mask=move_ok, other=0)
+    promotion = tl.load(moves_ptr + MOVES + move, mask=move_ok, other=-1)
+    product = tl.zeros((BLOCK,), dtype=tl.float32)
+    for tile in tl.static_range(A_TILES):
+        product += tl.load(partials_ptr + tile * 4096 + pair)
+    from_terms, to_terms = terms_ptr + pair // 64 * TERMS, terms_ptr + pair % 64 * TERMS
+    logit = tl.load(to_terms + R_TERM) * product + tl.load(to_terms + 1) + tl.load(from_terms)
+    logit += tl.load(terms_ptr + promotion, mask=promotion >= 0, other=0.0)
+    tl.store(rows_ptr + move, logit, mask=move_ok)
+
+
+#UNITS of the eval head's hidden layer for BOARDS boards (weights split: hidden and out, each hi then lo), and their part
+#of its output layer
+@triton.jit
+def head_value_tile(board_down_ptr, hidden_ptr, hidden_bias_ptr, out_ptr, value_partials_ptr, unit_tile, board_tile, B, INPUTS: tl.constexpr,
+                    HIDDEN: tl.constexpr, BINS: tl.constexpr, BLOCK_BINS: tl.constexpr, BOARDS: tl.constexpr, UNITS: tl.constexpr,
+                    DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
+    boards = board_tile * BOARDS + tl.arange(0, BOARDS)
+    board_ok = boards < B
+    units = unit_tile * UNITS + tl.arange(0, UNITS)
+    depth = tl.arange(0, DEPTH)
+    acc, rest = tl.zeros((BOARDS, UNITS), dtype=tl.float32), tl.zeros((BOARDS, UNITS), dtype=tl.float32)
+    for start in range(0, INPUTS, DEPTH):
+        inputs = start + depth
+        inputs_ok = inputs < INPUTS
+        down_hi, down_lo = split(tl.load(board_down_ptr + boards[:, None] * INPUTS + inputs[None, :], mask=board_ok[:, None] & inputs_ok[None, :],
+                                         other=0.0), LO_SCALE)
+        weights = hidden_ptr + units[None, :] * INPUTS + inputs[:, None]
+        weight_hi = tl.load(weights, mask=inputs_ok[:, None], other=0.0)
+        weight_lo = tl.load(weights + HIDDEN * INPUTS, mask=inputs_ok[:, None], other=0.0)
+        acc = tl.dot(down_hi, weight_hi, acc)
+        rest = tl.dot(down_lo, weight_hi, tl.dot(down_hi, weight_lo, rest))
+    hidden_hi, hidden_lo = split(gelu(acc + rest * (1 / LO_SCALE) + tl.load(hidden_bias_ptr + units)[None, :]), LO_SCALE)
+    bins = tl.arange(0, BLOCK_BINS)
+    weights = out_ptr + bins[None, :] * HIDDEN + units[:, None]
+    out_hi = tl.load(weights, mask=(bins < BINS)[None, :], other=0.0)
+    out_lo = tl.load(weights + BINS * HIDDEN, mask=(bins < BINS)[None, :], other=0.0)
+    value = tl.dot(hidden_hi, out_hi) + (tl.dot(hidden_lo, out_hi) + tl.dot(hidden_hi, out_lo)) * (1 / LO_SCALE)
+    tl.store(value_partials_ptr + (unit_tile * B + boards[:, None]) * BLOCK_BINS + bins[None, :], value, mask=board_ok[:, None])
+
+
+#programs 0 to boards * move programs - 1 each write MOVE_BLOCK moves of a board (head_moves), the rest each take a tile
+#of the eval head (head_value_tile: value_partials, summed by head_value_kernel)
+@triton.jit
+def head_answer_kernel(partials_ptr, squares_ptr, moves_ptr, board_down_ptr, hidden_ptr, hidden_bias_ptr, out_ptr, value_partials_ptr, rows_ptr, B,
+                       A_TILES: tl.constexpr, MOVES: tl.constexpr, MOVE_BLOCK: tl.constexpr, MOVE_PROGRAMS: tl.constexpr, TERMS: tl.constexpr,
+                       R_TERM: tl.constexpr, INPUTS: tl.constexpr, HIDDEN: tl.constexpr, BINS: tl.constexpr, BLOCK_BINS: tl.constexpr,
+                       BOARDS: tl.constexpr, UNITS: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr, PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
+    pid = tl.program_id(0)
+    if pid < B * MOVE_PROGRAMS:
+        b = pid // MOVE_PROGRAMS
+        head_moves(partials_ptr + b * A_TILES * 4096, squares_ptr + b * 64 * TERMS, moves_ptr, rows_ptr + b * (MOVES + 1), pid % MOVE_PROGRAMS * MOVE_BLOCK,
+                   A_TILES, MOVES, MOVE_BLOCK, TERMS, R_TERM)
+    else:
+        tile = pid - B * MOVE_PROGRAMS
+        board_tiles = tl.cdiv(B, BOARDS)
+        head_value_tile(board_down_ptr, hidden_ptr, hidden_bias_ptr, out_ptr, value_partials_ptr, tile // board_tiles, tile % board_tiles, B, INPUTS,
+                        HIDDEN, BINS, BLOCK_BINS, BOARDS, UNITS, DEPTH, LO_SCALE)
+
+
+#a board's expected score from the eval head's output (value_partials summed, then its bias): the bins' softmax times
+#their centres, or one bin's sigmoid (model.expected_score)
+@triton.jit
+def head_value_kernel(value_partials_ptr, out_bias_ptr, centres_ptr, rows_ptr, B, UNIT_TILES: tl.constexpr, BLOCK_TILES: tl.constexpr,
+                      MOVES: tl.constexpr, BINS: tl.constexpr, BLOCK_BINS: tl.constexpr, PDL: tl.constexpr):
+    dependent_launch_wait(PDL)
+    b = tl.program_id(0)
+    tiles, bins = tl.arange(0, BLOCK_TILES), tl.arange(0, BLOCK_BINS)
+    bin_ok = bins < BINS
+    partials = tl.load(value_partials_ptr + (tiles[:, None] * B + b) * BLOCK_BINS + bins[None, :], mask=(tiles < UNIT_TILES)[:, None], other=0.0)
+    value = tl.sum(partials, 0) + tl.load(out_bias_ptr + bins, mask=bin_ok, other=0.0)
+    if BINS == 1:
+        score = tl.sigmoid(tl.sum(tl.where(bins == 0, value, 0.0), 0))
+    else:
+        value = tl.where(bin_ok, value, float("-inf"))
+        exponent = libdevice.exp(value - tl.max(value, 0))
+        probability = exponent / tl.sum(exponent, 0)
+        score = tl.sum(probability * tl.load(centres_ptr + bins, mask=bin_ok, other=0.0), 0)
+    tl.store(rows_ptr + b * (MOVES + 1) + MOVES, score)
+
+
+#a's columns a program of head_matmul_kernel takes: fewer for fewer boards, so that a small batch runs on more
+#multiprocessors, more for more, so that fewer partials are written
+def head_a_columns(boards: int, d_model: int) -> int:
+    columns = 32 if boards <= 2 else 64 if boards <= 8 else 128
+    while d_model % columns:
+        columns //= 2
+    return columns
+
+
+#an opaque op for torch.compile, as linear. The stream B x T x d (fp16, or rounded to it) in, the answer rows out;
+#hidden and out are the eval head's two layers' weights split (2 x out_features x in_features)
+@torch.library.custom_op("chess::heads", mutates_args=())
+def heads(stream: torch.Tensor, a_weight: torch.Tensor, narrow_hi: torch.Tensor, narrow_lo: torch.Tensor, narrow_bias: torch.Tensor,
+          moves: torch.Tensor, hidden: torch.Tensor, hidden_bias: torch.Tensor, out: torch.Tensor, out_bias: torch.Tensor, centres: torch.Tensor,
+          eps: float) -> torch.Tensor:
+    stream = stream.contiguous()
+    B, T, D = stream.shape
+    move_count = moves.shape[1]
+    _, hidden_units, inputs = hidden.shape
+    bins = out.shape[1]
+    depth = HEAD_DEPTH if D % HEAD_DEPTH == 0 else HEAD_DEPTH // 2
+    if D % depth != 0 or hidden_units % VALUE_UNITS != 0:
+        raise ValueError(f"the fused heads read d_model {D} {depth} at a time and the eval head's {hidden_units} units {VALUE_UNITS} at a time")
+    a_columns = head_a_columns(B, D)
+    a_tiles = D // a_columns
+    block_bins, value_boards = max(16, triton.next_power_of_2(bins)), min(64, max(16, triton.next_power_of_2(B)))
+    unit_tiles, board_tiles = hidden_units // VALUE_UNITS, triton.cdiv(B, value_boards)
+    f32 = dict(device=stream.device, dtype=torch.float32)
+    partials, squares = torch.empty(B, a_tiles, 64, 64, **f32), torch.empty(B, 64, SQUARE_TERMS, **f32)
+    board_down, value_partials = torch.empty(B, inputs, **f32), torch.empty(unit_tiles, B, block_bins, **f32)
+    rows = torch.empty(B, move_count + 1, **f32)
+    launch = dependent_launch(stream.device)
+    boards_a_program = 2 if B >= PAIRED_BOARDS else 1
+    head_matmul_kernel[(a_tiles + 2, triton.cdiv(B, boards_a_program))](stream, a_weight, narrow_hi, narrow_lo, narrow_bias, partials, squares,
+                                                                        board_down, B, D, eps, T=T, BOARDS=boards_a_program, A_COLUMNS=a_columns,
+                                                                        DEPTH=depth, NARROW=NARROW_COLUMNS, DOWN=DOWN_COLUMNS, TERMS=SQUARE_TERMS,
+                                                                        R_TERM=R_TERM, META=META_ROWS, LO_SCALE=LO_SCALE,
+                                                                        num_warps=HEAD_WARPS[boards_a_program], **launch)
+    move_programs = triton.cdiv(move_count, MOVE_BLOCK)
+    head_answer_kernel[(B * move_programs + unit_tiles * board_tiles,)](
+        partials, squares, moves, board_down, hidden, hidden_bias, out, value_partials, rows, B, A_TILES=a_tiles, MOVES=move_count,
+        MOVE_BLOCK=MOVE_BLOCK, MOVE_PROGRAMS=move_programs, TERMS=SQUARE_TERMS, R_TERM=R_TERM, INPUTS=inputs, HIDDEN=hidden_units, BINS=bins, BLOCK_BINS=block_bins,
+        BOARDS=value_boards, UNITS=VALUE_UNITS, DEPTH=VALUE_DEPTH, LO_SCALE=LO_SCALE, num_warps=4, **launch)
+    head_value_kernel[(B,)](value_partials, out_bias, centres, rows, B, UNIT_TILES=unit_tiles, BLOCK_TILES=triton.next_power_of_2(unit_tiles),
+                            MOVES=move_count, BINS=bins, BLOCK_BINS=block_bins, num_warps=4, **launch)
+    return rows
+
+
+@heads.register_fake
+def _(stream, a_weight, narrow_hi, narrow_lo, narrow_bias, moves, hidden, hidden_bias, out, out_bias, centres, eps):
+    return stream.new_empty(stream.shape[0], moves.shape[1] + 1, dtype=torch.float32)
+
+
+#a weight as split gives it, hi then lo
+def split_weight(weight: torch.Tensor) -> torch.Tensor:
+    hi = weight.half()
+    return torch.stack([hi, ((weight.double() - hi.double()) * LO_SCALE).half()])
+
+
+#logits[f, t] = (W_f y_f + b_f) . (W_t y_t + b_t) / sqrt(d) = r_f r_t x_f A x_t + t_t + s_f for the normed rows y = r g x,
+#A = diag(g) W_f^T W_t diag(g) / sqrt(d) in fp16. The narrow weights (d x NARROW_COLUMNS, split) give board_down_project's
+#output, s_f = y_f . W_f^T b_t / sqrt(d) + b_f . b_t / sqrt(d), t_t = y_t . W_t^T b_f / sqrt(d) and the promotion logits
+def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.no_grad():
+        gain = model.ln.weight.double()
         from_weight, from_bias = model.from_projection.weight.double(), model.from_projection.bias.double()
         to_weight, to_bias = model.to_projection.weight.double(), model.to_projection.bias.double()
         promotion, down = model.promotion_projection, model.board_down_project[0]
         scale = 1 / math.sqrt(model.d_model)
-        narrow_weight = torch.cat([(to_bias @ from_weight)[None] * scale, promotion.weight.double(), down.weight.double()])
-        narrow_bias = torch.cat([(from_bias @ to_bias)[None] * scale, promotion.bias.double(), down.bias.double()])
-        return ((from_weight.T @ to_weight * scale).half(), (to_weight.T @ from_bias * scale).float(), narrow_weight.float(),
-                narrow_bias.float())
+        a = gain[:, None] * (from_weight.T @ to_weight * scale) * gain[None, :]
+        narrow = torch.cat([down.weight.double(), (to_bias @ from_weight)[None] * scale, (from_bias @ to_weight)[None] * scale,
+                            promotion.weight.double()])
+        narrow_bias = torch.cat([down.bias.double(), (from_bias @ to_bias)[None] * scale, torch.zeros(1, dtype=torch.float64, device=gain.device),
+                                 promotion.bias.double()])
+        padding = NARROW_COLUMNS - len(narrow)
+        narrow = F.pad(narrow * gain[None, :], (0, 0, 0, padding)).T.contiguous()
+        return a.half(), split_weight(narrow), F.pad(narrow_bias, (0, padding)).float()
 
 
-#ChessTransformer.forward with FusedBlocks and head_weights' matmuls, for inference: a change to it must be made here too
+#per move from * 64 + to, and the place of its promotion's logit among its board's square terms (-1 for none)
+def move_table(model: ChessTransformer) -> torch.Tensor:
+    promotions = torch.full_like(model.from_squares, -1)
+    promotions[model.promotion_move_ids] = model.promotion_to_squares * SQUARE_TERMS + PROMOTION_TERM + model.promotion_pieces
+    return torch.stack([model.from_squares * NUM_SQUARES + model.to_squares, promotions]).int()
+
+
+#ChessTransformer.forward with FusedBlocks and the heads' kernels, for inference: a change to it must be made here too.
+#It gives the answer rows (inference.answer_rows) rather than the model's logits
 class FusedTransformer(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
         self.d_model = model.d_model
         self.input_embedding = InputEmbedding(model)
-        self.templates, self.ln, self.loops = model.templates, model.ln, model.loops
+        self.templates, self.loops = model.templates, model.loops
         self.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
         link_input_mixes(list(self.encoder))
-        self.board_down_activation, self.eval_head = model.board_down_project[1], model.eval_head
-        for name in ("from_squares", "to_squares", "promotion_move_ids", "promotion_to_squares", "promotion_pieces"):
-            self.register_buffer(name, getattr(model, name))
-        self.a_weight, self.a_bias, self.narrow_weight, self.narrow_bias = (nn.Parameter(tensor, requires_grad=False) for tensor in head_weights(model))
-        promotions = model.promotion_projection.out_features
-        self.promotion_columns, self.down_columns = slice(1, 1 + promotions), slice(1 + promotions, None)
+        self.eps = model.ln.eps if model.ln.eps is not None else torch.finfo(torch.float32).eps
+        a_weight, narrow, narrow_bias = head_weights(model)
+        hidden, out = model.eval_head[0], model.eval_head[2]
+        edges = value_bin_edges(out.out_features, out.weight.device)
+        buffers = {"a_weight": a_weight, "narrow": narrow, "narrow_bias": narrow_bias, "moves": move_table(model), "hidden": split_weight(hidden.weight),
+                   "hidden_bias": hidden.bias.detach(), "out": split_weight(out.weight), "out_bias": out.bias.detach(), "centres": (edges[:-1] + edges[1:]) / 2}
+        for name, tensor in buffers.items():
+            self.register_buffer(name, tensor)
 
-    def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, board_state: torch.Tensor) -> torch.Tensor:
         embed_state = self.input_embedding(board_state)
         original_board_embed = embed_state
         for _ in range(self.loops):
             for block in self.encoder:
                 embed_state = block(embed_state, self.templates, original_board_embed)
-        model_output = self.ln(embed_state)
+        return self.answers(embed_state)
 
-        with torch.autocast(device_type=board_state.device.type, enabled=False):
-            #on every token: the metadata tokens' a is not needed, but slicing out the squares' would copy them
-            a = linear(model_output.half(), self.a_weight, self.a_bias, accumulate_fp32=True)
-            model_output = model_output.float()
-            narrow = F.linear(model_output, self.narrow_weight, self.narrow_bias) #B T: s, the promotion logits, board_down_project's
-            squares = narrow[:, :NUM_SQUARES]
-            logits = a[:, :NUM_SQUARES] @ model_output[:, :NUM_SQUARES].transpose(1, 2) + squares[..., :1]
-            combined_logits = logits[:, self.from_squares, self.to_squares]
-            combined_logits[:, self.promotion_move_ids] += squares[..., self.promotion_columns][:, self.promotion_to_squares, self.promotion_pieces]
-            compressed_board = self.board_down_activation(narrow[..., self.down_columns]).reshape(board_state.shape[0], -1)
-            return combined_logits, self.eval_head(compressed_board)
+    #the heads on the last block's stream
+    def answers(self, embed_state: torch.Tensor) -> torch.Tensor:
+        return heads(embed_state, self.a_weight, self.narrow[0], self.narrow[1], self.narrow_bias, self.moves, self.hidden, self.hidden_bias, self.out,
+                     self.out_bias, self.centres, self.eps)

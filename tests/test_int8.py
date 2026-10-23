@@ -174,7 +174,7 @@ def small_calibration(monkeypatch, tmp_path):
 #priors and score to int8's rounding, with the same top moves; the fp16 model is nearer
 @gpu
 def test_the_int8_model_computes_what_the_model_does(tmp_path, small_calibration):
-    from engine.inference import fp16_model, int8_model
+    from engine.inference import answer_rows, fp16_model, int8_model
     from model.int8_blocks import Int8Block
     model, boards = small_checkpoint(tmp_path)
     boards = boards.cuda()
@@ -183,36 +183,36 @@ def test_the_int8_model_computes_what_the_model_does(tmp_path, small_calibration
         with torch.no_grad():
             expected_logits, expected_values = model.cuda()(boards)
             int8 = int8_model(tmp_path / "model.pt", 0)
-            logits, values = int8(boards)
-            fp16_logits, _ = fp16_model(tmp_path / "model.pt")(boards)
+            rows = answer_rows(int8(boards))
+            fp16_rows = answer_rows(fp16_model(tmp_path / "model.pt")(boards))
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
     assert [isinstance(block, Int8Block) for block in int8.encoder] == [True, True, False]
-    distance = lambda found: 0.5 * (torch.softmax(found.float(), dim=-1) - torch.softmax(expected_logits, dim=-1)).abs().sum(dim=-1)
-    assert distance(logits).max() < 0.005 and distance(fp16_logits).max() < distance(logits).max()
-    assert torch.equal(logits.argmax(-1), expected_logits.argmax(-1))
-    assert torch.allclose(expected_score(values.float()), expected_score(expected_values), atol=5e-3)
+    distance = lambda found: 0.5 * (torch.softmax(found[:, :-1], dim=-1) - torch.softmax(expected_logits, dim=-1)).abs().sum(dim=-1)
+    assert distance(rows).max() < 0.005 and distance(fp16_rows).max() < distance(rows).max()
+    assert torch.equal(rows[:, :-1].argmax(-1), expected_logits.argmax(-1))
+    assert torch.allclose(rows[:, -1], expected_score(expected_values), atol=5e-3)
 
 
 #an int8 block's down mixing the next int8 block's input gives the bits the next block's own mix gives
 @gpu
 def test_down_mixes_the_next_blocks_input_to_the_bit(tmp_path, small_calibration):
-    from engine.inference import int8_model
+    from engine.inference import answer_rows, int8_model
     _, boards = small_checkpoint(tmp_path)
     flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
     try:
         with torch.no_grad():
             int8 = int8_model(tmp_path / "model.pt", 0)
-            mixed_in_down = int8(boards.cuda())
+            mixed_in_down = answer_rows(int8(boards.cuda()))
             linked = [block.input_mixed for block in int8.encoder[:2]]
             for block in int8.encoder[:2]:
                 block.next_scales, block.input_mixed = None, False
-            mixed_by_each = int8(boards.cuda())
+            mixed_by_each = answer_rows(int8(boards.cuda()))
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
-    assert linked == [False, True] and all(torch.equal(found, expected) for found, expected in zip(mixed_in_down, mixed_by_each))
+    assert linked == [False, True] and torch.equal(mixed_in_down, mixed_by_each)
 
 
 #programmatic dependent launch changes no bits: the int8 model (every kernel of fused_blocks and int8_blocks) recorded as

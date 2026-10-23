@@ -15,8 +15,11 @@ from model.model import expected_score
 from engine.selfplay import ANSWER_WIDTH, set_priority, slot_arrays
 from engine.player import clear_cublas_workspaces, load_model
 
-#a row of ANSWER_WIDTH numbers per board: the move logits, then the expected score
-def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+#a row of ANSWER_WIDTH numbers per board: the move logits, then the expected score. The fused model
+#(fused_blocks.FusedTransformer) gives the rows itself
+def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor] | torch.Tensor) -> torch.Tensor:
+    if isinstance(outputs, torch.Tensor):
+        return outputs
     move_logits, value_logits = outputs
     return torch.cat([move_logits.float(), expected_score(value_logits).unsqueeze(1)], dim=1)
 
