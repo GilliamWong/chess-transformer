@@ -228,8 +228,12 @@ The network runs every block but the last with its matmuls on normalised inputs 
 gate and up) and the mlp's down in int8 (`model/int8_blocks.py`): on the 5070 Ti it answers ~1.35x fp16's positions a
 second at 64 boards and the search does ~1.4x the nodes at 1 s a move (1.33x at 800 nodes), and an A100, A40 and L40S
 answer 1.09-1.3x fp16's positions. Its priors are further from fp32's (policy total variation 0.0030, fp16's 0.0011),
-but at equal nodes it plays as fp16 does: -0.2 [-8.4, +8.0] Elo over 3,663 games on Hyak. `--precision fp16` runs the
-network in fp16. Self-play and labels stay in fp16: int8's answers depend on the rest of the batch. The int8 weights are
+but at equal nodes it plays as fp16 does: -0.2 [-8.4, +8.0] Elo over 3,663 games on Hyak. One block more stays in fp16
+by default: the one whose int8 alone moves the policy furthest from the fp16 model's on the calibration positions
+(`engine/quantization.py`). A single block can cost as much as all the others: bt4prior_final's block 26 alone took its
+total variation from fp16's 0.0012 to 0.0054 (all blocks 0.0061), and with it in fp16 the network is at 0.0030, for ~1%
+of the network's speed (0.8% of the nodes a second at 1000 nodes).
+`--fp16-blocks N` keeps N blocks so (0 for every other block in int8), `--precision fp16` runs the network in fp16. Self-play and labels stay in fp16: int8's answers depend on the rest of the batch. The int8 weights are
 rounded once per checkpoint (GPTQ, ~1 min) and kept in `~/.cache/chess_transformer/int8`;
 `python -m engine.quantization <model.pt>` rounds them ahead of a match, which `isready` would not wait for.
 

@@ -362,8 +362,9 @@ class FusedBlock(nn.Module):
         return linear(hidden, self.down, residual=x, original=original_board_embed, residual_scale=self.next_scales[0], input_scale=self.next_scales[1])
 
 
-#each block's down mixes the input of the block after it (next_scales, input_mixed) when both are of one kind: the last
-#int8 block leaves the fp16 last block's input to that block, which rounds it as before
+#each block's down mixes the input of the block after it (next_scales, input_mixed) when both are of one kind: an fp16
+#block after an int8 one (the last, or one kept in fp16 for its int8 error) mixes its own input, as an int8 block after
+#an fp16 one does
 def link_input_mixes(blocks: list[nn.Module]) -> None:
     for block in blocks:
         block.next_scales, block.input_mixed = None, False

@@ -112,14 +112,17 @@ def parse_changes(text: str, settings: dict) -> dict:
 #int8 is the engine's, not for self-play or labels: its answers depend on the rest of the batch
 PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
 ENGINE_PRECISION = "int8"
+#the int8 network's blocks kept in fp16 besides the last, those whose int8 costs the policy most (quantization.py): one
+#block can cost as much as all the others (bt4prior_final's 26th). 0 is every block but the last in int8
+ENGINE_FP16_BLOCKS = 1
 
 
-#the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out; on the gpu
-#numbered device, or else the current one; blocking_wait see GraphedBatches
-def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION, device: int | None = None,
-                   blocking_wait: bool = False):
+#the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out; fp16_blocks
+#for int8; on the gpu numbered device, or else the current one; blocking_wait see GraphedBatches
+def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION,
+                   fp16_blocks: int = ENGINE_FP16_BLOCKS, device: int | None = None, blocking_wait: bool = False):
     with torch.cuda.device(device):
-        model = PRECISIONS[precision](checkpoint_path)
+        model = int8_model(checkpoint_path, fp16_blocks) if precision == "int8" else PRECISIONS[precision](checkpoint_path)
         lanes = ROUNDS_IN_FLIGHT if max_batch > 1 else 1
         chunk = chunk_positions(model.d_model, lanes)
         sizes = small_graph_sizes(max_batch, chunk)

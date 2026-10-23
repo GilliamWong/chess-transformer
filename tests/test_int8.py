@@ -130,21 +130,38 @@ SMALL_SETTINGS = {"d_model": 128, "num_layers": 3, "n_heads": 4, "kv_heads": 2, 
 
 
 #a small model saved in tmp_path, its input skip mixed in, and real positions to check it on
-def small_checkpoint(tmp_path) -> tuple[ChessTransformer, torch.Tensor]:
+def small_checkpoint(tmp_path, settings: dict = SMALL_SETTINGS) -> tuple[ChessTransformer, torch.Tensor]:
     torch.manual_seed(0)
-    model = ChessTransformer(**SMALL_SETTINGS).eval()
+    model = ChessTransformer(**settings).eval()
     mix_in_the_input(model)
     with torch.no_grad():
         model.templates.normal_()
         model.square_features.table.normal_(std=0.1)
         #sharp enough priors that a wrong scale or rotation shows
         model.from_projection.weight.mul_(8)
-    save_checkpoint(model, SMALL_SETTINGS, tmp_path / "model.pt")
+    save_checkpoint(model, settings, tmp_path / "model.pt")
     board, boards = chess.Board(), []
     for san in "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6 Be3 e5 Nb3 Be6 f3 Be7".split():
         board.push_san(san)
         boards.append(encode_board(board))
     return model, torch.tensor(boards)
+
+
+#SMALL_SETTINGS with more blocks, their query widths in turn
+def deeper(layers: int) -> dict:
+    ratios = SMALL_SETTINGS["qk_ratio"]
+    return {**SMALL_SETTINGS, "num_layers": layers, "qk_ratio": [ratios[layer % len(ratios)] for layer in range(layers)]}
+
+
+#small_checkpoint with five blocks, one of them rounding badly in int8: an input channel of its mlp's gate 100x the
+#others, so that its gate weights' row scales leave every other channel a step or two of int8
+def outlier_checkpoint(tmp_path, layer: int) -> tuple[ChessTransformer, torch.Tensor]:
+    settings = deeper(5)
+    model, boards = small_checkpoint(tmp_path, settings)
+    with torch.no_grad():
+        model.encoder[layer].mlp.gate_projection.weight[:, 0] *= 100
+    save_checkpoint(model, settings, tmp_path / "model.pt")
+    return model, boards
 
 
 @pytest.fixture
@@ -153,8 +170,8 @@ def small_calibration(monkeypatch, tmp_path):
     monkeypatch.setattr(quantization, "CALIBRATION_POSITIONS", 64)
 
 
-#the int8 model (inference.int8_model: every block but the last in int8) gives the fp32 model's priors and score to
-#int8's rounding, with the same top moves; the fp16 model is nearer
+#the int8 model (inference.int8_model without fp16 blocks: every block but the last in int8) gives the fp32 model's
+#priors and score to int8's rounding, with the same top moves; the fp16 model is nearer
 @gpu
 def test_the_int8_model_computes_what_the_model_does(tmp_path, small_calibration):
     from engine.inference import fp16_model, int8_model
@@ -165,7 +182,7 @@ def test_the_int8_model_computes_what_the_model_does(tmp_path, small_calibration
     try:
         with torch.no_grad():
             expected_logits, expected_values = model.cuda()(boards)
-            int8 = int8_model(tmp_path / "model.pt")
+            int8 = int8_model(tmp_path / "model.pt", 0)
             logits, values = int8(boards)
             fp16_logits, _ = fp16_model(tmp_path / "model.pt")(boards)
     finally:
@@ -186,7 +203,7 @@ def test_down_mixes_the_next_blocks_input_to_the_bit(tmp_path, small_calibration
     flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
     try:
         with torch.no_grad():
-            int8 = int8_model(tmp_path / "model.pt")
+            int8 = int8_model(tmp_path / "model.pt", 0)
             mixed_in_down = int8(boards.cuda())
             linked = [block.input_mixed for block in int8.encoder[:2]]
             for block in int8.encoder[:2]:
@@ -208,7 +225,7 @@ def test_dependent_launch_changes_no_bits(tmp_path, small_calibration, monkeypat
     boards = boards.numpy().astype("uint8")
     flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
     try:
-        int8 = int8_model(tmp_path / "model.pt")
+        int8 = int8_model(tmp_path / "model.pt", 0)
         dependent = GraphedBatches(int8, [len(boards)], in_flight=1)
         answers = dependent.collect(dependent.launch(boards)).copy()
         for module in (fused_blocks, int8_blocks):
@@ -221,10 +238,11 @@ def test_dependent_launch_changes_no_bits(tmp_path, small_calibration, monkeypat
     assert np.array_equal(answers, expected)
 
 
-#engine_network in int8: the int8 model compiled and recorded as cuda graphs answers as it does uncompiled
+#engine_network in int8: the int8 model (with the engine's fp16 blocks) compiled and recorded as cuda graphs answers as
+#it does uncompiled
 @gpu
 def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):
-    from engine.engine_search import engine_network
+    from engine.engine_search import ENGINE_FP16_BLOCKS, engine_network
     from engine.inference import answer_rows, int8_model
     _, boards = small_checkpoint(tmp_path)
     flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
@@ -232,12 +250,16 @@ def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):
         network = engine_network(tmp_path / "model.pt", 4, "int8")
         answers = network.collect(network.launch(boards[:3].numpy().astype("uint8")))
         with torch.no_grad():
-            expected = answer_rows(int8_model(tmp_path / "model.pt")(boards[:3].cuda())).cpu().numpy()
+            expected = answer_rows(int8_model(tmp_path / "model.pt", ENGINE_FP16_BLOCKS)(boards[:3].cuda())).cpu().numpy()
     finally:
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
     #fp16's rounding differs a little once compiled; a graph reading the wrong buffers is off by whole logits
     assert abs(answers - expected).max() < 0.05
+
+
+def failing(*arguments):
+    raise AssertionError("computed again")
 
 
 #the weights are computed once per checkpoint content and rounding settings and read back as they were saved: a copy of
@@ -246,7 +268,7 @@ def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):
 @gpu
 def test_the_int8_weights_are_cached_by_the_checkpoints_content(tmp_path, small_calibration, monkeypatch):
     model, _ = small_checkpoint(tmp_path)
-    computed = quantization.int8_weights(tmp_path / "model.pt")
+    computed = quantization.int8_weights(tmp_path / "model.pt", 0)
     assert sorted(computed) == [0, 1] and sorted(computed[0]) == ["down", "gate_up", "projection"]
     (tmp_path / "copy").mkdir()
     shutil.copy(tmp_path / "model.pt", tmp_path / "copy" / "model.pt")
@@ -254,14 +276,12 @@ def test_the_int8_weights_are_cached_by_the_checkpoints_content(tmp_path, small_
     with torch.no_grad():
         changed.encoder[0].Q.weight[0, 0] += 1
     save_checkpoint(changed, SMALL_SETTINGS, tmp_path / "changed.pt")
-    recomputed = quantization.int8_weights(tmp_path / "changed.pt")
-    quantization.cached_weights_path(tmp_path / "changed.pt").unlink()
-    recomputed_again = quantization.int8_weights(tmp_path / "changed.pt")
+    recomputed = quantization.int8_weights(tmp_path / "changed.pt", 0)
+    quantization.cached_weights_path(tmp_path / "changed.pt", 0).unlink()
+    recomputed_again = quantization.int8_weights(tmp_path / "changed.pt", 0)
 
-    def failing(*arguments):
-        raise AssertionError("computed again")
     monkeypatch.setattr(quantization, "compute_int8_weights", failing)
-    cached = quantization.int8_weights(tmp_path / "copy" / "model.pt")
+    cached = quantization.int8_weights(tmp_path / "copy" / "model.pt", 0)
 
     assert len(list(quantization.CACHE.iterdir())) == 2
     for layer, matmuls in computed.items():
@@ -270,6 +290,83 @@ def test_the_int8_weights_are_cached_by_the_checkpoints_content(tmp_path, small_
             assert torch.equal(cached[layer][name][0], integers) and torch.equal(cached[layer][name][1], scale)
             assert all(torch.equal(a, b) for a, b in zip(recomputed[layer][name], recomputed_again[layer][name]))
     assert not torch.equal(recomputed[0]["projection"][0], computed[0]["projection"][0])
-    path = quantization.cached_weights_path(tmp_path / "model.pt")
+    path = quantization.cached_weights_path(tmp_path / "model.pt", 0)
     monkeypatch.setattr(quantization, "DAMPENING", 2 * quantization.DAMPENING)
-    assert quantization.cached_weights_path(tmp_path / "model.pt") != path
+    assert quantization.cached_weights_path(tmp_path / "model.pt", 0) != path
+
+
+#the weights without the blocks kept in fp16 are cached by their count, beside the all-int8 weights they are taken from
+#(rounded once) and keeping their choice (measured once); the all-int8 weights keep the name of the files cached before
+#blocks could be kept in fp16, so those are read rather than rounded again
+@gpu
+def test_the_weights_without_fp16_blocks_are_cached_by_their_count(tmp_path, small_calibration, monkeypatch):
+    path = tmp_path / "model.pt"
+    small_checkpoint(tmp_path, deeper(4))
+    one = quantization.int8_weights(path, 1)
+    monkeypatch.setattr(quantization, "compute_int8_weights", failing)
+    two = quantization.int8_weights(path, 2)
+    monkeypatch.setattr(quantization, "block_errors", failing)
+    one_again, all_int8 = quantization.int8_weights(path, 1), quantization.int8_weights(path, 0)
+
+    assert sorted(all_int8) == [0, 1, 2] and len(one) == 2 and len(two) == 1 and set(two) < set(one) == set(one_again)
+    for layer, matmuls in one.items():
+        for name, pair in matmuls.items():
+            assert all(torch.equal(tensor, cached) and torch.equal(tensor, expected)
+                       for tensor, cached, expected in zip(pair, one_again[layer][name], all_int8[layer][name]))
+    assert sorted(quantization.CACHE.iterdir()) == sorted(quantization.cached_weights_path(path, count) for count in (0, 1, 2))
+    #production's calibration settings
+    monkeypatch.undo()
+    assert quantization.cached_weights_path(path, 0).name.endswith("_2199eb67a639465a.pt")
+
+
+#the block kept in fp16 is the one whose int8 costs the policy most, here the one whose gate rounds badly, and keeping it
+#brings the priors near the fp32 model's: between int8 blocks, and just before the last (the two fp16 blocks linked)
+@gpu
+@pytest.mark.parametrize("outlier", [2, 3])
+def test_the_block_whose_int8_costs_most_stays_in_fp16(tmp_path, small_calibration, outlier):
+    from engine.inference import int8_model
+    model, boards = outlier_checkpoint(tmp_path, outlier)
+    boards = boards.cuda()
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        errors = quantization.block_errors(tmp_path / "model.pt", quantization.int8_weights(tmp_path / "model.pt", 0))
+        with torch.no_grad():
+            expected_logits, _ = model.cuda()(boards)
+            kept_logits, _ = int8_model(tmp_path / "model.pt", 1)(boards)
+            all_int8_logits, _ = int8_model(tmp_path / "model.pt", 0)(boards)
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert sorted(errors) == [0, 1, 2, 3] and max(errors, key=errors.get) == outlier
+    assert sorted(quantization.int8_weights(tmp_path / "model.pt", 1)) == [layer for layer in range(4) if layer != outlier]
+    distance = lambda found: 0.5 * (torch.softmax(found.float(), dim=-1) - torch.softmax(expected_logits, dim=-1)).abs().sum(dim=-1)
+    assert distance(kept_logits).max() < 0.005 and distance(kept_logits).mean() < 0.5 * distance(all_int8_logits).mean()
+
+
+#an fp16 block between int8 blocks mixes its own input and computes as the fp16 model's block does, and the int8 block
+#after it mixes its own: the model answers to the bit as its blocks run one after another, each mixing its own input,
+#the int8 ones taken from the all-int8 model and the fp16 ones from the fp16 model
+@gpu
+def test_fp16_blocks_between_int8_blocks_compute_as_the_fp16_models(tmp_path, small_calibration):
+    from torch import nn
+    from engine.inference import fp16_model, int8_model
+    from model.fused_blocks import FusedBlock
+    from model.int8_blocks import Int8Block
+    _, boards = outlier_checkpoint(tmp_path, 2)
+    boards = boards.cuda()
+    flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
+    try:
+        with torch.no_grad():
+            kept = int8_model(tmp_path / "model.pt", 1)
+            answers = kept(boards)
+            all_int8, one_by_one = int8_model(tmp_path / "model.pt", 0), fp16_model(tmp_path / "model.pt")
+            blocks = [one_by_one.encoder[layer] if layer in (2, 4) else all_int8.encoder[layer] for layer in range(5)]
+            for block in blocks:
+                block.next_scales, block.input_mixed = None, False
+            one_by_one.encoder = nn.ModuleList(blocks)
+            expected = one_by_one(boards)
+    finally:
+        torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
+
+    assert [type(block) for block in kept.encoder] == [Int8Block, Int8Block, FusedBlock, Int8Block, FusedBlock]
+    assert all(torch.equal(found, wanted) for found, wanted in zip(answers, expected))

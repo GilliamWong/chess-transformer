@@ -1,17 +1,22 @@
-#the int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022) and cached
+#the int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022) and cached, without
+#the blocks kept in fp16 for their int8 error (block_errors)
 #   python -m engine.quantization <model.pt>    computes them ahead of a match
 import argparse
 import hashlib
 import os
 from pathlib import Path
 
+import chess
 import chess.pgn
 import numpy as np
 import torch
+from torch import nn
 
+from engine.inference import FP16_RESIDUAL_SCALE, answer_rows, fp16_model
 from engine.player import load_model
-from model.encoding import encode_board
-from model.int8_blocks import DOWN_INPUT_MULTIPLE, HADAMARD_BLOCK, down_inputs, hadamard
+from model.encoding import NUM_MOVE_IDS, encode_board, encode_move_to_id
+from model.fused_blocks import link_input_mixes
+from model.int8_blocks import DOWN_INPUT_MULTIPLE, HADAMARD_BLOCK, Int8Block, down_inputs, hadamard
 from model.model import ChessTransformer
 from training.data import CARLSEN_PGN
 
@@ -29,9 +34,13 @@ GPTQ_COLUMNS = 128
 #the last layer stays fp16: its down matmul alone costs the policy as much as all the others'
 FP16_LAST_LAYERS = 1
 INT8_MAX = 127
+#block_errors' version, changed with it: it and the count name the file of the weights without the blocks kept in fp16
+CHOICE_VERSION = 1
+#boards a forward of block_errors takes
+ERROR_BATCH = 256
 
 
-def calibration_boards() -> torch.Tensor:
+def calibration_positions() -> list[chess.Board]:
     boards = []
     with open(CARLSEN_PGN) as pgn:
         for _ in range(CALIBRATION_FIRST_GAME):
@@ -43,10 +52,14 @@ def calibration_boards() -> torch.Tensor:
                 if board.is_game_over() or len(boards) == CALIBRATION_POSITIONS:
                     break
                 if ply % CALIBRATION_STEP == CALIBRATION_STEP // 2:
-                    boards.append(encode_board(board))
+                    boards.append(board.copy(stack=False))
     if len(boards) < CALIBRATION_POSITIONS:
         raise ValueError(f"{CARLSEN_PGN} has {len(boards)} calibration positions past game {CALIBRATION_FIRST_GAME}, not {CALIBRATION_POSITIONS}")
-    return torch.from_numpy(np.array(boards)).long()
+    return boards
+
+
+def calibration_boards() -> torch.Tensor:
+    return torch.from_numpy(np.array([encode_board(board) for board in calibration_positions()])).long()
 
 
 #(int8, scale a row) of the weight (N x K) by GPTQ on its inputs' Hessian: each column's error spread over the later ones
@@ -115,26 +128,68 @@ def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> dict[
     return weights
 
 
-#the checkpoint's int8 weights' file in CACHE, named by the checkpoint file's content and everything else that rounds them
-def cached_weights_path(checkpoint_path: Path) -> Path:
+#each int8 block's error (the layers of weights): the policy's total variation over the legal moves from the fp16 model's
+#with only that block in int8, mean over the calibration boards
+@torch.no_grad()
+def block_errors(checkpoint_path: Path, weights: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]) -> dict[int, float]:
+    positions = calibration_positions()
+    boards = torch.from_numpy(np.array([encode_board(board) for board in positions])).long().cuda()
+    legal = torch.zeros(len(positions), NUM_MOVE_IDS, dtype=torch.bool)
+    for row, board in enumerate(positions):
+        legal[row, [encode_move_to_id(move, board.turn) for move in board.legal_moves]] = True
+    legal = legal.cuda()
+    model = fp16_model(checkpoint_path)
+    fp16_blocks = list(model.encoder)
+
+    def priors(int8_blocks: dict[int, nn.Module]) -> torch.Tensor:
+        blocks = [int8_blocks.get(layer, block) for layer, block in enumerate(fp16_blocks)]
+        link_input_mixes(blocks)
+        model.encoder = nn.ModuleList(blocks)
+        logits = torch.cat([answer_rows(model(boards[start:start + ERROR_BATCH]))[:, :-1] for start in range(0, len(boards), ERROR_BATCH)])
+        return torch.softmax(logits.double().masked_fill(~legal, -torch.inf), dim=-1)
+
+    fp16_priors = priors({})
+    errors = {}
+    for layer, matmuls in weights.items():
+        int8_priors = priors({layer: Int8Block(fp16_blocks[layer], matmuls, FP16_RESIDUAL_SCALE)})
+        errors[layer] = 0.5 * (int8_priors - fp16_priors).abs().sum(dim=-1).mean().item()
+    del model
+    torch.cuda.empty_cache()
+    return errors
+
+
+#the checkpoint's int8 weights' file in CACHE, named by the checkpoint file's content and everything else that rounds
+#them, and by the blocks kept in fp16 besides the last: without any, the name weights had before they could be kept
+def cached_weights_path(checkpoint_path: Path, fp16_blocks: int) -> Path:
     with open(checkpoint_path, "rb") as checkpoint:
         digest = hashlib.file_digest(checkpoint, "sha256").hexdigest()
     rounding = (VERSION, CALIBRATION_POSITIONS, CALIBRATION_FIRST_GAME, CALIBRATION_STEP, DAMPENING, GPTQ_COLUMNS, FP16_LAST_LAYERS,
                 HADAMARD_BLOCK, DOWN_INPUT_MULTIPLE)
+    if fp16_blocks:
+        rounding += (CHOICE_VERSION, fp16_blocks)
     return CACHE / f"{digest}_{hashlib.sha256(repr(rounding).encode()).hexdigest()[:16]}.pt"
 
 
-#the checkpoint's int8 weights (compute_int8_weights) on the cpu, from CACHE or computed on the gpu and cached
-def int8_weights(checkpoint_path: Path) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
-    path = cached_weights_path(checkpoint_path)
+#the checkpoint's int8 weights on the cpu, from CACHE or computed on the gpu and cached: compute_int8_weights' without
+#the fp16_blocks blocks of the largest block_errors
+def int8_weights(checkpoint_path: Path, fp16_blocks: int) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+    if fp16_blocks < 0:
+        raise ValueError(f"a count of blocks to keep in fp16, not {fp16_blocks}")
+    path = cached_weights_path(checkpoint_path, fp16_blocks)
     if path.exists():
         return torch.load(path, weights_only=True)
-    #fp64 but the heads, whose inputs the model casts to fp32
-    model = load_model(checkpoint_path, torch.device("cuda")).half_except_heads(torch.float64)
-    weights = {layer: {name: tuple(tensor.cpu() for tensor in pair) for name, pair in matmuls.items()}
-               for layer, matmuls in compute_int8_weights(model, calibration_boards()).items()}
-    del model
-    torch.cuda.empty_cache()
+    if fp16_blocks:
+        weights = int8_weights(checkpoint_path, 0)
+        errors = block_errors(checkpoint_path, weights)
+        kept = sorted(errors, key=errors.get, reverse=True)[:fp16_blocks]
+        weights = {layer: matmuls for layer, matmuls in weights.items() if layer not in kept}
+    else:
+        #fp64 but the heads, whose inputs the model casts to fp32
+        model = load_model(checkpoint_path, torch.device("cuda")).half_except_heads(torch.float64)
+        weights = {layer: {name: tuple(tensor.cpu() for tensor in pair) for name, pair in matmuls.items()}
+                   for layer, matmuls in compute_int8_weights(model, calibration_boards()).items()}
+        del model
+        torch.cuda.empty_cache()
     CACHE.mkdir(parents=True, exist_ok=True)
     #written whole under another name first: engines starting together each compute the same weights
     partial = path.with_name(f"{path.name}.{os.getpid()}.partial")
@@ -144,8 +199,12 @@ def int8_weights(checkpoint_path: Path) -> dict[int, dict[str, tuple[torch.Tenso
 
 
 if __name__ == "__main__":
+    from engine.engine_search import ENGINE_FP16_BLOCKS
     parser = argparse.ArgumentParser(description="the int8 weights of a checkpoint, computed and cached")
     parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--fp16-blocks", type=int, default=ENGINE_FP16_BLOCKS,
+                        help="the blocks kept in fp16 besides the last (engine_search.ENGINE_FP16_BLOCKS), default %(default)s")
     arguments = parser.parse_args()
-    int8_weights(arguments.checkpoint)
-    print(cached_weights_path(arguments.checkpoint))
+    weights = int8_weights(arguments.checkpoint, arguments.fp16_blocks)
+    print(cached_weights_path(arguments.checkpoint, arguments.fp16_blocks))
+    print("kept in fp16 besides the last:", sorted(set(int8_weights(arguments.checkpoint, 0)) - set(weights)))
