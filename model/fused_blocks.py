@@ -14,7 +14,7 @@ import triton.language as tl
 from torch import nn
 from triton.language.extra.cuda import gdc_wait
 
-from model.model import NUM_SQUARES, ChessTransformer, TransformerBlock
+from model.model import EDGE, KING, KNIGHT, NO_PIECE, NUM_SQUARES, PAWN, QUEEN, THEIRS, ChessTransformer, TransformerBlock
 
 #warps an attention instance has for each 64 of its square rows, and for its metadata rows
 SQUARE_WARPS, META_WARPS = 2, 2
@@ -373,24 +373,81 @@ def link_input_mixes(blocks: list[nn.Module]) -> None:
             block.next_scales, following.input_mixed = (following.residual_scale, following.input_scale), True
 
 
-#tokens and columns a program of input_embedding_kernel takes: whole rows in one program were slower
-EMBEDDING_TOKENS, EMBEDDING_COLUMNS = 8, 256
+#tokens and columns a program of input_embedding_kernel takes, by the batch's tokens: whole rows in one program were slower
+def embedding_block(tokens: int) -> tuple[int, int]:
+    return 8, 256
 
 
-#the input embedding in one kernel, so that every block reads one buffer: inductor recomputed or copied it for each
+#where the square is from the first square holding the piece CODE (a second queen is rare), or NO_PIECE
 @triton.jit
-def input_embedding_kernel(boards_ptr, rows_ptr, embed_ptr, position_ptr, table_ptr, out_ptr, tokens, D, T: tl.constexpr, SQUARES: tl.constexpr,
-                           FEATURES: tl.constexpr, BLOCK_TOKENS: tl.constexpr, BLOCK_D: tl.constexpr, PDL: tl.constexpr):
+def piece_offset_row(codes, squares, place, CODE: tl.constexpr, NO_PIECE: tl.constexpr):
+    piece = tl.min(tl.where(codes == CODE, squares[None, :], 64), 1)
+    return tl.where(piece < 64, (place // 8 - piece // 8 + 7) * 15 + place % 8 - piece % 8 + 7, NO_PIECE)
+
+
+#a direction's column of tokens x 8
+@triton.jit
+def direction_column(values, directions, DIRECTION: tl.constexpr):
+    return tl.sum(tl.where(directions[None, :] == DIRECTION, values, 0), 1)
+
+
+#the code where found first holds along each direction (0 if it never does) and how far out (model.first_along)
+@triton.jit
+def first_along(along, found, steps):
+    distance = tl.min(tl.where(found, steps[None, None, :], 8), 2)
+    return tl.sum(tl.where(steps[None, None, :] == distance[:, :, None], along, 0), 2), distance
+
+
+#feature FEATURE's table row for each token
+@triton.jit
+def feature_row(table_ptr, offsets_ptr, row, FEATURE: tl.constexpr, d, D, mask):
+    return tl.load(table_ptr + (row + tl.load(offsets_ptr + FEATURE))[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
+
+
+#the input embedding in one kernel, so that every block reads one buffer (inductor recomputed or copied it for each):
+#each square's 23 feature rows as SquareFeatures.indices finds them (a change to it must be made here too), from rays
+#(each square's squares out along the 8 directions, nearest first, past the edge 64) and jumps (its knight jumps)
+@triton.jit
+def input_embedding_kernel(boards_ptr, rays_ptr, jumps_ptr, offsets_ptr, embed_ptr, position_ptr, table_ptr, out_ptr, tokens, D, T: tl.constexpr,
+                           PAWN: tl.constexpr, KNIGHT: tl.constexpr, QUEEN: tl.constexpr, KING: tl.constexpr, THEIRS: tl.constexpr,
+                           EDGE: tl.constexpr, NO_PIECE: tl.constexpr, BLOCK_TOKENS: tl.constexpr, BLOCK_D: tl.constexpr, PDL: tl.constexpr):
     dependent_launch_wait(PDL)
     token = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     board, place = token // T, token % T
     token_ok, d_ok = token < tokens, d < D
-    square_ok = token_ok & (place < SQUARES)
+    square_ok = token_ok & (place < 64)
+    board_ptr = boards_ptr + board * T
+    squares, directions, steps = tl.arange(0, 64), tl.arange(0, 8), tl.arange(0, 8)
+    codes = tl.load(board_ptr[:, None] + squares[None, :], mask=square_ok[:, None], other=0)
+    #the codes out along each direction, EDGE past the edge (and on the 8th step, which pads the 7)
+    ray = tl.load(rays_ptr + (place[:, None, None] * 8 + directions[None, :, None]) * 8 + steps[None, None, :], mask=square_ok[:, None, None], other=64)
+    along = tl.load(board_ptr[:, None, None] + ray, mask=ray < 64, other=EDGE)
+    first, distance = first_along(along, (along != 0) & (along != EDGE), steps)
+    lines = tl.where(first > 0, 1 + (first - 1) * 7 + distance, 0)
+    neighbours = tl.sum(tl.where(steps[None, None, :] == 0, along, 0), 2)
+    jump = tl.load(jumps_ptr + place[:, None] * 8 + directions[None, :], mask=square_ok[:, None], other=64)
+    jumped = tl.load(board_ptr[:, None] + jump, mask=jump < 64, other=EDGE)
+    knights = tl.minimum(tl.sum((jumped == KNIGHT).to(tl.int32), 1), 2) * 3 + tl.minimum(tl.sum((jumped == KNIGHT + THEIRS).to(tl.int32), 1), 2)
+    #the nearest pawn up and down the file (directions 0 and 1)
+    pawn, pawn_distance = first_along(along, (along == PAWN) | (along == PAWN + THEIRS), steps)
+    pawns = tl.where(pawn > 0, 1 + (pawn == PAWN + THEIRS).to(tl.int32) * 7 + pawn_distance, 0)
+
+    #the rows summed in SquareFeatures.indices' order
+    mask = square_ok[:, None] & d_ok[None, :]
     features = tl.zeros((BLOCK_TOKENS, BLOCK_D), dtype=tl.float32)
-    for feature in range(FEATURES):
-        row = tl.load(rows_ptr + (board * SQUARES + place) * FEATURES + feature, mask=square_ok, other=0)
-        features += tl.load(table_ptr + row[:, None] * D + d[None, :], mask=square_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
+    features += feature_row(table_ptr, offsets_ptr, piece_offset_row(codes, squares, place, KING, NO_PIECE), 0, d, D, mask)
+    features += feature_row(table_ptr, offsets_ptr, piece_offset_row(codes, squares, place, KING + THEIRS, NO_PIECE), 1, d, D, mask)
+    features += feature_row(table_ptr, offsets_ptr, piece_offset_row(codes, squares, place, QUEEN, NO_PIECE), 2, d, D, mask)
+    features += feature_row(table_ptr, offsets_ptr, piece_offset_row(codes, squares, place, QUEEN + THEIRS, NO_PIECE), 3, d, D, mask)
+    for direction in tl.static_range(8):
+        features += feature_row(table_ptr, offsets_ptr, direction_column(neighbours, directions, direction), 4 + direction, d, D, mask)
+    for direction in tl.static_range(8):
+        features += feature_row(table_ptr, offsets_ptr, direction_column(lines, directions, direction), 12 + direction, d, D, mask)
+    features += feature_row(table_ptr, offsets_ptr, knights, 20, d, D, mask)
+    features += feature_row(table_ptr, offsets_ptr, direction_column(pawns, directions, 0), 21, d, D, mask)
+    features += feature_row(table_ptr, offsets_ptr, direction_column(pawns, directions, 1), 22, d, D, mask)
+
     code = tl.load(boards_ptr + token, mask=token_ok, other=0)
     mask = token_ok[:, None] & d_ok[None, :]
     total = tl.load(embed_ptr + code[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
@@ -400,21 +457,24 @@ def input_embedding_kernel(boards_ptr, rows_ptr, embed_ptr, position_ptr, table_
     tl.store(out_ptr + token[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-#boards B x T, rows B x 64 x features (each square's rows in the feature table): B x T x D
+#boards B x T: B x T x D. rays 64 x 8 x 8 and jumps 64 x 8 (input_embedding_kernel), offsets the features' first rows
 @torch.library.custom_op("chess::input_embedding", mutates_args=())
-def input_embedding(boards: torch.Tensor, rows: torch.Tensor, embed: torch.Tensor, position: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
-    boards, rows = boards.contiguous(), rows.contiguous()
+def input_embedding(boards: torch.Tensor, rays: torch.Tensor, jumps: torch.Tensor, offsets: torch.Tensor, embed: torch.Tensor, position: torch.Tensor,
+                    table: torch.Tensor) -> torch.Tensor:
+    boards = boards.contiguous()
     B, T = boards.shape
     D = table.shape[1]
     out = table.new_empty(B, T, D)
-    grid = (triton.cdiv(B * T, EMBEDDING_TOKENS), triton.cdiv(D, EMBEDDING_COLUMNS))
-    input_embedding_kernel[grid](boards, rows, embed.contiguous(), position.contiguous(), table.contiguous(), out, B * T, D, T=T, SQUARES=NUM_SQUARES,
-                                 FEATURES=rows.shape[-1], BLOCK_TOKENS=EMBEDDING_TOKENS, BLOCK_D=EMBEDDING_COLUMNS, **dependent_launch(boards.device))
+    block_tokens, block_d = embedding_block(B * T)
+    grid = (triton.cdiv(B * T, block_tokens), triton.cdiv(D, block_d))
+    input_embedding_kernel[grid](boards, rays, jumps, offsets, embed.contiguous(), position.contiguous(), table.contiguous(), out, B * T, D, T=T, PAWN=PAWN,
+                                 KNIGHT=KNIGHT, QUEEN=QUEEN, KING=KING, THEIRS=THEIRS, EDGE=EDGE, NO_PIECE=NO_PIECE, BLOCK_TOKENS=block_tokens,
+                                 BLOCK_D=block_d, **dependent_launch(boards.device))
     return out
 
 
 @input_embedding.register_fake
-def _(boards, rows, embed, position, table):
+def _(boards, rays, jumps, offsets, embed, position, table):
     return table.new_empty(*boards.shape, table.shape[1])
 
 
@@ -423,10 +483,12 @@ class InputEmbedding(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
         self.embed, self.position_embed, self.features = model.embed, model.position_embed, model.square_features
+        self.register_buffer("rays", F.pad(self.features.rays, (0, 1), value=NUM_SQUARES).int().contiguous())
+        self.register_buffer("jumps", self.features.knight_jumps.int().contiguous())
 
     def forward(self, board_state: torch.Tensor) -> torch.Tensor:
-        rows = self.features.indices(board_state) + self.features.row_offsets
-        return input_embedding(board_state, rows, self.embed.weight, self.position_embed, self.features.table)
+        return input_embedding(board_state, self.rays, self.jumps, self.features.row_offsets, self.embed.weight, self.position_embed,
+                               self.features.table)
 
 
 #logits[i, j] = (W_f x_i + b_f) . (W_t x_j + b_t) / sqrt(d) = a_i . x_j + s_i: from and to as one d x d matmul (a)

@@ -261,6 +261,34 @@ def test_the_input_embedding_is_the_models(dtype):
     assert found.dtype == dtype and torch.allclose(found, expected, rtol=rtol, atol=atol)
 
 
+#input_embedding_kernel finds each square's 23 feature rows itself, as SquareFeatures.indices does: on positions of a
+#random game and ones with promoted pieces, several queens, en passant and kings in corners, with tables of whole
+#numbers, whose sums are exact in any order, so that no wrong row can hide
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_the_input_embedding_finds_the_feature_rows_of_square_features():
+    from model.fused_blocks import InputEmbedding
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    with torch.no_grad():
+        for weight in (model.embed.weight, model.position_embed, model.square_features.table):
+            weight.copy_(torch.randint(-512, 512, weight.shape))
+    fens = ["Q6k/1Q6/8/8/8/8/1q6/K6q w - - 0 1", "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
+            "7K/3N1N2/2n3n1/8/8/2B1b3/8/k7 b - - 0 1", "8/8/8/8/8/8/8/K6k w - - 0 1"]
+    random, board = np.random.default_rng(0), chess.Board()
+    while len(fens) < 600:
+        board = chess.Board() if board.is_game_over() else board
+        board.push(random.choice(list(board.legal_moves)))
+        fens.append(board.fen())
+    boards = torch.tensor([encode_board(chess.Board(fen)) for fen in fens]).cuda()
+
+    with torch.no_grad():
+        found = InputEmbedding(model)(boards)
+        features = F.pad(model.square_features(boards), (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
+        expected = model.embed(boards) + model.position_embed + features
+
+    assert torch.equal(found, expected)
+
+
 #programmatic dependent launch only from sm_90: a kernel built for older gpus (hyak's A100s and A40s) with griddepcontrol
 #does not compile
 @pytest.mark.parametrize("capability", [(8, 6), (9, 0)])
