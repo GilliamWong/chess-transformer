@@ -151,8 +151,11 @@ impl Tree {
         let edges = parent.edges();
         let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt;
         let sqrt_children_visits = f64::from(children_visits).sqrt();
-        //select_edge's u, its arithmetic in its order
-        let u = |exploration: f64, q: f64, started: u32| q + (exploration * (sqrt_children_visits / f64::from(1 + started)));
+        //select_edge's u, its arithmetic in its order (sqrt_children_visits / 1.0 is sqrt_children_visits: no division)
+        let u = |exploration: f64, q: f64, started: u32| match started {
+            0 => q + (exploration * sqrt_children_visits),
+            started => q + (exploration * (sqrt_children_visits / f64::from(1 + started))),
+        };
 
         let noised = node == self.root_index() && !self.noised_priors.is_empty();
         //select_edge's numbers for a move: c_puct x prior, q, started visits, and false for a proven loss it passes over

@@ -461,18 +461,19 @@ impl Tree {
         let noised = node == self.root && !self.noised_priors.is_empty();
         for (index, (&prior, &child)) in self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate() {
             let prior = if noised { self.noised_priors[index] } else { f64::from(prior) };
-            let (q, started) = match child {
-                NO_NODE => (first_play_urgency, 0),
+            let u = match child {
+                //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
+                NO_NODE => first_play_urgency + (c_puct * prior * sqrt_children_visits),
                 child => {
                     let child = &self.nodes[child as usize];
                     if child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss) {
                         continue;
                     }
                     let q = if child.visit_count > 0 { child.mean_score() } else { first_play_urgency };
-                    (q, child.visit_count + child.in_flight)
+                    let started = child.visit_count + child.in_flight;
+                    q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started)))
                 }
             };
-            let u = q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started)));
             if u > best_u {
                 (best, best_u) = (index, u);
             }
