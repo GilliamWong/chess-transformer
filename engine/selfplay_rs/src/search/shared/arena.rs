@@ -57,6 +57,33 @@ impl Node {
         before as u32
     }
 
+    //a node of a tree being copied, before anything else sees it
+    pub fn set_counts(&self, visits: u32, in_flight: u32, value_sum: f64) {
+        self.count.store(u64::from(in_flight) << 32 | u64::from(visits), Ordering::Relaxed);
+        self.value_sum.store(value_sum.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn take_visits(&self, visits: u32) {
+        self.count.fetch_sub(u64::from(visits), Ordering::Relaxed);
+    }
+
+    //the node as if never visited, its position's key kept
+    pub fn reset(&self) {
+        for field in [&self.count, &self.value_sum, &self.visited_policy_sqrt, &self.edges_at, &self.proof_value, &self.proof_meta] {
+            field.store(0, Ordering::Relaxed);
+        }
+    }
+
+    //the numbers, key and proof of a node (not its edges) copied to a node of a tree being made
+    pub fn copy_to(&self, target: &Node) {
+        target.count.store(self.count.load(Ordering::Relaxed), Ordering::Relaxed);
+        target.value_sum.store(self.value_sum.load(Ordering::Relaxed), Ordering::Relaxed);
+        target.visited_policy_sqrt.store(self.visited_policy_sqrt.load(Ordering::Relaxed), Ordering::Relaxed);
+        target.proof_value.store(self.proof_value.load(Ordering::Relaxed), Ordering::Relaxed);
+        target.proof_meta.store(self.proof_meta.load(Ordering::Relaxed), Ordering::Relaxed);
+        target.key.store(self.key.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
     pub fn value_sum(&self) -> f64 {
         f64::from_bits(self.value_sum.load(Ordering::Relaxed))
     }

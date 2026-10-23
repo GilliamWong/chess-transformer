@@ -20,10 +20,10 @@ import torch
 from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
-from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, COLLISION_CAP, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GATHER_SPIN_US,
-                                  GATHER_WORKERS, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, THREAD_AFFINITIES,
-                                  THREAD_AFFINITY, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks, engine_search_settings,
-                                  parse_changes)
+from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, COLLISION_CAP, CONCURRENT_DESCENTS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION,
+                                  GATHER_SPIN_US, GATHER_WORKERS, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT,
+                                  THREAD_AFFINITIES, THREAD_AFFINITY, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks,
+                                  engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
@@ -531,6 +531,9 @@ if __name__ == "__main__":
     parser.add_argument("--rust-rounds", action="store_true",
                         help="for --select mcts --gpu: the search's rounds in Searches' own loop, a thread a gpu and no python between "
                              "rounds (engine_search.RUST_ROUNDS); the same search, on gpus whose lanes are lean (sm_120)")
+    parser.add_argument("--concurrent-descents", action="store_true", default=CONCURRENT_DESCENTS,
+                        help="for --select mcts --gpu: the networks' threads descend, finish and back up in the one tree at once instead of "
+                             "one at a time under its lock (search/shared.rs); a different search, not with --gather-workers")
     parser.add_argument("--thread-affinity", choices=THREAD_AFFINITIES, default=THREAD_AFFINITY,
                         help="for --select mcts --gpu: pin the gather workers and then each gpu's thread to a cpu of its own "
                              "(engine_search.thread_cpus): ccd fills one L3's cores, then their smt siblings, then the next L3; cores "
@@ -590,6 +593,8 @@ if __name__ == "__main__":
         parser.error("--blocking-wait needs --select mcts --gpu")
     if arguments.rust_rounds and not (arguments.select == "mcts" and arguments.gpu):
         parser.error("--rust-rounds needs --select mcts --gpu")
+    if arguments.concurrent_descents and not (arguments.select == "mcts" and arguments.gpu and arguments.leaves > 1 and not arguments.gather_workers):
+        parser.error("--concurrent-descents needs --select mcts --gpu, --leaves above 1 and no --gather-workers")
     if arguments.thread_affinity != THREAD_AFFINITY and not (arguments.select == "mcts" and arguments.gpu):
         parser.error("--thread-affinity needs --select mcts --gpu")
     if arguments.fp16_blocks is not None and not (arguments.select == "mcts" and arguments.gpu and arguments.precision in (None, "int8")):
@@ -612,5 +617,6 @@ if __name__ == "__main__":
                              "gather_workers": arguments.gather_workers, "gather_spin_us": arguments.gather_spin_us,
                              "collision_cap": arguments.collision_cap, "collision_scaling": arguments.collision_scaling,
                              **({"rust_rounds": True} if arguments.rust_rounds else {}),
+                             **({"concurrent_descents": True} if arguments.concurrent_descents else {}),
                              **({"thread_affinity": arguments.thread_affinity} if arguments.thread_affinity != THREAD_AFFINITY else {})},
              clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

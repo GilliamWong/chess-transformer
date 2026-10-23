@@ -11,6 +11,7 @@
 //cannot be done beside backups, so proofs are made with the gate held exclusively
 mod arena;
 mod cache;
+mod reuse;
 
 use arena::{Edges, Node, Nodes};
 pub use cache::SharedCache;
@@ -108,6 +109,43 @@ impl SharedTree {
             waiting: AtomicUsize::new(0),
             reserved: AtomicUsize::new(0),
             full: AtomicBool::new(false),
+            gate: RwLock::new(()),
+            counts: Counts::default(),
+        }
+    }
+
+    //a copy of a Tree whose search is done (nothing waits for the network), nodes numbered as they are in the Tree
+    pub fn from_tree(tree: &Tree) -> SharedTree {
+        assert_eq!(tree.pending(), 0, "a tree to copy has nothing waiting");
+        let nodes = Nodes::new();
+        let edges = Edges::new();
+        for (id, node) in tree.nodes.iter().enumerate() {
+            assert_eq!(nodes.push(tree.node_keys[id]), id);
+            let copy = nodes.get(id);
+            copy.set_counts(node.visit_count, node.in_flight, node.value_sum);
+            copy.set_visited_policy_sqrt(node.visited_policy_sqrt);
+            if let Some(proof) = node.proof {
+                copy.set_proof(proof);
+            }
+            if node.has_edges() {
+                let first = edges.alloc(node.edges().len());
+                for (index, edge) in node.edges().enumerate() {
+                    edges.set(first + index, tree.moves[edge], tree.priors[edge]);
+                    edges.child(first + index).store(tree.children[edge], Ordering::Relaxed);
+                }
+                copy.publish_edges(first, node.edges().len());
+            }
+        }
+        SharedTree {
+            board: tree.board.clone(),
+            keys: tree.keys.clone(),
+            root: tree.root_index(),
+            nodes,
+            edges,
+            pending: Mutex::new(HashMap::new()),
+            waiting: AtomicUsize::new(0),
+            reserved: AtomicUsize::new(0),
+            full: AtomicBool::new(tree.full),
             gate: RwLock::new(()),
             counts: Counts::default(),
         }

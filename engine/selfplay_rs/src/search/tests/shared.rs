@@ -3,7 +3,7 @@
 use super::batch::{LOCKED_PAWNS, MATE_IN_TWO, OPENING, ROOKS, START, cases, search_in_flight};
 use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 //the stand-in network of tests.rs, with the concurrent cache
 struct SharedNetwork {
@@ -334,4 +334,96 @@ fn the_shared_cache_gives_back_what_threads_put_in() {
     }
     cache.clear();
     assert!(cache.get(mix(0), &mut found).is_none());
+}
+
+//the edges in a SharedTree that a line of moves goes down from the root
+fn edges_of(tree: &SharedTree, line: &[Move]) -> Vec<usize> {
+    let mut node = tree.root_index();
+    line.iter()
+        .map(|&played| {
+            let edge = tree.node(node).edges().find(|&edge| tree.chess_move(edge) == played).expect("the line's move");
+            node = tree.child_index(edge).expect("the line's node");
+            edge
+        })
+        .collect()
+}
+
+//Searches' advance and the next start on a SharedTree, as tests.rs advanced() does them on a Tree: the line's first move in
+//place, the stale candidates and the copy unless stopped before them, then the rest of the line in place and the candidates
+//under it (a walk without them), compacted to be compared node for node
+fn shared_advanced(
+    tree: &SharedTree,
+    line: &[Move],
+    threads: usize,
+    stopped: Option<&str>,
+    settings: &SearchSettings,
+    tables: Option<&Tables>,
+) -> SharedTree {
+    let mut advanced = SharedTree::from_tree(&tree.to_tree());
+    let edges = edges_of(&advanced, line);
+    let mut node = advanced.root_index();
+    let places: Vec<u16> = edges
+        .iter()
+        .map(|&edge| {
+            let place = (edge - advanced.node(node).edges().start) as u16;
+            node = advanced.child_index(edge).expect("the line's node");
+            place
+        })
+        .collect();
+    advanced.move_root(&edges[..1]);
+    let (never, always) = (AtomicBool::new(false), AtomicBool::new(true));
+    let candidates = advanced.stale_candidates(threads, if stopped == Some("walk") { &always } else { &never });
+    if candidates.is_some() {
+        advanced.compact(Some(if stopped == Some("copy") { &always } else { &never }));
+    }
+    let rest = edges_of(&advanced, &line[1..]);
+    advanced.move_root(&rest);
+    assert!(advanced.root().proof().is_none(), "a root is never proven");
+    match candidates {
+        Some(candidates) => advanced.drop_stale_candidates(&places[1..], &candidates, settings, tables).expect("the tables"),
+        None => advanced.drop_stale_leaves(settings, tables).expect("the tables"),
+    }
+    advanced.compact(None);
+    advanced
+}
+
+//tests.rs' reuse test on SharedTrees: a line played at once (play_line, then the stale leaves) and by advance's way leave the
+//tree Tree's moves played one at a time leave, number for number, in searches with repeats, proofs and the tables
+#[test]
+fn reusing_a_shared_tree_leaves_the_tree_a_tree_is_left() {
+    let tables = tables();
+    let (mut lines, mut stale, mut proven) = (0, 0, 0);
+    for (fen, moves, simulations, certainty, tables) in cases(&tables) {
+        let settings = settings(certainty);
+        let mut tree = tree_after(fen, moves);
+        search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
+        let shared = shared_tree_after(fen, moves);
+        shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
+        //one thread's search is Tree's, which the other test shows with rounds in flight: here one round at a time
+        let mut copy = shared.to_tree();
+        copy.pending.clear();
+        assert_eq!(tree.root().visit_count, shared.root().visits());
+        for line in reusable_lines(&tree) {
+            let line_moves: Vec<Move> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+            let mut old = copied(&tree);
+            stale += reused_move_by_move(&mut old, &line_moves, &settings, tables);
+
+            let mut at_once = SharedTree::from_tree(&shared.to_tree());
+            at_once.play_line(&edges_of(&at_once, &line_moves));
+            at_once.drop_stale_leaves(&settings, tables).expect("the tables");
+            assert_same_trees(&old, &at_once.to_tree());
+            for (threads, stopped) in [(1, None), (1, Some("copy")), (1, Some("walk")), (4, None), (4, Some("copy")), (4, Some("walk"))] {
+                let advanced = shared_advanced(&shared, &line_moves, threads, stopped, &settings, tables);
+                assert_same_trees(&old, &advanced.to_tree());
+            }
+            //the parallel walk finds the one-thread walk's candidates in its order
+            let mut moved = SharedTree::from_tree(&shared.to_tree());
+            moved.move_root(&edges_of(&moved, &line_moves[..1]));
+            let never = AtomicBool::new(false);
+            assert_eq!(moved.stale_candidates(4, &never), moved.stale_candidates(1, &never));
+            lines += 1;
+            proven += old.nodes.iter().filter(|node| node.proof.is_some()).count();
+        }
+    }
+    assert!(lines >= 15 && stale > 0 && proven > 0, "{lines} lines, {stale} stale leaves, {proven} proven nodes");
 }

@@ -339,7 +339,11 @@ impl Rounds<'_> {
     //extra_for_fall's
     fn extra_for_fall(&self, (last, seconds): (i64, f64)) -> PyResult<f64> {
         let settings = self.settings;
-        let score = {
+        let score = if self.searches.concurrent_descents {
+            //a search another thread's finish just ended needs no extension
+            let Some(score) = self.searches.shared_root_score_if_running(settings.game)? else { return Ok(0.0) };
+            score
+        } else {
             let state = self.searches.lock()?;
             let search =
                 state.searches.iter().find(|search| search.id == settings.game).ok_or_else(|| PyValueError::new_err("no search"))?;
@@ -395,7 +399,7 @@ impl Rounds<'_> {
                             run.extension = None;
                             continue;
                         }
-                        let report = self.searches.stop_search(&mut *self.searches.lock()?, settings.game)?;
+                        let report = self.searches.stop_running(settings.game)?;
                         run.stop(report);
                         shared.changed.notify_all();
                         break;
@@ -457,12 +461,23 @@ impl Rounds<'_> {
                 None => &[],
             };
             let answered = shared.now();
+            //concurrent descents finish outside the run's lock, so that the threads finish at once; a thread may then find
+            //the search gone before its report is in, which every call it makes then takes as the search being done
+            let finished = if self.searches.concurrent_descents {
+                let reports = self.searches.shared_finish(answers, Some(name))?;
+                Some((reports, self.searches.shared_root_numbers(settings.game)?))
+            } else {
+                None
+            };
             let mut run = shared.lock()?;
             //under the lock, so that no thread finds the search gone from Searches (done) before its report is in
-            let (reports, root) = {
-                let mut state = self.searches.lock()?;
-                let reports = self.searches.finish_round(&mut state, answers, Some(name))?;
-                (reports, root_numbers(&state, settings.game))
+            let (reports, root) = match finished {
+                Some(finished) => finished,
+                None => {
+                    let mut state = self.searches.lock()?;
+                    let reports = self.searches.finish_round(&mut state, answers, Some(name))?;
+                    (reports, root_numbers(&state, settings.game))
+                }
             };
             run.seen(root);
             run.rounds_out -= 1;
@@ -491,15 +506,20 @@ impl Rounds<'_> {
                 let first_answers = *run.first_answers.get_or_insert(now);
                 let decided = f64::from(most - second) > Self::simulations_left(&run) / settings.smart_pruning_factor
                     && now - first_answers >= settings.smart_pruning_wait;
-                let proven = settings.certainty && {
-                    let state = self.searches.lock()?;
-                    let search = state
-                        .searches
-                        .iter()
-                        .find(|search| search.id == settings.game)
-                        .ok_or_else(|| PyValueError::new_err("no search"))?;
-                    search.tree.root_decided() || settings.stop_at_one_move_left && search.tree.moves_not_lost() <= 1
-                };
+                let proven = settings.certainty
+                    && if self.searches.concurrent_descents {
+                        self.searches.shared_tree(settings.game)?.is_some_and(|tree| {
+                            tree.root_decided() || settings.stop_at_one_move_left && tree.moves_not_lost() <= 1
+                        })
+                    } else {
+                        let state = self.searches.lock()?;
+                        let search = state
+                            .searches
+                            .iter()
+                            .find(|search| search.id == settings.game)
+                            .ok_or_else(|| PyValueError::new_err("no search"))?;
+                        search.tree.root_decided() || settings.stop_at_one_move_left && search.tree.moves_not_lost() <= 1
+                    };
                 //once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
                 let mut extra = 0.0;
                 if decided
@@ -512,7 +532,7 @@ impl Rounds<'_> {
                 if extra > 0.0 {
                     run.deadline = run.deadline.map(|deadline| deadline + extra);
                 } else if run.only_move || decided || proven {
-                    let report = self.searches.stop_search(&mut *self.searches.lock()?, settings.game)?;
+                    let report = self.searches.stop_running(settings.game)?;
                     run.stop(report);
                 }
             }

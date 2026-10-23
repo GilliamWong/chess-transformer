@@ -16,6 +16,17 @@ impl SharedCache {
         SharedCache { shards: (0..shards).map(|_| Mutex::new(Cache::new(positions.div_ceil(shards)))).collect() }
     }
 
+    //a Tree's cache, answer for answer, with room for `positions`
+    pub fn from_cache(cache: &Cache, positions: usize) -> SharedCache {
+        let shared = SharedCache::new(positions);
+        for generation in [&cache.older, &cache.newer] {
+            for (&key, &(start, count, value)) in &generation.places {
+                shared.insert(key, &generation.priors[start..start + usize::from(count)], value);
+            }
+        }
+        shared
+    }
+
     fn shard(&self, key: u64) -> std::sync::MutexGuard<'_, Cache> {
         self.shards[(key >> (64 - SHARD_BITS)) as usize].lock().expect("a cache shard")
     }

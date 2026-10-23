@@ -551,3 +551,5 @@ fn bench_worker_latency() {
         }
     }
 }
+
+mod shared;
