@@ -119,6 +119,52 @@ def test_descend_into_writes_descends_boards(dtype):
     assert rounds > 10 and reports[0][4] == 600
 
 
+#a lean round (descend_into's legal_columns) writes rows of each board's tokens and its answer columns, its legal moves'
+#padded with the expected score's; finished with those columns of the answer rows, it searches as rounds of whole rows do
+def test_lean_rounds_search_as_whole_rows():
+    evaluate = cpu_batches(BoardModel()).evaluate_boards
+    whole, lean = (selfplay_rs.Searches(**rust_search_settings(False), cache_positions=1000) for _ in range(2))
+    for searches in (whole, lean):
+        searches.start(0, "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4", [], 800)
+    rows, reports, rounds = np.full((16, selfplay_rs.LEAN_ROW), 7, dtype=np.uint8), [], 0
+    while not reports:
+        boards = leaf_boards(whole.descend(16, 16, 48))
+        written, _ = lean.descend_into(rows, 16, 16, 48, legal_columns=True)
+        assert written == len(boards) and (rows[:written, :TOKENS_PER_BOARD] == boards).all()
+        columns = rows[:written, TOKENS_PER_BOARD:].copy().view("<i2").astype(np.int64)
+        assert (columns[:, -1] == ANSWER_WIDTH - 1).all() and (columns < ANSWER_WIDTH).all()
+        answers = evaluate(boards) if written else np.zeros((0, ANSWER_WIDTH), dtype=np.float32)
+        reports = whole.finish(answers)
+        assert lean.finish(np.take_along_axis(answers, columns, axis=1)) == reports
+        assert reports or lean.root_visits(0) == whole.root_visits(0)
+        rounds += 1
+    assert rounds > 10 and reports[0][4] == 800
+
+
+#a search that fails settles its network (GraphedBatches.settle: its batches still on the gpu waited for, its lanes
+#freed) before the error goes on
+def test_a_failed_search_settles_its_network():
+    class Failing(ImmediateBatches):
+        settled = 0
+
+        def collect(self, launched):
+            raise RuntimeError("the gpu went away")
+
+        def settle(self):
+            self.settled += 1
+    network = Failing(cpu_batches(BoardModel()).evaluate_boards)
+    with pytest.raises(RuntimeError, match="went away"):
+        EngineSearch(network, 16).search(chess.Board(), simulations=200)
+    assert network.settled == 1
+
+
+#lean lanes by compute capability: the gpus of LEAN_CAPABILITIES, today's lanes on the others
+@pytest.mark.parametrize("capability, lean", [((12, 0), True), ((8, 0), False), ((8, 6), False), ((9, 0), False)])
+def test_lean_lanes_by_capability(monkeypatch, capability, lean):
+    monkeypatch.setattr(engine_search.torch.cuda, "get_device_capability", lambda device=None: capability)
+    assert engine_search.lean_lanes() == lean
+
+
 #descend_into refuses an array without room for a round's boards, or one it cannot write, before it descends
 def test_descend_into_wants_room_to_write():
     searches = selfplay_rs.Searches(**rust_search_settings(False))
@@ -754,7 +800,7 @@ class ScriptedSearches:
     def start(self, game, fen, moves, simulations):
         pass
 
-    def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None):
+    def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None, legal_columns=False):
         boards[:count] = 0
         return count, self.root
 
@@ -1515,9 +1561,9 @@ class CollisionsRecorded:
         self.searches, self.collisions = searches, []
 
     def descend_into(self, boards: np.ndarray, leaves: int, collisions: int, simulations: int, round: int | None = None,
-                     root_of: int | None = None) -> tuple:
+                     root_of: int | None = None, legal_columns: bool = False) -> tuple:
         self.collisions.append(collisions)
-        return self.searches.descend_into(boards, leaves, collisions, simulations, round=round, root_of=root_of)
+        return self.searches.descend_into(boards, leaves, collisions, simulations, round=round, root_of=root_of, legal_columns=legal_columns)
 
     def __getattr__(self, name: str):
         return getattr(self.searches, name)

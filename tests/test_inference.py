@@ -13,8 +13,9 @@ from model.encoding import EN_PASSANT_TOKEN_OFFSET, NUM_SQUARES, TOKENS_PER_BOAR
 import selfplay_rs
 from engine import inference
 from engine.inference import ExactSizeCompiled, GraphedBatches, answer_rows, cpu_batches, fp16_model, graph_sizes, small_graph_sizes
-from engine.selfplay import rust_search_settings
+from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from fake_models import BoardModel
+from selfplay_rs import LEAN_COLUMNS, LEAN_ROW
 from model.model import VALUE_BINS, ChessTransformer, expected_score
 from tools.checkpoint import save_checkpoint
 from engine.player import CudaGraphModel
@@ -197,6 +198,26 @@ def test_boards_written_into_the_lane_answer_as_launched():
         searches.finish(expected)
 
 
+#a lean lane answers a search's rows (Searches.descend_into's legal_columns) with exactly the columns of the answer rows a
+#lane of whole rows gives the same boards, round after round on either lane, waiting by event or by the copy
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("blocking_wait", [False, True])
+def test_lean_lanes_answer_the_columns_of_whole_rows(blocking_wait):
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    searches = selfplay_rs.Searches(**rust_search_settings(False))
+    searches.start(0, chess.STARTING_FEN, [], 200)
+    whole, lean = GraphedBatches(model, [8, 16], 2, blocking_wait=blocking_wait), GraphedBatches(model, [8, 16], 2, blocking_wait=blocking_wait, lean=True)
+    for _ in range(6):
+        lane = lean.free_lane()
+        written, _ = searches.descend_into(lane.rows_array, 12, 12, 36, legal_columns=True)
+        boards = lane.rows_array[:written, :TOKENS_PER_BOARD].copy()
+        columns = lane.rows_array[:written, TOKENS_PER_BOARD:].copy().view("<i2").astype(np.int64)
+        rows = whole.collect(whole.launch(boards)).copy()
+        answers = lean.collect(lean.launch_filled(lane, written)).copy()
+        assert written and np.array_equal(answers, np.take_along_axis(rows, columns, axis=1))
+        searches.finish(answers)
+
+
 #two batches out at once in two lanes come back with the bits each gets alone: lanes recorded on one stream into one
 #memory pool wrote over each other's activations. A model big enough that the two batches overlap
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
@@ -217,6 +238,22 @@ def test_batches_in_flight_together_answer_as_alone():
     for _ in range(20):
         launched = [together.launch(batch) for batch in batches]
         answers = [together.collect(batch_launched).copy() for batch_launched in launched]
+        assert all(np.array_equal(answer, expected_answer) for answer, expected_answer in zip(answers, expected))
+
+    #lean lanes too: rows of the boards and some columns of their answers, the columns of the rows alone
+    columns = random.integers(0, ANSWER_WIDTH, size=(2, 256, LEAN_COLUMNS))
+    rows = np.zeros((2, 256, LEAN_ROW), dtype=np.uint8)
+    rows[:, :, :TOKENS_PER_BOARD] = batches
+    rows[:, :, TOKENS_PER_BOARD:] = columns.astype("<i2").view(np.uint8).reshape(2, 256, -1)
+    expected = [np.take_along_axis(rows_alone, batch_columns, axis=1) for rows_alone, batch_columns in zip(expected, columns)]
+    lean = GraphedBatches(model, [256], lean=True)
+    for _ in range(20):
+        launched = []
+        for batch_rows in rows:
+            lane = lean.free_lane()
+            lane.rows_array[:256] = batch_rows
+            launched.append(lean.launch_filled(lane, 256))
+        answers = [lean.collect(batch_launched).copy() for batch_launched in launched]
         assert all(np.array_equal(answer, expected_answer) for answer, expected_answer in zip(answers, expected))
 
 

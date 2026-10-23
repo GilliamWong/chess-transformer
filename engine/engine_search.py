@@ -122,10 +122,17 @@ ENGINE_PRECISION = "int8"
 ENGINE_FP16_BLOCKS = 1
 
 
+#the gpus whose lanes are lean by default (inference.Lane): sm_120's (the 5070 Ti, the 5090), where they were timed;
+#others keep whole rows until timed
+LEAN_CAPABILITIES = {(12, 0)}
+
+
 #the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out; fp16_blocks
-#for int8; on the gpu numbered device, or else the current one; blocking_wait see GraphedBatches
+#for int8; on the gpu numbered device, or else the current one; blocking_wait see GraphedBatches. lean: lean lanes, by
+#default on the gpus of LEAN_CAPABILITIES
 def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION,
-                   fp16_blocks: int = ENGINE_FP16_BLOCKS, device: int | None = None, blocking_wait: bool = False):
+                   fp16_blocks: int = ENGINE_FP16_BLOCKS, device: int | None = None, blocking_wait: bool = False,
+                   lean: bool | None = None):
     with torch.cuda.device(device):
         model = int8_model(checkpoint_path, fp16_blocks) if precision == "int8" else PRECISIONS[precision](checkpoint_path)
         lanes = ROUNDS_IN_FLIGHT if max_batch > 1 else 1
@@ -133,7 +140,12 @@ def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: st
         sizes = small_graph_sizes(max_batch, chunk)
         #one board a round (mcts.py's search) never fills the largest graph
         compiled = ExactSizeCompiled(model, min(sizes[-1], chunk)) if max_batch > 1 else torch.compile(model, dynamic=True)
-        return GraphedBatches(compiled, sizes, lanes, chunk, blocking_wait)
+        return GraphedBatches(compiled, sizes, lanes, chunk, blocking_wait, lean_lanes() if lean is None else lean)
+
+
+#whether the current gpu's lanes are lean by default
+def lean_lanes() -> bool:
+    return torch.cuda.get_device_capability() in LEAN_CAPABILITIES
 
 
 #what the threads driving a search's networks share, behind changed's lock; changed is notified as a round comes back
@@ -275,6 +287,9 @@ class EngineSearch:
             with run.changed:
                 run.stopping = True
                 run.changed.notify_all()
+            #the network's rounds still out, finished on the gpu before anything else is
+            if hasattr(network, "settle"):
+                network.settle()
             raise
 
     #the search's rounds on one network until the report is in and the network's rounds are back: what to do next is
@@ -325,10 +340,13 @@ class EngineSearch:
                     return
             if name is not None:
                 collisions = self.round_collisions(count, run.simulations, visits)
-                #the boards go straight into the lane's pinned buffer (GraphedBatches'), or else an array of their own
+                #the boards go straight into the lane's pinned buffer (GraphedBatches'), a lean lane's in rows with their
+                #answers' columns, or else an array of their own
                 lane = network.free_lane() if hasattr(network, "free_lane") else None
-                boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.boards_array
-                written, seen = self.searches.descend_into(boards, count, collisions, SIMULATIONS_PER_LEAF * count, round=name, root_of=GAME)
+                lean = getattr(lane, "lean", False)
+                boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.rows_array if lean else lane.boards_array
+                written, seen = self.searches.descend_into(boards, count, collisions, SIMULATIONS_PER_LEAF * count, round=name, root_of=GAME,
+                                                           legal_columns=lean)
                 if not written:
                     run.starved = answered
                 launched_at = time.perf_counter()

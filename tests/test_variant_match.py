@@ -97,7 +97,7 @@ def test_sprt_llr():
 def test_each_variant_gets_the_network_it_names(monkeypatch, tmp_path):
     from tools.play import variant_match
     built, given = [], []
-    monkeypatch.setattr(variant_match, "engine_network", lambda checkpoint, max_batch, precision, fp16_blocks: built.append((precision, fp16_blocks))
+    monkeypatch.setattr(variant_match, "engine_network", lambda checkpoint, max_batch, precision, fp16_blocks, lean: built.append((precision, fp16_blocks))
                         or len(built))
     monkeypatch.setattr(variant_match, "play", lambda networks, *rest: given.append(networks))
     (tmp_path / "openings.txt").write_text(OPENINGS[0] + "\n")

@@ -14,6 +14,8 @@ from model.encoding import TOKENS_PER_BOARD, encode_board
 from model.model import expected_score
 from engine.selfplay import ANSWER_WIDTH, set_priority, slot_arrays
 from engine.player import clear_cublas_workspaces, load_model
+from engine.cuda_runtime import DEVICE_TO_HOST, HOST_TO_DEVICE, cuda_runtime
+from selfplay_rs import LEAN_COLUMNS, LEAN_ROW
 
 #a row of ANSWER_WIDTH numbers per board: the move logits, then the expected score. The fused model
 #(fused_blocks.FusedTransformer) gives the rows itself
@@ -88,19 +90,33 @@ def graph_sizes(max_batch: int) -> list[int]:
     return sizes
 
 #a batch in flight's own stream, cuda graphs (one for every size in sizes, sharing a memory pool, each running its boards
-#chunk at a time) and buffers
+#chunk at a time) and buffers. A lean lane (Searches.descend_into's legal_columns) takes a board as a row of bytes, its
+#tokens and its answer's columns, widens the tokens on the gpu and sends back only those columns (LEAN_COLUMNS floats
+#rather than ANSWER_WIDTH), and is launched and collected through the cuda runtime's calls (cuda_runtime.py).
+#The lane owns everything its raw handles point at (handles()): the graphs and their pool, the buffers, the stream and
+#the event; the model's weights are GraphedBatches'. Nothing is freed or recorded again while the lane lives
 class Lane:
-    def __init__(self, model: nn.Module, sizes: list[int], chunk: int | None):
+    def __init__(self, model: nn.Module, sizes: list[int], chunk: int | None, lean: bool = False):
         self.stream = torch.cuda.Stream()
+        self.device = torch.cuda.current_device()
         #launched and not yet collected: another launch would write over its answers
         self.pending = False
+        self.lean = lean
         largest = sizes[-1]
         #recorded on real boards: zero boards once hit a device-side assert
         self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
         self.boards_host = torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, pin_memory=True)
         #boards_host's memory as an array, which Searches.descend_into writes a round's boards into
         self.boards_array = self.boards_host.numpy()
-        self.answers_host = torch.zeros(largest, ANSWER_WIDTH, dtype=torch.float32, pin_memory=True)
+        if lean:
+            #the rows: the tokens, then the columns, which the padding takes from the expected score's
+            self.rows = torch.zeros(largest, LEAN_ROW, dtype=torch.uint8, device="cuda")
+            self.rows[:, :TOKENS_PER_BOARD] = self.boards
+            self.rows[:, TOKENS_PER_BOARD:].view(torch.int16).fill_(ANSWER_WIDTH - 1)
+            self.rows_host = torch.zeros(largest, LEAN_ROW, dtype=torch.uint8, pin_memory=True)
+            self.rows_array = self.rows_host.numpy()
+        self.answers_host = torch.zeros(largest, LEAN_COLUMNS if lean else ANSWER_WIDTH, dtype=torch.float32, pin_memory=True)
+        self.answers_array = self.answers_host.numpy()
         #recorded after each batch for GraphedBatches' blocking_wait
         self.done = torch.cuda.Event(blocking=True)
 
@@ -108,34 +124,60 @@ class Lane:
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream), torch.no_grad():
             for size in sizes:
-                chunked_answer_rows(model, self.boards[:size], chunk)
+                self.answer(model, size, chunk)
         torch.cuda.current_stream().wait_stream(self.stream)
 
         #recorded on their own stream: lanes recorded on one stream into one pool wrote over each other's activations
-        pool = torch.cuda.graph_pool_handle()
+        self.pool = torch.cuda.graph_pool_handle()
         self.graphs, self.answers = {}, {}
         for size in reversed(sizes):
             self.graphs[size] = torch.cuda.CUDAGraph()
             clear_cublas_workspaces()
-            with torch.cuda.graph(self.graphs[size], pool=pool, stream=self.stream), torch.no_grad():
-                self.answers[size] = chunked_answer_rows(model, self.boards[:size], chunk)
+            with torch.cuda.graph(self.graphs[size], pool=self.pool, stream=self.stream), torch.no_grad():
+                self.answers[size] = self.answer(model, size, chunk)
             clear_cublas_workspaces()
+        #the event's handle exists from its first record
+        self.done.record(self.stream)
+        self.done.synchronize()
+        #a lean collect copies the answers' bytes as they are
+        assert not lean or all(answers.dtype == torch.float32 and answers.is_contiguous() for answers in self.answers.values())
+
+    #the graph's work for size boards: their answer rows, or a lean lane's columns of them
+    def answer(self, model: nn.Module, size: int, chunk: int | None) -> torch.Tensor:
+        if not self.lean:
+            return chunked_answer_rows(model, self.boards[:size], chunk)
+        self.boards[:size].copy_(self.rows[:size, :TOKENS_PER_BOARD])
+        rows = chunked_answer_rows(model, self.boards[:size], chunk)
+        return rows.gather(1, self.rows[:size, TOKENS_PER_BOARD:].view(torch.int16).long())
+
+    #the raw handles a launch and a collect use, for the cuda runtime's calls: the device, the stream, the event, the
+    #pinned rows and answers, the device rows, and by graph size its exec and its answers on the device
+    def handles(self) -> dict:
+        return {"device": self.device, "stream": self.stream.cuda_stream, "done": self.done.cuda_event,
+                "rows_host": self.rows_host.data_ptr(), "rows": self.rows.data_ptr(), "answers_host": self.answers_host.data_ptr(),
+                "graphs": {size: (graph.raw_cuda_graph_exec(), self.answers[size].data_ptr()) for size, graph in self.graphs.items()}}
 
 #the model as cuda graphs in in_flight lanes that run their batches at once, a batch through the smallest graph that
 #holds it on the first lane free. launch returns at once and collect waits, in any order: at most in_flight batches out.
 #chunk: the boards a forward takes (chunk_positions), None for a batch's all at once.
-#collect's copy spins a core until the batch is done; blocking_wait sleeps until then instead, a little slower to wake
+#collect's copy spins a core until the batch is done; blocking_wait sleeps until then instead, a little slower to wake.
+#lean: lean lanes (Lane's), which take launch_filled's boards only
 class GraphedBatches:
     def __init__(self, model: nn.Module, sizes: list[int], in_flight: int = 2, chunk: int | None = None,
-                 blocking_wait: bool = False):
+                 blocking_wait: bool = False, lean: bool = False):
         #the graphs read the model's weights where they were when recorded: freed, their memory went to the next
         #tensors made and every answer came back wrong
         self.model = model
         self.sizes = sizes
-        self.lanes = [Lane(model, sizes, chunk) for _ in range(in_flight)]
+        self.lanes = [Lane(model, sizes, chunk, lean) for _ in range(in_flight)]
         self.blocking_wait = blocking_wait
+        self.runtime = cuda_runtime() if lean else None
+        #by lane: its handles, read once
+        self.handles = {id(lane): lane.handles() for lane in self.lanes} if lean else {}
 
     def launch(self, boards: np.ndarray) -> tuple[Lane, int, int]:
+        if self.runtime is not None:
+            raise RuntimeError("lean lanes answer rows with their columns (launch_filled), not boards")
         lane = self.free_lane()
         lane.boards_host[:len(boards)] = torch.from_numpy(boards)
         return self.launch_filled(lane, len(boards))
@@ -147,9 +189,19 @@ class GraphedBatches:
             raise RuntimeError("more batches in flight than lanes")
         return lane
 
-    #launch of the count boards already in free_lane's boards_array
+    #launch of the count boards already in free_lane's boards_array (a lean lane's rows_array). A lean lane's calls leave
+    #the thread's current device (torch's too) at the lane's
     def launch_filled(self, lane: Lane, count: int) -> tuple[Lane, int, int]:
         size = next(size for size in self.sizes if size >= count)
+        if lane.lean:
+            runtime, handles = self.runtime, self.handles[id(lane)]
+            stream = handles["stream"]
+            runtime.check(runtime.set_device(handles["device"]), "the lane's device")
+            runtime.check(runtime.memcpy(handles["rows"], handles["rows_host"], count * LEAN_ROW, HOST_TO_DEVICE, stream), "the boards' copy")
+            lane.pending = True
+            runtime.check(runtime.graph_launch(handles["graphs"][size][0], stream), "the graph's launch")
+            runtime.check(runtime.event_record(handles["done"], stream), "the batch's event")
+            return lane, size, count
         lane.pending = True
         with torch.cuda.stream(lane.stream):
             lane.boards[:count].copy_(lane.boards_host[:count], non_blocking=True)
@@ -161,12 +213,31 @@ class GraphedBatches:
     #copied here, not at launch: the gpu's copies queue, and a copy at launch held the other lane's boards behind it
     def collect(self, launched: tuple[Lane, int, int]) -> np.ndarray:
         lane, size, count = launched
+        if lane.lean:
+            runtime, handles = self.runtime, self.handles[id(lane)]
+            stream = handles["stream"]
+            runtime.check(runtime.set_device(handles["device"]), "the lane's device")
+            if self.blocking_wait:
+                runtime.check(runtime.event_synchronize(handles["done"]), "the batch")
+            answers = handles["graphs"][size][1]
+            runtime.check(runtime.memcpy(handles["answers_host"], answers, count * LEAN_COLUMNS * 4, DEVICE_TO_HOST, stream), "the answers' copy")
+            runtime.check(runtime.stream_synchronize(stream), "the batch")
+            lane.pending = False
+            return lane.answers_array[:count]
         if self.blocking_wait:
             lane.done.synchronize()
         with torch.cuda.stream(lane.stream):
             lane.answers_host[:count].copy_(lane.answers[size][:count])
         lane.pending = False
         return lane.answers_host[:count].numpy()
+
+    #waits for every lane's batch still on the gpu and frees the lanes: a search that failed leaves its rounds out, whose
+    #graphs and copies would otherwise run on into buffers the network gives back
+    def settle(self) -> None:
+        for lane in self.lanes:
+            if lane.pending:
+                lane.stream.synchronize()
+                lane.pending = False
 
 #GraphedBatches' interface without a gpu (and in the tests): launch does the work
 class ImmediateBatches:

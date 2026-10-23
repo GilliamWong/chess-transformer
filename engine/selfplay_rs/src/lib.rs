@@ -337,7 +337,16 @@ struct RoundOut {
     number: u64,
     name: Option<u64>,
     leaves: Vec<(u64, u32)>,
+    //descended for lean answers: LEAN_COLUMNS numbers a board, its legal moves' logits and its expected score
+    lean: bool,
 }
+
+//a lean round's columns of a board's answer row (descend_into's legal_columns): its legal moves' in python-chess's order,
+//padded to LEGAL_SLOTS (chess's most legal moves) with the expected score's, which also ends them
+const LEGAL_SLOTS: usize = 218;
+const LEAN_COLUMNS: usize = LEGAL_SLOTS + 1;
+//a lean lane's bytes a board: its tokens, then its columns as u16s
+const LEAN_ROW: usize = TOKENS_PER_BOARD + 2 * LEAN_COLUMNS;
 
 //the tree of a game's search that ended last, for the game's next search, at the position after `moves`
 struct KeptTree {
@@ -443,27 +452,47 @@ impl BoardsBuffer {
         Ok(target)
     }
 
-    //the boards it has room for
-    fn boards(&self) -> usize {
+    //the boards it has room for, at a row of `width` items each
+    fn boards(&self, width: usize) -> usize {
         match self {
-            BoardsBuffer::Bytes(buffer) => buffer.item_count() / TOKENS_PER_BOARD,
-            BoardsBuffer::Wide(buffer) => buffer.item_count() / TOKENS_PER_BOARD,
+            BoardsBuffer::Bytes(buffer) => buffer.item_count() / width,
+            BoardsBuffer::Wide(buffer) => buffer.item_count() / width,
         }
     }
 
-    fn write(&self, py: Python<'_>, tokens: &[u8]) -> PyResult<()> {
+    //the tokens, a board's TOKENS_PER_BOARD after another; with columns, lean rows (LEAN_ROW bytes: the board's tokens,
+    //then its LEAN_COLUMNS columns as little-endian u16s)
+    fn write(&self, py: Python<'_>, tokens: &[u8], columns: Option<&[u16]>) -> PyResult<()> {
         let unwritable = || PyValueError::new_err("the boards must go into one writable contiguous array");
-        match self {
-            BoardsBuffer::Bytes(buffer) => {
+        match (self, columns) {
+            (BoardsBuffer::Bytes(buffer), None) => {
                 for (cell, &token) in buffer.as_mut_slice(py).ok_or_else(unwritable)?.iter().zip(tokens) {
                     cell.set(token);
                 }
             }
-            BoardsBuffer::Wide(buffer) => {
+            (BoardsBuffer::Bytes(buffer), Some(columns)) => {
+                let cells = buffer.as_mut_slice(py).ok_or_else(unwritable)?;
+                debug_assert_eq!(tokens.len() / TOKENS_PER_BOARD, columns.len() / LEAN_COLUMNS);
+                let (boards, board_columns) = (tokens.as_chunks::<TOKENS_PER_BOARD>().0, columns.as_chunks::<LEAN_COLUMNS>().0);
+                let rows = cells.as_chunks::<LEAN_ROW>().0;
+                for (row, (board, board_columns)) in rows.iter().zip(boards.iter().zip(board_columns)) {
+                    let (row_tokens, row_columns) = row.split_at(TOKENS_PER_BOARD);
+                    for (cell, &token) in row_tokens.iter().zip(board) {
+                        cell.set(token);
+                    }
+                    for (cells, column) in row_columns.as_chunks::<2>().0.iter().zip(board_columns) {
+                        let [low, high] = column.to_le_bytes();
+                        cells[0].set(low);
+                        cells[1].set(high);
+                    }
+                }
+            }
+            (BoardsBuffer::Wide(buffer), None) => {
                 for (cell, &token) in buffer.as_mut_slice(py).ok_or_else(unwritable)?.iter().zip(tokens) {
                     cell.set(i64::from(token));
                 }
             }
+            (BoardsBuffer::Wide(_), Some(_)) => return Err(PyValueError::new_err("lean rows go into an array of bytes")),
         }
         Ok(())
     }
@@ -487,7 +516,8 @@ impl Searches {
         self.state.lock().map_err(|_| PyRuntimeError::new_err("a call to these searches panicked, which may have left them broken"))
     }
 
-    //descend's round, its boards added to boards
+    //descend's round, its boards added to boards; with columns, a lean round, every board's LEAN_COLUMNS added to them
+    #[allow(clippy::too_many_arguments)]
     fn descend_round(
         &self,
         state: &mut State,
@@ -496,6 +526,7 @@ impl Searches {
         simulations: Option<u32>,
         round: Option<u64>,
         boards: &mut Vec<u8>,
+        mut columns: Option<&mut Vec<u16>>,
     ) -> PyResult<()> {
         if let Some(name) = round
             && state.rounds.iter().any(|out| out.name == Some(name))
@@ -525,8 +556,21 @@ impl Searches {
             if gathered > 0 {
                 round_leaves.push((search.id, gathered));
             }
+            if let Some(columns) = columns.as_deref_mut() {
+                let score = (self.answer_width - 1) as u16;
+                for (moves, turn) in search.tree.round_moves(number) {
+                    if moves.len() > LEGAL_SLOTS {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "a leaf with {} legal moves, past a lean row's {LEGAL_SLOTS}",
+                            moves.len()
+                        )));
+                    }
+                    columns.extend(moves.iter().map(|&chess_move| self.move_ids.id(chess_move, turn) as u16));
+                    columns.extend(std::iter::repeat_n(score, LEAN_COLUMNS - moves.len()));
+                }
+            }
         }
-        state.rounds.push_back(RoundOut { number, name: round, leaves: round_leaves });
+        state.rounds.push_back(RoundOut { number, name: round, leaves: round_leaves, lean: columns.is_some() });
         Ok(())
     }
 
@@ -541,16 +585,29 @@ impl Searches {
                 .ok_or_else(|| PyRuntimeError::new_err(format!("round {name} is not waiting for its answers"))),
         }?;
         let boards = state.rounds[index].leaves.iter().map(|&(_, leaves)| leaves as usize).sum();
-        let answers = answers_for(answers, boards, self.answer_width)?;
+        let width = if state.rounds[index].lean { LEAN_COLUMNS } else { self.answer_width };
+        let answers = answers_for(answers, boards, width)?;
         let out = state.rounds.remove(index).expect("the round");
         let index_of: HashMap<u64, usize> = state.searches.iter().enumerate().map(|(index, search)| (search.id, index)).collect();
-        let mut rows = answers.chunks_exact(self.answer_width);
+        let mut rows = answers.chunks_exact(width);
+        //a lean answer put back in its columns of a whole row, where finish_leaf reads it
+        let mut row = if out.lean { vec![0.0; self.answer_width] } else { Vec::new() };
         for (id, leaves) in out.leaves {
             let tree = &mut state.searches[index_of[&id]].tree;
             for answer in rows.by_ref().take(leaves as usize) {
+                if out.lean {
+                    let (moves, turn) = tree.round_moves(out.number).next().expect("the round's next leaf");
+                    let columns = moves.iter().map(|&chess_move| self.move_ids.id(chess_move, turn));
+                    for (column, number) in
+                        columns.chain(std::iter::once(self.answer_width - 1)).zip(answer.iter().take(moves.len()).chain(answer.last()))
+                    {
+                        row[column] = number.get();
+                    }
+                }
+                let lean = out.lean;
                 tree.finish_leaf(
                     out.number,
-                    |column| answer[column].get(),
+                    |column| if lean { row[column] } else { answer[column].get() },
                     self.answer_width,
                     &self.move_ids,
                     state.cache.as_mut(),
@@ -717,7 +774,7 @@ impl Searches {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let boards = py.detach(|| -> PyResult<Vec<u8>> {
             let mut boards = Vec::new();
-            self.descend_round(&mut *self.lock()?, leaves, collisions, simulations, round, &mut boards)?;
+            self.descend_round(&mut *self.lock()?, leaves, collisions, simulations, round, &mut boards, None)?;
             Ok(boards)
         })?;
         Ok(PyBytes::new(py, &boards))
@@ -726,8 +783,10 @@ impl Searches {
     //descend with the boards written into `boards` (a writable array of bytes or int64s, such as a lane's pinned buffer,
     //with room for `leaves` boards of every search running) rather than returned, and root_visits' numbers of search
     //`root_of` after the round, so that a caller needs no call of its own for them: (the boards written, those numbers,
-    //None for no root_of or a search not running)
-    #[pyo3(signature = (boards, leaves=1, collisions=0, simulations=None, *, round=None, root_of=None))]
+    //None for no root_of or a search not running). legal_columns: a lean round, into an array of bytes in lean rows
+    //(LEAN_ROW a board: the tokens, then the board's LEAN_COLUMNS answer columns as little-endian u16s), whose finish
+    //takes LEAN_COLUMNS numbers a board, those columns of its answer row
+    #[pyo3(signature = (boards, leaves=1, collisions=0, simulations=None, *, round=None, root_of=None, legal_columns=false))]
     #[allow(clippy::too_many_arguments)]
     fn descend_into(
         &self,
@@ -738,21 +797,22 @@ impl Searches {
         simulations: Option<u32>,
         round: Option<u64>,
         root_of: Option<u64>,
+        legal_columns: bool,
     ) -> PyResult<(usize, Option<RootNumbers>)> {
         let target = BoardsBuffer::get(boards)?;
-        let room = target.boards();
-        let (tokens, root) = py.detach(|| {
+        let room = target.boards(if legal_columns { LEAN_ROW } else { TOKENS_PER_BOARD });
+        let (tokens, columns, root) = py.detach(|| {
             let mut guard = self.lock()?;
             let state = &mut *guard;
             let searching = state.searches.iter().filter(|search| !search.stopped).count();
             if leaves as usize * searching > room {
                 return Err(PyValueError::new_err(format!("room for {room} boards, not {leaves} for each of {searching} searches")));
             }
-            let mut tokens = Vec::new();
-            self.descend_round(state, leaves, collisions, simulations, round, &mut tokens)?;
-            Ok((tokens, root_of.and_then(|id| root_numbers(state, id))))
+            let (mut tokens, mut columns) = (Vec::new(), Vec::new());
+            self.descend_round(state, leaves, collisions, simulations, round, &mut tokens, legal_columns.then_some(&mut columns))?;
+            Ok((tokens, columns, root_of.and_then(|id| root_numbers(state, id))))
         })?;
-        target.write(py, &tokens)?;
+        target.write(py, &tokens, legal_columns.then_some(&columns[..]))?;
         Ok((tokens.len() / TOKENS_PER_BOARD, root))
     }
 
@@ -937,5 +997,7 @@ fn selfplay_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SelfPlayGames>()?;
     module.add_class::<Searches>()?;
     module.add_function(wrap_pyfunction!(softmax, module)?)?;
+    module.add("LEAN_COLUMNS", LEAN_COLUMNS)?;
+    module.add("LEAN_ROW", LEAN_ROW)?;
     Ok(())
 }

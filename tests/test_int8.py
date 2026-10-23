@@ -433,7 +433,7 @@ def test_the_engine_network_runs_in_int8(tmp_path, small_calibration):
     _, boards = small_checkpoint(tmp_path)
     flags = torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32
     try:
-        network = engine_network(tmp_path / "model.pt", 4, "int8")
+        network = engine_network(tmp_path / "model.pt", 4, "int8", lean=False)
         answers = network.collect(network.launch(boards[:3].numpy().astype("uint8")))
         with torch.no_grad():
             expected = answer_rows(int8_model(tmp_path / "model.pt", ENGINE_FP16_BLOCKS)(boards[:3].cuda())).cpu().numpy()

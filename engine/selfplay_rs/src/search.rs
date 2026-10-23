@@ -398,6 +398,14 @@ impl Tree {
         self.pending.iter().map(|(_, leaves)| leaves.len()).sum()
     }
 
+    //the legal moves of the round's leaves waiting for the network, in their order, with the side to move at each
+    pub fn round_moves(&self, round: u64) -> impl Iterator<Item = (&[Move], Color)> {
+        self.pending
+            .iter()
+            .filter(move |(id, _)| *id == round)
+            .flat_map(|(_, leaves)| leaves.iter().map(|leaf| (&leaf.moves[..], leaf.turn)))
+    }
+
     //the leaves of the round waiting for the network, in the room of a round whose leaves are all back if it has none
     fn round_leaves(&mut self, round: u64) -> &mut VecDeque<PendingLeaf> {
         let waiting = self.pending.iter().position(|(id, leaves)| *id == round && !leaves.is_empty());
