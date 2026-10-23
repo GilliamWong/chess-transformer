@@ -255,6 +255,21 @@ def test_the_leaves_of_a_round(visits, simulations, expected):
     assert search.round_leaves(simulations) == expected
 
 
+#with a cap the rounds out on all the networks hold a leaf per visits_per_leaf_out root visits at most: grow_leaves' one
+#round until a round takes all its leaves, then more as the tree grows, one at least; without (the default) the networks'
+#two each once a round takes all its leaves
+@pytest.mark.parametrize("visits, cap, networks, expected", [(1024, 0, 4, (64, 8)), (1024, 16, 4, (64, 1)), (5000, 16, 4, (64, 4)),
+                                                             (100_000, 16, 4, (64, 8)), (160, 16, 1, (10, 1)), (50, 64, 1, (3, 1))])
+def test_a_cap_keeps_the_leaves_out_to_the_trees_size(visits, cap, networks, expected):
+    class Searches:
+        def root_visits(self, game):
+            return visits, 0, 0
+    search = EngineSearch([cpu_batches(BoardModel())] * networks, 64, grow_leaves=16, visits_per_leaf_out=cap)
+    search.searches = Searches()
+
+    assert search.round_leaves(None) == expected
+
+
 #a free queen, which the material count finds, and mates in one, which a flat eval finds by searching every move
 @pytest.mark.parametrize("model, fen, best", [
     (BoardModel(), "4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1", "e4d5"),
@@ -337,6 +352,16 @@ def test_a_search_on_several_networks_keeps_them_all_busy():
 
     assert report.simulations == 3000 and report.line[0].uci() == "e4d5"
     assert group.most_out == 6 and all(network.rounds > 5 for network in group.networks)
+
+
+#the cap holds in a search on several networks: at 3,000 simulations and a leaf out per 64 root visits, two rounds of 16
+#are out at most, where the three networks take six without it
+def test_a_cap_holds_on_several_networks():
+    group = SlowNetworks(3, 0.003, BoardModel())
+    search = EngineSearch(group.networks, 16, smart_pruning=False, visits_per_leaf_out=64)
+    report = search.search(chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"), simulations=3000)
+
+    assert report.simulations == 3000 and group.most_out == 2
 
 
 #one network in a list is the search on that network; one leaf a round, mcts.py's search, is for one network only
@@ -775,6 +800,25 @@ def test_the_engine_takes_gpus(monkeypatch, tmp_path):
 
     assert built == [(0, True), (2, True)] and len(search.networks) == 2 and search.search(chess.Board(), simulations=200).simulations == 200
     assert all(run.returncode == 2 and "--gpus needs --select mcts --gpu" in run.stderr for run in refused)
+
+
+#uci.py's --visits-per-leaf-out reaches the search, which has no cap without it
+@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+@pytest.mark.parametrize("arguments, cap", [([], 0), (["--visits-per-leaf-out", "16"], 16)])
+def test_the_engine_takes_a_cap_on_the_leaves_out(monkeypatch, arguments, cap):
+    built = []
+
+    class Recorded(EngineSearch):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            built.append(self.visits_per_leaf_out)
+    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision, device=None, blocking_wait=False: cpu_batches(BoardModel()))
+    monkeypatch.setattr(engine_search, "EngineSearch", Recorded)
+    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *arguments])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
+    runpy.run_module("engine.uci", run_name="__main__")
+
+    assert built == [cap]
 
 
 #uci.py started without --precision builds the engine's network in int8 (self-play and labels stay fp16: they never

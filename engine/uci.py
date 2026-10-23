@@ -21,7 +21,7 @@ from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT,
-                                  EngineSearch, engine_network, engine_search_settings, parse_changes)
+                                  VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
@@ -533,6 +533,9 @@ if __name__ == "__main__":
     parser.add_argument("--search-log", type=Path, help="for --select mcts: a folder to add every search to, as <process id>.jsonl")
     parser.add_argument("--grow-leaves", type=int, default=GROW_LEAVES,
                         help="for --select mcts --gpu: about one leaf a round per this many simulations done or left, up to --leaves; 0 for --leaves every round")
+    parser.add_argument("--visits-per-leaf-out", type=int, default=VISITS_PER_LEAF_OUT,
+                        help="for --select mcts --gpu: at most a leaf out on the network (the rounds out on all of --gpus) per this many "
+                             "root visits; 0 for no cap, the default")
     parser.add_argument("--no-smart-pruning", dest="smart_pruning", action="store_false",
                         help="for --select mcts --gpu: search all of go's movetime or nodes even once the move is decided (lc0's SmartPruningFactor=0)")
     parser.add_argument("--smart-pruning-factor", type=float, default=SMART_PRUNING_FACTOR,
@@ -574,5 +577,5 @@ if __name__ == "__main__":
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
                              "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
-                             "stop_at_one_move_left": arguments.stop_at_one_move_left},
+                             "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out},
              clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

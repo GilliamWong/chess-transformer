@@ -32,6 +32,9 @@ COLLISIONS = 64
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per GROW_LEAVES simulations done or left, as lc0 grows its batches with the tree; 0 for fixed
 GROW_LEAVES = 16
+#with a cap, the rounds out on all the networks hold a leaf (a round counting as its leaves) per this many root visits
+#at most, so that a small tree is not spread over as many leaves as many gpus take; 0 for none
+VISITS_PER_LEAF_OUT = 0
 #as many simulations as the search can do, for a search with only a deadline
 UNLIMITED = 2**32 - 1
 GAME = 0 #the id of the search in Searches: one game at a time
@@ -145,15 +148,16 @@ class EngineSearch:
     #ENGINE_SETTINGS), a fresh tree every move, no second round on the network and no smart pruning. smart_pruning False
     #searches the whole budget even once the move is decided (lc0's SmartPruningFactor=0), for matches that give both
     #engines exactly the same time; smart_pruning_factor, smart_pruning_wait and stop_at_one_move_left are
-    #SMART_PRUNING_FACTOR's, SMART_PRUNING_WAIT's and STOP_AT_ONE_MOVE_LEFT's. use_tablebase: the tables of positions of
-    #up to tablebase_pieces pieces, from the folders of syzygy_path (a SyzygyPath) rather than the downloaded ones if it
-    #is given. settings: changes to engine_search_settings. cache_positions: the answer cache's size; memory_limit_mb:
-    #Searches' (lc0's RamLimitMb), 0 for none; advance_threads: ADVANCE_THREADS'
+    #SMART_PRUNING_FACTOR's, SMART_PRUNING_WAIT's and STOP_AT_ONE_MOVE_LEFT's, visits_per_leaf_out VISITS_PER_LEAF_OUT's
+    #cap. use_tablebase: the tables of positions of up to tablebase_pieces pieces, from the folders of syzygy_path (a
+    #SyzygyPath) rather than the downloaded ones if it is given. settings: changes to engine_search_settings.
+    #cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0 for none; advance_threads:
+    #ADVANCE_THREADS'
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
-                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS):
+                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched = leaves > 1
@@ -163,6 +167,7 @@ class EngineSearch:
         self.collisions = COLLISIONS if batched else 0
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1 #on each network
         self.grow_leaves = grow_leaves if batched else 0
+        self.visits_per_leaf_out = visits_per_leaf_out if batched else 0
         #rounds on lanes of their own (GraphedBatches') run at once
         self.rounds_at_once = batched and len(getattr(self.networks[0], "lanes", ())) > 1
         self.smart_pruning = batched and smart_pruning
@@ -332,15 +337,20 @@ class EngineSearch:
         share = min(1.0, max(0.0, (fall - FALL_START_CP) / (FALL_FULL_CP - FALL_START_CP)))
         return share * seconds
 
-    #the next round's leaves, and the rounds out at once over all the networks: one until a round takes all of them
+    #the next round's leaves, and the rounds out at once over all the networks: one until a round takes all of them, and
+    #with a cap (visits_per_leaf_out) as many as the root's visits allow, one at least
     def round_leaves(self, simulations: int | None) -> tuple[int, int]:
-        rounds = self.rounds_in_flight * len(self.networks)
-        if not self.grow_leaves:
-            return self.leaves, rounds
+        count, rounds = self.leaves, self.rounds_in_flight * len(self.networks)
+        if not self.grow_leaves and not self.visits_per_leaf_out:
+            return count, rounds
         visits = self.searches.root_visits(GAME)[0]
-        done_or_left = visits if simulations is None else min(visits, simulations - visits)
-        count = max(1, min(self.leaves, done_or_left // self.grow_leaves))
-        return count, rounds if count == self.leaves else 1
+        if self.grow_leaves:
+            done_or_left = visits if simulations is None else min(visits, simulations - visits)
+            count = max(1, min(self.leaves, done_or_left // self.grow_leaves))
+            rounds = rounds if count == self.leaves else 1
+        if self.visits_per_leaf_out:
+            rounds = max(1, min(rounds, visits // (self.visits_per_leaf_out * count)))
+        return count, rounds
 
     #the simulations the search has left: those waiting for the network count as left, so a move is only decided if
     #they could not change it either. With a deadline, the time left at the speed of the last rounds
