@@ -224,6 +224,6 @@ def test_the_engine_searches_6_pieces_without_their_dtz_tables(wdl_only_table_se
 
     report = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True, tablebase_pieces=6).search(chess.Board(fen), 400)
 
-    #smart pruning stops the search once the move is decided
+    #certainty proves the capture won by the tables, and the search stops once its move is proven
     takes_the_rook = chess.Move.from_uci("d1d5")
-    assert report.line[0] == takes_the_rook and dict(report.root_moves)[takes_the_rook] > report.simulations / 2
+    assert report.simulations > 0 and report.line[0] == takes_the_rook and report.score == 1.0
