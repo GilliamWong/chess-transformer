@@ -6,6 +6,7 @@ use rand_distr::{Distribution, Gamma};
 use shakmaty::{Chess, Color, Move, MoveList, Position};
 use shakmaty_syzygy::SyzygyError;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 
 //mcts.py's constants
@@ -129,34 +130,77 @@ struct PendingLeaf {
 }
 
 //the network's answer for a position: its legal moves' priors in python-chess's order, and its expected score
-struct Answer {
-    priors: Box<[f32]>,
+struct Answer<'a> {
+    priors: &'a [f32],
     value: f32,
+}
+
+//a hasher for zobrist keys, which are uniform already: one multiply spreads them over the table, where std's SipHash
+//would hash them again
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only u64 keys")
+    }
+
+    fn write_u64(&mut self, key: u64) {
+        self.0 = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type KeyMap<V> = HashMap<u64, V, BuildHasherDefault<KeyHasher>>;
+
+//a generation of the cache: by position, its priors' place in one vector and its value
+#[derive(Default)]
+struct Generation {
+    places: KeyMap<(usize, u16, f32)>,
+    priors: Vec<f32>,
+}
+
+impl Generation {
+    fn get(&self, key: u64) -> Option<Answer<'_>> {
+        let &(start, count, value) = self.places.get(&key)?;
+        Some(Answer { priors: &self.priors[start..start + usize::from(count)], value })
+    }
+
+    fn clear(&mut self) {
+        self.places.clear();
+        self.priors.clear();
+    }
 }
 
 //the network's answers by position (lc0's nn cache): a position reached again by another order of moves (a third of a
 //d512 search's leaves at 1 s a move) needs no network call. The network sees no history, so a position's answer is the
-//same however it was reached. In two generations: when the newer is full the older is dropped, keeping the latest
+//same however it was reached. In two generations: when the newer is full the older is cleared and becomes the newer,
+//keeping the latest. A generation keeps its priors in one vector, so that turning one over frees nothing
 pub struct Cache {
-    newer: HashMap<u64, Answer>,
-    older: HashMap<u64, Answer>,
+    newer: Generation,
+    older: Generation,
     generation: usize, //positions the newer generation holds before it becomes the older
 }
 
 impl Cache {
     pub fn new(positions: usize) -> Cache {
-        Cache { newer: HashMap::new(), older: HashMap::new(), generation: positions.div_ceil(2) }
+        Cache { newer: Generation::default(), older: Generation::default(), generation: positions.div_ceil(2) }
     }
 
-    fn get(&self, key: u64) -> Option<&Answer> {
-        self.newer.get(&key).or_else(|| self.older.get(&key))
+    fn get(&self, key: u64) -> Option<Answer<'_>> {
+        self.newer.get(key).or_else(|| self.older.get(key))
     }
 
-    fn insert(&mut self, key: u64, answer: Answer) {
-        if self.newer.len() >= self.generation {
-            self.older = std::mem::take(&mut self.newer);
+    fn insert(&mut self, key: u64, priors: &[f32], value: f32) {
+        if self.newer.places.len() >= self.generation {
+            std::mem::swap(&mut self.older, &mut self.newer);
+            self.newer.clear();
         }
-        self.newer.insert(key, answer);
+        self.newer.places.insert(key, (self.newer.priors.len(), priors.len() as u16, value));
+        self.newer.priors.extend_from_slice(priors);
     }
 
     pub fn clear(&mut self) {
@@ -398,7 +442,7 @@ impl Tree {
             //a hash collision would give another number of moves
             match cache.and_then(|cache| cache.get(leaf_key)).filter(|answer| answer.priors.len() == moves.len()) {
                 Some(answer) => {
-                    self.expand(node, &moves, &answer.priors);
+                    self.expand(node, &moves, answer.priors);
                     self.backup(&path, f64::from(answer.value), 0);
                 }
                 None => {
@@ -436,10 +480,10 @@ impl Tree {
         let priors = std::mem::take(&mut self.logits);
         self.expand(node, &leaf.moves, &priors);
         self.backup(&leaf.path, f64::from(value), 1);
-        match cache {
-            Some(cache) => cache.insert(leaf.key, Answer { priors: priors.into_boxed_slice(), value }),
-            None => self.logits = priors,
+        if let Some(cache) = cache {
+            cache.insert(leaf.key, &priors, value);
         }
+        self.logits = priors;
     }
 
     //mcts.expand: the moves as edges, without nodes

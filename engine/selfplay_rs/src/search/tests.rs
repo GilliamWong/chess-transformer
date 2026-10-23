@@ -271,3 +271,28 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
     }
     assert!(lines >= 15 && stale > 0 && proven > 0, "{lines} lines, {stale} stale leaves, {proven} proven nodes");
 }
+
+//the answer cache keeps its two latest generations and a position's latest answer, and turns a generation over without
+//taking time out of the search (dropping a generation's boxed answers there stalled it)
+#[test]
+fn the_cache_keeps_two_generations_and_turns_one_over_at_once() {
+    let generation = 1_000_000u64;
+    let mut cache = Cache::new(2 * generation as usize);
+    let priors = |key: u64| -> Vec<f32> { (0..37).map(|index| (key + index) as f32).collect() };
+    let mut slowest_turnover = std::time::Duration::ZERO;
+    for key in 0..=3 * generation {
+        let started = std::time::Instant::now();
+        cache.insert(key, &priors(key), key as f32);
+        if key >= 2 * generation && key % generation == 0 {
+            slowest_turnover = slowest_turnover.max(started.elapsed());
+        }
+    }
+    cache.insert(3 * generation, &priors(7), 7.0);
+
+    let found = |key: u64| cache.get(key).map(|answer| (answer.priors.to_vec(), answer.value));
+    assert_eq!(found(2 * generation), Some((priors(2 * generation), (2 * generation) as f32)));
+    assert_eq!(found(3 * generation - 1), Some((priors(3 * generation - 1), (3 * generation - 1) as f32)));
+    assert_eq!(found(3 * generation), Some((priors(7), 7.0)));
+    assert_eq!(found(2 * generation - 1), None);
+    assert!(slowest_turnover.as_millis() < 20, "a turnover took {slowest_turnover:?}");
+}
