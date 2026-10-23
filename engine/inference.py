@@ -94,9 +94,11 @@ def graph_sizes(max_batch: int) -> list[int]:
 #tokens and its answer's columns, widens the tokens on the gpu and sends back only those columns (LEAN_COLUMNS floats
 #rather than ANSWER_WIDTH), and is launched and collected through the cuda runtime's calls (cuda_runtime.py).
 #The lane owns everything its raw handles point at (handles()): the graphs and their pool, the buffers, the stream and
-#the event; the model's weights are GraphedBatches'. Nothing is freed or recorded again while the lane lives
+#the event; the model's weights are GraphedBatches'. Nothing is freed or recorded again while the lane lives.
+#warm_up: the model run once at every size before recording, which compiles and loads every kernel the graphs use; the
+#lanes after a network's first find them all done
 class Lane:
-    def __init__(self, model: nn.Module, sizes: list[int], chunk: int | None, lean: bool = False):
+    def __init__(self, model: nn.Module, sizes: list[int], chunk: int | None, lean: bool = False, warm_up: bool = True):
         self.stream = torch.cuda.Stream()
         self.device = torch.cuda.current_device()
         #launched and not yet collected: another launch would write over its answers
@@ -123,7 +125,7 @@ class Lane:
         #warmup calls off the default stream, as recording a graph needs
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream), torch.no_grad():
-            for size in sizes:
+            for size in sizes if warm_up else []:
                 self.answer(model, size, chunk)
         torch.cuda.current_stream().wait_stream(self.stream)
 
@@ -169,7 +171,7 @@ class GraphedBatches:
         #tensors made and every answer came back wrong
         self.model = model
         self.sizes = sizes
-        self.lanes = [Lane(model, sizes, chunk, lean) for _ in range(in_flight)]
+        self.lanes = [Lane(model, sizes, chunk, lean, warm_up=number == 0) for number in range(in_flight)]
         self.blocking_wait = blocking_wait
         self.runtime = cuda_runtime() if lean else None
         #by lane: its handles, read once
