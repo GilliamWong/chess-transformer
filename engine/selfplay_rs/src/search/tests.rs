@@ -219,10 +219,17 @@ fn reusable_lines(tree: &Tree) -> Vec<Vec<usize>> {
     lines
 }
 
-//Searches' advance and the next start: the line's first move in place, the stale candidates and the copy unless
-//stopped before them, then the rest of the line in place and the candidates under it (a walk without them), compacted
-//to be compared node for node. Returns the tree and whether the candidates were found
-fn advanced(tree: &Tree, line: &[usize], stopped: Option<&str>, settings: &SearchSettings, tables: Option<&Tables>) -> (Tree, bool) {
+//Searches' advance and the next start: the line's first move in place, the stale candidates and the copy on `threads`
+//threads unless stopped before them, then the rest of the line in place and the candidates under it (a walk without
+//them), compacted to be compared node for node. Returns the tree and whether the candidates were found
+fn advanced(
+    tree: &Tree,
+    line: &[usize],
+    threads: usize,
+    stopped: Option<&str>,
+    settings: &SearchSettings,
+    tables: Option<&Tables>,
+) -> (Tree, bool) {
     let mut node = tree.root;
     let places: Vec<u16> = line
         .iter()
@@ -235,9 +242,9 @@ fn advanced(tree: &Tree, line: &[usize], stopped: Option<&str>, settings: &Searc
     let mut advanced = copied(tree);
     advanced.move_root(&line[..1]);
     let (never, always) = (AtomicBool::new(false), AtomicBool::new(true));
-    let candidates = advanced.stale_candidates(if stopped == Some("walk") { &always } else { &never });
+    let candidates = advanced.stale_candidates(threads, if stopped == Some("walk") { &always } else { &never });
     if candidates.is_some() {
-        advanced.compact(Some(if stopped == Some("copy") { &always } else { &never }));
+        advanced.compact(threads, Some(if stopped == Some("copy") { &always } else { &never }));
     }
     let (mut rest, mut node) = (Vec::new(), advanced.root);
     for &place in &places[1..] {
@@ -252,7 +259,7 @@ fn advanced(tree: &Tree, line: &[usize], stopped: Option<&str>, settings: &Searc
         Some(candidates) => advanced.drop_stale_candidates(&places[1..], &candidates, settings, tables).expect("the tables"),
         None => advanced.drop_stale_leaves(settings, tables).expect("the tables"),
     }
-    advanced.compact(None);
+    advanced.compact(1, None);
     (advanced, found)
 }
 
@@ -315,11 +322,20 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
             new.play_line(&line);
             new.drop_stale_leaves(&settings, tables).expect("the tables");
             assert_same_trees(&old, &new);
-            for stopped in [None, Some("copy"), Some("walk")] {
-                let (advanced, found) = advanced(&tree, &line, stopped, &settings, tables);
+            for (threads, stopped) in [(1, None), (1, Some("copy")), (1, Some("walk")), (4, None), (4, Some("copy")), (4, Some("walk"))] {
+                let (advanced, found) = advanced(&tree, &line, threads, stopped, &settings, tables);
                 assert_same_trees(&new, &advanced);
                 walked += usize::from(!found);
             }
+            //the parallel walk finds the one-thread walk's candidates in its order, and the parallel copy leaves the
+            //tree the one-thread copy leaves, number for number
+            let (mut moved, never) = (copied(&tree), AtomicBool::new(false));
+            moved.move_root(&line[..1]);
+            assert_eq!(moved.stale_candidates(4, &never), moved.stale_candidates(1, &never));
+            let (mut one, mut four) = (copied(&new), copied(&new));
+            one.compact(1, None);
+            four.compact(4, None);
+            assert_same_trees(&one, &four);
             lines += 1;
             proven += new.nodes.iter().filter(|node| node.proof.is_some()).count();
         }
@@ -357,7 +373,7 @@ fn proven_nodes_hide_stale_leaves_from_advance_as_from_the_walk() {
         let mut walked = copied(&proved);
         walked.play_line(&line);
         walked.drop_stale_leaves(&settings, None).expect("no tables");
-        let (advanced, _) = advanced(&proved, &line, None, &settings, None);
+        let (advanced, _) = advanced(&proved, &line, 4, None, &settings, None);
         assert_same_trees(&walked, &advanced);
     }
 }

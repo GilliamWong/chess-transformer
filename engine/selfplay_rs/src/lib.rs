@@ -331,16 +331,25 @@ struct KeptTree {
 //next root may make stale (None if the thread was stopped before it found them all)
 enum Kept {
     Searched(Tree),
-    Advancing(JoinHandle<(Tree, Option<Vec<Vec<u16>>>)>, Arc<AtomicBool>),
+    Advancing(JoinHandle<(Tree, Option<Vec<Vec<u16>>>)>, Arc<Stops>),
     Advanced(Tree, Option<Vec<Vec<u16>>>),
 }
 
+//what of an advance's thread is to stop where it is: the copy, for a search that starts, and the walk too once the tree
+//is no longer wanted
+#[derive(Default)]
+struct Stops {
+    copy: AtomicBool,
+    walk: AtomicBool,
+}
+
 impl Kept {
-    //the tree to search on: an advance not done yet is stopped where it is, so that it takes none of the move's time
+    //the tree to search on: an advance not done yet stops its copy where it is, which the tree does without, and the
+    //search waits for its walk (on the walk's threads, the shortest way to the stale leaves)
     fn ready(self) -> Option<Kept> {
         match self {
-            Kept::Advancing(thread, abort) => {
-                abort.store(true, Ordering::Relaxed);
+            Kept::Advancing(thread, stops) => {
+                stops.copy.store(true, Ordering::Relaxed);
                 thread.join().ok().map(|(tree, candidates)| Kept::Advanced(tree, candidates))
             }
             kept => Some(kept),
@@ -349,8 +358,9 @@ impl Kept {
 
     //no longer wanted: an advance's thread stops at its next look and frees the tree
     fn abandon(self) {
-        if let Kept::Advancing(_, abort) = self {
-            abort.store(true, Ordering::Relaxed);
+        if let Kept::Advancing(_, stops) = self {
+            stops.copy.store(true, Ordering::Relaxed);
+            stops.walk.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -369,6 +379,7 @@ struct Searches {
     kept: HashMap<u64, KeptTree>,
     cache: Option<Cache>,
     memory_limit: usize, //bytes a search's tree may take (search.rs Round), usize::MAX for no limit
+    advance_threads: usize,
 }
 
 impl Searches {
@@ -438,12 +449,12 @@ impl Searches {
     //tree_reuse keeps the tree of a game's (an id's) last search for its next search; cache_positions is the size of
     //the cache of network answers by position (search.rs Cache), 0 for none; value_sharpness see search.rs sharpen,
     //certainty search.rs SearchSettings'. memory_limit_mb (lc0's RamLimitMb, 0 for none) ends a search once its tree's
-    //vectors would grow past that many megabytes; the cache comes on top, and so does the copy a kept tree's next
-    //search makes of the part it keeps
+    //vectors would grow past that many megabytes; the cache comes on top, and so does advance's copy of the part of the
+    //tree it keeps. advance_threads: the threads advance walks and copies a kept tree on, off the clock
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0))]
+                        memory_limit_mb=0, advance_threads=4))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -461,6 +472,7 @@ impl Searches {
         value_sharpness: f64,
         certainty: bool,
         memory_limit_mb: usize,
+        advance_threads: usize,
     ) -> PyResult<Searches> {
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -478,6 +490,7 @@ impl Searches {
             kept: HashMap::new(),
             cache: (cache_positions > 0).then(|| Cache::new(cache_positions)),
             memory_limit: if memory_limit_mb == 0 { usize::MAX } else { memory_limit_mb.saturating_mul(1_000_000) },
+            advance_threads: advance_threads.max(1),
         })
     }
 
@@ -576,8 +589,9 @@ impl Searches {
     //carries the id's kept tree on to the position after `moves` (the game's, the engine's own move last), for uci.py to
     //call once that move is sent. The root moves down in place, and on a thread of its own, while the opponent thinks,
     //the tree finds the leaves the next root may make stale (search.rs stale_candidates) and copies the root's part out
-    //of the rest (compact). The next search's start then only moves the root down the reply; one that comes before the
-    //thread is done stops it and goes on from the tree as far as it got. False when no tree is kept for these moves
+    //of the rest (compact), both on advance_threads threads. The next search's start then only moves the root down the
+    //reply; one that comes before the thread is done waits for the walk, stops the copy and goes on from the tree as
+    //it is. False when no tree is kept for these moves
     fn advance(&mut self, id: u64, fen: &str, moves: Vec<String>) -> PyResult<bool> {
         if self.searches.iter().any(|search| search.id == id) {
             return Err(PyValueError::new_err(format!("search {id} is running")));
@@ -590,18 +604,18 @@ impl Searches {
         let Some(Kept::Searched(mut tree) | Kept::Advanced(mut tree, _)) = kept.tree.ready() else { return Ok(false) };
         let Some((line, _)) = line_to(&tree, &moves[kept.moves.len()..]) else { return Ok(false) };
         tree.move_root(&line);
-        let abort = Arc::new(AtomicBool::new(false));
-        let stop = abort.clone();
+        let (stops, threads) = (Arc::new(Stops::default()), self.advance_threads);
+        let thread_stops = stops.clone();
         let carry = move || {
-            let candidates = tree.stale_candidates(&stop);
+            let candidates = tree.stale_candidates(threads, &thread_stops.walk);
             if candidates.is_some() {
-                drop(tree.compact(Some(&stop)));
+                drop(tree.compact(threads, Some(&thread_stops.copy)));
             }
             (tree, candidates)
         };
         //without a thread the tree is not kept
         let Ok(thread) = std::thread::Builder::new().spawn(carry) else { return Ok(false) };
-        self.kept.insert(id, KeptTree { fen: fen.to_string(), moves, tree: Kept::Advancing(thread, abort) });
+        self.kept.insert(id, KeptTree { fen: fen.to_string(), moves, tree: Kept::Advancing(thread, stops) });
         Ok(true)
     }
 

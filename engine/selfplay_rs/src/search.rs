@@ -7,8 +7,9 @@ use shakmaty::{Chess, Color, Move, MoveList, Position};
 use shakmaty_syzygy::SyzygyError;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::mem::MaybeUninit;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 //mcts.py's constants
 pub struct SearchSettings {
@@ -266,6 +267,20 @@ pub type Vectors = (Vec<Node>, Vec<u64>, Vec<Move>, Vec<f32>, Vec<u32>);
 
 //nodes a walk or copy that may be stopped (an abort flag) goes through between looks at the flag
 const ABORT_CHECKS: usize = 4096;
+
+//fewer items than this (a level's nodes, the order's) are copied on one thread: more would not pay for the threads. The
+//tests' small trees take several
+const PARALLEL_ITEMS: usize = if cfg!(test) { 64 } else { 16384 };
+
+//parts of the tree a thread of stale_candidates gets on the mean, so that a big part at the end leaves none idle long
+const PARTS_A_THREAD: usize = 16;
+
+//a part of the tree for one of stale_candidates' threads: a subtree (its node, and the places of the moves down to it)
+//or a candidate leaf
+enum Part {
+    Subtree(usize, Vec<u16>),
+    Leaf(Vec<u16>),
+}
 
 pub struct Tree {
     pub board: Chess,   //the root's position
@@ -765,12 +780,66 @@ impl Tree {
     //the leaves drop_stale_leaves may find stale once the root has moved further down, found before the moves are
     //known (Searches' advance, while the opponent thinks): every leaf below the root with visits, no moves and no
     //proof of its own, in the walk's order, each as the places of its line's moves among their nodes' moves, which hold
-    //across compact. Leaves below a node proven now are kept too, as a later root's own proof is dropped. None once
-    //abort is set
-    pub fn stale_candidates(&self, abort: &AtomicBool) -> Option<Vec<Vec<u16>>> {
-        let mut candidates = Vec::new();
-        let mut looked = 0;
-        self.find_candidates(self.root, &mut Vec::new(), &mut candidates, &mut looked, abort).then_some(candidates)
+    //across compact. Leaves below a node proven now are kept too, as a later root's own proof is dropped. The walk
+    //runs on `threads` threads, each taking the next of the tree's parts (split_for_walk), their candidates joined in
+    //the parts' order. None once abort is set
+    pub fn stale_candidates(&self, threads: usize, abort: &AtomicBool) -> Option<Vec<Vec<u16>>> {
+        let share = (self.root().visit_count / (threads * PARTS_A_THREAD).max(1) as u32).max(1);
+        let mut parts = Vec::new();
+        self.split_for_walk(self.root, &mut Vec::new(), share, &mut parts);
+        let next = AtomicUsize::new(0);
+        //the parts a thread walked, with their candidates, or None once stopped
+        let walk = || {
+            let (mut walked, mut looked) = (Vec::new(), 0);
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(part) = parts.get(index) else { return Some(walked) };
+                let mut candidates = Vec::new();
+                match part {
+                    Part::Leaf(places) => candidates.push(places.clone()),
+                    Part::Subtree(node, places) => {
+                        if !self.find_candidates(*node, &mut places.clone(), &mut candidates, &mut looked, abort) {
+                            return None;
+                        }
+                    }
+                }
+                walked.push((index, candidates));
+            }
+        };
+        let walked: Vec<Option<_>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (1..threads).map(|_| scope.spawn(walk)).collect();
+            let mut walked = vec![walk()];
+            walked.extend(workers.into_iter().map(|worker| worker.join().expect("a walk's thread")));
+            walked
+        });
+        let mut walked: Vec<(usize, Vec<Vec<u16>>)> = walked.into_iter().collect::<Option<Vec<_>>>()?.into_iter().flatten().collect();
+        walked.sort_unstable_by_key(|&(index, _)| index);
+        Some(walked.into_iter().flat_map(|(_, candidates)| candidates).collect())
+    }
+
+    //the parts of the tree below node (its line's moves at `places`) for stale_candidates' threads, in the walk's
+    //order: a subtree of at most `share` visits is one part, a bigger one is split into its moves'; a leaf met on the
+    //way that is a candidate is a part of its own
+    fn split_for_walk(&self, node: usize, places: &mut Vec<u16>, share: u32, parts: &mut Vec<Part>) {
+        if node != self.root && self.nodes[node].visit_count <= share {
+            parts.push(Part::Subtree(node, places.clone()));
+            return;
+        }
+        let edges = self.nodes[node].edges();
+        for edge in edges.clone() {
+            let child = self.children[edge];
+            if child == NO_NODE {
+                continue;
+            }
+            places.push((edge - edges.start) as u16);
+            let child = child as usize;
+            if self.nodes[child].has_edges() {
+                self.split_for_walk(child, places, share, parts);
+            } else if self.nodes[child].visit_count > 0 && self.nodes[child].proof.is_none() {
+                parts.push(Part::Leaf(places.clone()));
+            }
+            places.pop();
+        }
     }
 
     fn find_candidates(
@@ -926,7 +995,7 @@ impl Tree {
         assert!(self.pending.is_empty(), "a move is played once the search's leaves are back");
         if keep_subtree && self.children[edge] != NO_NODE {
             self.move_root(&[edge]);
-            self.compact(None);
+            self.compact(1, None);
         } else {
             self.board.play_unchecked(self.moves[edge]);
             self.keys.push(position_key(&self.board));
@@ -942,7 +1011,7 @@ impl Tree {
     //the root, with its subtree: the subtree is copied once, where play would copy it at every move
     pub fn play_line(&mut self, line: &[usize]) {
         self.move_root(line);
-        let old = self.compact(None);
+        let old = self.compact(1, None);
         //the old tree is freed on a thread of its own, off the move's clock (1.6 ms at 100k nodes); here if none starts
         let _ = std::thread::Builder::new().spawn(move || drop(old));
     }
@@ -966,11 +1035,128 @@ impl Tree {
         }
     }
 
-    //the root's part of the tree copied out of the rest (left there by move_root) as a tree of its own, the root first.
-    //Its proofs still hold: a proof comes from the game's end by its rules or the tables, which a new root leaves as it
-    //was (a two-fold repetition proves nothing). Returns the old tree's vectors to free, or None once abort is set (the
-    //tree then left as it was)
-    pub fn compact(&mut self, abort: Option<&AtomicBool>) -> Option<Vectors> {
+    //the root's part of the tree copied out of the rest (left there by move_root) as a tree of its own, in breadth-first
+    //order from the root. Its proofs still hold: a proof comes from the game's end by its rules or the tables, which a
+    //new root leaves as it was (a two-fold repetition proves nothing). On one thread in one pass; on more, the order is
+    //found a level at a time in chunks, then each stretch of it is copied into its own part of the new vectors, whose
+    //pages that thread is the first to touch: the same tree. Returns the old tree's vectors to free, or None once abort
+    //is set (the tree then left as it was)
+    pub fn compact(&mut self, threads: usize, abort: Option<&AtomicBool>) -> Option<Vectors> {
+        if threads <= 1 {
+            return self.compact_on_one_thread(abort);
+        }
+        let tree: &Tree = self;
+        //the kept nodes in breadth-first order (their numbers in the new tree), and of each its moves with a node and
+        //its moves
+        let (mut order, mut counts) = (vec![tree.root as u32], Vec::new());
+        let mut level = 0..1;
+        while !level.is_empty() {
+            let chunks: Vec<&[u32]> = order[level.clone()].chunks(chunk_size(level.len(), threads)).collect();
+            let found = each_in_parallel(&chunks, |chunk| tree.next_level(chunk, abort));
+            let found: Vec<Level> = found.into_iter().collect::<Option<_>>()?;
+            for (next, chunk_counts) in found {
+                order.extend(next);
+                counts.extend(chunk_counts);
+            }
+            level = level.end..order.len();
+        }
+
+        //the order in stretches, one a thread, each with its edges and where they and its children's numbers start
+        let size = chunk_size(order.len(), threads);
+        let positions: Vec<Range<usize>> = (0..order.len()).step_by(size).map(|start| start..(start + size).min(order.len())).collect();
+        let (mut first_edge, mut first_child) = (0, 1);
+        let starts: Vec<(usize, usize, usize)> = positions
+            .iter()
+            .map(|positions| {
+                let edges = counts[positions.clone()].iter().map(|&(_, edges)| usize::from(edges)).sum();
+                let start = (edges, first_edge, first_child);
+                first_edge += edges;
+                first_child += counts[positions.clone()].iter().map(|&(with_node, _)| usize::from(with_node)).sum::<usize>();
+                start
+            })
+            .collect();
+
+        //room for the whole tree, so the copy never regrows (that took twice the time); unwritten room takes no memory
+        let (node_room, edge_room) = (tree.nodes.len(), tree.moves.len());
+        let (mut nodes, mut node_keys) = (Vec::with_capacity(node_room), Vec::with_capacity(node_room));
+        let (mut moves, mut priors, mut children) =
+            (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
+        {
+            let mut nodes_left = &mut nodes.spare_capacity_mut()[..order.len()];
+            let mut keys_left = &mut node_keys.spare_capacity_mut()[..order.len()];
+            let mut moves_left = &mut moves.spare_capacity_mut()[..first_edge];
+            let mut priors_left = &mut priors.spare_capacity_mut()[..first_edge];
+            let mut children_left = &mut children.spare_capacity_mut()[..first_edge];
+            let mut stretches = Vec::with_capacity(positions.len());
+            for (positions, &(edges, first_edge, first_child)) in positions.iter().zip(&starts) {
+                let (nodes, node_keys, moves, priors, children);
+                (nodes, nodes_left) = std::mem::take(&mut nodes_left).split_at_mut(positions.len());
+                (node_keys, keys_left) = std::mem::take(&mut keys_left).split_at_mut(positions.len());
+                (moves, moves_left) = std::mem::take(&mut moves_left).split_at_mut(edges);
+                (priors, priors_left) = std::mem::take(&mut priors_left).split_at_mut(edges);
+                (children, children_left) = std::mem::take(&mut children_left).split_at_mut(edges);
+                stretches.push(Stretch {
+                    positions: positions.clone(),
+                    first_edge,
+                    first_child,
+                    nodes,
+                    node_keys,
+                    moves,
+                    priors,
+                    children,
+                });
+            }
+            let order = &order;
+            let copied = match stretches.len() {
+                1 => tree.copy_stretch(stretches.pop().expect("a stretch"), order, abort),
+                _ => std::thread::scope(|scope| {
+                    let workers: Vec<_> =
+                        stretches.into_iter().map(|stretch| scope.spawn(move || tree.copy_stretch(stretch, order, abort))).collect();
+                    //the scope joins any thread a failed copy leaves running
+                    workers.into_iter().all(|worker| worker.join().expect("a thread of the copy"))
+                }),
+            };
+            if !copied {
+                return None;
+            }
+        }
+        //SAFETY: the stretches split the first order.len() nodes and first_edge edges between them, and each wrote all
+        //of its own
+        unsafe {
+            nodes.set_len(order.len());
+            node_keys.set_len(order.len());
+            moves.set_len(first_edge);
+            priors.set_len(first_edge);
+            children.set_len(first_edge);
+        }
+        self.root = 0;
+        Some((
+            std::mem::replace(&mut self.nodes, nodes),
+            std::mem::replace(&mut self.node_keys, node_keys),
+            std::mem::replace(&mut self.moves, moves),
+            std::mem::replace(&mut self.priors, priors),
+            std::mem::replace(&mut self.children, children),
+        ))
+    }
+
+    //the nodes the moves of a chunk of a level lead to (that part of the next level), in order, and of each node in the
+    //chunk its moves with a node and its moves; None once abort is set
+    fn next_level(&self, chunk: &[u32], abort: Option<&AtomicBool>) -> Option<Level> {
+        let (mut next, mut counts) = (Vec::new(), Vec::with_capacity(chunk.len()));
+        for (index, &node) in chunk.iter().enumerate() {
+            if index.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
+                return None;
+            }
+            let (before, edges) = (next.len(), self.nodes[node as usize].edges());
+            next.extend(self.children[edges.clone()].iter().filter(|&&child| child != NO_NODE));
+            counts.push(((next.len() - before) as u8, edges.len() as u8));
+        }
+        Some((next, counts))
+    }
+
+    //compact on one thread, in one pass: the nodes in breadth-first order, each one's moves as it comes, and the moves
+    //with a node getting theirs copied at the end
+    fn compact_on_one_thread(&mut self, abort: Option<&AtomicBool>) -> Option<Vectors> {
         //room for the whole tree, so the copy never regrows (that took twice the time); unwritten room takes no memory
         let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
         let mut nodes = Vec::with_capacity(node_room);
@@ -993,7 +1179,6 @@ impl Tree {
             moves.extend_from_slice(&self.moves[edges.clone()]);
             priors.extend_from_slice(&self.priors[edges.clone()]);
             children.extend_from_slice(&self.children[edges]);
-            //the few moves with a node get theirs copied, numbered in the new tree
             for child in &mut children[first_edge..] {
                 if *child != NO_NODE {
                     nodes.push(self.nodes[*child as usize]);
@@ -1012,6 +1197,75 @@ impl Tree {
             std::mem::replace(&mut self.children, children),
         ))
     }
+
+    //compact's copy of a stretch of the breadth-first order: each node with its moves at their new edges, and the moves'
+    //nodes numbered as the order has them. False once abort is set
+    fn copy_stretch(&self, stretch: Stretch, order: &[u32], abort: Option<&AtomicBool>) -> bool {
+        let (mut edge, mut child) = (stretch.first_edge, stretch.first_child);
+        for (slot, position) in stretch.positions.clone().enumerate() {
+            if slot.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
+                return false;
+            }
+            let old = order[position] as usize;
+            let mut node = self.nodes[old];
+            if position == 0 {
+                node.proof = None;
+            }
+            let edges = node.edges();
+            //a node without moves keeps the first edge Node::new gives it
+            if !edges.is_empty() {
+                node.edges_at = (edge as u64) << 8 | edges.len() as u64;
+            }
+            stretch.nodes[slot].write(node);
+            stretch.node_keys[slot].write(self.node_keys[old]);
+            for old_edge in edges {
+                let at = edge - stretch.first_edge;
+                stretch.moves[at].write(self.moves[old_edge]);
+                stretch.priors[at].write(self.priors[old_edge]);
+                stretch.children[at].write(match self.children[old_edge] {
+                    NO_NODE => NO_NODE,
+                    _ => {
+                        child += 1;
+                        (child - 1) as u32
+                    }
+                });
+                edge += 1;
+            }
+        }
+        true
+    }
+}
+
+//a part of a level of compact's breadth-first order: the nodes its chunk's moves lead to, and of each node of the chunk
+//its moves with a node and its moves
+type Level = (Vec<u32>, Vec<(u8, u8)>);
+
+//a stretch of the breadth-first order for one of compact's threads: its positions, where its edges and the numbers of
+//its moves' nodes start, and its parts of the new vectors
+struct Stretch<'a> {
+    positions: Range<usize>,
+    first_edge: usize,
+    first_child: usize,
+    nodes: &'a mut [MaybeUninit<Node>],
+    node_keys: &'a mut [MaybeUninit<u64>],
+    moves: &'a mut [MaybeUninit<Move>],
+    priors: &'a mut [MaybeUninit<f32>],
+    children: &'a mut [MaybeUninit<u32>],
+}
+
+//the items in a chunk for compact's threads: a `threads`th of them each, or all in one below PARALLEL_ITEMS
+fn chunk_size(items: usize, threads: usize) -> usize {
+    if items < PARALLEL_ITEMS { items.max(1) } else { items.div_ceil(threads.max(1)) }
+}
+
+//f of each item, in order, each on a scoped thread of its own (the first here); items is not empty
+fn each_in_parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = items[1..].iter().map(|item| scope.spawn(|| f(item))).collect();
+        let mut done = vec![f(&items[0])];
+        done.extend(workers.into_iter().map(|worker| worker.join().expect("a thread of the copy")));
+        done
+    })
 }
 
 #[cfg(test)]
