@@ -20,9 +20,9 @@ def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     move_logits, value_logits = outputs
     return torch.cat([move_logits.float(), expected_score(value_logits).unsqueeze(1)], dim=1)
 
-#the L2 a position's activations take between a block's kernels, per unit of the model's width: a d768's 64 positions a
-#lane fill the 5070 Ti's 48 MB with two lanes at once (forwards of 128 there cost two-lane batches 4-9%)
-L2_BYTES_PER_POSITION_WIDTH = 512
+#the L2 a position's activations take between a block's kernels, per unit of the model's width: two lanes of a d768 run
+#best at 64 positions a forward on the 5090's 96 MB L2 (forwards of 128 cost int8 batches 3%, 4-9% on the 5070 Ti)
+L2_BYTES_PER_POSITION_WIDTH = 1024
 #smaller forwards leave the matmuls too few tiles for a big gpu
 MIN_CHUNK_POSITIONS = 64
 

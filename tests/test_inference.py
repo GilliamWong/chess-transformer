@@ -35,10 +35,10 @@ def test_small_graph_sizes_pad_little(max_batch, chunk):
     assert all(whole in sizes for whole in range(every, max_batch + 1, every))
 
 
-#a forward's boards are as many as the gpu's L2 holds for every lane's at once (a d768: 64 a lane with two lanes on the
-#5070 Ti's 48 MB), and never so few that a small-L2 gpu runs its batches as forwards of a few boards
-@pytest.mark.parametrize("l2_mb, width, lanes, chunk", [(48, 768, 2, 64), (48, 768, 1, 128), (96, 768, 2, 128), (48, 512, 2, 96),
-                                                        (48, 128, 2, 384), (6, 768, 2, 64)])
+#a forward's boards are as many as the gpu's L2 holds for every lane's at once (a d768 with two lanes: 64 on the 5090's
+#96 MB), and never so few that a small-L2 gpu runs its batches as forwards of a few boards
+@pytest.mark.parametrize("l2_mb, width, lanes, chunk", [(96, 768, 2, 64), (96, 768, 1, 128), (48, 768, 2, 64), (48, 256, 2, 96),
+                                                        (48, 128, 2, 192), (6, 768, 1, 64)])
 def test_chunk_positions_fit_the_l2(monkeypatch, l2_mb, width, lanes, chunk):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(L2_cache_size=l2_mb << 20))
