@@ -3,6 +3,7 @@
 //(inference.Lane): the loop writes a round's rows into a lane's pinned buffer and makes the cuda runtime calls lean
 //launch_filled and collect make, through their addresses (cuda_runtime.py). python keeps the networks, and so every
 //buffer, graph, stream and event their handles point at, alive while the loop runs (RoundLoop holds them)
+use crate::affinity;
 use crate::rules::TOKENS_PER_BOARD;
 use crate::{LEAN_COLUMNS, LEAN_ROW, RootNumbers, SearchReport, Searches, root_numbers, root_score_of};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -83,6 +84,7 @@ struct Network {
     device: i32,
     blocking_wait: bool,
     lanes: Vec<Lane>,
+    cpu: Option<usize>, //its thread's, pinned (EngineSearch's thread_affinity)
 }
 
 fn item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -114,7 +116,11 @@ impl Network {
         if lanes.is_empty() {
             return Err(PyValueError::new_err("a network without lanes"));
         }
-        Ok(Network { device, blocking_wait: item(network, "blocking_wait")?.extract()?, lanes })
+        let cpu: Option<usize> = network.get_item("cpu")?.map(|cpu| cpu.extract()).transpose()?;
+        if let Some(cpu) = cpu.filter(|cpu| !affinity::allowed().contains(cpu)) {
+            return Err(PyValueError::new_err(format!("cpu {cpu} is not one this process may run on: {:?}", affinity::allowed())));
+        }
+        Ok(Network { device, blocking_wait: item(network, "blocking_wait")?.extract()?, lanes, cpu })
     }
 
     //lean launch_filled's calls on the lane free first: the rows' copy, the smallest graph that holds them, the event
@@ -653,7 +659,9 @@ pub(crate) fn start_loop(
         .map(|mut network| {
             let (searches, shared, settings) = (Arc::clone(&searches), Arc::clone(&shared), Arc::clone(&settings));
             std::thread::spawn(move || {
-                //where this gpu's thread would be pinned to the cores near it
+                if let Some(cpu) = network.cpu {
+                    affinity::pin_current(cpu);
+                }
                 let rounds = Rounds { searches: searches.get(), settings: &settings, shared: &shared, calls, networks: count };
                 let failed = rounds.rounds_on(&mut network).err();
                 if failed.is_some() {

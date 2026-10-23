@@ -41,6 +41,10 @@ MAX_COLLISION_VISITS = 80_000
 #this long for the next round before they sleep
 GATHER_WORKERS = 0
 GATHER_SPIN_US = 50
+#the search's threads, the gather workers' then the networks', each pinned to a cpu of its own (thread_cpus): "none"
+#leaves them to the os
+THREAD_AFFINITIES = ("none", "ccd", "cores")
+THREAD_AFFINITY = "none"
 #a round is gathered while the last one is on the gpu (+9% simulations/s), and the two run at once (GraphedBatches)
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per GROW_LEAVES simulations done or left, as lc0 grows its batches with the tree; 0 for fixed
@@ -129,6 +133,29 @@ ENGINE_PRECISION = "int8"
 ENGINE_FP16_BLOCKS = 1
 
 
+#the cpus of count threads under a policy of THREAD_AFFINITIES, from selfplay_rs.cpu_topology's (l3s, cores) or the
+#machine's, the largest L3 first: "ccd" fills an L3's physical cores, then their smt siblings, then the next L3, so
+#that a round's caller and its gather workers share one (a team split over a 9950X3D's ccds was slower); "cores"
+#gives each a physical core of its own, the next L3's before any smt sibling. None where the os gives no topology
+def thread_cpus(policy: str, count: int, topology: tuple | None = None) -> list[int]:
+    if policy not in THREAD_AFFINITIES:
+        raise ValueError(f"thread_affinity is one of {', '.join(THREAD_AFFINITIES)}, not {policy!r}")
+    if policy == "none" or not count:
+        return []
+    topology = topology if topology is not None else selfplay_rs.cpu_topology()
+    if topology is None:
+        return []
+    l3s, cores = topology
+    #stable: equal L3s stay in the os's order
+    by_l3 = [[core for core in cores if core[0] in cpus] for _, cpus in sorted(l3s, key=lambda l3: -l3[0])]
+    first, siblings = [[core[0] for core in l3] for l3 in by_l3], [[cpu for core in l3 for cpu in core[1:]] for l3 in by_l3]
+    if policy == "ccd":
+        cpus = [cpu for l3_first, l3_siblings in zip(first, siblings) for cpu in l3_first + l3_siblings]
+    else:
+        cpus = [cpu for l3 in first for cpu in l3] + [cpu for l3 in siblings for cpu in l3]
+    return [cpus[index % len(cpus)] for index in range(count)]
+
+
 #the gpus whose lanes are lean by default (inference.Lane): sm_120's (the 5070 Ti, the 5090), where they were timed;
 #others keep whole rows until timed
 LEAN_CAPABILITIES = {(12, 0)}
@@ -199,14 +226,14 @@ class EngineSearch:
     #cap. use_tablebase: the tables of positions of up to tablebase_pieces pieces, from the folders of syzygy_path (a
     #SyzygyPath) rather than the downloaded ones if it is given. settings: changes to engine_search_settings.
     #cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0 for none; advance_threads:
-    #ADVANCE_THREADS'. rust_rounds: RUST_ROUNDS'
+    #ADVANCE_THREADS'. rust_rounds: RUST_ROUNDS'. thread_affinity: THREAD_AFFINITY's
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT,
                  collision_cap: int = COLLISION_CAP, gather_workers: int = GATHER_WORKERS, gather_spin_us: int = GATHER_SPIN_US,
-                 collision_scaling: bool = COLLISION_SCALING, rust_rounds: bool = RUST_ROUNDS):
+                 collision_scaling: bool = COLLISION_SCALING, rust_rounds: bool = RUST_ROUNDS, thread_affinity: str = THREAD_AFFINITY):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched = leaves > 1
@@ -230,9 +257,13 @@ class EngineSearch:
         self.smart_pruning_factor, self.smart_pruning_wait = smart_pruning_factor, smart_pruning_wait
         self.stop_at_one_move_left = stop_at_one_move_left
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
+        #the caller of a round's gather is a network's thread, the gather's worker 0
+        pinned_workers = max(gather_workers - 1, 0) if batched else 0
+        cpus = thread_cpus(thread_affinity, pinned_workers + len(self.networks) if batched else 0)
+        gather_cpus, self.network_cpus = cpus[:pinned_workers], cpus[pinned_workers:]
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
                                              advance_threads=advance_threads, gather_workers=gather_workers if batched else 0,
-                                             gather_spin_us=gather_spin_us)
+                                             gather_spin_us=gather_spin_us, gather_cpus=gather_cpus)
         #reports give the score on the network's own scale, as a gui showed and adjudicated it before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
@@ -245,8 +276,11 @@ class EngineSearch:
         self.certainty = search_settings.get("certainty", False)
         self.round_times: deque = deque([FIRST_ROUND_SECONDS], maxlen=ROUND_TIMES)
         self.round_seconds = FIRST_ROUND_SECONDS
-        #the threads that drive the networks after the first, which the searching thread drives itself
-        self.threads = ThreadPoolExecutor(len(self.networks) - 1) if len(self.networks) > 1 else None
+        #the threads that drive the networks after the first, which the searching thread drives itself, or all of them
+        #pinned: on linux a pinned thread's new threads (advance's) would start on its one cpu
+        self.drives_first = not self.network_cpus
+        pooled = len(self.networks) - self.drives_first
+        self.threads = ThreadPoolExecutor(pooled) if pooled else None
 
     #a new game (uci's ucinewgame): its first search starts a fresh tree with an empty cache, as lc0's does
     def new_game(self) -> None:
@@ -280,9 +314,11 @@ class EngineSearch:
         if self.rust_rounds:
             self.rounds_in_rust(run)
             return self.search_report(run.report)
-        driven = [self.threads.submit(self.drive, network, run) for network in self.networks[1:]] if self.threads else []
+        cpus = self.network_cpus or [None] * len(self.networks)
+        driven = [self.threads.submit(self.drive, network, run, cpu) for network, cpu in list(zip(self.networks, cpus))[self.drives_first:]]
         try:
-            self.drive(self.networks[0], run)
+            if self.drives_first:
+                self.drive(self.networks[0], run)
         finally:
             for drive in driven:
                 drive.result()
@@ -294,8 +330,10 @@ class EngineSearch:
         return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
                             [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]])
 
-    #rounds_on, a failure stopping the other networks' rounds too
-    def drive(self, network, run: SearchRun) -> None:
+    #rounds_on on the thread pinned to cpu if it is given, a failure stopping the other networks' rounds too
+    def drive(self, network, run: SearchRun, cpu: int | None = None) -> None:
+        if cpu is not None:
+            selfplay_rs.pin_thread(cpu)
         try:
             self.rounds_on(network, run)
         except BaseException:
@@ -311,7 +349,9 @@ class EngineSearch:
     #thread passes on uci's stop and gives the info lines
     def rounds_in_rust(self, run: SearchRun) -> None:
         seconds = None if run.deadline is None else run.deadline - time.perf_counter()
-        loop = self.searches.round_loop([(network, network.rust_network()) for network in self.networks], cuda_runtime().addresses(),
+        cpus = self.network_cpus or [None] * len(self.networks)
+        networks = [(network, network.rust_network() | ({} if cpu is None else {"cpu": cpu})) for network, cpu in zip(self.networks, cpus)]
+        loop = self.searches.round_loop(networks, cuda_runtime().addresses(),
                                         self.rust_round_settings(), run.simulations, seconds, run.extension, run.only_move, run.root,
                                         list(self.round_times))
         while (report := loop.wait(RUST_WAIT_SECONDS)) is None:
