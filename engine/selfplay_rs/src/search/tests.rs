@@ -61,7 +61,14 @@ impl Network {
 
 //engine_search.py's rounds until the root has its simulations or the tree is full: a leaf per 16 simulations up to 64, as
 //many collisions, three simulations a leaf
-fn search(tree: &mut Tree, simulations: u32, memory_limit: usize, settings: &SearchSettings, tables: Option<&Tables>, network: &mut Network) {
+fn search(
+    tree: &mut Tree,
+    simulations: u32,
+    memory_limit: usize,
+    settings: &SearchSettings,
+    tables: Option<&Tables>,
+    network: &mut Network,
+) {
     let mut boards = Vec::new();
     while tree.root().visit_count < simulations && !(tree.full && tree.pending.is_empty()) {
         let leaves = (tree.root().visit_count / 16).clamp(1, 64);

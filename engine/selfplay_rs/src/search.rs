@@ -216,7 +216,7 @@ pub struct Round {
     pub leaves: u32,
     pub simulations: u32,
     pub collisions: u32,
-    pub visit_limit: u32,     //the search's simulations, those already done and waiting included
+    pub visit_limit: u32,    //the search's simulations, those already done and waiting included
     pub memory_limit: usize, //bytes the tree's vectors may take, a growth's copy included; usize::MAX for none
 }
 
@@ -326,7 +326,11 @@ impl Tree {
     //an edge's prior, a root edge's with its noise
     fn prior(&self, edge: usize) -> f64 {
         let root = self.nodes[0].edges();
-        if !self.noised_priors.is_empty() && root.contains(&edge) { self.noised_priors[edge - root.start] } else { f64::from(self.priors[edge]) }
+        if !self.noised_priors.is_empty() && root.contains(&edge) {
+            self.noised_priors[edge - root.start]
+        } else {
+            f64::from(self.priors[edge])
+        }
     }
 
     pub fn chess_move(&self, edge: usize) -> Move {
