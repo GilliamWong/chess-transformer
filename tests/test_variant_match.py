@@ -93,6 +93,22 @@ def test_sprt_llr():
 
 #each variant's rounds go to its own network (--a-precision, --b-precision): b, searching three times a's nodes, sends
 #its network more than twice the boards
+#main builds each variant's network in the precision and with the fp16 blocks it names, once for variants that share them
+def test_each_variant_gets_the_network_it_names(monkeypatch, tmp_path):
+    from tools.play import variant_match
+    built, given = [], []
+    monkeypatch.setattr(variant_match, "engine_network", lambda checkpoint, max_batch, precision, fp16_blocks: built.append((precision, fp16_blocks))
+                        or len(built))
+    monkeypatch.setattr(variant_match, "play", lambda networks, *rest: given.append(networks))
+    (tmp_path / "openings.txt").write_text(OPENINGS[0] + "\n")
+    for options in (["--a-fp16-blocks", "0"], ["--b-precision", "fp16"], []):
+        monkeypatch.setattr(sys, "argv", ["variant_match", "unused.pt", str(tmp_path / "openings.txt"), "--nodes", "10", "--no-tablebase",
+                                          "--out", str(tmp_path / "out"), *options])
+        variant_match.main()
+
+    assert built == [("int8", 0), ("int8", 1), ("int8", 1), ("fp16", 1), ("int8", 1)] and given == [[1, 2], [3, 4], [5, 5]]
+
+
 def test_each_variant_has_its_own_network():
     variants = [Variant(name, variant_settings(change, False)) for name, change in (("a", "smart_pruning=0"), ("b", "smart_pruning=0,node_scale=3"))]
     games = [(2 * index + colour, opening, colour == 0, (0, 1)) for index, opening in enumerate(OPENINGS) for colour in (0, 1)]
