@@ -437,3 +437,5 @@ fn a_search_ends_at_its_memory_limit_as_the_same_search() {
     assert_same_trees(&unlimited, &limited);
     assert!(!unlimited.full && limited.allocated_bytes() > memory_limit / 3);
 }
+
+mod batch;

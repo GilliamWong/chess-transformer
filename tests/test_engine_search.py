@@ -1449,3 +1449,21 @@ def test_a_long_search_tells_the_gui_how_it_stands(monkeypatch):
     went = gui.tell("go movetime 500")
     assert gui.sent_at("bestmove", since=went, seconds=5) is not None and len(gui.lines_sent("info depth")) >= 4
     gui.close()
+
+
+#Searches' gather_workers (search/batch.rs): the engine's searches, on a kept tree too, the same for any number
+def test_gather_workers_make_the_same_search_for_any_number():
+    reports, counts = [], []
+    for workers in (1, 3):
+        search = EngineSearch(cpu_batches(BoardModel()), 64, smart_pruning=False)
+        search.searches = selfplay_rs.Searches(**engine_search_settings(False), tree_reuse=True, cache_positions=100_000, gather_workers=workers)
+        board = chess.Board()
+        first = search.search(board, simulations=3000)
+        board.push(first.line[0])
+        board.push(first.line[1])
+        reports.append((first, search.search(board, simulations=6000)))
+        counts.append(search.searches.gather_counts())
+    assert reports[0] == reports[1] and reports[0][1].simulations == 6000
+    #all but the items, which the workers share a pass's picks out in
+    rounds, passes, _, picks, leaves, cached = counts[0][:6]
+    assert counts[0][:2] + counts[0][3:] == counts[1][:2] + counts[1][3:] and passes > rounds and picks >= leaves > 0 and cached > 0
