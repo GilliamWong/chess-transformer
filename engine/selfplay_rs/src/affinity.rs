@@ -28,7 +28,8 @@ pub fn topology() -> Option<Topology> {
         kept.sort_unstable();
         kept
     };
-    let mut l3s: Vec<(u64, Vec<usize>)> = l3s.into_iter().map(|(bytes, cpus)| (bytes, kept(cpus))).filter(|(_, cpus)| !cpus.is_empty()).collect();
+    let mut l3s: Vec<(u64, Vec<usize>)> =
+        l3s.into_iter().map(|(bytes, cpus)| (bytes, kept(cpus))).filter(|(_, cpus)| !cpus.is_empty()).collect();
     let mut cores: Vec<Vec<usize>> = cores.into_iter().map(kept).filter(|cpus| !cpus.is_empty()).collect();
     l3s.sort_by_key(|(_, cpus)| cpus[0]);
     l3s.dedup_by(|one, other| one.1 == other.1);

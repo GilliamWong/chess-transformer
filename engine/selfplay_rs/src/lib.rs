@@ -789,7 +789,9 @@ impl Searches {
             )));
         }
         if !gather_cpus.is_empty() && gather_cpus.len() + 1 != gather_workers.max(1) {
-            return Err(PyValueError::new_err(format!("{gather_workers} gather workers take a cpu for each but the caller, not {gather_cpus:?}")));
+            return Err(PyValueError::new_err(format!(
+                "{gather_workers} gather workers take a cpu for each but the caller, not {gather_cpus:?}"
+            )));
         }
         if let Some(cpu) = gather_cpus.iter().find(|cpu| !affinity::allowed().contains(cpu)) {
             return Err(PyValueError::new_err(format!("cpu {cpu} is not one this process may run on: {:?}", affinity::allowed())));
