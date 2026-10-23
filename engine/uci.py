@@ -527,6 +527,9 @@ if __name__ == "__main__":
                              "default the current one. On more than one the search is another (more leaves out), for --leaves above 1")
     parser.add_argument("--blocking-wait", action=argparse.BooleanOptionalAction,
                         help="for --select mcts --gpu: wait for the gpu asleep instead of spinning a core; default on for several --gpus, off for one")
+    parser.add_argument("--rust-rounds", action="store_true",
+                        help="for --select mcts --gpu: the search's rounds in Searches' own loop, a thread a gpu and no python between "
+                             "rounds (engine_search.RUST_ROUNDS); the same search, on gpus whose lanes are lean (sm_120)")
     parser.add_argument("--fp16-blocks", type=int,
                         help=f"for the int8 network: the blocks kept in fp16 besides the last, those whose int8 costs the policy most "
                              f"(engine/quantization.py), default {ENGINE_FP16_BLOCKS}; 0 for every other block in int8")
@@ -570,6 +573,8 @@ if __name__ == "__main__":
         parser.error("--gpus needs --select mcts --gpu, and on more than one gpu --leaves above 1")
     if arguments.blocking_wait is not None and not (arguments.select == "mcts" and arguments.gpu):
         parser.error("--blocking-wait needs --select mcts --gpu")
+    if arguments.rust_rounds and not (arguments.select == "mcts" and arguments.gpu):
+        parser.error("--rust-rounds needs --select mcts --gpu")
     if arguments.fp16_blocks is not None and not (arguments.select == "mcts" and arguments.gpu and arguments.precision in (None, "int8")):
         parser.error("--fp16-blocks needs --select mcts --gpu and the int8 network")
     if arguments.fp16_blocks is not None and arguments.fp16_blocks < 0:
@@ -586,5 +591,6 @@ if __name__ == "__main__":
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
                              "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
-                             "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out},
+                             "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out,
+                             **({"rust_rounds": True} if arguments.rust_rounds else {})},
              clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

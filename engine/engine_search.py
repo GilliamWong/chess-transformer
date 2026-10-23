@@ -19,7 +19,9 @@ import torch
 from model.encoding import TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
 from engine.inference import ExactSizeCompiled, GraphedBatches, chunk_positions, fp16_model, int8_model, small_graph_sizes
-from engine.player import ROOT_MOVES_REPORTED, SearchReport, score_to_centipawns
+from engine.player import MAX_REPORTED_SCORE, ROOT_MOVES_REPORTED, SearchReport, score_to_centipawns
+from engine.cuda_runtime import cuda_runtime
+from training.data import EXPECTED_SCORE_PER_CENTIPAWN
 from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
 
 #leaves a round (lc0's minibatch), and its descents that may end on a leaf already waiting before it stops gathering.
@@ -73,6 +75,11 @@ FALL_FULL_CP = 30
 SPEED_ROUNDS = 8
 #a search's info lines for the gui while it runs, one about this often (lc0 sends one a second)
 INFO_SECONDS = 1.0
+#a search's rounds in Searches' own loop (Searches.round_loop, rounds.rs), a thread a network, no python between them:
+#the same search as the python loop's on networks of lean lanes only
+RUST_ROUNDS = False
+#how often the searching thread looks at uci's stop and the info lines meanwhile
+RUST_WAIT_SECONDS = 0.005
 #the network's answers kept by position (search.rs Cache), ~260 bytes each (1.3 GB): replaying 6 tournament games, 4M
 #rather than self-play's 500k gave 18% more nodes a search on the mean (3.5% on the median) from as many network
 #calls. The engine's own: every self-play worker has a selfplay.CACHE_POSITIONS cache
@@ -192,19 +199,24 @@ class EngineSearch:
     #cap. use_tablebase: the tables of positions of up to tablebase_pieces pieces, from the folders of syzygy_path (a
     #SyzygyPath) rather than the downloaded ones if it is given. settings: changes to engine_search_settings.
     #cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0 for none; advance_threads:
-    #ADVANCE_THREADS'
+    #ADVANCE_THREADS'. rust_rounds: RUST_ROUNDS'
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT,
                  collision_cap: int = COLLISION_CAP, gather_workers: int = GATHER_WORKERS, gather_spin_us: int = GATHER_SPIN_US,
-                 collision_scaling: bool = COLLISION_SCALING):
+                 collision_scaling: bool = COLLISION_SCALING, rust_rounds: bool = RUST_ROUNDS):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched = leaves > 1
         if len(self.networks) > 1 and not batched:
             raise ValueError("one leaf a round is mcts.py's search, which runs on one network")
+        if rust_rounds and not all(hasattr(network, "rust_network") for network in self.networks):
+            raise ValueError("Searches' own round loop runs on networks of lean lanes (engine_network's on sm_120)")
+        self.rust_rounds = rust_rounds
+        #the batches and their boards Searches' own round loop launched, all its searches'
+        self.rust_counts = [0, 0]
         self.round_simulations = SIMULATIONS_PER_LEAF * leaves
         self.collisions = COLLISIONS if batched else 0
         self.collision_cap = collision_cap if batched else 0
@@ -265,6 +277,9 @@ class EngineSearch:
         deadline = started + seconds if seconds is not None else None
         run = SearchRun(simulations, deadline, extension if deadline is not None else None, board.legal_moves.count() == 1, stop, info,
                         started + INFO_SECONDS, self.searches.root_visits(GAME))
+        if self.rust_rounds:
+            self.rounds_in_rust(run)
+            return self.search_report(run.report)
         driven = [self.threads.submit(self.drive, network, run) for network in self.networks[1:]] if self.threads else []
         try:
             self.drive(self.networks[0], run)
@@ -291,6 +306,45 @@ class EngineSearch:
             if hasattr(network, "settle"):
                 network.settle()
             raise
+
+    #the search's rounds in Searches' own loop (rust_rounds): rounds_on's, in Rust on a thread a network, while this
+    #thread passes on uci's stop and gives the info lines
+    def rounds_in_rust(self, run: SearchRun) -> None:
+        seconds = None if run.deadline is None else run.deadline - time.perf_counter()
+        loop = self.searches.round_loop([(network, network.rust_network()) for network in self.networks], cuda_runtime().addresses(),
+                                        self.rust_round_settings(), run.simulations, seconds, run.extension, run.only_move, run.root,
+                                        list(self.round_times))
+        while (report := loop.wait(RUST_WAIT_SECONDS)) is None:
+            if run.told is not None and run.told.is_set():
+                loop.tell_stop()
+            if run.info is not None and time.perf_counter() >= run.next_info:
+                run.next_info = time.perf_counter() + INFO_SECONDS
+                #the search may have ended since the wait, and left Searches
+                try:
+                    running = self.searches.report_now(GAME)
+                except ValueError:
+                    running = None
+                if running is not None:
+                    run.info(self.search_report(running))
+        round_times, batches, boards = loop.counts()
+        self.round_times = deque(round_times, maxlen=ROUND_TIMES)
+        self.round_seconds = statistics.median(self.round_times)
+        self.rust_counts[0] += batches
+        self.rust_counts[1] += boards
+        run.report = report
+
+    #rounds_on's settings, for Searches' own loop (rounds.rs LoopSettings)
+    def rust_round_settings(self) -> dict:
+        return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
+                    visits_per_leaf_out=self.visits_per_leaf_out, collisions=self.collisions, collision_cap=self.collision_cap,
+                    collision_scaling=self.collision_scaling, collision_scaling_start=float(COLLISION_SCALING_START),
+                    collision_scaling_end=float(COLLISION_SCALING_END), collision_scaling_power=COLLISION_SCALING_POWER,
+                    max_collision_visits=MAX_COLLISION_VISITS, simulations_per_leaf=SIMULATIONS_PER_LEAF, smart_pruning=self.smart_pruning,
+                    smart_pruning_factor=self.smart_pruning_factor, smart_pruning_wait=self.smart_pruning_wait,
+                    stop_at_one_move_left=self.stop_at_one_move_left, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
+                    speed_rounds=SPEED_ROUNDS, round_times_kept=ROUND_TIMES, fall_start_cp=float(FALL_START_CP), fall_full_cp=float(FALL_FULL_CP),
+                    max_reported_score=MAX_REPORTED_SCORE, expected_score_per_centipawn=EXPECTED_SCORE_PER_CENTIPAWN,
+                    value_sharpness=self.value_sharpness)
 
     #the search's rounds on one network until the report is in and the network's rounds are back: what to do next is
     #decided under run's lock, and the rounds are gathered, run and finished outside it

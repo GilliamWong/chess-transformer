@@ -1,6 +1,7 @@
 //mcts.py's search for many trees at once while python runs the network: self play games (SelfPlayGames) and match
 //searches (Searches). A round is descend (the leaves that need the network come back as boards), then finish
 mod games;
+mod rounds;
 mod rules;
 mod search;
 mod workers;
@@ -9,7 +10,7 @@ use games::{FinishedGame, Game, GameSettings};
 use pyo3::buffer::{PyBuffer, ReadOnlyCell};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use rules::{
     MOVE_ID_TABLE_LENGTH, MoveIds, TOKENS_PER_BOARD, Tables, encode_board, final_result, game_result, legal_moves_in_python_order,
     position_key,
@@ -64,8 +65,25 @@ fn answer_numbers<'a>(py: Python<'a>, answers: &'a PyBuffer<f32>) -> PyResult<&'
     answers.as_slice(py).ok_or_else(|| PyValueError::new_err("the answers must be one contiguous array"))
 }
 
+//an answer's number: a cell of the array a caller gave, or an f32 of the pinned answers Searches' own round loop reads
+trait Number {
+    fn number(&self) -> f32;
+}
+
+impl Number for ReadOnlyCell<f32> {
+    fn number(&self) -> f32 {
+        self.get()
+    }
+}
+
+impl Number for f32 {
+    fn number(&self) -> f32 {
+        *self
+    }
+}
+
 //the network's answers, answer_width float32s for each board descend gave it
-fn answers_for(answers: &[ReadOnlyCell<f32>], boards: usize, answer_width: usize) -> PyResult<&[ReadOnlyCell<f32>]> {
+fn answers_for<N: Number>(answers: &[N], boards: usize, answer_width: usize) -> PyResult<&[N]> {
     if answers.len() != boards * answer_width {
         return Err(PyValueError::new_err(format!("{} numbers of answers for {boards} boards of {answer_width} each", answers.len())));
     }
@@ -423,6 +441,15 @@ struct Searches {
 //root_visits': (the root's visits, the visits of its two most visited moves)
 type RootNumbers = (u32, u32, u32);
 
+//root_score's: the chosen move's score, or the root's for its side to move before the move has a visit
+fn root_score_of(search: &Search) -> f64 {
+    let tree = &search.tree;
+    match tree.principal_variation().first().and_then(|&edge| tree.child(edge)) {
+        Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
+        _ => 1.0 - tree.root().mean_score(),
+    }
+}
+
 //root_visits' numbers of search id, None when it is not running
 fn root_numbers(state: &State, id: u64) -> Option<RootNumbers> {
     let search = state.searches.iter().find(|search| search.id == id)?;
@@ -575,7 +602,7 @@ impl Searches {
     }
 
     //finish's round
-    fn finish_round(&self, state: &mut State, answers: &[ReadOnlyCell<f32>], round: Option<u64>) -> PyResult<Vec<SearchReport>> {
+    fn finish_round<N: Number>(&self, state: &mut State, answers: &[N], round: Option<u64>) -> PyResult<Vec<SearchReport>> {
         let index = match round {
             None => (!state.rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers")),
             Some(name) => state
@@ -601,13 +628,13 @@ impl Searches {
                     for (column, number) in
                         columns.chain(std::iter::once(self.answer_width - 1)).zip(answer.iter().take(moves.len()).chain(answer.last()))
                     {
-                        row[column] = number.get();
+                        row[column] = number.number();
                     }
                 }
                 let lean = out.lean;
                 tree.finish_leaf(
                     out.number,
-                    |column| if lean { row[column] } else { answer[column].get() },
+                    |column| if lean { row[column] } else { answer[column].number() },
                     self.answer_width,
                     &self.move_ids,
                     state.cache.as_mut(),
@@ -616,6 +643,46 @@ impl Searches {
             }
         }
         Ok(self.take_reports(state))
+    }
+
+    //descend_into's lean round for Searches' own round loop (rounds.rs): the rows written at rows_host, a lane's pinned
+    //buffer with room for `room` boards
+    #[allow(clippy::too_many_arguments)]
+    fn descend_rows(
+        &self,
+        rows_host: usize,
+        room: usize,
+        leaves: u32,
+        collisions: u32,
+        simulations: u32,
+        round: u64,
+        root_of: u64,
+    ) -> PyResult<(usize, Option<RootNumbers>)> {
+        let (tokens, columns, root) = {
+            let mut guard = self.lock()?;
+            let state = &mut *guard;
+            let searching = state.searches.iter().filter(|search| !search.stopped).count();
+            if leaves as usize * searching > room {
+                return Err(PyValueError::new_err(format!("room for {room} boards, not {leaves} for each of {searching} searches")));
+            }
+            let (mut tokens, mut columns) = (Vec::new(), Vec::new());
+            self.descend_round(state, leaves, collisions, Some(simulations), Some(round), &mut tokens, Some(&mut columns))?;
+            (tokens, columns, root_numbers(state, root_of))
+        };
+        //SAFETY: the lane's rows, room boards long, are the loop's until it launches them
+        unsafe { rounds::write_lean_rows(rows_host as *mut u8, &tokens, &columns) };
+        Ok((tokens.len() / TOKENS_PER_BOARD, root))
+    }
+
+    //stop's
+    fn stop_search(&self, state: &mut State, id: u64) -> PyResult<Option<SearchReport>> {
+        let search =
+            state.searches.iter_mut().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+        if search.tree.root().visit_count == 0 && search.tree.pending() == 0 {
+            return Err(PyRuntimeError::new_err(format!("search {id} was stopped before its first simulation")));
+        }
+        search.stopped = true;
+        Ok(self.take_reports(state).into_iter().next())
     }
 
     //removes the searches that are done, the reports of those that were searched
@@ -841,20 +908,32 @@ impl Searches {
         })
     }
 
+    //EngineSearch's rust_rounds: the running search's rounds on threads of their own, a network each, engine_search.py's
+    //rounds_on in Rust (rounds.rs). networks: (a GraphedBatches of lean lanes, its rust_network()); addresses: the cuda
+    //runtime calls' (cuda_runtime.py); settings: EngineSearch's (rust_round_settings()); then the run's simulations,
+    //seconds to its deadline, fall extension, only move, root numbers and round times. RoundLoop.wait has its report
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (networks, addresses, settings, simulations, seconds, extension, only_move, root, round_times))]
+    fn round_loop(
+        slf: &Bound<'_, Self>,
+        networks: Vec<(Py<PyAny>, Bound<'_, PyDict>)>,
+        addresses: HashMap<String, usize>,
+        settings: rounds::LoopSettings,
+        simulations: Option<u32>,
+        seconds: Option<f64>,
+        extension: Option<(i64, f64)>,
+        only_move: bool,
+        root: RootNumbers,
+        round_times: Vec<f64>,
+    ) -> PyResult<rounds::RoundLoop> {
+        let searches = Arc::new(slf.clone().unbind());
+        rounds::start_loop(searches, networks, addresses, settings, simulations, seconds, extension, only_move, root, round_times)
+    }
+
     //ends a search at its next report: at once when none of its leaves is waiting for the network, else from the finish
     //that brings the last of them back
     fn stop(&self, py: Python<'_>, id: u64) -> PyResult<Option<SearchReport>> {
-        py.detach(|| {
-            let mut guard = self.lock()?;
-            let state = &mut *guard;
-            let search =
-                state.searches.iter_mut().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-            if search.tree.root().visit_count == 0 && search.tree.pending() == 0 {
-                return Err(PyRuntimeError::new_err(format!("search {id} was stopped before its first simulation")));
-            }
-            search.stopped = true;
-            Ok(self.take_reports(state).into_iter().next())
-        })
+        py.detach(|| self.stop_search(&mut *self.lock()?, id))
     }
 
     //(the root's visits, the visits of its two most visited moves) of a running search, for smart pruning: the most
@@ -869,11 +948,7 @@ impl Searches {
             let state = self.lock()?;
             let search =
                 state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-            let tree = &search.tree;
-            Ok(match tree.principal_variation().first().and_then(|&edge| tree.child(edge)) {
-                Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
-                _ => 1.0 - tree.root().mean_score(),
-            })
+            Ok(root_score_of(search))
         })
     }
 
@@ -997,6 +1072,7 @@ fn selfplay_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SelfPlayGames>()?;
     module.add_class::<Searches>()?;
     module.add_function(wrap_pyfunction!(softmax, module)?)?;
+    module.add_class::<rounds::RoundLoop>()?;
     module.add("LEAN_COLUMNS", LEAN_COLUMNS)?;
     module.add("LEAN_ROW", LEAN_ROW)?;
     Ok(())

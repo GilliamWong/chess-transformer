@@ -49,9 +49,9 @@ class CudaRuntime:
         if error:
             raise CudaError(f"{what}: cuda error {error}, {self.library.cudaGetErrorString(error).decode()}")
 
-    #the calls' addresses, for Rust to make them itself
+    #the calls' addresses, cudaGetErrorString's too, for Searches' own round loop to make them itself
     def addresses(self) -> dict[str, int]:
-        return {name: ctypes.cast(getattr(self.library, name), ctypes.c_void_p).value for name in self.CALLS}
+        return {name: ctypes.cast(getattr(self.library, name), ctypes.c_void_p).value for name in [*self.CALLS, "cudaGetErrorString"]}
 
 
 RUNTIME: CudaRuntime | None = None

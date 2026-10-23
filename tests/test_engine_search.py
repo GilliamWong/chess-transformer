@@ -1,6 +1,7 @@
 #the uci engine's search (engine/engine_search.py): rounds of many leaves (selfplay_rs.Searches.descend), its
 #deadline and node limit, smart pruning, the tree kept for the next move, the engine's own settings, and uci.py's go
 #limits and clock, the commands it takes while it searches, its options and the positions it refuses
+import gc
 import io
 import queue
 import runpy
@@ -20,7 +21,7 @@ import torch
 from torch import nn
 from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import BoardModel, CountingNetwork, UniformModel
-from engine.inference import ImmediateBatches, cpu_batches
+from engine.inference import GraphedBatches, ImmediateBatches, cpu_batches, small_graph_sizes
 from model.model import ChessTransformer
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from tools.checkpoint import save_checkpoint
@@ -156,6 +157,53 @@ def test_a_failed_search_settles_its_network():
     with pytest.raises(RuntimeError, match="went away"):
         EngineSearch(network, 16).search(chess.Board(), simulations=200)
     assert network.settled == 1
+
+
+#Searches' own round loop (rust_rounds) makes the python loop's search, report for report and tree for tree (the next
+#searches start from the kept trees), with smart pruning, gather_batch or a cap on the leaves out, waiting by event or
+#by the copy
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("blocking_wait, settings", [(False, {}), (True, {}), (False, {"gather_workers": 2, "collision_cap": 32}),
+                                                     (False, {"visits_per_leaf_out": 8, "smart_pruning": False})])
+def test_rust_rounds_search_as_the_python_loop(blocking_wait, settings):
+    board, reports = chess.Board(), {}
+    for rust_rounds in (False, True):
+        search = EngineSearch(lean_network(blocking_wait), 16, rust_rounds=rust_rounds, **settings)
+        found = []
+        for move in ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]:
+            found.append(search.search(board, simulations=600))
+            board.push_uci(move)
+        board = chess.Board()
+        reports[rust_rounds] = found
+    assert reports[True] == reports[False]
+    assert search.rust_counts[0] > 20 and search.rust_counts[1] > search.rust_counts[0]
+
+
+#on two networks Searches' own loop runs both, rounds out on each at once
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_rust_rounds_drive_every_network():
+    networks = [lean_network(True), lean_network(True)]
+    search = EngineSearch(networks, 16, smart_pruning=False, rust_rounds=True)
+    assert search.search(chess.Board(), simulations=3000).simulations == 3000
+    assert search.rust_counts[0] > 40 and all(not lane.pending for network in networks for lane in network.lanes)
+
+
+#a cuda error in Searches' own loop comes back as python's exception, its other rounds waited for
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_a_cuda_error_in_the_rust_rounds_is_raised():
+    network = lean_network()
+    handles = network.rust_network()
+    handles["lanes"] = [{**lane, "device": 99} for lane in handles["lanes"]]
+    network.rust_network = lambda: handles
+    search = EngineSearch(network, 16, rust_rounds=True)
+    with pytest.raises(RuntimeError, match="cuda error"):
+        search.search(chess.Board(), simulations=600)
+
+
+#Searches' own round loop takes networks of lean lanes only
+def test_rust_rounds_want_lean_lanes():
+    with pytest.raises(ValueError, match="lean lanes"):
+        EngineSearch(cpu_batches(BoardModel()), 16, rust_rounds=True)
 
 
 #lean lanes by compute capability: the gpus of LEAN_CAPABILITIES, today's lanes on the others
@@ -1324,10 +1372,27 @@ class Gui:
 def board_search() -> EngineSearch:
     return EngineSearch(cpu_batches(BoardModel()), 16)
 
+#a small network on lean lanes (inference.Lane's) of 16 boards. The earlier tests' graphs are collected first: one freed
+#while these are recorded breaks the recording
+def lean_network(blocking_wait: bool = False) -> GraphedBatches:
+    gc.collect()
+    torch.manual_seed(0)
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    return GraphedBatches(model, small_graph_sizes(16), 2, blocking_wait=blocking_wait, lean=True)
+
+#board_search's in Searches' own round loop (rust_rounds), on a gpu
+def rust_search() -> EngineSearch:
+    return EngineSearch(lean_network(), 16, rust_rounds=True)
+
+gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+#the uci tests below with the python loop, and with Searches' own
+both_loops = pytest.mark.parametrize("make_search", [board_search, pytest.param(rust_search, marks=gpu)])
+
 #stop ends a running search as its deadline would (10 s here), and the engine answers with its move at once (stop was
 #read only once the search had ended)
-def test_stop_ends_a_running_search(monkeypatch):
-    gui = Gui(monkeypatch, board_search)
+@both_loops
+def test_stop_ends_a_running_search(monkeypatch, make_search):
+    gui = Gui(monkeypatch, make_search)
     gui.tell("position startpos")
     gui.tell("go movetime 10000")
     time.sleep(0.3)
@@ -1338,8 +1403,9 @@ def test_stop_ends_a_running_search(monkeypatch):
 
 #isready during a search is answered at once, the search going on (UCI); one after a command the engine has not taken
 #yet waits for it, so that readyok still means all before it is done
-def test_isready_is_answered_while_the_engine_searches(monkeypatch):
-    gui = Gui(monkeypatch, board_search)
+@both_loops
+def test_isready_is_answered_while_the_engine_searches(monkeypatch, make_search):
+    gui = Gui(monkeypatch, make_search)
     gui.tell("go movetime 10000")
     time.sleep(0.3)
     asked = gui.tell("isready")
@@ -1356,8 +1422,9 @@ def test_isready_is_answered_while_the_engine_searches(monkeypatch):
     gui.close()
 
 #quit during a search ends it, and the engine
-def test_quit_ends_a_running_search(monkeypatch):
-    gui = Gui(monkeypatch, board_search)
+@both_loops
+def test_quit_ends_a_running_search(monkeypatch, make_search):
+    gui = Gui(monkeypatch, make_search)
     gui.tell("go movetime 10000")
     time.sleep(0.3)
     gui.tell("quit")

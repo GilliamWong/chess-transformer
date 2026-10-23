@@ -231,6 +231,13 @@ class GraphedBatches:
         lane.pending = False
         return lane.answers_host[:count].numpy()
 
+    #what Searches' own round loop (Searches.round_loop) needs of a network of lean lanes: their handles, and the wait.
+    #The loop holds this object, and so every handle's lane, while it runs
+    def rust_network(self) -> dict:
+        if self.runtime is None:
+            raise ValueError("Searches' round loop needs lean lanes")
+        return {"blocking_wait": self.blocking_wait, "lanes": [self.handles[id(lane)] for lane in self.lanes]}
+
     #waits for every lane's batch still on the gpu and frees the lanes: a search that failed leaves its rounds out, whose
     #graphs and copies would otherwise run on into buffers the network gives back
     def settle(self) -> None:
