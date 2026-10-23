@@ -18,7 +18,7 @@ import selfplay_rs
 import torch
 from model.encoding import TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
-from engine.inference import ExactSizeCompiled, GraphedBatches, fp16_model, int8_model, small_graph_sizes
+from engine.inference import ExactSizeCompiled, GraphedBatches, chunk_positions, fp16_model, int8_model, small_graph_sizes
 from engine.player import ROOT_MOVES_REPORTED, SearchReport, score_to_centipawns
 from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
 
@@ -120,10 +120,12 @@ def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: st
                    blocking_wait: bool = False):
     with torch.cuda.device(device):
         model = PRECISIONS[precision](checkpoint_path)
-        sizes = small_graph_sizes(max_batch)
+        lanes = ROUNDS_IN_FLIGHT if max_batch > 1 else 1
+        chunk = chunk_positions(model.d_model, lanes)
+        sizes = small_graph_sizes(max_batch, chunk)
         #one board a round (mcts.py's search) never fills the largest graph
-        compiled = ExactSizeCompiled(model, sizes[-1]) if max_batch > 1 else torch.compile(model, dynamic=True)
-        return GraphedBatches(compiled, sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1, blocking_wait)
+        compiled = ExactSizeCompiled(model, min(sizes[-1], chunk)) if max_batch > 1 else torch.compile(model, dynamic=True)
+        return GraphedBatches(compiled, sizes, lanes, chunk, blocking_wait)
 
 
 #what the threads driving a search's networks share, behind changed's lock; changed is notified as a round comes back

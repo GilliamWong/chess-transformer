@@ -20,12 +20,21 @@ def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     move_logits, value_logits = outputs
     return torch.cat([move_logits.float(), expected_score(value_logits).unsqueeze(1)], dim=1)
 
-#boards a forward takes at once, a bigger batch's graph running several: a d768's activations for 128 fit a 48 MB L2
-CHUNK_POSITIONS = 128
+#the L2 a position's activations take between a block's kernels, per unit of the model's width: a d768's 64 positions a
+#lane fill the 5070 Ti's 48 MB with two lanes at once (forwards of 128 there cost two-lane batches 4-9%)
+L2_BYTES_PER_POSITION_WIDTH = 512
+#smaller forwards leave the matmuls too few tiles for a big gpu
+MIN_CHUNK_POSITIONS = 64
 
-#answer_rows for every board, CHUNK_POSITIONS boards at a time
-def chunked_answer_rows(model: nn.Module, boards: torch.Tensor) -> torch.Tensor:
-    rows = [answer_rows(model(chunk)) for chunk in boards.split(CHUNK_POSITIONS)]
+#boards a forward takes at once, a bigger batch's graph running several: as many as fit the gpu's L2 with every lane's
+#forward at once
+def chunk_positions(width: int, lanes: int) -> int:
+    l2_bytes = torch.cuda.get_device_properties(torch.cuda.current_device()).L2_cache_size
+    return max(MIN_CHUNK_POSITIONS, l2_bytes // (lanes * width * L2_BYTES_PER_POSITION_WIDTH) // 16 * 16)
+
+#answer_rows for every board, chunk boards at a time (None: all at once)
+def chunked_answer_rows(model: nn.Module, boards: torch.Tensor, chunk: int | None) -> torch.Tensor:
+    rows = [answer_rows(model(part)) for part in boards.split(chunk or len(boards))]
     return rows[0] if len(rows) == 1 else torch.cat(rows)
 
 CPU = torch.device("cpu")
@@ -58,12 +67,15 @@ def serve(network, boards: list[np.ndarray], answers: list[np.ndarray], connecti
 
 #graph sizes for batches from one up to max_batch (one search's rounds, a match's few games): past 16, 4 boards or a
 #sixteenth apart. A round of the engine's 64 leaves often sends fewer boards (the cache answers some), and steps of 16
-#rather than 4 cost it 3% of its nodes/s
-def small_graph_sizes(max_batch: int) -> list[int]:
-    sizes = [1, 2, 4, 8, 16]
-    while sizes[-1] < max_batch:
-        sizes.append(sizes[-1] + max(4, sizes[-1] // 16))
-    return sizes
+#rather than 4 cost it 3% of its nodes/s. Past a chunk (chunked_answer_rows), whole chunks and the last one in the same
+#steps, so that no batch pads into a forward of its own (a graph of 133 ran 128 boards as forwards of 128 and 5)
+def small_graph_sizes(max_batch: int, chunk: int | None = None) -> list[int]:
+    chunk = min(chunk or max_batch, max_batch)
+    steps = [1]
+    while steps[-1] < chunk:
+        steps.append(min(chunk, steps[-1] * 2 if steps[-1] < 16 else steps[-1] + max(4, steps[-1] // 16)))
+    sizes = [whole + step for whole in range(0, max_batch, chunk) for step in steps]
+    return sizes[:next(index for index, size in enumerate(sizes) if size >= max_batch) + 1]
 
 #every 64 up to 1024, then every 128, then every 256: padding wastes a few percent at most
 def graph_sizes(max_batch: int) -> list[int]:
@@ -72,9 +84,10 @@ def graph_sizes(max_batch: int) -> list[int]:
         sizes.append(sizes[-1] + (64 if sizes[-1] < 1024 else 128 if sizes[-1] < 2048 else 256))
     return sizes
 
-#a batch in flight's own stream, cuda graphs (one for every size in sizes, sharing a memory pool) and buffers
+#a batch in flight's own stream, cuda graphs (one for every size in sizes, sharing a memory pool, each running its boards
+#chunk at a time) and buffers
 class Lane:
-    def __init__(self, model: nn.Module, sizes: list[int]):
+    def __init__(self, model: nn.Module, sizes: list[int], chunk: int | None):
         self.stream = torch.cuda.Stream()
         #launched and not yet collected: another launch would write over its answers
         self.pending = False
@@ -90,7 +103,7 @@ class Lane:
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream), torch.no_grad():
             for size in sizes:
-                chunked_answer_rows(model, self.boards[:size])
+                chunked_answer_rows(model, self.boards[:size], chunk)
         torch.cuda.current_stream().wait_stream(self.stream)
 
         #recorded on their own stream: lanes recorded on one stream into one pool wrote over each other's activations
@@ -99,18 +112,20 @@ class Lane:
         for size in reversed(sizes):
             self.graphs[size] = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graphs[size], pool=pool, stream=self.stream), torch.no_grad():
-                self.answers[size] = chunked_answer_rows(model, self.boards[:size])
+                self.answers[size] = chunked_answer_rows(model, self.boards[:size], chunk)
 
 #the model as cuda graphs in in_flight lanes that run their batches at once, a batch through the smallest graph that
 #holds it on the first lane free. launch returns at once and collect waits, in any order: at most in_flight batches out.
+#chunk: the boards a forward takes (chunk_positions), None for a batch's all at once.
 #collect's copy spins a core until the batch is done; blocking_wait sleeps until then instead, a little slower to wake
 class GraphedBatches:
-    def __init__(self, model: nn.Module, sizes: list[int], in_flight: int = 2, blocking_wait: bool = False):
+    def __init__(self, model: nn.Module, sizes: list[int], in_flight: int = 2, chunk: int | None = None,
+                 blocking_wait: bool = False):
         #the graphs read the model's weights where they were when recorded: freed, their memory went to the next
         #tensors made and every answer came back wrong
         self.model = model
         self.sizes = sizes
-        self.lanes = [Lane(model, sizes) for _ in range(in_flight)]
+        self.lanes = [Lane(model, sizes, chunk) for _ in range(in_flight)]
         self.blocking_wait = blocking_wait
 
     def launch(self, boards: np.ndarray) -> tuple[Lane, int, int]:
@@ -217,13 +232,14 @@ def inference_process(checkpoint_path: str, compile_model: bool, precision: str,
             model = fp16_model(Path(checkpoint_path))
         else:
             model = load_model(Path(checkpoint_path), torch.device("cuda"))
-            if precision == "bf16":
-                model = Bf16(model)
+        #serve keeps two batches out
+        chunk = chunk_positions(model.d_model, lanes=2)
+        if precision == "bf16":
+            model = Bf16(model)
         if compile_model:
             #most of a big batch's forwards are whole chunks
-            model = ExactSizeCompiled(model, CHUNK_POSITIONS)
-        #serve keeps two batches out
-        network = GraphedBatches(model, graph_sizes(len(slot_names) * games_per_process), in_flight=2)
+            model = ExactSizeCompiled(model, chunk)
+        network = GraphedBatches(model, graph_sizes(len(slot_names) * games_per_process), in_flight=2, chunk=chunk)
     else:
         network = cpu_batches(load_model(Path(checkpoint_path), CPU))
     ready.set()

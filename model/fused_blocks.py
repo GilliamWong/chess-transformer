@@ -445,6 +445,7 @@ def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, t
 class FusedTransformer(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
+        self.d_model = model.d_model
         self.input_embedding = InputEmbedding(model)
         self.templates, self.ln, self.loops = model.templates, model.ln, model.loops
         self.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)

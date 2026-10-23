@@ -1,6 +1,7 @@
 import copy
 import math
 import time
+from types import SimpleNamespace
 
 import chess
 import numpy as np
@@ -17,15 +18,31 @@ from engine.player import CudaGraphModel
 from tests.test_model import mix_in_the_input
 
 
-#every batch up to max_batch has a graph, and past 16 boards pads by fewer than 4 boards or a sixteenth: steps of 16
-#cost the engine's rounds of 64 leaves 3% of its nodes/s
-@pytest.mark.parametrize("max_batch", [64, 300])
-def test_small_graph_sizes_pad_little(max_batch):
-    sizes = small_graph_sizes(max_batch)
+#every batch up to max_batch has a graph, and past 16 boards a forward pads by fewer than 4 boards or a sixteenth: steps
+#of 16 cost the engine's rounds of 64 leaves 3% of its nodes/s. Past a chunk a batch runs whole chunks and pads only its
+#last forward, never into another: a graph of 133 ran 128 boards as forwards of 128 and 5
+@pytest.mark.parametrize("max_batch, chunk", [(64, None), (300, None), (64, 64), (256, 64), (300, 48)])
+def test_small_graph_sizes_pad_little(max_batch, chunk):
+    sizes = small_graph_sizes(max_batch, chunk)
     assert sizes == sorted(set(sizes)) and sizes[0] == 1 and sizes[-1] >= max_batch
-    for batch in range(17, max_batch + 1):
+    every = chunk or max_batch
+    for batch in range(1, max_batch + 1):
         padded = next(size for size in sizes if size >= batch)
-        assert padded - batch < max(4, padded // 16)
+        assert math.ceil(padded / every) == math.ceil(batch / every)
+        last = padded - (padded - 1) // every * every
+        if last > 16:
+            assert padded - batch < max(4, last // 16)
+    assert all(whole in sizes for whole in range(every, max_batch + 1, every))
+
+
+#a forward's boards are as many as the gpu's L2 holds for every lane's at once (a d768: 64 a lane with two lanes on the
+#5070 Ti's 48 MB), and never so few that a small-L2 gpu runs its batches as forwards of a few boards
+@pytest.mark.parametrize("l2_mb, width, lanes, chunk", [(48, 768, 2, 64), (48, 768, 1, 128), (96, 768, 2, 128), (48, 512, 2, 96),
+                                                        (48, 128, 2, 384), (6, 768, 2, 64)])
+def test_chunk_positions_fit_the_l2(monkeypatch, l2_mb, width, lanes, chunk):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(L2_cache_size=l2_mb << 20))
+    assert inference.chunk_positions(width, lanes) == chunk
 
 
 #for a batch smaller than the graph and for one board; graphs recorded on zero boards once hit a device-side assert
@@ -64,11 +81,10 @@ def test_exact_size_compiled_runs_each_size_through_its_compile(monkeypatch):
     assert compiled_for == [(4, False), (2, True)]
 
 
-#a batch bigger than CHUNK_POSITIONS runs as forwards of that many in its graph: every board's answer in its place, the
-#last chunk part padding
+#a batch bigger than a chunk runs as forwards of that many in its graph: every board's answer in its place, the last
+#chunk part padding
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
-def test_chunked_graphs_answer_like_the_model(monkeypatch):
-    monkeypatch.setattr(inference, "CHUNK_POSITIONS", 3)
+def test_chunked_graphs_answer_like_the_model():
     torch.manual_seed(0)
     model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
     board, boards = chess.Board(), []
@@ -79,7 +95,7 @@ def test_chunked_graphs_answer_like_the_model(monkeypatch):
     with torch.no_grad():
         expected = answer_rows(model(torch.from_numpy(boards).long().cuda())).cpu().numpy()
 
-    graphs = GraphedBatches(model, [8])
+    graphs = GraphedBatches(model, [8], chunk=3)
     answers = graphs.collect(graphs.launch(boards))
 
     assert np.allclose(answers, expected, atol=1e-3)
