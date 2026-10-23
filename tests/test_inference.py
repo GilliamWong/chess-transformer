@@ -581,17 +581,23 @@ def test_tiles_are_picked_by_rows_per_multiprocessor():
     assert [fused_blocks.tile_for(tiles, rows, 170) for rows in (170, 171, 1360, 1361)] == ["a board each", "eight", "eight", "more"]
 
 
-#a gpu whose tiles were not timed (an H100, sm_90) takes the tiles for any rows at every size, not sm_120's narrow ones
-def test_an_untimed_gpu_takes_the_tiles_for_any_rows(monkeypatch):
+#sm_120's tiles by rows stay on sm_120: an A100 (sm_80), A40 (sm_86) and RTX 4090 / L40S (sm_89) keep their own tiles
+#at every size, and a gpu not timed (an H100, sm_90) sm_120's for any rows, as before the tables went by rows
+@pytest.mark.parametrize("capability, multiprocessors, expected", [
+    ((8, 0), 108, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 32, 64, 4, 3), "down": (128, 64, 128, 4, 3)}),
+    ((8, 6), 84, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (64, 128, 128, 4, 3)}),
+    ((8, 9), 142, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (128, 64, 128, 4, 3)}),
+    ((9, 0), 132, {"projection": (128, 128, 64, 8, 3), "gate_up": (128, 64, 64, 4, 2), "down": (128, 128, 64, 8, 3, 128)})])
+def test_other_gpus_keep_their_tiles_at_every_size(monkeypatch, capability, multiprocessors, expected):
     fused_blocks = pytest.importorskip("model.fused_blocks")
     int8_blocks = pytest.importorskip("model.int8_blocks")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (9, 0))
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: SimpleNamespace(multi_processor_count=132))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: SimpleNamespace(multi_processor_count=multiprocessors))
     device = torch.device("cuda")
 
-    for M in (70, 70 * 64):
-        assert fused_blocks.linear_tile(device, M) == fused_blocks.UNTIMED_LINEAR_TILES[-1][1]
-        assert all(int8_blocks.int8_tile(device, matmul, M) == tiles[-1][1] for matmul, tiles in int8_blocks.INT8_TILES[(12, 0)].items())
+    for boards in (1, 2, 4, 8, 16, 64, 128):
+        assert fused_blocks.linear_tile(device, 70 * boards) == (128, 128, 4, 3)
+        assert {matmul: int8_blocks.int8_tile(device, matmul, 70 * boards) for matmul in expected} == expected
 
 
 #the heads' matmul (fused_blocks.FusedTransformer): fp16 inputs accumulating in fp32 and giving fp32, as close to the
