@@ -1,5 +1,6 @@
 import copy
 import math
+import time
 
 import chess
 import numpy as np
@@ -134,6 +135,28 @@ def test_batches_are_collected_in_any_order():
     graphs.collect(first)
 
     assert np.array_equal(graphs.collect(third), expected)
+
+
+#blocking_wait's collect sleeps through a batch the gpu is still working on, where the copy would spin its core the whole
+#time, and answers as the copy does
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+def test_blocking_wait_sleeps_through_the_batch():
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
+    boards = np.array([encode_board(chess.Board())], dtype=np.uint8)
+    spinning = GraphedBatches(model, [1], in_flight=1)
+    expected = spinning.collect(spinning.launch(boards)).copy()
+
+    graphs = GraphedBatches(model, [1], in_flight=1, blocking_wait=True)
+    #a few tenths of a second of gpu work ahead of the batch on its lane
+    with torch.cuda.stream(graphs.lanes[0].stream):
+        torch.cuda._sleep(500_000_000)
+    launched = graphs.launch(boards)
+    started, started_cpu = time.perf_counter(), time.thread_time()
+    answers = graphs.collect(launched)
+    waited, cpu = time.perf_counter() - started, time.thread_time() - started_cpu
+
+    assert np.array_equal(answers, expected)
+    assert waited > 0.05 and cpu < 0.25 * waited
 
 
 #two batches out at once in two lanes come back with the bits each gets alone: lanes recorded on one stream into one

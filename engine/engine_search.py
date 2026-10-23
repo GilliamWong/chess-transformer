@@ -103,13 +103,14 @@ PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
 ENGINE_PRECISION = "int8"
 
 
-#the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out
-def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION):
+#the network in a precision as cuda graphs for a round's leaves, from one to max_batch, a lane a round out;
+#blocking_wait see GraphedBatches
+def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION, blocking_wait: bool = False):
     model = PRECISIONS[precision](checkpoint_path)
     sizes = small_graph_sizes(max_batch)
     #one board a round (mcts.py's search) never fills the largest graph
     compiled = ExactSizeCompiled(model, sizes[-1]) if max_batch > 1 else torch.compile(model, dynamic=True)
-    return GraphedBatches(compiled, sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1)
+    return GraphedBatches(compiled, sizes, ROUNDS_IN_FLIGHT if max_batch > 1 else 1, blocking_wait)
 
 
 class EngineSearch:

@@ -83,6 +83,8 @@ class Lane:
         self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
         self.boards_host = torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, pin_memory=True)
         self.answers_host = torch.zeros(largest, ANSWER_WIDTH, dtype=torch.float32, pin_memory=True)
+        #recorded after each batch for GraphedBatches' blocking_wait
+        self.done = torch.cuda.Event(blocking=True)
 
         #warmup calls off the default stream, as recording a graph needs
         self.stream.wait_stream(torch.cuda.current_stream())
@@ -100,14 +102,16 @@ class Lane:
                 self.answers[size] = chunked_answer_rows(model, self.boards[:size])
 
 #the model as cuda graphs in in_flight lanes that run their batches at once, a batch through the smallest graph that
-#holds it on the first lane free. launch returns at once and collect waits, in any order: at most in_flight batches out
+#holds it on the first lane free. launch returns at once and collect waits, in any order: at most in_flight batches out.
+#collect's copy spins a core until the batch is done; blocking_wait sleeps until then instead, a little slower to wake
 class GraphedBatches:
-    def __init__(self, model: nn.Module, sizes: list[int], in_flight: int = 2):
+    def __init__(self, model: nn.Module, sizes: list[int], in_flight: int = 2, blocking_wait: bool = False):
         #the graphs read the model's weights where they were when recorded: freed, their memory went to the next
         #tensors made and every answer came back wrong
         self.model = model
         self.sizes = sizes
         self.lanes = [Lane(model, sizes) for _ in range(in_flight)]
+        self.blocking_wait = blocking_wait
 
     def launch(self, boards: np.ndarray) -> tuple[Lane, int, int]:
         count = len(boards)
@@ -120,11 +124,15 @@ class GraphedBatches:
         with torch.cuda.stream(lane.stream):
             lane.boards[:count].copy_(lane.boards_host[:count], non_blocking=True)
             lane.graphs[size].replay()
+            if self.blocking_wait:
+                lane.done.record(lane.stream)
         return lane, size, count
 
     #copied here, not at launch: the gpu's copies queue, and a copy at launch held the other lane's boards behind it
     def collect(self, launched: tuple[Lane, int, int]) -> np.ndarray:
         lane, size, count = launched
+        if self.blocking_wait:
+            lane.done.synchronize()
         with torch.cuda.stream(lane.stream):
             lane.answers_host[:count].copy_(lane.answers[size][:count])
         lane.pending = False

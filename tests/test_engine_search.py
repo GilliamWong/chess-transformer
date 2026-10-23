@@ -596,7 +596,7 @@ def test_the_engine_takes_a_precision(monkeypatch, tmp_path):
     settings = {"d_model": 32, "num_layers": 1, "n_heads": 2, "mlp_hidden": 64, "value_bins": 16}
     save_checkpoint(ChessTransformer(**settings), settings, tmp_path / "model.pt")
     built = []
-    monkeypatch.setattr(uci, "engine_network", lambda checkpoint, leaves, precision: built.append(precision) or cpu_batches(BoardModel()))
+    monkeypatch.setattr(uci, "engine_network", lambda checkpoint, leaves, precision, blocking_wait: built.append(precision) or cpu_batches(BoardModel()))
     search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {"smart_pruning": False}, "fp16")
     refused = subprocess.run([sys.executable, "-m", "engine.uci", str(tmp_path / "model.pt"), "--select", "mcts", "--precision", "fp16"],
                              cwd=REPOSITORY, capture_output=True, text=True, input="")
@@ -606,16 +606,18 @@ def test_the_engine_takes_a_precision(monkeypatch, tmp_path):
 
 
 #uci.py started without --precision builds the engine's network in int8 (self-play and labels stay fp16: they never
-#build it)
+#build it), spinning while it waits for the gpu unless --blocking-wait
 @pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
 def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
     built = []
-    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision: built.append(precision) or cpu_batches(BoardModel()))
-    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu"])
-    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
-    runpy.run_module("engine.uci", run_name="__main__")
+    monkeypatch.setattr(engine_search, "engine_network",
+                        lambda checkpoint, leaves, precision, blocking_wait: built.append((precision, blocking_wait)) or cpu_batches(BoardModel()))
+    for flags in ([], ["--blocking-wait"]):
+        monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *flags])
+        monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
+        runpy.run_module("engine.uci", run_name="__main__")
 
-    assert built == ["int8"]
+    assert built == [("int8", False), ("int8", True)]
 
 
 #uci.py's lc0 time options reach the clock and the search: the first move bonus on each game's first move, smart
@@ -626,7 +628,7 @@ def test_the_engine_takes_lc0s_time_options(monkeypatch):
     def search(self, board, nodes, seconds, extension, stop, info=None):
         given.append((seconds, self.smart_pruning_factor, self.smart_pruning_wait, self.stop_at_one_move_left))
         return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
-    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision: cpu_batches(BoardModel()))
+    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision, blocking_wait: cpu_batches(BoardModel()))
     monkeypatch.setattr(EngineSearch, "search", search)
     go = "go " + " ".join(CLOCK_60)
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(["isready", "position startpos", go, "position startpos moves e2e4 e7e5", go,
