@@ -43,6 +43,11 @@ MOST_OF_THE_TIME_LEFT = 1.0
 #move's shares, never past this part of the time left
 MOST_EXTENSION = 2.0
 MOST_OF_THE_TIME_LEFT_EXTENDED = 1 / 3
+#lc0's legacy time manager gives a game's first search on the clock 1 + its first move bonus (lc0's 1.8) + its book ply
+#bonus (0.25) x the plies before it, at most MOST_BOOK_PLIES, times its share: it starts without a kept tree. 0 for none
+FIRST_MOVE_BONUS = 0.0
+BOOK_PLY_BONUS = 0.0
+MOST_BOOK_PLIES = 12
 
 def phase_weight(men: int) -> float:
     return next((weight for fewest, most, weight in PHASE_WEIGHTS if fewest <= men <= most), 1.0)
@@ -82,13 +87,16 @@ def info_line(report: SearchReport, seconds: float) -> str:
 #go's limits for the search, and on a clock (wtime/btime) the time a move gets: its weighted share of the time left (less
 #the reserve and the bank) over the moves still to play, plus the increment, plus the bank: the time earlier searches
 #were given and did not use (smart pruning stops some early), as lc0's legacy time manager spends it. A search whose
-#score falls may run on (extension). The arguments are the constants above of the same names, for
-#tools/play/variant_match.py to tune
+#score falls may run on (extension), and the game's first search may get a bonus. The arguments are the constants
+#above of the same names, for tools/play/variant_match.py to tune. A new game needs a new Clock
 class Clock:
     def __init__(self, moves_per_man: float = MOVES_PER_MAN, least_moves_left: int = LEAST_MOVES_LEFT, reserve_seconds: float = RESERVE_SECONDS,
-                 most_of_the_time_left: float = MOST_OF_THE_TIME_LEFT):
+                 most_of_the_time_left: float = MOST_OF_THE_TIME_LEFT, first_move_bonus: float = FIRST_MOVE_BONUS,
+                 book_ply_bonus: float = BOOK_PLY_BONUS):
         self.moves_per_man, self.least_moves_left = moves_per_man, least_moves_left
         self.reserve_seconds, self.most_of_the_time_left = reserve_seconds, most_of_the_time_left
+        self.first_move_bonus, self.book_ply_bonus = first_move_bonus, book_ply_bonus
+        self.first_search = True #the game's first search on the clock is still to come
         self.saved = 0.0 #the seconds earlier searches were given and did not use
         self.allotted: float | None = None #the seconds the search on the clock was given
         self.share = 0.0 #its move's share of the time left
@@ -105,8 +113,12 @@ class Clock:
             seconds = max(0.0, numbers["movetime"] / 1000 - MOVE_OVERHEAD_SECONDS)
         elif time_left in numbers:
             seconds_left = numbers[time_left] / 1000 - MOVE_OVERHEAD_SECONDS
+            bonus = 1.0
+            if self.first_search:
+                bonus += self.first_move_bonus + self.book_ply_bonus * min(MOST_BOOK_PLIES, board.ply())
+                self.first_search = False
             seconds = self.allotted = self.seconds_for_move(seconds_left, numbers.get(increment, 0) / 1000, numbers.get("movestogo"),
-                                                            chess.popcount(board.occupied))
+                                                            chess.popcount(board.occupied), bonus)
             if self.last_score is not None:
                 self.extension = (self.last_score, self.extra_seconds(seconds_left))
         nodes = numbers.get("nodes")
@@ -114,16 +126,18 @@ class Clock:
             nodes = simulations
         return nodes, seconds
 
-    def seconds_for_move(self, time_left: float, increment: float, moves_to_go: int | None, men: int) -> float:
+    #bonus multiplies the move's share, as lc0's first move bonus does before it adds the bank: the time left pays for it
+    def seconds_for_move(self, time_left: float, increment: float, moves_to_go: int | None, men: int, bonus: float = 1.0) -> float:
         spare = max(0.0, time_left - self.reserve_seconds)
         self.saved = min(self.saved, spare)
         #the bank goes into this move, so the moves after are planned without it
         weight = 1.0 if moves_to_go else phase_weight(men)
         weighted_left = moves_to_go or max(self.least_moves_left * weight, sum(self.moves_per_man * phase_weight(k) for k in range(3, men + 1)))
         share = self.share = (spare - self.saved) * weight / weighted_left + increment
-        seconds = max(0.0, min(share + self.saved, spare, time_left * self.most_of_the_time_left))
-        #the bank pays for what the move gets beyond its share
-        self.saved -= max(0.0, seconds - share)
+        own = share * bonus
+        seconds = max(0.0, min(own + self.saved, spare, time_left * self.most_of_the_time_left))
+        #the bank pays for what the move gets beyond its share and bonus
+        self.saved -= max(0.0, seconds - own)
         return seconds
 
     #the seconds a search whose score falls may add: MOST_EXTENSION shares, never past MOST_OF_THE_TIME_LEFT_EXTENDED of
@@ -179,12 +193,13 @@ def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, t
 def main(checkpoint_path: Path | None = None, random_mover: bool = False, selection: str = "argmax",
          temperature: float = TEMPERATURE, sample_plies: int = SAMPLE_PLIES, simulations: int = SIMULATIONS,
          gpu: bool = False, leaves: int = LEAVES, tablebase: bool = False, search_log: Path | None = None, search_options: dict | None = None,
-         precision: str = ENGINE_PRECISION):
+         precision: str = ENGINE_PRECISION, clock_options: dict | None = None):
     torch.set_num_threads(1)
     search_options = search_options or {}
+    clock_options = clock_options or {}
     player = None
     board = chess.Board()
-    clock = Clock()
+    clock = Clock(**clock_options)
 
     for line in sys.stdin:
         words = line.split()
@@ -206,7 +221,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
 
         elif command == "ucinewgame":
             board = chess.Board()
-            clock = Clock()
+            clock = Clock(**clock_options)
             if isinstance(player, EngineSearch):
                 player.new_game()
 
@@ -262,6 +277,10 @@ if __name__ == "__main__":
                         help="for --select mcts --gpu: about one leaf a round per this many simulations done or left, up to --leaves; 0 for --leaves every round")
     parser.add_argument("--no-smart-pruning", dest="smart_pruning", action="store_false",
                         help="for --select mcts --gpu: search all of go's movetime or nodes even once the move is decided (lc0's SmartPruningFactor=0)")
+    parser.add_argument("--first-move-bonus", type=float, default=FIRST_MOVE_BONUS,
+                        help="for --select mcts on a clock: the game's first search gets 1 + this + --book-ply-bonus x its ply (at most "
+                             f"{MOST_BOOK_PLIES}) times its share, default %(default)s; lc0's 1.8")
+    parser.add_argument("--book-ply-bonus", type=float, default=BOOK_PLY_BONUS, help="for --first-move-bonus, default %(default)s; lc0's 0.25")
     parser.add_argument("--search-settings", default="",
                         help="for --select mcts: changes to the search's settings (engine_search.py), e.g. c_puct=0.6")
     arguments = parser.parse_args()
@@ -277,4 +296,5 @@ if __name__ == "__main__":
              simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
              search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION,
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
-                             "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase))})
+                             "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase))},
+             clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

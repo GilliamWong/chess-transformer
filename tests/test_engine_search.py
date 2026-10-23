@@ -25,7 +25,7 @@ from engine import engine_search
 from engine.engine_search import EngineSearch, engine_search_settings, parse_changes
 from engine.player import SearchReport
 from engine import uci
-from engine.uci import MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
+from engine.uci import MOST_EXTENSION, MOST_OF_THE_TIME_LEFT, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
 REPOSITORY = Path(__file__).parent.parent
 
@@ -360,6 +360,56 @@ def test_a_new_game_starts_a_fresh_clock(monkeypatch):
     assert last_score == 0 and extra > 0
 
 
+#the start position's men with `ply` plies before it, as a book line's fen counts them
+def board_at_ply(ply: int) -> chess.Board:
+    board = chess.Board()
+    board.turn, board.fullmove_number = ply % 2 == 0, 1 + ply // 2
+    return board
+
+LC0_FIRST_MOVE = {"first_move_bonus": 1.8, "book_ply_bonus": 0.25}
+CLOCK_60 = "wtime 60000 btime 60000 winc 600 binc 600".split()
+
+#lc0's first move bonus: the game's first search on the clock gets 1 + 1.8 + 0.25 x its ply, at most 12, times what it
+#gets without (x5.8 out of a UHO book: ~9.9 s at 60+0.6 for a share of 1.7 s)
+@pytest.mark.parametrize("arguments", [CLOCK_60, "wtime 180000 btime 180000 winc 2000 binc 2000".split(), "wtime 60000 btime 60000 movestogo 40".split()])
+@pytest.mark.parametrize("ply, bonus", [(0, 2.8), (1, 3.05), (8, 4.8), (16, 5.8), (40, 5.8)])
+def test_the_games_first_search_gets_lc0s_bonus(arguments, ply, bonus):
+    board = board_at_ply(ply)
+    assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(bonus * Clock().limits(arguments, board, 800)[1])
+
+
+#the bonus is the first search's own, out of the time left: what it leaves unused is banked as any search's is, and the
+#next move gets that and no bonus, as from a clock without one that had banked as much. A search off the clock
+#(movetime) leaves the bonus to the first on it, as lc0's does, and a falling score's extension counts in shares without it
+def test_the_first_search_bonus_is_given_once_and_banked():
+    clock, board = Clock(**LC0_FIRST_MOVE), board_at_ply(16)
+    clock.limits("movetime 1000".split(), board, 800)
+    clock.searched(0.98, 0)
+    _, first = clock.limits(CLOCK_60, board, 800)
+    plain = Clock()
+    _, plain_first = plain.limits(CLOCK_60, board, 800)
+    assert first == pytest.approx(5.8 * plain_first) and clock.saved == 0
+    assert clock.extension == (0, pytest.approx(MOST_EXTENSION * plain.share))
+
+    bank = plain_first / 2
+    clock.searched(first - bank, 0)
+    plain.searched(plain_first - bank, 0)
+    assert clock.saved == pytest.approx(bank) == plain.saved
+    arguments = f"wtime {round((60 - first + bank) * 1000)} btime 60000 winc 600 binc 600".split()
+    _, second = clock.limits(arguments, board_at_ply(18), 800)
+    assert second == pytest.approx(plain.limits(arguments, board_at_ply(18), 800)[1]) == plain.share + bank
+    assert clock.saved == pytest.approx(plain.saved) and clock.extension == pytest.approx(plain.extension)
+
+
+#however large the bonus, the first search never gets the reserve, nor more than the time left, nor past its cap
+def test_the_first_search_bonus_keeps_to_the_reserve_and_the_time_left():
+    board, arguments = board_at_ply(16), "wtime 3000 btime 60000 winc 1000 binc 1000".split()
+    assert Clock().limits(arguments, board, 800)[1] < 1.1
+    assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(3 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS)
+    assert Clock(reserve_seconds=0.0, **LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(3 - MOVE_OVERHEAD_SECONDS)
+    assert Clock(most_of_the_time_left=0.25, **LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx((3 - MOVE_OVERHEAD_SECONDS) / 4)
+
+
 #a search on the clock whose score has fallen FALL_FULL_CP below the last search's runs on past its deadline by all of
 #its extension's seconds, once; one whose score held stops at its deadline
 def test_a_falling_score_runs_the_search_on():
@@ -455,6 +505,26 @@ def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
     runpy.run_module("engine.uci", run_name="__main__")
 
     assert built == ["int8"]
+
+
+#uci.py's --first-move-bonus and --book-ply-bonus reach the clock: each game's first move gets the bonus, no other
+@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+def test_the_engine_takes_lc0s_time_options(monkeypatch):
+    given = []
+    def search(self, board, nodes, seconds, extension):
+        given.append(seconds)
+        return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
+    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision: cpu_batches(BoardModel()))
+    monkeypatch.setattr(EngineSearch, "search", search)
+    go = "go " + " ".join(CLOCK_60)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(["isready", "position startpos", go, "position startpos moves e2e4 e7e5", go,
+                                                               "ucinewgame", "position startpos", go, "quit"])))
+    options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25"]
+    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *options])
+    runpy.run_module("engine.uci", run_name="__main__")
+
+    first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
+    assert given[0] == first and given[1] != first and given[2] == given[0]
 
 
 #the engine as a gui drives it: a move within go movetime, go nodes' simulations (in a new game: a kept tree's visits
