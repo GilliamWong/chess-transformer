@@ -1,9 +1,11 @@
 //cargo test --release bench_ -- --ignored --nocapture --test-threads 1: gather_batch against gather (stand-in network)
 //environment: BENCH_VISITS ROUNDS IN_FLIGHT WORKERS REPEATS FIRST POSITIONS SPIN_US COLLISIONS (0: the round's leaves)
 //FENS (a json list), FINISH_BATCH (0: finish_leaf), CPUS (the caller's cpu, then its workers'), and the stand-in's
-//VALUE_NOISE (logit sd) and PRIOR_SCALE
+//VALUE_NOISE (logit sd) and PRIOR_SCALE; bench_drivers' DRIVERS, DRIVER_CPUS and WORKER_CPUS
 use super::*;
 use crate::search::batch::{BatchCounts, Split};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Instant;
 
 //four middlegames of the kit's positions, the opening's, and a rook and pawn ending the tables score
@@ -66,14 +68,24 @@ impl StandIn {
         StandIn { prior_scale: setting("BENCH_PRIOR_SCALE", 1.0), value_noise: setting("BENCH_VALUE_NOISE", 0.0) }
     }
 
+    fn seed(board: &[u8]) -> u64 {
+        board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)))
+    }
+
+    //a column of a board's answer: a move's logit, or the value in the last
+    fn column(&self, board: &[u8], seed: u64, column: usize) -> f32 {
+        if column < ANSWER_WIDTH - 1 {
+            return self.prior_scale * answer(board, seed, column);
+        }
+        let value = answer(board, seed, column);
+        let noise = self.value_noise * 3f32.sqrt() * (2.0 * uniform(seed ^ 0x5eed) - 1.0);
+        1.0 / (1.0 + (-((value / (1.0 - value)).ln() + noise)).exp())
+    }
+
     //the whole answer for a board, as the network's row of logits and value
     fn row(&self, board: &[u8]) -> Vec<f32> {
-        let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
-        let mut row: Vec<f32> = (0..ANSWER_WIDTH - 1).map(|column| self.prior_scale * answer(board, seed, column)).collect();
-        let value = answer(board, seed, ANSWER_WIDTH - 1);
-        let noise = self.value_noise * 3f32.sqrt() * (2.0 * uniform(seed ^ 0x5eed) - 1.0);
-        row.push(1.0 / (1.0 + (-((value / (1.0 - value)).ln() + noise)).exp()));
-        row
+        let seed = StandIn::seed(board);
+        (0..ANSWER_WIDTH).map(|column| self.column(board, seed, column)).collect()
     }
 }
 
@@ -268,6 +280,141 @@ fn bench_gather_batch() {
                 );
             }
         }
+    }
+}
+
+//bench_drivers' rounds started and out, those with leaves finished, and the finished count when a round last found none
+#[derive(Default)]
+struct DriversRun {
+    started: u64,
+    out: usize,
+    answered: u64,
+    starved: Option<u64>,
+}
+
+//BENCH_DRIVERS threads on one tree behind a lock, as Searches' round loop runs a thread a gpu (rounds.rs), each with
+//BENCH_IN_FLIGHT rounds out and the stand-in's answers at once (read in the finish, only the columns it asks for): a
+//round gathered (gather, or gather_batch on BENCH_WORKERS workers, the lock's holder their caller), then finished,
+//BENCH_ROUNDS in all. DRIVER_CPUS pins the threads (in turn), WORKER_CPUS the workers besides the caller
+#[test]
+#[ignore]
+fn bench_drivers() {
+    let (visits, timed, repeats) =
+        (setting("BENCH_VISITS", 750_000u32), setting("BENCH_ROUNDS", 12_000u64), setting("BENCH_REPEATS", 3usize));
+    let (drivers, in_flight) = (setting("BENCH_DRIVERS", 8usize), setting("BENCH_IN_FLIGHT", 2usize));
+    let (worker_count, collisions) = (setting("BENCH_WORKERS", 0usize), setting("BENCH_COLLISIONS", 0u32));
+    let cpus = |name: &str| if std::env::var(name).is_ok() { settings_list(name, "") } else { Vec::new() };
+    let (driver_cpus, worker_cpus) = (cpus("BENCH_DRIVER_CPUS"), cpus("BENCH_WORKER_CPUS"));
+    let spin = Duration::from_micros(setting("BENCH_SPIN_US", 50u64));
+    let workers = (worker_count > 0).then(|| Workers::new(worker_count, spin, &worker_cpus));
+    let (stand_in, settings, move_ids) = (StandIn::from_environment(), settings(true), Network::new().move_ids);
+    let (fen, moves, _) = POSITIONS[setting("BENCH_FIRST", 0usize)];
+    let (mut base, mut base_cache) = (tree_after(fen, moves), Cache::new(5_000_000));
+    rounds(&mut base, &mut base_cache, Method::Gather, (usize::MAX, visits), 2, 0, stand_in, &settings, None, &move_ids);
+    println!(
+        "{fen}: {} nodes; {drivers} drivers {driver_cpus:?}, {in_flight} rounds out each, workers {worker_count} {worker_cpus:?}, \
+         collisions {collisions}, {timed} rounds",
+        base.nodes.len()
+    );
+    for repeat in 0..repeats {
+        let shared = Mutex::new((tree_with_room(&base, timed as usize), cache_with_room(&base_cache, timed as usize)));
+        let (run, leaves) = ((Mutex::new(DriversRun::default()), Condvar::new()), AtomicU64::new(0));
+        let start = base.root().visit_count;
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            for driver in 0..drivers {
+                let (shared, leaves, workers, settings, move_ids) = (&shared, &leaves, workers.as_ref(), &settings, &move_ids);
+                let cpu = (!driver_cpus.is_empty()).then(|| driver_cpus[driver % driver_cpus.len()]);
+                let run = &run;
+                scope.spawn(move || {
+                    if let Some(cpu) = cpu {
+                        assert!(crate::affinity::pin_current(cpu), "driver pinned to cpu {cpu}");
+                    }
+                    let mut waiting: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
+                    loop {
+                        //rounds.rs' choice: a driver whose last round found no leaves gathers again only once another
+                        //round is back, rather than holding the tree with empty rounds
+                        let next_round = {
+                            let mut state = run.0.lock().expect("the run");
+                            loop {
+                                let blocked = state.starved == Some(state.answered) && state.out > waiting.len();
+                                if state.started < timed && waiting.len() < in_flight && !blocked {
+                                    state.started += 1;
+                                    state.out += 1;
+                                    break Some((state.started - 1, state.answered));
+                                }
+                                if waiting.is_empty() && state.started < timed {
+                                    state = run.1.wait(state).expect("the run");
+                                    continue;
+                                }
+                                break None;
+                            }
+                        };
+                        if let Some((id, answered)) = next_round {
+                            {
+                                let mut boards = Vec::new();
+                                let mut guard = shared.lock().expect("the tree");
+                                let (tree, cache) = &mut *guard;
+                                let count = (tree.root().visit_count / 16).clamp(1, 64);
+                                let round = Round {
+                                    id,
+                                    leaves: count,
+                                    simulations: 3 * count,
+                                    collisions: if collisions == 0 { count } else { collisions },
+                                    visit_limit: u32::MAX,
+                                    memory_limit: usize::MAX,
+                                };
+                                let mut counts = BatchCounts::default();
+                                match workers {
+                                    Some(workers) => {
+                                        tree.gather_batch(&round, settings, None, Some(cache), &mut boards, workers, u32::MAX, &mut counts)
+                                    }
+                                    None => tree.gather(&round, settings, None, Some(cache), &mut boards),
+                                }
+                                .expect("no tables");
+                                drop(guard);
+                                leaves.fetch_add((boards.len() / TOKENS_PER_BOARD) as u64, Ordering::Relaxed);
+                                if boards.is_empty() {
+                                    run.0.lock().expect("the run").starved = Some(answered);
+                                }
+                                waiting.push_back((id, boards));
+                            }
+                            continue;
+                        }
+                        let Some((id, boards)) = waiting.pop_front() else { break };
+                        {
+                            let mut guard = shared.lock().expect("the tree");
+                            let (tree, cache) = &mut *guard;
+                            for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
+                                let seed = StandIn::seed(board);
+                                tree.finish_leaf(
+                                    id,
+                                    |column| stand_in.column(board, seed, column),
+                                    ANSWER_WIDTH,
+                                    move_ids,
+                                    Some(cache),
+                                    settings,
+                                );
+                            }
+                        }
+                        let mut state = run.0.lock().expect("the run");
+                        state.out -= 1;
+                        state.answered += u64::from(!boards.is_empty());
+                        run.1.notify_all();
+                    }
+                });
+            }
+        });
+        let seconds = started.elapsed().as_secs_f64();
+        let simulations = shared.lock().expect("the tree").0.root().visit_count - start;
+        let leaves = leaves.load(Ordering::Relaxed);
+        println!(
+            "DRIVERS\trepeat {repeat}\tevals_per_s {:.0}\tsims_per_s {:.0}\tus_per_eval {:.3}\tleaves_per_round {:.1}",
+            leaves as f64 / seconds,
+            f64::from(simulations) / seconds,
+            seconds * 1e6 / leaves as f64,
+            leaves as f64 / timed as f64
+        );
     }
 }
 
