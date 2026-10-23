@@ -17,13 +17,13 @@ DOWN_INPUT_MULTIPLE = 128
 #int8 matmul tiles (rows, columns, depth, warps, stages[, registers a thread may use]) by compute capability and matmul,
 #as fused_blocks.tile_for lists, within 99 KB of shared memory; a tile changes only the speed (the int32 sums are exact).
 #sm_120's were timed in the engine's network on an RTX 5070 Ti and an RTX 5090, one batch and two at once: below 16 rows
-#a multiprocessor the narrower tiles fill more of them, and below one (a 5090's one or two boards) 16 columns. The
-#others' are the fastest at 32 to 128 boards on an A100, A40 and L40S. Only sm_120's down is capped (timed there): two
-#blocks share a multiprocessor
-INT8_TILES = {(12, 0): {"projection": [(4, (64, 64, 64, 4, 4)), (math.inf, (128, 128, 64, 8, 3))],
-                        "gate_up": [(0.5, (128, 16, 128, 4, 3)), (4, (64, 32, 64, 4, 4)), (8, (128, 32, 64, 4, 3)),
+#a multiprocessor the narrower tiles fill more of them, 32 rows to 2 a multiprocessor, and below one (a 5090's one or
+#two boards) down's 16 columns. The others' are the fastest at 32 to 128 boards on an A100, A40 and L40S. Only sm_120's
+#down is capped (timed there): two blocks share a multiprocessor
+INT8_TILES = {(12, 0): {"projection": [(2, (32, 64, 64, 4, 4)), (4, (64, 64, 64, 4, 4)), (math.inf, (128, 128, 64, 8, 3))],
+                        "gate_up": [(2, (32, 64, 64, 4, 4)), (4, (64, 32, 64, 4, 4)), (8, (128, 32, 64, 4, 3)),
                                     (math.inf, (128, 64, 64, 4, 2))],
-                        "down": [(0.9, (64, 16, 128, 4, 4)), (2, (128, 32, 128, 4, 4)), (4, (64, 64, 64, 4, 4)),
+                        "down": [(0.9, (64, 16, 128, 4, 4)), (2, (32, 64, 128, 4, 3)), (4, (64, 64, 64, 4, 4)),
                                  (12, (128, 64, 128, 8, 3)), (math.inf, (128, 128, 64, 8, 3, 128))]},
               (8, 9): {"projection": [(math.inf, (128, 64, 128, 4, 3))], "gate_up": [(math.inf, (128, 64, 64, 4, 3))],
                        "down": [(math.inf, (128, 64, 128, 4, 3))]},
