@@ -163,6 +163,9 @@ impl Hasher for KeyHasher {
 
 type KeyMap<V> = HashMap<u64, V, BuildHasherDefault<KeyHasher>>;
 
+//the priors a cached position is given room for, above the ~37 legal moves of a middlegame's
+const PRIORS_A_POSITION: usize = 40;
+
 //a generation of the cache: by position, its priors' place in one vector and its value
 #[derive(Default)]
 struct Generation {
@@ -205,6 +208,12 @@ impl Cache {
         if self.newer.places.len() >= self.generation {
             std::mem::swap(&mut self.older, &mut self.newer);
             self.newer.clear();
+        }
+        //a generation makes its room at its first answer, so that filling it never regrows its vectors (a regrowth
+        //copies all they hold)
+        if self.newer.places.capacity() == 0 {
+            self.newer.places.reserve(self.generation);
+            self.newer.priors.reserve(self.generation * PRIORS_A_POSITION);
         }
         self.newer.places.insert(key, (self.newer.priors.len(), priors.len() as u16, value));
         self.newer.priors.extend_from_slice(priors);

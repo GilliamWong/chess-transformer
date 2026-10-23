@@ -362,19 +362,24 @@ fn proven_nodes_hide_stale_leaves_from_advance_as_from_the_walk() {
     }
 }
 
-//the answer cache keeps its two latest generations and a position's latest answer, and turns a generation over without
-//taking time out of the search (dropping a generation's boxed answers there stalled it)
+//the answer cache keeps its two latest generations and a position's latest answer, and no insert takes time out of the
+//search: a turnover is quick (dropping a generation's boxed answers there stalled it), and a generation's vectors are
+//made at its first answer, never regrown while it fills (a regrowth copies all they hold)
 #[test]
 fn the_cache_keeps_two_generations_and_turns_one_over_at_once() {
     let generation = 1_000_000u64;
     let mut cache = Cache::new(2 * generation as usize);
     let priors = |key: u64| -> Vec<f32> { (0..37).map(|index| (key + index) as f32).collect() };
-    let mut slowest_turnover = std::time::Duration::ZERO;
+    let (mut slowest_turnover, mut room) = (std::time::Duration::ZERO, None);
     for key in 0..=3 * generation {
         let started = std::time::Instant::now();
         cache.insert(key, &priors(key), key as f32);
-        if key >= 2 * generation && key % generation == 0 {
+        let made = Some((cache.newer.priors.as_ptr(), cache.newer.priors.capacity(), cache.newer.places.capacity()));
+        if key % generation == 0 {
             slowest_turnover = slowest_turnover.max(started.elapsed());
+            room = made;
+        } else {
+            assert_eq!(made, room, "insert {key} regrew the newer generation");
         }
     }
     cache.insert(3 * generation, &priors(7), 7.0);
