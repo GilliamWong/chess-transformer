@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from model.encoding import EN_PASSANT_TOKEN_OFFSET, NUM_SQUARES, TOKENS_PER_BOARD, encode_board
 import selfplay_rs
@@ -83,6 +84,38 @@ def test_exact_size_compiled_runs_each_size_through_its_compile(monkeypatch):
         model(boards[:2])
 
     assert compiled_for == [(4, False), (2, True)]
+
+
+#a model whose compiles hold on one gpu only, as a network's do on the gpu its weights are on
+class OnGpu(nn.Module):
+    def __init__(self, gpu: int):
+        super().__init__()
+        self.gpu = gpu
+        self.linear = nn.Linear(4, 4)
+
+    def forward(self, boards: torch.Tensor) -> torch.Tensor:
+        return self.linear(boards) + self.gpu
+
+
+#dynamo keeps one frame's compiles for every instance of a module, and compiles no more past its recompile_limit (8):
+#each gpu's network adds 3 (sizes 1, 2 on and the exact size), and from the third of 8 gpus on the networks ran
+#uncompiled. Every one of them is compiled for every size
+def test_the_network_of_every_gpu_is_compiled(monkeypatch):
+    compiles = []
+    compile = torch.compile
+    monkeypatch.setattr(torch, "compile", lambda model, dynamic: compile(model, dynamic=dynamic, backend=lambda graph, inputs: compiles.append(1) or graph.forward))
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
+    boards = torch.ones(4, 4)
+    try:
+        for gpu in range(8):
+            network = ExactSizeCompiled(OnGpu(gpu), 4)
+            with torch.no_grad():
+                for size in (1, 2, 4):
+                    network(boards[:size])
+    finally:
+        torch._dynamo.reset()
+
+    assert len(compiles) == 8 * 3
 
 
 #a batch bigger than a chunk runs as forwards of that many in its graph: every board's answer in its place, the last

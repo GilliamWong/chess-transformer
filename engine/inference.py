@@ -285,8 +285,11 @@ class ExactSizeCompiled(nn.Module):
 
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         #floats (the norms' eps) constant from the start: dynamic, dynamo traced them as symbols, then started over with
-        #them constant, a second trace and compile of the whole model at startup for the same graph
-        with torch._dynamo.config.patch(specialize_float=True):
+        #them constant, a second trace and compile of the whole model at startup for the same graph. Dynamo keeps one
+        #frame's compiles for every instance and compiles no more past recompile_limit (8): each gpu's network adds 3,
+        #so from a third gpu on they ran uncompiled. The limit is one gpu's for each
+        limit = torch._dynamo.config.recompile_limit * max(1, torch.cuda.device_count())
+        with torch._dynamo.config.patch(specialize_float=True, recompile_limit=limit):
             return (self.exact if len(boards) == self.exact_size else self.dynamic)(boards)
 
 #fp16_model with every block in int8 (model/int8_blocks.py) but the last and the fp16_blocks whose int8 costs the
