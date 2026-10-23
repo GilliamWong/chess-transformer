@@ -354,6 +354,35 @@ def test_a_search_on_several_networks_keeps_them_all_busy():
     assert group.most_out == 6 and all(network.rounds > 5 for network in group.networks)
 
 
+#Searches counting its rounds that found leaves and those that found none
+class CountingRounds:
+    def __init__(self, searches):
+        self.searches = searches
+        self.empty = self.with_leaves = 0
+
+    def __getattr__(self, name):
+        return getattr(self.searches, name)
+
+    def descend(self, *arguments, **keywords):
+        boards = self.searches.descend(*arguments, **keywords)
+        if len(boards):
+            self.with_leaves += 1
+        else:
+            self.empty += 1
+        return boards
+
+
+#a network whose round finds no leaves, every descent ending on a leaf already out (all of a fresh tree's), waits for
+#another network's round to come back rather than holding Searches with empty rounds meanwhile (1,398 of them against
+#54 with leaves, on 5 ms networks)
+def test_a_network_without_leaves_waits_for_the_others():
+    search = EngineSearch(SlowNetworks(3, 0.005, BoardModel()).networks, 64, smart_pruning=False, grow_leaves=0)
+    search.searches = rounds = CountingRounds(search.searches)
+
+    assert search.search(chess.Board(), simulations=4000).simulations == 4000
+    assert rounds.empty < rounds.with_leaves, (rounds.empty, rounds.with_leaves)
+
+
 #the cap holds in a search on several networks: at 3,000 simulations and a leaf out per 64 root visits, two rounds of 16
 #are out at most, where the three networks take six without it
 def test_a_cap_holds_on_several_networks():
