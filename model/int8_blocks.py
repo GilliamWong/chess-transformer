@@ -20,7 +20,7 @@ DOWN_INPUT_MULTIPLE = 128
 #a multiprocessor the narrower tiles fill more of them. The others' are the fastest at 32 to 128 boards on an A100, A40
 #and L40S. Only sm_120's down is capped (timed there): two blocks share a multiprocessor
 INT8_TILES = {(12, 0): {"projection": [(4, (64, 64, 64, 4, 4)), (math.inf, (128, 128, 64, 8, 3))],
-                        "gate_up": [(4, (64, 32, 64, 4, 4)), (8, (128, 64, 64, 4, 3)), (math.inf, (128, 64, 64, 4, 2))],
+                        "gate_up": [(4, (64, 32, 64, 4, 4)), (8, (128, 32, 64, 4, 3)), (math.inf, (128, 64, 64, 4, 2))],
                         "down": [(2, (128, 32, 128, 4, 4)), (4, (64, 64, 64, 4, 4)), (12, (128, 64, 128, 8, 3)),
                                  (math.inf, (128, 128, 64, 8, 3, 128))]},
               (8, 9): {"projection": [(math.inf, (128, 64, 128, 4, 3))], "gate_up": [(math.inf, (128, 64, 64, 4, 3))],
