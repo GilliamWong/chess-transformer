@@ -414,16 +414,21 @@ PAIRED_LOCK = threading.Lock()
 PAIRED_MOST = 64
 
 
+#the count of in-place updates of a tensor (an inference tensor, made in torch.inference_mode, has none)
+def version(tensor: torch.Tensor) -> int:
+    return 0 if tensor.is_inference() else tensor._version
+
+
 def paired_templates(templates: torch.Tensor) -> torch.Tensor | None:
     found = PAIRED.get(templates.data_ptr())
-    if found is not None and found[1] == templates._version and found[0].shape == templates.shape:
+    if found is not None and found[1] == version(templates) and found[0].shape == templates.shape:
         return found[2]
     if torch.cuda.is_current_stream_capturing():
         return None
     with torch.no_grad():
         paired = templates.reshape(4, 2, 64, 8, 8).permute(2, 4, 0, 3, 1).contiguous()
     with PAIRED_LOCK:
-        PAIRED[templates.data_ptr()] = (templates, templates._version, paired)
+        PAIRED[templates.data_ptr()] = (templates, version(templates), paired)
         while len(PAIRED) > PAIRED_MOST:
             del PAIRED[next(iter(PAIRED))]
     return paired

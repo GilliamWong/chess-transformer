@@ -196,6 +196,11 @@ def test_paired_templates_are_the_templates_rearranged_and_follow_them(monkeypat
     assert updated is not paired and halves.shape == updated.view(64, 8, 4, 8, 2).shape
     assert updated.view(64, 8, 4, 8, 2)[3, 1, 2, 4, 1] == templates[5, 3, 33]
 
+    #a model made in torch.inference_mode has tensors that count no updates
+    with torch.inference_mode():
+        fixed = (torch.randn(TEMPLATES, 64, 64, device="cuda") / 2).half()
+    assert attention_cuda.paired_templates(fixed) is attention_cuda.paired_templates(fixed)
+
     other = (torch.randn(TEMPLATES, 64, 64, device="cuda") / 2).half()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
