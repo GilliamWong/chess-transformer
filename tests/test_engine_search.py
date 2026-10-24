@@ -170,7 +170,7 @@ def test_a_failed_search_settles_its_network():
 @pytest.mark.parametrize("blocking_wait, leaves, settings", [(False, 16, {}), (True, 16, {}), (False, 1, {}),
                                                              (False, 16, {"gather_workers": 2, "collision_cap": 32}),
                                                              (False, 16, {"visits_per_leaf_out": 8, "smart_pruning": False}),
-                                                             (True, 16, {"gather_workers": 2, "collision_cap": 32, "thread_affinity": "cores"})])
+                                                             (True, 16, {"gather_workers": 2, "collision_cap": 32, "pin_threads": True})])
 def test_rust_rounds_search_as_the_python_loop(blocking_wait, leaves, settings):
     board, reports = chess.Board(), {}
     for rust_rounds in (False, None):
@@ -206,15 +206,17 @@ def test_rust_rounds_drive_every_network():
     assert search.rust_counts[0] > 40 and all(not lane.pending for network in networks for lane in network.lanes)
 
 
-#pinned, Searches' own loop runs each network's thread on its cpu while the search runs; a cpu the process may not run
-#on is refused
+#on several networks Searches' own loop runs each network's thread pinned to its cpu (thread_cpus') while the search
+#runs, under the tree's lock and in concurrent descents (the default); a cpu the process may not run on is refused
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
-def test_the_rust_rounds_threads_are_pinned():
+@pytest.mark.parametrize("concurrent_descents", [False, None])
+def test_the_rust_rounds_threads_are_pinned(concurrent_descents):
     networks = [lean_network(True), lean_network(True)]
-    search = EngineSearch(networks, 16, smart_pruning=False, rust_rounds=True, thread_affinity="ccd")
+    search = EngineSearch(networks, 16, smart_pruning=False, concurrent_descents=concurrent_descents)
     before, seen = pinned_threads(), []
     search.search(chess.Board(), seconds=1.5, info=lambda report: seen.append(pinned_threads() - before))
-    assert seen and seen[0] == Counter(search.network_cpus) and len(search.network_cpus) == 2, seen
+    assert search.rust_rounds and search.concurrent_descents == (concurrent_descents is None)
+    assert seen and seen[0] == Counter(search.network_cpus) and search.network_cpus == engine_search.thread_cpus(2) != [], seen
     handles = networks[0].rust_network() | {"cpu": 100_000}
     networks[0].rust_network = lambda: handles
     with pytest.raises(ValueError, match="may run on"):
@@ -283,26 +285,30 @@ def pinned_threads() -> Counter:
     return pinned
 
 
-#thread_cpus, the largest L3 first: "ccd" an L3's physical cores, then their smt siblings, then the next L3's; "cores" a
-#physical core a thread, then the next L3's cores, then the smt siblings. On the 9175F's one core an L3 (linux numbers a
-#core's siblings k and k + 32) in the os's order. None for "none", no threads or no topology, and a policy it does not
-#know is refused
+#thread_cpus: a physical core a thread, all in the largest L3 that has a core for each, else the L3s' cores the largest
+#first, and smt siblings last. A 9950X3D as windows numbers it (a core's siblings 2k and 2k + 1, ccd 0 with the
+#v-cache 0-15) and as linux does (k and k + 16, ccds 0-7 and 8-15), with the v-cache ccd first and second; a 2 x 9175F
+#(one core an L3, siblings k and k + 32), whole and held to socket 0, in the os's order; an L3 too small for the threads
+#passed over for one that holds them. None for no threads, more threads than cpus or no topology
 def test_the_threads_cpus(monkeypatch):
-    zen = ([(96 << 20, list(range(16))), (32 << 20, list(range(16, 32)))], [[cpu, cpu + 1] for cpu in range(0, 32, 2)])
-    assert engine_search.thread_cpus("ccd", 11, zen) == [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5]
-    assert engine_search.thread_cpus("ccd", 18, zen)[16:] == [16, 18]
-    assert engine_search.thread_cpus("cores", 11, zen) == [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-    assert engine_search.thread_cpus("cores", 18, zen)[16:] == [1, 3]
-    flipped = ([(32 << 20, list(range(16))), (96 << 20, list(range(16, 32)))], zen[1])
-    assert engine_search.thread_cpus("ccd", 3, flipped) == engine_search.thread_cpus("cores", 3, flipped) == [16, 18, 20]
+    windows = ([(96 << 20, list(range(16))), (32 << 20, list(range(16, 32)))], [[cpu, cpu + 1] for cpu in range(0, 32, 2)])
+    assert engine_search.thread_cpus(1, windows) == [0] and engine_search.thread_cpus(8, windows) == list(range(0, 16, 2))
+    assert engine_search.thread_cpus(11, windows) == [*range(0, 16, 2), 16, 18, 20]
+    assert engine_search.thread_cpus(18, windows) == [*range(0, 32, 2), 1, 3]
+    flipped = ([(32 << 20, list(range(16))), (96 << 20, list(range(16, 32)))], windows[1])
+    assert engine_search.thread_cpus(3, flipped) == [16, 18, 20] and engine_search.thread_cpus(9, flipped) == [*range(16, 32, 2), 0]
+    linux = ([(96 << 20, [*range(8), *range(16, 24)]), (32 << 20, [*range(8, 16), *range(24, 32)])], [[core, core + 16] for core in range(16)])
+    assert engine_search.thread_cpus(8, linux) == list(range(8)) and engine_search.thread_cpus(18, linux) == [*range(16), 16, 17]
     epyc = ([(32 << 20, [core, core + 32]) for core in range(32)], [[core, core + 32] for core in range(32)])
-    assert engine_search.thread_cpus("ccd", 4, epyc) == [0, 32, 1, 33]
-    assert engine_search.thread_cpus("cores", 34, epyc) == [*range(32), 32, 33]
-    assert engine_search.thread_cpus("none", 4, zen) == [] and engine_search.thread_cpus("cores", 0, zen) == []
-    with pytest.raises(ValueError, match="thread_affinity"):
-        engine_search.thread_cpus("spread", 4, zen)
+    assert engine_search.thread_cpus(8, epyc) == list(range(8)) and engine_search.thread_cpus(34, epyc) == [*range(32), 32, 33]
+    socket = ([(32 << 20, [core, core + 32]) for core in range(16)], [[core, core + 32] for core in range(16)])
+    assert engine_search.thread_cpus(16, socket) == list(range(16)) and engine_search.thread_cpus(17, socket) == [*range(16), 32]
+    uneven = ([(64 << 20, [0, 1, 2, 3]), (32 << 20, list(range(4, 12)))], [[cpu, cpu + 1] for cpu in range(0, 12, 2)])
+    assert engine_search.thread_cpus(2, uneven) == [0, 2] and engine_search.thread_cpus(3, uneven) == [4, 6, 8]
+    assert engine_search.thread_cpus(5, uneven) == [0, 2, 4, 6, 8]
+    assert engine_search.thread_cpus(0, windows) == [] and engine_search.thread_cpus(33, windows) == []
     monkeypatch.setattr(engine_search.selfplay_rs, "cpu_topology", lambda: None)
-    assert engine_search.thread_cpus("cores", 4) == []
+    assert engine_search.thread_cpus(4) == []
 
 
 #a network recording the cpu each launch came from
@@ -321,13 +327,12 @@ class CpuRecording:
 #pinned threads search as the os's do, report for report over a game's moves (the tree kept), the network's thread on
 #its cpu for every round, the gather workers on the cpus before it. torch's openmp unpins a thread at its first parallel
 #region (the cpu model's here), which the next search's pin undoes: the first search's rounds are not counted
-@pytest.mark.parametrize("policy", ["ccd", "cores"])
-def test_pinning_changes_no_search(policy):
+def test_pinning_changes_no_search():
     board, reports = chess.Board(), {}
-    for affinity in ("none", policy):
+    for pinned in (False, True):
         network = CpuRecording(cpu_batches(BoardModel()))
         before = pinned_threads()
-        search = EngineSearch(network, 16, gather_workers=3, collision_cap=32, thread_affinity=affinity)
+        search = EngineSearch(network, 16, gather_workers=3, collision_cap=32, pin_threads=pinned)
         workers = pinned_threads() - before
         found = []
         for move in ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]:
@@ -336,11 +341,33 @@ def test_pinning_changes_no_search(policy):
             if len(found) == 1:
                 network.cpus.clear()
         board = chess.Board()
-        reports[affinity] = found
-    cpus = engine_search.thread_cpus(policy, 3)
-    assert reports[policy] == reports["none"]
+        reports[pinned] = found
+    cpus = engine_search.thread_cpus(3)
+    assert reports[True] == reports[False]
     assert search.network_cpus == cpus[2:] and set(network.cpus) == set(cpus[2:]), (search.network_cpus, set(network.cpus))
     assert workers == Counter(cpus[:2]), workers
+
+
+#on several networks the python loop's thread for each network is pinned to that network's cpu (thread_cpus') under the
+#tree's lock and in concurrent descents (the default): every round is launched from it. The answers are numpy's, as
+#torch's openmp would unpin the threads
+def test_the_python_loops_threads_are_pinned():
+    for concurrent_descents in (False, None):
+        networks = [CpuRecording(ImmediateBatches(answers_by_board)) for _ in range(3)]
+        search = EngineSearch(networks, 16, smart_pruning=False, concurrent_descents=concurrent_descents)
+        search.search(chess.Board(), simulations=1500)
+        assert search.concurrent_descents == (concurrent_descents is None) and search.network_cpus == engine_search.thread_cpus(3) != []
+        assert [set(network.cpus) for network in networks] == [{cpu} for cpu in search.network_cpus]
+
+
+#the threads are pinned by default on several networks (thread_cpus' cpus, the gather workers' first) and not on one,
+#where pinning is level; told, they are pinned or not
+def test_threads_are_pinned_by_default_on_several_networks():
+    one, three = cpu_batches(BoardModel()), [cpu_batches(BoardModel()) for _ in range(3)]
+    assert EngineSearch(three, 16).network_cpus == engine_search.thread_cpus(3) and len(engine_search.thread_cpus(4)) == 4
+    assert EngineSearch(three, 16, gather_workers=2).network_cpus == engine_search.thread_cpus(4)[1:]
+    assert EngineSearch(one, 16).network_cpus == EngineSearch(three, 16, pin_threads=False).network_cpus == []
+    assert EngineSearch(one, 16, pin_threads=True).network_cpus == engine_search.thread_cpus(1)
 
 
 #the gather workers' cpus: one for each but the caller, each one the process may run on
@@ -1103,7 +1130,8 @@ def test_the_engine_takes_a_precision(monkeypatch, tmp_path):
 
 
 #uci.py's --gpus builds the network on each of the devices, each waited for asleep, and searches on all of them at once
-#in the one tree (concurrent descents), and is refused without the gpu search, or with one leaf a round on several
+#in the one tree (concurrent descents), a thread pinned to a cpu for each; it is refused without the gpu search, or with
+#one leaf a round on several
 def test_the_engine_takes_gpus(monkeypatch, tmp_path):
     built = []
     monkeypatch.setattr(uci, "engine_networks", lambda checkpoint, leaves, precision, fp16_blocks, devices, blocking_wait:
@@ -1113,7 +1141,7 @@ def test_the_engine_takes_gpus(monkeypatch, tmp_path):
                               capture_output=True, text=True, input="") for gpu in (["--leaves", "4"], ["--gpu", "--leaves", "1"])]
 
     assert built == [(1, 0, True), (1, 2, True)] and len(search.networks) == 2 and search.concurrent_descents
-    assert search.search(chess.Board(), simulations=200).simulations >= 200
+    assert search.network_cpus == engine_search.thread_cpus(2) != [] and search.search(chess.Board(), simulations=200).simulations >= 200
     assert all(run.returncode == 2 and "--gpus needs --select mcts --gpu" in run.stderr for run in refused)
 
 
@@ -1155,29 +1183,6 @@ def test_the_engine_takes_the_gathers_settings(monkeypatch, arguments, expected)
     runpy.run_module("engine.uci", run_name="__main__")
 
     assert built == [expected]
-
-
-#uci.py's --thread-affinity reaches the search, whose threads stay unpinned without it; it is refused without the gpu
-#search
-@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
-@pytest.mark.parametrize("arguments, policy", [([], "none"), (["--thread-affinity", "cores"], "cores")])
-def test_the_engine_takes_a_thread_affinity(monkeypatch, arguments, policy):
-    built = []
-
-    class Recorded(EngineSearch):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            built.append(self.network_cpus)
-    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision, fp16_blocks, device=None, blocking_wait=False: cpu_batches(BoardModel()))
-    monkeypatch.setattr(engine_search, "EngineSearch", Recorded)
-    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *arguments])
-    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
-    runpy.run_module("engine.uci", run_name="__main__")
-    refused = subprocess.run([sys.executable, "-m", "engine.uci", "unused.pt", "--select", "mcts", "--thread-affinity", "cores"], cwd=REPOSITORY,
-                             capture_output=True, text=True, input="")
-
-    assert built == [engine_search.thread_cpus(policy, 1)] and len(built[0]) == (policy == "cores")
-    assert refused.returncode == 2 and "--thread-affinity needs --select mcts --gpu" in refused.stderr
 
 
 #uci.py started without --precision builds the engine's network in int8 with the block whose int8 costs the policy most

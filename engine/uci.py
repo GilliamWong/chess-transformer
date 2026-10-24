@@ -22,8 +22,7 @@ from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, COLLISION_CAP, ENGINE_FP16_BLOCKS, ENGINE_PRECISION,
                                   GATHER_SPIN_US, GATHER_WORKERS, GROW_LEAVES, LEAVES, PRECISIONS, SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT,
-                                  THREAD_AFFINITIES, THREAD_AFFINITY, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks,
-                                  engine_search_settings, parse_changes)
+                                  VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks, engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
 from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
@@ -528,10 +527,6 @@ if __name__ == "__main__":
                              "default the current one. On more than one the search is another (more leaves out), for --leaves above 1")
     parser.add_argument("--blocking-wait", action=argparse.BooleanOptionalAction,
                         help="for --select mcts --gpu: wait for the gpu asleep instead of spinning a core; default on for several --gpus, off for one")
-    parser.add_argument("--thread-affinity", choices=THREAD_AFFINITIES, default=THREAD_AFFINITY,
-                        help="for --select mcts --gpu: pin the gather workers and then each gpu's thread to a cpu of its own "
-                             "(engine_search.thread_cpus): ccd fills one L3's cores, then their smt siblings, then the next L3; cores "
-                             "a physical core each. The same search. Default %(default)s")
     parser.add_argument("--fp16-blocks", type=int,
                         help=f"for the int8 network: the blocks kept in fp16 besides the last, those whose int8 costs the policy most "
                              f"(engine/quantization.py), default {ENGINE_FP16_BLOCKS}; 0 for every other block in int8")
@@ -585,8 +580,6 @@ if __name__ == "__main__":
         parser.error("--gpus needs --select mcts --gpu, and on more than one gpu --leaves above 1")
     if arguments.blocking_wait is not None and not (arguments.select == "mcts" and arguments.gpu):
         parser.error("--blocking-wait needs --select mcts --gpu")
-    if arguments.thread_affinity != THREAD_AFFINITY and not (arguments.select == "mcts" and arguments.gpu):
-        parser.error("--thread-affinity needs --select mcts --gpu")
     if arguments.fp16_blocks is not None and not (arguments.select == "mcts" and arguments.gpu and arguments.precision in (None, "int8")):
         parser.error("--fp16-blocks needs --select mcts --gpu and the int8 network")
     if arguments.fp16_blocks is not None and arguments.fp16_blocks < 0:
@@ -605,6 +598,5 @@ if __name__ == "__main__":
                              "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
                              "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out,
                              "gather_workers": arguments.gather_workers, "gather_spin_us": arguments.gather_spin_us,
-                             "collision_cap": arguments.collision_cap, "collision_scaling": arguments.collision_scaling,
-                             **({"thread_affinity": arguments.thread_affinity} if arguments.thread_affinity != THREAD_AFFINITY else {})},
+                             "collision_cap": arguments.collision_cap, "collision_scaling": arguments.collision_scaling},
              clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

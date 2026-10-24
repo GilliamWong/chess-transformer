@@ -207,8 +207,8 @@ mod tests {
     }
 
     //sysfs as linux gives a 2 x EPYC 9175F (a core's siblings k and k + 32, one 32 MB L3 a core) to a process held to
-    //socket 0 (numactl --cpunodebind=0), and this 9950X3D (siblings k and k + 16, ccds 0-7 and 8-15); without the
-    //caches' folders there is no topology
+    //socket 0 (numactl --cpunodebind=0) and to one on both sockets, and this 9950X3D (siblings k and k + 16, ccds 0-7
+    //and 8-15); without the caches' folders there is no topology
     #[test]
     fn sysfs_gives_the_topology() {
         let root = std::env::temp_dir().join(format!("selfplay_rs_sysfs_{}", std::process::id()));
@@ -221,6 +221,10 @@ mod tests {
         let topology = grouped(sysfs_groups(&epyc, &socket).expect("the fake sysfs"), &socket).expect("a topology");
         assert_eq!(topology.cores, (0..16).map(|core| vec![core, core + 32]).collect::<Vec<_>>());
         assert_eq!(topology.l3s, (0..16).map(|core| (32 << 20, vec![core, core + 32])).collect::<Vec<_>>());
+        let machine: Vec<usize> = (0..64).collect();
+        let topology = grouped(sysfs_groups(&epyc, &machine).expect("the fake sysfs"), &machine).expect("a topology");
+        assert_eq!(topology.cores, (0..32).map(|core| vec![core, core + 32]).collect::<Vec<_>>());
+        assert_eq!(topology.l3s, (0..32).map(|core| (32 << 20, vec![core, core + 32])).collect::<Vec<_>>());
         let zen = root.join("zen");
         for cpu in 0..32 {
             let ccd = if cpu % 16 < 8 { ("98304K", "0-7,16-23") } else { ("32768K", "8-15,24-31") };

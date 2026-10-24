@@ -41,10 +41,6 @@ MAX_COLLISION_VISITS = 80_000
 #this long for the next round before they sleep
 GATHER_WORKERS = 0
 GATHER_SPIN_US = 50
-#the search's threads, the gather workers' then the networks', each pinned to a cpu of its own (thread_cpus): "none"
-#leaves them to the os
-THREAD_AFFINITIES = ("none", "ccd", "cores")
-THREAD_AFFINITY = "none"
 #a round is gathered while the last one is on the gpu (+9% simulations/s), and the two run at once (GraphedBatches)
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per GROW_LEAVES simulations done or left, as lc0 grows its batches with the tree; 0 for fixed
@@ -130,27 +126,23 @@ ENGINE_PRECISION = "int8"
 ENGINE_FP16_BLOCKS = 1
 
 
-#the cpus of count threads under a policy of THREAD_AFFINITIES, from selfplay_rs.cpu_topology's (l3s, cores) or the
-#machine's, the largest L3 first: "ccd" fills an L3's physical cores, then their smt siblings, then the next L3, so
-#that a round's caller and its gather workers share one (a team split over a 9950X3D's ccds was slower); "cores"
-#gives each a physical core of its own, the next L3's before any smt sibling. None where the os gives no topology
-def thread_cpus(policy: str, count: int, topology: tuple | None = None) -> list[int]:
-    if policy not in THREAD_AFFINITIES:
-        raise ValueError(f"thread_affinity is one of {', '.join(THREAD_AFFINITIES)}, not {policy!r}")
-    if policy == "none" or not count:
+#the cpus of count threads that work in one tree (the gather workers', then the networks'), from selfplay_rs.cpu_topology's
+#(l3s, cores) or the machine's: a physical core each, all in one L3 if one has a core for each (the largest such: a team
+#split over a 9950X3D's ccds was slower), else the L3s' cores the largest L3 first, and smt siblings only once every
+#physical core has a thread (a 9175F's L3s have one core each). None where the os gives no topology, or for more threads
+#than cpus, which pinned would share one
+def thread_cpus(count: int, topology: tuple | None = None) -> list[int]:
+    if not count:
         return []
     topology = topology if topology is not None else selfplay_rs.cpu_topology()
     if topology is None:
         return []
     l3s, cores = topology
+    by_l3 = [(size, [core for core in cores if core[0] in cpus]) for size, cpus in l3s]
     #stable: equal L3s stay in the os's order
-    by_l3 = [[core for core in cores if core[0] in cpus] for _, cpus in sorted(l3s, key=lambda l3: -l3[0])]
-    first, siblings = [[core[0] for core in l3] for l3 in by_l3], [[cpu for core in l3 for cpu in core[1:]] for l3 in by_l3]
-    if policy == "ccd":
-        cpus = [cpu for l3_first, l3_siblings in zip(first, siblings) for cpu in l3_first + l3_siblings]
-    else:
-        cpus = [cpu for l3 in first for cpu in l3] + [cpu for l3 in siblings for cpu in l3]
-    return [cpus[index % len(cpus)] for index in range(count)]
+    by_l3.sort(key=lambda l3: (len(l3[1]) < count, -l3[0]))
+    cpus = [core[0] for _, l3 in by_l3 for core in l3] + [cpu for _, l3 in by_l3 for core in l3 for cpu in core[1:]]
+    return cpus[:count] if count <= len(cpus) else []
 
 
 #the gpus whose lanes are lean by default (inference.Lane): sm_120's (the 5070 Ti, the 5090), where they were timed;
@@ -258,18 +250,20 @@ class EngineSearch:
     #cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0 for none; advance_threads:
     #ADVANCE_THREADS'. rust_rounds: the rounds in Searches' own loop (Searches.round_loop, rounds.rs), a thread a network
     #and no python between them, the python loop's search exactly; None for it on networks of lean lanes, the only ones it
-    #runs on (sm_120's), and the python loop on others. thread_affinity: THREAD_AFFINITY's. concurrent_descents: the
-    #networks' threads descend, finish and back up in the tree at once (search/shared.rs) rather than one at a time under
-    #its lock, another search on several networks (the threads steer around each other by the simulations in flight) and
-    #not with gather_workers; None for it on several networks without gather workers, as one thread alone is 16% slower
+    #runs on (sm_120's), and the python loop on others. concurrent_descents: the networks' threads descend, finish and back
+    #up in the tree at once (search/shared.rs) rather than one at a time under its lock, another search on several
+    #networks (the threads steer around each other by the simulations in flight) and not with gather_workers; None for it
+    #on several networks without gather workers, as one thread alone is 16% slower. pin_threads: the gather workers' and
+    #then the networks' threads each on a cpu of thread_cpus', the same search; None for it on several networks, and not on
+    #one, where it is level and other work on its cpu would hold it up
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT,
                  collision_cap: int = COLLISION_CAP, gather_workers: int = GATHER_WORKERS, gather_spin_us: int = GATHER_SPIN_US,
-                 collision_scaling: bool = COLLISION_SCALING, rust_rounds: bool | None = None, thread_affinity: str = THREAD_AFFINITY,
-                 concurrent_descents: bool | None = None):
+                 collision_scaling: bool = COLLISION_SCALING, rust_rounds: bool | None = None, concurrent_descents: bool | None = None,
+                 pin_threads: bool | None = None):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched, several = leaves > 1, len(self.networks) > 1
@@ -299,7 +293,8 @@ class EngineSearch:
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
         #the caller of a round's gather is a network's thread, the gather's worker 0
         pinned_workers = max(gather_workers - 1, 0) if batched else 0
-        cpus = thread_cpus(thread_affinity, pinned_workers + len(self.networks) if batched else 0)
+        pinned = several if pin_threads is None else pin_threads
+        cpus = thread_cpus(pinned_workers + len(self.networks) if pinned and batched else 0)
         gather_cpus, self.network_cpus = cpus[:pinned_workers], cpus[pinned_workers:]
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
                                              advance_threads=advance_threads, gather_workers=gather_workers if batched else 0,
