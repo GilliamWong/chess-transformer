@@ -172,6 +172,7 @@ class GraphedBatches:
         self.model = model
         self.sizes = sizes
         self.lanes = [Lane(model, sizes, chunk, lean, warm_up=number == 0) for number in range(in_flight)]
+        self.lean = lean
         self.blocking_wait = blocking_wait
         self.runtime = cuda_runtime() if lean else None
         #by lane: its handles, read once

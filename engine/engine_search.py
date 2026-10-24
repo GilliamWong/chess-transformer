@@ -79,9 +79,6 @@ FALL_FULL_CP = 30
 SPEED_ROUNDS = 8
 #a search's info lines for the gui while it runs, one about this often (lc0 sends one a second)
 INFO_SECONDS = 1.0
-#a search's rounds in Searches' own loop (Searches.round_loop, rounds.rs), a thread a network, no python between them:
-#the same search as the python loop's on networks of lean lanes only
-RUST_ROUNDS = False
 #the search's trees are ones the networks' threads descend, finish and back up in at once (search/shared.rs), where plain
 #gather takes the one tree lock for every descend and finish. Another search (the threads steer around each other by
 #the simulations in flight), not with gather_workers; lean lanes and rust_rounds keep the python out of the loop
@@ -263,24 +260,27 @@ class EngineSearch:
     #cap. use_tablebase: the tables of positions of up to tablebase_pieces pieces, from the folders of syzygy_path (a
     #SyzygyPath) rather than the downloaded ones if it is given. settings: changes to engine_search_settings.
     #cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0 for none; advance_threads:
-    #ADVANCE_THREADS'. rust_rounds: RUST_ROUNDS'. thread_affinity: THREAD_AFFINITY's,
-    #concurrent_descents: CONCURRENT_DESCENTS'
+    #ADVANCE_THREADS'. rust_rounds: the rounds in Searches' own loop (Searches.round_loop, rounds.rs), a thread a network
+    #and no python between them, the python loop's search exactly; None for it on networks of lean lanes, the only ones it
+    #runs on (sm_120's), and the python loop on others. thread_affinity: THREAD_AFFINITY's, concurrent_descents:
+    #CONCURRENT_DESCENTS'
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT,
                  collision_cap: int = COLLISION_CAP, gather_workers: int = GATHER_WORKERS, gather_spin_us: int = GATHER_SPIN_US,
-                 collision_scaling: bool = COLLISION_SCALING, rust_rounds: bool = RUST_ROUNDS, thread_affinity: str = THREAD_AFFINITY,
+                 collision_scaling: bool = COLLISION_SCALING, rust_rounds: bool | None = None, thread_affinity: str = THREAD_AFFINITY,
                  concurrent_descents: bool = CONCURRENT_DESCENTS):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched = leaves > 1
         if len(self.networks) > 1 and not batched:
             raise ValueError("one leaf a round is mcts.py's search, which runs on one network")
-        if rust_rounds and not all(hasattr(network, "rust_network") for network in self.networks):
+        lean = all(getattr(network, "lean", False) for network in self.networks)
+        self.rust_rounds = lean if rust_rounds is None else rust_rounds
+        if self.rust_rounds and not lean:
             raise ValueError("Searches' own round loop runs on networks of lean lanes (engine_network's on sm_120)")
-        self.rust_rounds = rust_rounds
         if concurrent_descents and (gather_workers or not batched):
             raise ValueError("concurrent descents are another way to gather a round's leaves in parallel than gather_workers, and need leaves above 1")
         #the batches and their boards Searches' own round loop launched, all its searches'

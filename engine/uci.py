@@ -528,9 +528,6 @@ if __name__ == "__main__":
                              "default the current one. On more than one the search is another (more leaves out), for --leaves above 1")
     parser.add_argument("--blocking-wait", action=argparse.BooleanOptionalAction,
                         help="for --select mcts --gpu: wait for the gpu asleep instead of spinning a core; default on for several --gpus, off for one")
-    parser.add_argument("--rust-rounds", action="store_true",
-                        help="for --select mcts --gpu: the search's rounds in Searches' own loop, a thread a gpu and no python between "
-                             "rounds (engine_search.RUST_ROUNDS); the same search, on gpus whose lanes are lean (sm_120)")
     parser.add_argument("--concurrent-descents", action="store_true", default=CONCURRENT_DESCENTS,
                         help="for --select mcts --gpu: the networks' threads descend, finish and back up in the one tree at once instead of "
                              "one at a time under its lock (search/shared.rs); a different search, not with --gather-workers")
@@ -591,8 +588,6 @@ if __name__ == "__main__":
         parser.error("--gpus needs --select mcts --gpu, and on more than one gpu --leaves above 1")
     if arguments.blocking_wait is not None and not (arguments.select == "mcts" and arguments.gpu):
         parser.error("--blocking-wait needs --select mcts --gpu")
-    if arguments.rust_rounds and not (arguments.select == "mcts" and arguments.gpu):
-        parser.error("--rust-rounds needs --select mcts --gpu")
     if arguments.concurrent_descents and not (arguments.select == "mcts" and arguments.gpu and arguments.leaves > 1 and not arguments.gather_workers):
         parser.error("--concurrent-descents needs --select mcts --gpu, --leaves above 1 and no --gather-workers")
     if arguments.thread_affinity != THREAD_AFFINITY and not (arguments.select == "mcts" and arguments.gpu):
@@ -616,7 +611,6 @@ if __name__ == "__main__":
                              "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out,
                              "gather_workers": arguments.gather_workers, "gather_spin_us": arguments.gather_spin_us,
                              "collision_cap": arguments.collision_cap, "collision_scaling": arguments.collision_scaling,
-                             **({"rust_rounds": True} if arguments.rust_rounds else {}),
                              **({"concurrent_descents": True} if arguments.concurrent_descents else {}),
                              **({"thread_affinity": arguments.thread_affinity} if arguments.thread_affinity != THREAD_AFFINITY else {})},
              clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})
