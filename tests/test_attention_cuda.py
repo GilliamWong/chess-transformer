@@ -203,6 +203,20 @@ def test_paired_templates_are_the_templates_rearranged_and_follow_them(monkeypat
         assert attention_cuda.paired_templates(other) is None
 
 
+#models loaded on threads (--gpus) pair their templates at once: every one is kept up to the most, the oldest go after
+@sm_120
+def test_templates_paired_on_threads_are_all_kept_up_to_the_most(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(attention_cuda, "PAIRED", {})
+    monkeypatch.setattr(attention_cuda, "PAIRED_MOST", 6)
+    many = [(torch.randn(TEMPLATES, 64, 64, device="cuda") / 2).half() for _ in range(10)]
+    with ThreadPoolExecutor(4) as pool:
+        paired = list(pool.map(attention_cuda.paired_templates, many))
+    assert len(attention_cuda.PAIRED) == 6
+    assert all(attention_cuda.paired_templates(templates) is not None for templates in many)
+    assert all(torch.equal(found.view(64, 8, 4, 8, 2)[5, 3, 1, 6, 0], templates[2, 5, 6 * 8 + 3]) for found, templates in zip(paired, many))
+
+
 #the fused model pairs its templates and compiles the kernels when it is built, not while a cuda graph records them
 @sm_120
 def test_building_the_fused_model_prepares_the_cuda_attention(timed_here, monkeypatch):

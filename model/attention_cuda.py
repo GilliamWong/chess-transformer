@@ -7,6 +7,7 @@
 import ctypes
 import math
 import sys
+import threading
 import warnings
 
 import torch
@@ -402,8 +403,11 @@ def kernels(device: torch.device) -> Kernels | None:
 
 #the templates [template][square][key] as the kernel's bias operands read them, [square][key % 8][template // 2][key // 8] of
 #pairs of templates, made once for as long as the tensor lives unchanged (the entry holds the tensor, so that its memory is
-#not another's), or None while a cuda graph records and it is not made
+#not another's), or None while a cuda graph records and it is not made. The models of every gpu pair theirs at once, on threads
 PAIRED: dict[int, tuple[torch.Tensor, int, torch.Tensor]] = {}
+PAIRED_LOCK = threading.Lock()
+#the most kept: the oldest go first
+PAIRED_MOST = 64
 
 
 def paired_templates(templates: torch.Tensor) -> torch.Tensor | None:
@@ -412,11 +416,12 @@ def paired_templates(templates: torch.Tensor) -> torch.Tensor | None:
         return found[2]
     if torch.cuda.is_current_stream_capturing():
         return None
-    if len(PAIRED) >= 8:
-        PAIRED.clear()
     with torch.no_grad():
         paired = templates.reshape(4, 2, 64, 8, 8).permute(2, 4, 0, 3, 1).contiguous()
-    PAIRED[templates.data_ptr()] = (templates, templates._version, paired)
+    with PAIRED_LOCK:
+        PAIRED[templates.data_ptr()] = (templates, templates._version, paired)
+        while len(PAIRED) > PAIRED_MOST:
+            del PAIRED[next(iter(PAIRED))]
     return paired
 
 
