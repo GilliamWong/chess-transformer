@@ -197,11 +197,11 @@ def test_rust_rounds_run_on_lean_lanes_only():
         EngineSearch([lean, whole], 16, rust_rounds=True)
 
 
-#on two networks Searches' own loop runs both, rounds out on each at once
+#on two networks Searches' own loop runs both, rounds out on each at once, in the tree under its lock
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_rust_rounds_drive_every_network():
     networks = [lean_network(True), lean_network(True)]
-    search = EngineSearch(networks, 16, smart_pruning=False, rust_rounds=True)
+    search = EngineSearch(networks, 16, smart_pruning=False, rust_rounds=True, concurrent_descents=False)
     assert search.search(chess.Board(), simulations=3000).simulations == 3000
     assert search.rust_counts[0] > 40 and all(not lane.pending for network in networks for lane in network.lanes)
 
@@ -620,10 +620,12 @@ class SlowNetwork:
 
 
 #on several networks (gpus) a search keeps two rounds out on each, every one of them busy, and ends at its simulations
-#with the move one network finds
-def test_a_search_on_several_networks_keeps_them_all_busy():
+#with the move one network finds, in the tree under its lock and in concurrent descents (the default)
+@pytest.mark.parametrize("concurrent_descents", [False, None])
+def test_a_search_on_several_networks_keeps_them_all_busy(concurrent_descents):
     group = SlowNetworks(3, 0.003, BoardModel())
-    report = EngineSearch(group.networks, 16, smart_pruning=False).search(chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"), simulations=3000)
+    search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=concurrent_descents)
+    report = search.search(chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"), simulations=3000)
 
     assert report.simulations == 3000 and report.line[0].uci() == "e4d5"
     assert group.most_out == 6 and all(network.rounds > 5 for network in group.networks)
@@ -649,9 +651,10 @@ class CountingRounds:
 
 #a network whose round finds no leaves, every descent ending on a leaf already out (all of a fresh tree's), waits for
 #another network's round to come back rather than holding Searches with empty rounds meanwhile (1,398 of them against
-#54 with leaves, on 5 ms networks)
-def test_a_network_without_leaves_waits_for_the_others():
-    search = EngineSearch(SlowNetworks(3, 0.005, BoardModel()).networks, 64, smart_pruning=False, grow_leaves=0)
+#54 with leaves, on 5 ms networks), under the tree's lock and in concurrent descents
+@pytest.mark.parametrize("concurrent_descents", [False, None])
+def test_a_network_without_leaves_waits_for_the_others(concurrent_descents):
+    search = EngineSearch(SlowNetworks(3, 0.005, BoardModel()).networks, 64, smart_pruning=False, grow_leaves=0, concurrent_descents=concurrent_descents)
     search.searches = rounds = CountingRounds(search.searches)
 
     assert search.search(chess.Board(), simulations=4000).simulations == 4000
@@ -659,10 +662,11 @@ def test_a_network_without_leaves_waits_for_the_others():
 
 
 #the cap holds in a search on several networks: at 3,000 simulations and a leaf out per 64 root visits, two rounds of 16
-#are out at most, where the three networks take six without it
-def test_a_cap_holds_on_several_networks():
+#are out at most, where the three networks take six without it; under the tree's lock and in concurrent descents
+@pytest.mark.parametrize("concurrent_descents", [False, None])
+def test_a_cap_holds_on_several_networks(concurrent_descents):
     group = SlowNetworks(3, 0.003, BoardModel())
-    search = EngineSearch(group.networks, 16, smart_pruning=False, visits_per_leaf_out=64)
+    search = EngineSearch(group.networks, 16, smart_pruning=False, visits_per_leaf_out=64, concurrent_descents=concurrent_descents)
     report = search.search(chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"), simulations=3000)
 
     assert report.simulations == 3000 and group.most_out == 2
@@ -1098,8 +1102,8 @@ def test_the_engine_takes_a_precision(monkeypatch, tmp_path):
     assert refused[1].returncode == 2 and "--fp16-blocks needs --select mcts --gpu and the int8 network" in refused[1].stderr
 
 
-#uci.py's --gpus builds the network on each of the devices, each waited for asleep, and searches on all of them, and is
-#refused without the gpu search, or with one leaf a round on several
+#uci.py's --gpus builds the network on each of the devices, each waited for asleep, and searches on all of them at once
+#in the one tree (concurrent descents), and is refused without the gpu search, or with one leaf a round on several
 def test_the_engine_takes_gpus(monkeypatch, tmp_path):
     built = []
     monkeypatch.setattr(uci, "engine_networks", lambda checkpoint, leaves, precision, fp16_blocks, devices, blocking_wait:
@@ -1108,7 +1112,8 @@ def test_the_engine_takes_gpus(monkeypatch, tmp_path):
     refused = [subprocess.run([sys.executable, "-m", "engine.uci", "unused.pt", "--select", "mcts", *gpu, "--gpus", "0,1"], cwd=REPOSITORY,
                               capture_output=True, text=True, input="") for gpu in (["--leaves", "4"], ["--gpu", "--leaves", "1"])]
 
-    assert built == [(1, 0, True), (1, 2, True)] and len(search.networks) == 2 and search.search(chess.Board(), simulations=200).simulations == 200
+    assert built == [(1, 0, True), (1, 2, True)] and len(search.networks) == 2 and search.concurrent_descents
+    assert search.search(chess.Board(), simulations=200).simulations >= 200
     assert all(run.returncode == 2 and "--gpus needs --select mcts --gpu" in run.stderr for run in refused)
 
 
@@ -1965,27 +1970,16 @@ def test_concurrent_descents_exclude_gather_workers_and_one_leaf_rounds():
         selfplay_rs.Searches(**rust_search_settings(False), concurrent_descents=True, gather_workers=2)
 
 
-#uci.py's --concurrent-descents reaches the search, which has none without it; it is refused without the gpu search or with
-#gather workers
-@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
-@pytest.mark.parametrize("arguments, expected", [([], False), (["--concurrent-descents"], True)])
-def test_the_engine_takes_concurrent_descents(monkeypatch, arguments, expected):
-    built = []
+#concurrent descents are the default on several networks without gather workers, and not on one network, whose thread
+#alone is slower in them; told, they are on or off as told
+def test_concurrent_descents_by_default_on_several_networks(monkeypatch):
+    made, searches = [], selfplay_rs.Searches
+    monkeypatch.setattr(engine_search.selfplay_rs, "Searches", lambda **settings: made.append(settings.get("concurrent_descents", False)) or searches(**settings))
+    one, three = cpu_batches(BoardModel()), [cpu_batches(BoardModel()) for _ in range(3)]
+    found = [EngineSearch(networks, 16, **options).concurrent_descents for networks, options in
+             ((one, {}), (three, {}), (three, {"gather_workers": 2}), (three, {"concurrent_descents": False}), (one, {"concurrent_descents": True}))]
 
-    class Recorded(EngineSearch):
-        def __init__(self, *args, concurrent_descents=False, **kwargs):
-            super().__init__(*args, concurrent_descents=concurrent_descents, **kwargs)
-            built.append(concurrent_descents)
-    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision, fp16_blocks, device=None, blocking_wait=False: cpu_batches(BoardModel()))
-    monkeypatch.setattr(engine_search, "EngineSearch", Recorded)
-    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *arguments])
-    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
-    runpy.run_module("engine.uci", run_name="__main__")
-    refused = [subprocess.run([sys.executable, "-m", "engine.uci", "unused.pt", "--select", "mcts", *more, "--concurrent-descents"], cwd=REPOSITORY,
-                              capture_output=True, text=True, input="") for more in ([], ["--gpu", "--gather-workers", "2"])]
-
-    assert built == [expected]
-    assert all(run.returncode == 2 and "--concurrent-descents needs" in run.stderr for run in refused)
+    assert found == made == [False, True, False, False, True]
 
 
 #Searches' own round loop on concurrent descents: on one network the python loop's search, report for report and tree for tree
@@ -2005,12 +1999,14 @@ def test_rust_rounds_with_concurrent_descents_search_as_the_python_loop(blocking
     assert search.rust_counts[0] > 20
 
 
-#on two and four networks the loop in rust runs every thread at once in the one tree, and leaves every lane free
+#on two and four networks of lean lanes the search is by default the loop in rust running every thread at once in the
+#one tree, and leaves every lane free
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 @pytest.mark.parametrize("count", [2, 4])
 def test_rust_rounds_with_concurrent_descents_drive_every_network(count):
     networks = [lean_network(True) for _ in range(count)]
-    search = EngineSearch(networks, 16, smart_pruning=False, rust_rounds=True, concurrent_descents=True)
+    search = EngineSearch(networks, 16, smart_pruning=False)
+    assert search.rust_rounds and search.concurrent_descents
     board = chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1")
     report = search.search(board, simulations=3000)
     assert 3000 <= report.simulations < 3000 + 16 * count * 3 and report.line[0] in board.legal_moves
