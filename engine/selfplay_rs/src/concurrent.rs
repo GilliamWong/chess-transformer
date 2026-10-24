@@ -174,10 +174,11 @@ impl Searches {
         let mut row = if out.lean { vec![0.0; self.answer_width] } else { Vec::new() };
         let mut logits = Vec::new();
         for (&(_, count), tree) in out.leaves.iter().zip(&trees) {
-            let _hold = tree.hold();
+            let mut hold = tree.hold();
             let leaves = tree.take_round(out.number);
             assert_eq!(leaves.len(), count as usize, "the round's leaves in the tree");
             for (leaf, answer) in leaves.into_iter().zip(rows.by_ref()) {
+                hold.give_way();
                 if out.lean {
                     let columns = leaf.moves.iter().map(|&chess_move| self.move_ids.id(chess_move, leaf.turn));
                     for (column, number) in

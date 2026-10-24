@@ -16,12 +16,31 @@ mod reuse;
 use arena::{Edges, Node, Nodes};
 pub use cache::SharedCache;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::*;
 
-//the share of the gate a call holds while it works
-type Hold<'a> = RwLockReadGuard<'a, ()>;
+//the share of the gate a call holds while it works. A thread that wants the tree to itself says so (writers), and the calls
+//give way between two descents, so that it waits for the longest descent and not for the longest call
+pub struct Hold<'a> {
+    tree: &'a SharedTree,
+    guard: Option<RwLockReadGuard<'a, ()>>,
+}
+
+impl Hold<'_> {
+    //gives the share up if a thread waits for the tree to itself, and takes it again once that thread has had it (a share
+    //taken again at once would pass the thread that waits: the gate is not fair)
+    pub fn give_way(&mut self) {
+        if self.tree.writers.load(Ordering::Relaxed) > 0 {
+            self.tree.counts.gave_way.fetch_add(1, Ordering::Relaxed);
+            self.guard = None;
+            while self.tree.writers.load(Ordering::Acquire) > 0 {
+                std::thread::yield_now();
+            }
+            self.guard = Some(self.tree.gate.read().expect("the gate"));
+        }
+    }
+}
 
 //the bytes a node and an edge take, for the memory limit
 const NODE_BYTES: usize = size_of::<Node>();
@@ -49,6 +68,7 @@ struct Call {
 //what the tree counts of itself, for the benches
 #[derive(Default)]
 pub struct Counts {
+    pub gave_way: AtomicU64,
     pub exclusive: AtomicU64,
     pub orphans: AtomicU64,
 }
@@ -71,6 +91,8 @@ pub struct SharedTree {
     closed: AtomicBool,
     //calls hold it shared, whatever needs the tree still holds it exclusive
     gate: RwLock<()>,
+    //threads waiting for the tree to themselves
+    writers: AtomicUsize,
     pub counts: Counts,
 }
 
@@ -120,6 +142,7 @@ impl SharedTree {
             full: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             gate: RwLock::new(()),
+            writers: AtomicUsize::new(0),
             counts: Counts::default(),
         }
     }
@@ -144,24 +167,32 @@ impl SharedTree {
 
     //a share of the gate, held while a call works
     pub fn hold(&self) -> Hold<'_> {
-        self.gate.read().expect("the gate")
+        Hold { tree: self, guard: Some(self.gate.read().expect("the gate")) }
+    }
+
+    //the gate exclusively, once the calls have given way to the waiting
+    fn writer(&self) -> RwLockWriteGuard<'_, ()> {
+        self.writers.fetch_add(1, Ordering::AcqRel);
+        let writer = self.gate.write().expect("the gate");
+        self.writers.fetch_sub(1, Ordering::AcqRel);
+        writer
     }
 
     //the tree to itself: `work` runs once every call has left it and none enters. `hold` is the caller's share, given
     //up first and taken again after (nothing may wait for the gate while holding a share and another thread waits for it)
-    fn exclusive<'a, R>(&'a self, hold: &mut Option<Hold<'a>>, work: impl FnOnce() -> R) -> R {
-        drop(hold.take());
-        let writer = self.gate.write().expect("the gate");
+    fn exclusive<'a, R>(&'a self, hold: &mut Hold<'a>, work: impl FnOnce() -> R) -> R {
+        hold.guard = None;
+        let writer = self.writer();
         self.counts.exclusive.fetch_add(1, Ordering::Relaxed);
         let result = work();
         drop(writer);
-        *hold = Some(self.hold());
+        hold.guard = Some(self.gate.read().expect("the gate"));
         result
     }
 
     //the tree to itself for a caller that holds no share
     pub fn quiet<R>(&self, work: impl FnOnce() -> R) -> R {
-        let _writer = self.gate.write().expect("the gate");
+        let _writer = self.writer();
         work()
     }
 
@@ -523,7 +554,7 @@ impl SharedTree {
         cache: Option<&SharedCache>,
         boards: &mut Vec<u8>,
     ) -> Result<Vec<PendingLeaf>, SyzygyError> {
-        let mut hold = Some(self.hold());
+        let mut hold = self.hold();
         let mut call = Call { simulations: 0, collisions: Vec::new(), leaves: Vec::new() };
         let gathered = self.gather_in(&mut hold, round, settings, tables, cache, boards, &mut call);
         for path in &call.collisions {
@@ -535,7 +566,7 @@ impl SharedTree {
     #[allow(clippy::too_many_arguments)]
     fn gather_in<'a>(
         &'a self,
-        hold: &mut Option<Hold<'a>>,
+        hold: &mut Hold<'a>,
         round: &Round,
         settings: &SearchSettings,
         tables: Option<&Tables>,
@@ -549,6 +580,7 @@ impl SharedTree {
         let mut path = Vec::new();
         let mut priors = Vec::new();
         while call.leaves.len() < round.leaves as usize && call.simulations < round.simulations && self.has_room(round.visit_limit) {
+            hold.give_way();
             //the root's own evaluation always fits, so that a full search still has moves to report
             let reserved = self.root().has_edges();
             if reserved && !self.reserve(round.memory_limit) {
@@ -617,11 +649,21 @@ impl SharedTree {
                         } else {
                             (Outcome::Draw, 0)
                         };
-                        self.exclusive(hold, || {
-                            self.prove(&path, Proof { outcome, value: 1.0 - result, plies });
+                        let proof = Proof { outcome, value: 1.0 - result, plies };
+                        if self.nodes.get(node).visits() == 0 {
+                            //a leaf nobody has visited, and nobody can before its proof is seen: it rewrites no sum
+                            self.nodes.get(node).set_proof(proof);
                             self.backup(&path, value);
-                            self.propagate_proofs(&path);
-                        });
+                            if self.proves_parent(&path) {
+                                self.exclusive(hold, || self.propagate_proofs(&path));
+                            }
+                        } else {
+                            self.exclusive(hold, || {
+                                self.prove(&path, proof);
+                                self.backup(&path, value);
+                                self.propagate_proofs(&path);
+                            });
+                        }
                     }
                     _ => {
                         self.backup(&path, value);
@@ -725,6 +767,7 @@ impl SharedTree {
             full: AtomicBool::new(tree.full),
             closed: AtomicBool::new(false),
             gate: RwLock::new(()),
+            writers: AtomicUsize::new(0),
             counts: Counts::default(),
         }
     }

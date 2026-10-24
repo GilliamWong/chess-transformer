@@ -1,9 +1,10 @@
 //the tree many threads search at once against Tree (one thread: the same search, number for number) and against its own
 //invariants after searches on many threads
-use super::batch::{LOCKED_PAWNS, MATE_IN_TWO, OPENING, ROOKS, START, cases, search_in_flight};
+use super::batch::{LOCKED_PAWNS, MATE_IN_TWO, OPENING, PAWNS_AND_ROOKS, ROOKS, START, cases, search_in_flight};
 use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
 use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::time::Duration;
 
 //the stand-in network of tests.rs, with the concurrent cache
 struct SharedNetwork {
@@ -494,4 +495,80 @@ fn rounds_without_leaves_queue_nothing() {
         tree.queue(round, Vec::new());
     }
     assert_eq!(tree.queued_rounds(), 0);
+}
+
+//certainty turned on after the game's ends were visited (a visited leaf is proven by its next visit, its visits rewritten with the
+//proven score in every sum above): the same tree as Tree's, number for number
+#[test]
+fn proofs_made_after_the_leaves_were_visited_rewrite_the_sums_as_tree_does() {
+    //draws worth less the second time, so that the proofs of the stalemates found rewrite what their visits scored
+    let (without, with) = (settings(false), SearchSettings { draw: 0.3, ..settings(true) });
+    let gather_with = |settings: &'static SearchSettings| {
+        move |tree: &mut Tree, round: &Round, cache: &Cache, boards: &mut Vec<u8>| {
+            tree.gather(round, settings, None, Some(cache), boards).expect("no tables")
+        }
+    };
+    let (without, with): (&'static SearchSettings, &'static SearchSettings) = (Box::leak(Box::new(without)), Box::leak(Box::new(with)));
+    for fen in [MATE_IN_TWO, "8/8/8/4k3/8/8/8/4K2R w - - 0 1", "7k/8/5K2/8/8/8/8/6Q1 w - - 0 1"] {
+        let mut old = tree_after(fen, &[]);
+        search_in_flight(&mut old, 3_000, 1, without, &mut Network::new(), None, gather_with(without));
+        search_in_flight(&mut old, 8_000, 1, with, &mut Network::new(), None, gather_with(with));
+        let new = shared_tree_after(fen, &[]);
+        shared_in_flight(&new, 3_000, 1, without, None, &SharedNetwork::new(), usize::MAX);
+        shared_in_flight(&new, 8_000, 1, with, None, &SharedNetwork::new(), usize::MAX);
+        assert_same_trees(&old, &new.to_tree());
+        assert!(old.nodes.iter().any(|node| node.proof.is_some()), "{fen}");
+    }
+}
+
+//tables met after the leaves were visited (a search carried on with the tables, as a reused tree meets them when its root moves
+//down) prove leaves that have visits, which rewrites the sums above them: the same tree as Tree's, number for number
+#[test]
+fn tables_met_after_the_leaves_were_visited_prove_them_as_tree_does() {
+    let Some(tables) = tables() else {
+        eprintln!("no syzygy tables: the ending they score is left out");
+        return;
+    };
+    let settings = settings(true);
+    let gather_with = |tables: Option<&'static Tables>| {
+        let settings = &settings;
+        move |tree: &mut Tree, round: &Round, cache: &Cache, boards: &mut Vec<u8>| {
+            tree.gather(round, settings, tables, Some(cache), boards).expect("the tables")
+        }
+    };
+    let tables: &'static Tables = Box::leak(Box::new(tables));
+    let mut old = tree_after(PAWNS_AND_ROOKS, &[]);
+    search_in_flight(&mut old, 4_000, 1, &settings, &mut Network::new(), None, gather_with(None));
+    let before = old.nodes.iter().filter(|node| node.proof.is_some()).count();
+    search_in_flight(&mut old, 12_000, 1, &settings, &mut Network::new(), None, gather_with(Some(tables)));
+    let new = shared_tree_after(PAWNS_AND_ROOKS, &[]);
+    shared_in_flight(&new, 4_000, 1, &settings, None, &SharedNetwork::new(), usize::MAX);
+    shared_in_flight(&new, 12_000, 1, &settings, Some(tables), &SharedNetwork::new(), usize::MAX);
+    assert_same_trees(&old, &new.to_tree());
+    assert!(old.nodes.iter().filter(|node| node.proof.is_some()).count() > before + 5);
+}
+
+//a thread that wants the tree to itself waits for the descent the others are in and not for their whole calls: with a call of
+//thousands of descents running, the wait is a fraction of the call
+#[test]
+fn a_thread_that_wants_the_tree_to_itself_waits_for_a_descent_not_a_call() {
+    let (settings, network) = (settings(true), SharedNetwork::new());
+    let tree = shared_tree_after(START, &[]);
+    shared_in_flight(&tree, 20_000, 2, &settings, None, &network, usize::MAX);
+    let round = Round { id: 0, leaves: 30_000, simulations: 200_000, collisions: 150_000, visit_limit: u32::MAX, memory_limit: usize::MAX };
+    let (call, wait) = std::thread::scope(|scope| {
+        let gathering = scope.spawn(|| {
+            let started = std::time::Instant::now();
+            tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables");
+            started.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(5));
+        let started = std::time::Instant::now();
+        tree.quiet(|| ());
+        let waited = started.elapsed();
+        (gathering.join().expect("a thread"), waited)
+    });
+    assert!(call > Duration::from_millis(30), "the call took {call:?}");
+    let gave_way = tree.counts.gave_way.load(Ordering::Relaxed);
+    assert!(gave_way > 0 && wait * 4 < call, "waited {wait:?} of a call of {call:?}, the call gave way {gave_way} times");
 }
