@@ -67,6 +67,8 @@ pub struct SharedTree {
     reserved: AtomicUsize,
     //no room for another simulation: the search ends as at its simulations, until a move is played
     full: AtomicBool,
+    //the search is over and reported: a call that still has the tree gathers nothing more
+    closed: AtomicBool,
     //calls hold it shared, whatever needs the tree still holds it exclusive
     gate: RwLock<()>,
     pub counts: Counts,
@@ -116,6 +118,7 @@ impl SharedTree {
             waiting: AtomicUsize::new(0),
             reserved: AtomicUsize::new(0),
             full: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             gate: RwLock::new(()),
             counts: Counts::default(),
         }
@@ -461,7 +464,17 @@ impl SharedTree {
 
     //room for one more descent: the root's own visits and the leaves waiting are within the simulations
     fn has_room(&self, visit_limit: u32) -> bool {
-        self.root().visits() as usize + self.pending() < visit_limit as usize
+        self.root().visits() as usize + self.pending() < visit_limit as usize && !self.closed.load(Ordering::Acquire)
+    }
+
+    //no call gathers any more; the caller has the tree to itself (quiet)
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    //a closed tree searched again: the next search of the game starts from it
+    pub fn reopen(&mut self) {
+        *self.closed.get_mut() = false;
     }
 
     //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent
@@ -489,7 +502,9 @@ impl SharedTree {
 
     //the network leaves of the round, in the order they were gathered in, for finish_leaf
     pub fn queue(&self, round: u64, leaves: Vec<PendingLeaf>) {
-        self.pending.lock().expect("the pending leaves").entry(round).or_default().extend(leaves);
+        if !leaves.is_empty() {
+            self.pending.lock().expect("the pending leaves").entry(round).or_default().extend(leaves);
+        }
     }
 
     pub fn take_round(&self, round: u64) -> Vec<PendingLeaf> {
@@ -671,6 +686,11 @@ impl SharedTree {
 
 #[cfg(test)]
 impl SharedTree {
+    //the rounds with leaves queued
+    pub fn queued_rounds(&self) -> usize {
+        self.pending.lock().expect("the pending leaves").len()
+    }
+
     //a copy of a Tree whose search is done (nothing waits for the network), nodes numbered as they are in the Tree
     pub fn from_tree(tree: &Tree) -> SharedTree {
         assert_eq!(tree.pending(), 0, "a tree to copy has nothing waiting");
@@ -703,6 +723,7 @@ impl SharedTree {
             waiting: AtomicUsize::new(0),
             reserved: AtomicUsize::new(0),
             full: AtomicBool::new(tree.full),
+            closed: AtomicBool::new(false),
             gate: RwLock::new(()),
             counts: Counts::default(),
         }

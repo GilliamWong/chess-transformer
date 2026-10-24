@@ -468,3 +468,30 @@ fn proven_nodes_hide_stale_leaves_from_a_shared_trees_advance_as_from_the_walk()
         assert_same_trees(&walked, &advanced.to_tree());
     }
 }
+
+//a closed tree (its search is over and reported) takes no leaf for a call that still has it
+#[test]
+fn a_closed_tree_gathers_nothing() {
+    let (settings, network) = (settings(true), SharedNetwork::new());
+    let tree = shared_tree_after(START, &[]);
+    shared_in_flight(&tree, 200, 1, &settings, None, &network, usize::MAX);
+    let round = |id| Round { id, leaves: 8, simulations: 24, collisions: 8, visit_limit: u32::MAX, memory_limit: usize::MAX };
+    let open = tree.gather(&round(0), &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables");
+    assert!(!open.is_empty());
+    tree.close();
+    assert!(tree.gather(&round(1), &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables").is_empty());
+    //the game's next search starts from the tree it left
+    let mut tree = tree;
+    tree.reopen();
+    assert!(!tree.gather(&round(2), &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables").is_empty());
+}
+
+//a round that found no leaves keeps nothing in the tree: the search loop may run a great many of them while it waits
+#[test]
+fn rounds_without_leaves_queue_nothing() {
+    let tree = shared_tree_after(START, &[]);
+    for round in 0..10_000 {
+        tree.queue(round, Vec::new());
+    }
+    assert_eq!(tree.queued_rounds(), 0);
+}

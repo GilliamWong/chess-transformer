@@ -4,6 +4,7 @@
 import ctypes
 import gc
 import io
+import itertools
 import os
 import queue
 import runpy
@@ -1906,7 +1907,11 @@ def test_concurrent_descents_on_several_networks_search_one_tree(networks, leave
 
     assert 3000 <= report.simulations < 3000 + 3 * leaves * networks and report.line[0] in board.legal_moves
     assert group.most_out == 2 * networks and all(network.rounds > 5 for network in group.networks)
+    #a search that does not come back would run empty rounds for ever: told to stop, it falls short
+    stop = threading.Timer(20, lambda: search.searches.stop(0))
+    stop.start()
     again = search.search(board, simulations=report.simulations + 500)
+    stop.cancel()
     assert again.simulations >= report.simulations + 500
 
 
@@ -1996,4 +2001,49 @@ def test_rust_rounds_with_concurrent_descents_drive_every_network(count):
     assert 3000 <= report.simulations < 3000 + 16 * count * 3 and report.line[0] in board.legal_moves
     assert search.rust_counts[0] > 40 * count // 2 and all(not lane.pending for network in networks for lane in network.lanes)
     assert search.search(board, simulations=report.simulations + 500).simulations >= report.simulations + 500
+
+
+#threads drive one Searches in rounds of their own, each search with a stop that comes at any moment (a thread may be midway
+#through gathering): every search ends with exactly one report and no error, and the game goes on from the tree it left
+def test_concurrent_searches_end_under_stops_at_any_moment():
+    evaluate = cpu_batches(BoardModel()).evaluate_boards
+    searches = selfplay_rs.Searches(**engine_search_settings(False), tree_reuse=True, cache_positions=100_000, concurrent_descents=True)
+    names, board, ended = itertools.count(), chess.Board(), []
+    for turn in range(40):
+        reports, errors, fen, moves = [], [], board.root().fen(), [move.uci() for move in board.move_stack]
+        searches.start(0, fen, moves, 2**31)
+
+        def drive():
+            try:
+                while not reports:
+                    name = next(names)
+                    boards = leaf_boards(searches.descend(16, 16, 48, round=name))
+                    reports.extend(searches.finish(evaluate(boards) if len(boards) else np.zeros((0, ANSWER_WIDTH), dtype=np.float32), round=name))
+            except BaseException as error:
+                errors.append(error)
+
+        def stop():
+            time.sleep(0.003 + 0.002 * (turn % 7))
+            while not reports:
+                try:
+                    stopped = searches.stop(0)
+                except RuntimeError:
+                    time.sleep(0.001)
+                    continue
+                except ValueError:
+                    break
+                reports.extend([stopped] if stopped else [])
+                break
+        threads = [threading.Thread(target=drive) for _ in range(4)] + [threading.Thread(target=stop)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert not errors and len(reports) == 1 and reports[0][4] > 0, (turn, errors, reports)
+        ended.append(reports[0][4])
+        move = chess.Move.from_uci(reports[0][1][0])
+        board.push(move)
+        board.push(next(iter(board.legal_moves)))
+        searches.advance(0, fen, [move.uci() for move in board.move_stack])
+    assert len(ended) == 40 and sum(ended) > 40 * 20
 

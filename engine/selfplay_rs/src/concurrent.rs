@@ -19,6 +19,20 @@ impl SharedSearch {
         (self.stopped || self.tree.root().visits() >= self.simulations || self.tree.is_full()) && self.tree.pending() == 0
     }
 
+    //the search's report if it is done, looked at with no call in its tree: a thread that was gathering when it looked done
+    //may have a leaf out by now. A search that is done closes its tree to the calls that still have it
+    fn end(&self) -> Option<SearchReport> {
+        if !self.done() {
+            return None;
+        }
+        self.tree.quiet(|| {
+            self.done().then(|| {
+                self.tree.close();
+                self.report()
+            })
+        })
+    }
+
     //as player.search_move reports it
     fn report(&self) -> SearchReport {
         let tree = &self.tree;
@@ -193,8 +207,14 @@ impl Searches {
     //its tree
     pub(crate) fn shared_reports(&self, state: &mut State) -> Vec<SearchReport> {
         let mut reports = Vec::new();
-        for search in state.shared_searches.extract_if(.., |search| search.done()) {
-            reports.push(search.tree.quiet(|| search.report()));
+        let mut at = 0;
+        while at < state.shared_searches.len() {
+            let Some(report) = state.shared_searches[at].end() else {
+                at += 1;
+                continue;
+            };
+            reports.push(report);
+            let search = state.shared_searches.remove(at);
             if self.tree_reuse {
                 state.shared_kept.insert(search.id, KeptTree { fen: search.fen, moves: search.moves, tree: Kept::Searched(search.tree) });
             }
@@ -283,6 +303,7 @@ impl Searches {
         match kept.tree.ready()? {
             Kept::Searched(tree) => {
                 let mut tree = Arc::into_inner(tree)?;
+                tree.reopen();
                 let (line, _) = shared_line_to(&tree, since)?;
                 if !line.is_empty() {
                     tree.play_line(&line);
@@ -292,6 +313,7 @@ impl Searches {
             }
             Kept::Advanced(tree, candidates) => {
                 let mut tree = Arc::into_inner(tree)?;
+                tree.reopen();
                 let (line, places) = shared_line_to(&tree, since)?;
                 tree.move_root(&line);
                 match candidates {
