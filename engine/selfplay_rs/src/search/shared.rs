@@ -72,10 +72,17 @@ pub struct SharedTree {
     pub counts: Counts,
 }
 
+//whether the tests that look for races have the threads yield between a protocol's steps (jitter)
+#[cfg(test)]
+pub static JITTER: AtomicBool = AtomicBool::new(false);
+
 //yields the thread now and then between a protocol's steps, to widen the windows the tests look for races in
 #[cfg(test)]
 fn jitter() {
     use std::cell::Cell;
+    if !JITTER.load(Ordering::Relaxed) {
+        return;
+    }
     thread_local!(static STATE: Cell<u64> = const { Cell::new(0x2545_f491_4f6c_dd1d) });
     let draw = STATE.with(|state| {
         let mut x = state.get();
@@ -114,49 +121,8 @@ impl SharedTree {
         }
     }
 
-    //a copy of a Tree whose search is done (nothing waits for the network), nodes numbered as they are in the Tree
-    pub fn from_tree(tree: &Tree) -> SharedTree {
-        assert_eq!(tree.pending(), 0, "a tree to copy has nothing waiting");
-        let nodes = Nodes::new();
-        let edges = Edges::new();
-        for (id, node) in tree.nodes.iter().enumerate() {
-            assert_eq!(nodes.push(tree.node_keys[id]), id);
-            let copy = nodes.get(id);
-            copy.set_counts(node.visit_count, node.in_flight, node.value_sum);
-            copy.set_visited_policy_sqrt(node.visited_policy_sqrt);
-            if let Some(proof) = node.proof {
-                copy.set_proof(proof);
-            }
-            if node.has_edges() {
-                let first = edges.alloc(node.edges().len());
-                for (index, edge) in node.edges().enumerate() {
-                    edges.set(first + index, tree.moves[edge], tree.priors[edge]);
-                    edges.child(first + index).store(tree.children[edge], Ordering::Relaxed);
-                }
-                copy.publish_edges(first, node.edges().len());
-            }
-        }
-        SharedTree {
-            board: tree.board.clone(),
-            keys: tree.keys.clone(),
-            root: tree.root_index(),
-            nodes,
-            edges,
-            pending: Mutex::new(HashMap::new()),
-            waiting: AtomicUsize::new(0),
-            reserved: AtomicUsize::new(0),
-            full: AtomicBool::new(tree.full),
-            gate: RwLock::new(()),
-            counts: Counts::default(),
-        }
-    }
-
     pub fn root(&self) -> &Node {
         self.nodes.get(self.root)
-    }
-
-    pub fn root_index(&self) -> usize {
-        self.root
     }
 
     pub fn is_full(&self) -> bool {
@@ -200,18 +166,10 @@ impl SharedTree {
         self.edges.chess_move(edge)
     }
 
-    pub fn node(&self, id: usize) -> &Node {
-        self.nodes.get(id)
-    }
-
     //the edge's node, None until a simulation has gone through it
     pub fn child_index(&self, edge: usize) -> Option<usize> {
         let child = self.edges.child(edge).load(Ordering::Acquire);
         (child != NO_NODE).then_some(child as usize)
-    }
-
-    pub fn prior(&self, edge: usize) -> f64 {
-        f64::from(self.edges.prior(edge))
     }
 
     //the edge's node, None until a simulation has gone through it
@@ -324,7 +282,8 @@ impl SharedTree {
     fn select_edge(&self, id: usize, settings: &SearchSettings) -> usize {
         let parent = self.nodes.get(id);
         let (parent_visits, _) = parent.counts();
-        let c_puct = settings.c_puct + settings.c_puct_factor * ((f64::from(parent_visits) + settings.c_puct_base) / settings.c_puct_base).ln();
+        let c_puct =
+            settings.c_puct + settings.c_puct_factor * ((f64::from(parent_visits) + settings.c_puct_base) / settings.c_puct_base).ln();
         let children_visits = parent_visits.saturating_sub(1).max(1);
         let edges = parent.edges();
         let first_play_urgency = (1.0 - parent.mean_score(parent_visits)) - settings.fpu_reduction * parent.visited_policy_sqrt();
@@ -416,9 +375,7 @@ impl SharedTree {
     //until they are published
     fn expand(&self, id: usize, moves: &MoveList, priors: &[f32]) {
         let first = self.edges.alloc(moves.len());
-        for (index, (&chess_move, &prior)) in moves.iter().zip(priors).enumerate() {
-            self.edges.set(first + index, chess_move, prior);
-        }
+        self.edges.write(first, moves, priors);
         jitter();
         self.nodes.get(id).publish_edges(first, moves.len());
     }
@@ -447,7 +404,13 @@ impl SharedTree {
         let node = self.nodes.get(id);
         let mut seen = node.begin_refresh();
         loop {
-            let sum = python_sum(node.edges().filter(|&edge| self.visits(edge) > 0).map(|edge| f64::from(self.edges.prior(edge))));
+            let edges = node.edges();
+            let children = self.edges.children(edges.clone()).iter();
+            let visited = children.zip(self.edges.priors(edges)).filter(|(child, _)| {
+                let child = child.load(Ordering::Acquire);
+                child != NO_NODE && self.nodes.get(child as usize).visits() > 0
+            });
+            let sum = python_sum(visited.map(|(_, prior)| f64::from(f32::from_bits(prior.load(Ordering::Relaxed)))));
             jitter();
             node.set_visited_policy_sqrt(sum.sqrt());
             let now = node.refreshes();
@@ -708,12 +671,62 @@ impl SharedTree {
 
 #[cfg(test)]
 impl SharedTree {
+    //a copy of a Tree whose search is done (nothing waits for the network), nodes numbered as they are in the Tree
+    pub fn from_tree(tree: &Tree) -> SharedTree {
+        assert_eq!(tree.pending(), 0, "a tree to copy has nothing waiting");
+        let nodes = Nodes::new();
+        let edges = Edges::new();
+        for (id, node) in tree.nodes.iter().enumerate() {
+            assert_eq!(nodes.push(tree.node_keys[id]), id);
+            let copy = nodes.get(id);
+            copy.set_counts(node.visit_count, node.in_flight, node.value_sum);
+            copy.set_visited_policy_sqrt(node.visited_policy_sqrt);
+            if let Some(proof) = node.proof {
+                copy.set_proof(proof);
+            }
+            if node.has_edges() {
+                let first = edges.alloc(node.edges().len());
+                for (index, edge) in node.edges().enumerate() {
+                    edges.set(first + index, tree.moves[edge], tree.priors[edge]);
+                    edges.child(first + index).store(tree.children[edge], Ordering::Relaxed);
+                }
+                copy.publish_edges(first, node.edges().len());
+            }
+        }
+        SharedTree {
+            board: tree.board.clone(),
+            keys: tree.keys.clone(),
+            root: tree.root_index(),
+            nodes,
+            edges,
+            pending: Mutex::new(HashMap::new()),
+            waiting: AtomicUsize::new(0),
+            reserved: AtomicUsize::new(0),
+            full: AtomicBool::new(tree.full),
+            gate: RwLock::new(()),
+            counts: Counts::default(),
+        }
+    }
+
+    pub fn node(&self, id: usize) -> &Node {
+        self.nodes.get(id)
+    }
+
+    pub fn prior(&self, edge: usize) -> f64 {
+        f64::from(self.edges.prior(edge))
+    }
+
+    pub fn root_index(&self) -> usize {
+        self.root
+    }
+
     //a Tree of the same numbers with its edges numbered as Tree's vectors have them (those of a one thread search, in the
     //order the nodes were expanded in), to compare a search with Tree's number for number
     pub fn to_tree(&self) -> Tree {
         let count = self.nodes.len();
-        let mut expanded: Vec<(usize, usize)> =
-            (0..count).filter_map(|id| Some(self.nodes.get(id).edges()).filter(|edges| !edges.is_empty()).map(|edges| (edges.start, id))).collect();
+        let mut expanded: Vec<(usize, usize)> = (0..count)
+            .filter_map(|id| Some(self.nodes.get(id).edges()).filter(|edges| !edges.is_empty()).map(|edges| (edges.start, id)))
+            .collect();
         expanded.sort_unstable();
         let mut first_edge = vec![0; count];
         let (mut moves, mut priors, mut children) = (Vec::new(), Vec::new(), Vec::new());

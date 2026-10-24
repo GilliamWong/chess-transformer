@@ -2,7 +2,7 @@
 //find them and to queue or take a round, and the threads that drive the networks descend, finish and back up in one
 //tree at once. The plain mode's search and its locks (lib.rs) are untouched
 use super::*;
-use search::{SharedCache, SharedTree};
+use search::SharedTree;
 
 //a running search of concurrent mode; the tree is shared with the calls in it
 pub(crate) struct SharedSearch {
@@ -86,8 +86,12 @@ impl Searches {
             }
             let number = state.rounds_descended;
             state.rounds_descended += 1;
-            let searches: Vec<_> =
-                state.shared_searches.iter().filter(|search| !search.stopped).map(|search| (search.id, search.simulations, search.tree.clone())).collect();
+            let searches: Vec<_> = state
+                .shared_searches
+                .iter()
+                .filter(|search| !search.stopped)
+                .map(|search| (search.id, search.simulations, search.tree.clone()))
+                .collect();
             (number, searches)
         };
         let mut round_leaves = Vec::new();
@@ -100,9 +104,8 @@ impl Searches {
                 visit_limit,
                 memory_limit: self.memory_limit,
             };
-            let queued = tree
-                .gather(&limits, &self.settings, self.tables.as_ref(), self.shared_cache.as_ref(), boards)
-                .map_err(tablebase_error)?;
+            let queued =
+                tree.gather(&limits, &self.settings, self.tables.as_ref(), self.shared_cache.as_ref(), boards).map_err(tablebase_error)?;
             if !queued.is_empty() {
                 round_leaves.push((id, queued.len() as u32));
             }
@@ -130,7 +133,9 @@ impl Searches {
         let (out, trees) = {
             let mut state = self.lock()?;
             let index = match round {
-                None => (!state.rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers")),
+                None => {
+                    (!state.rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers"))
+                }
                 Some(name) => state
                     .rounds
                     .iter()

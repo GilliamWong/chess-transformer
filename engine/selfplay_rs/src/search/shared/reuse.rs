@@ -59,9 +59,6 @@ impl SharedTree {
             assert_eq!(nodes.push(old.key()), index);
             let node = nodes.get(index);
             old.copy_to(node);
-            if index == 0 {
-                node.clear_proof();
-            }
             let old_edges = old.edges();
             if !old_edges.is_empty() {
                 let first = edges.alloc(old_edges.len());
@@ -215,7 +212,14 @@ impl SharedTree {
         }
     }
 
-    fn find_candidates(&self, node: usize, places: &mut Vec<u16>, candidates: &mut Vec<Vec<u16>>, looked: &mut usize, abort: &AtomicBool) -> bool {
+    fn find_candidates(
+        &self,
+        node: usize,
+        places: &mut Vec<u16>,
+        candidates: &mut Vec<Vec<u16>>,
+        looked: &mut usize,
+        abort: &AtomicBool,
+    ) -> bool {
         *looked += 1;
         if looked.is_multiple_of(ABORT_CHECKS) && abort.load(Ordering::Relaxed) {
             return false;

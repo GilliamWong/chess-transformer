@@ -4,8 +4,8 @@
 use crate::search::{NO_NODE, Outcome, Proof};
 use shakmaty::{Move, Role, Square};
 use std::ops::Range;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::ptr::{null_mut, slice_from_raw_parts_mut};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const NODE_CHUNK_BITS: u32 = if cfg!(test) { 6 } else { 16 };
 const NODE_CHUNKS: usize = 1 << 14;
@@ -58,6 +58,7 @@ impl Node {
     }
 
     //a node of a tree being copied, before anything else sees it
+    #[cfg(test)]
     pub fn set_counts(&self, visits: u32, in_flight: u32, value_sum: f64) {
         self.count.store(u64::from(in_flight) << 32 | u64::from(visits), Ordering::Relaxed);
         self.value_sum.store(value_sum.to_bits(), Ordering::Relaxed);
@@ -167,25 +168,72 @@ impl Node {
     }
 }
 
-//chunks made on first use
-struct Table<C>(Box<[OnceLock<C>]>);
+//chunks of `columns` times `1 << bits` elements made on first use, a pointer to each. A chunk is allocated once, by whichever
+//thread needs it first, and freed only with the table, so a reference into one is valid for the table's life. Elements are
+//found by an index that counts `1 << bits` to a chunk, a column of a chunk by its number
+struct Table<T> {
+    chunks: Box<[AtomicPtr<T>]>,
+    bits: u32,
+    columns: usize,
+}
 
-impl<C> Table<C> {
-    fn new(chunks: usize) -> Table<C> {
-        Table((0..chunks).map(|_| OnceLock::new()).collect())
+impl<T> Table<T> {
+    fn new(chunks: usize, bits: u32, columns: usize) -> Table<T> {
+        Table { chunks: (0..chunks).map(|_| AtomicPtr::new(null_mut())).collect(), bits, columns }
     }
 
-    fn get(&self, chunk: usize) -> &C {
-        self.0[chunk].get().expect("an index is given out only once its chunk is made")
+    //the chunk's first element; every index given out is in a chunk that is made (the allocators make it before they give
+    //the index out)
+    fn chunk_of(&self, index: usize) -> *mut T {
+        let chunk = self.chunks[index >> self.bits].load(Ordering::Acquire);
+        assert!(!chunk.is_null(), "an index in a chunk that was never made");
+        chunk
     }
 
-    fn made(&self, chunk: usize, make: impl FnOnce() -> C) -> &C {
-        self.0[chunk].get_or_init(make)
+    fn get(&self, index: usize) -> &T {
+        &self.slice(index, 0, 1)[0]
+    }
+
+    //`len` elements of a column from `index`, all in its chunk
+    fn slice(&self, index: usize, column: usize, len: usize) -> &[T] {
+        let offset = index & ((1 << self.bits) - 1);
+        assert!(column < self.columns && offset + len <= 1 << self.bits, "elements across a chunk's end");
+        // SAFETY: the chunk holds columns << bits elements and never moves or goes before the table does, and the assert keeps
+        // the elements inside the column
+        unsafe { std::slice::from_raw_parts(self.chunk_of(index).add((column << self.bits) + offset), len) }
+    }
+
+    //makes the chunk of the index (columns << bits elements, from `make`) if no thread has
+    fn made(&self, index: usize, make: impl FnOnce() -> Box<[T]>) {
+        let slot = &self.chunks[index >> self.bits];
+        if !slot.load(Ordering::Acquire).is_null() {
+            return;
+        }
+        let fresh = Box::into_raw(make());
+        assert_eq!(fresh.len(), self.columns << self.bits);
+        if slot.compare_exchange(null_mut(), fresh.cast(), Ordering::AcqRel, Ordering::Acquire).is_err() {
+            // SAFETY: fresh came from Box::into_raw just now, and the other thread's chunk won the slot
+            drop(unsafe { Box::from_raw(fresh) });
+        }
+    }
+}
+
+impl<T> Drop for Table<T> {
+    fn drop(&mut self) {
+        let len = self.columns << self.bits;
+        for slot in self.chunks.iter_mut() {
+            let chunk = *slot.get_mut();
+            if !chunk.is_null() {
+                // SAFETY: a made chunk is a Box<[T]> of len elements that only this table owns, and no reference into it
+                // outlives the table
+                drop(unsafe { Box::from_raw(slice_from_raw_parts_mut(chunk, len)) });
+            }
+        }
     }
 }
 
 pub struct Nodes {
-    table: Table<Box<[Node]>>,
+    table: Table<Node>,
     next: AtomicUsize,
 }
 
@@ -194,7 +242,7 @@ impl Nodes {
     pub const CAPACITY: usize = (NODE_CHUNKS << NODE_CHUNK_BITS) - 1;
 
     pub fn new() -> Nodes {
-        Nodes { table: Table::new(NODE_CHUNKS), next: AtomicUsize::new(0) }
+        Nodes { table: Table::new(NODE_CHUNKS, NODE_CHUNK_BITS, 1), next: AtomicUsize::new(0) }
     }
 
     pub fn len(&self) -> usize {
@@ -202,15 +250,15 @@ impl Nodes {
     }
 
     pub fn get(&self, index: usize) -> &Node {
-        &self.table.get(index >> NODE_CHUNK_BITS)[index & ((1 << NODE_CHUNK_BITS) - 1)]
+        self.table.get(index)
     }
 
     //a new node with its position's key; its index is given to others only once it is published
     pub fn push(&self, key: u64) -> usize {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         assert!(index < Self::CAPACITY, "the tree is past its nodes");
-        let chunk = self.table.made(index >> NODE_CHUNK_BITS, || (0..1 << NODE_CHUNK_BITS).map(|_| Node::default()).collect());
-        chunk[index & ((1 << NODE_CHUNK_BITS) - 1)].key.store(key, Ordering::Relaxed);
+        self.table.made(index, || (0..1 << NODE_CHUNK_BITS).map(|_| Node::default()).collect());
+        self.table.get(index).key.store(key, Ordering::Relaxed);
         index
     }
 }
@@ -221,7 +269,7 @@ const CHILDREN: usize = 1;
 const MOVES: usize = 2;
 
 pub struct Edges {
-    table: Table<Box<[AtomicU32]>>,
+    table: Table<AtomicU32>,
     next: AtomicUsize,
 }
 
@@ -229,7 +277,7 @@ impl Edges {
     pub const CAPACITY: usize = EDGE_CHUNKS << EDGE_CHUNK_BITS;
 
     pub fn new() -> Edges {
-        Edges { table: Table::new(EDGE_CHUNKS), next: AtomicUsize::new(0) }
+        Edges { table: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 3), next: AtomicUsize::new(0) }
     }
 
     //the edges given out so far, the gaps at chunk ends included
@@ -250,7 +298,7 @@ impl Edges {
             }
         };
         assert!(first + count <= Self::CAPACITY, "the tree is past its edges");
-        self.table.made(first >> EDGE_CHUNK_BITS, || {
+        self.table.made(first, || {
             let chunk = 1usize << EDGE_CHUNK_BITS;
             (0..3 * chunk).map(|slot| AtomicU32::new(if slot / chunk == CHILDREN { NO_NODE } else { 0 })).collect()
         });
@@ -262,9 +310,7 @@ impl Edges {
             return &[];
         }
         debug_assert_eq!(edges.start >> EDGE_CHUNK_BITS, (edges.end - 1) >> EDGE_CHUNK_BITS, "a node's edges lie in one chunk");
-        let chunk = self.table.get(edges.start >> EDGE_CHUNK_BITS);
-        let start = (column << EDGE_CHUNK_BITS) + (edges.start & ((1 << EDGE_CHUNK_BITS) - 1));
-        &chunk[start..start + edges.len()]
+        self.table.slice(edges.start, column, edges.len())
     }
 
     pub fn priors(&self, edges: Range<usize>) -> &[AtomicU32] {
@@ -287,10 +333,19 @@ impl Edges {
         decode(self.column(edge..edge + 1, MOVES)[0].load(Ordering::Relaxed))
     }
 
-    //an edge's move and prior, written by the thread that owns its node before the node's edges are published
+    //a node's moves and priors from edge `first`, written by the thread that owns the node before its edges are published
+    pub fn write(&self, first: usize, moves: &[Move], priors: &[f32]) {
+        let edges = first..first + moves.len();
+        let slots = self.column(edges.clone(), MOVES).iter().zip(self.priors(edges));
+        for ((move_slot, prior_slot), (&chess_move, &prior)) in slots.zip(moves.iter().zip(priors)) {
+            move_slot.store(encode(chess_move), Ordering::Relaxed);
+            prior_slot.store(prior.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    //an edge's move and prior
     pub fn set(&self, edge: usize, chess_move: Move, prior: f32) {
-        self.column(edge..edge + 1, MOVES)[0].store(encode(chess_move), Ordering::Relaxed);
-        self.priors(edge..edge + 1)[0].store(prior.to_bits(), Ordering::Relaxed);
+        self.write(edge, &[chess_move], &[prior]);
     }
 }
 

@@ -217,6 +217,7 @@ fn search_on_threads(
     network: &SharedNetwork,
     memory_limit: usize,
 ) {
+    crate::search::shared::JITTER.store(true, Ordering::Relaxed);
     let next_round = AtomicU64::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads {
@@ -227,7 +228,8 @@ fn search_on_threads(
                     if room && rounds.len() < in_flight {
                         let leaves = (tree.root().visits() / 16).clamp(1, most_leaves);
                         let id = next_round.fetch_add(1, Ordering::Relaxed);
-                        let round = Round { id, leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: simulations, memory_limit };
+                        let round =
+                            Round { id, leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: simulations, memory_limit };
                         let mut boards = Vec::new();
                         let queued = tree.gather(&round, settings, None, Some(&network.cache), &mut boards).expect("no tables");
                         tree.queue(id, queued);
@@ -256,7 +258,11 @@ fn searches_on_many_threads_leave_a_consistent_tree() {
                     let tree = shared_tree_after(fen, moves);
                     search_on_threads(&tree, threads, 3_000, in_flight, 16, &settings, &SharedNetwork::new(), usize::MAX);
                     assert_eq!(tree.pending(), 0);
-                    assert!(tree.root().visits() >= 3_000 && tree.root().visits() < 3_000 + 64 * threads as u32, "{}", tree.root().visits());
+                    assert!(
+                        tree.root().visits() >= 3_000 && tree.root().visits() < 3_000 + 64 * threads as u32,
+                        "{}",
+                        tree.root().visits()
+                    );
                     check_tree(&tree, &settings);
                     collided += tree.counts.orphans.load(Ordering::Relaxed);
                 }
@@ -292,7 +298,11 @@ fn a_search_ends_at_its_memory_limit_as_the_same_search() {
     let limited = shared_tree_after(START, &[]);
     shared_in_flight(&limited, 1_000_000, 2, &settings, None, &SharedNetwork::new(), memory_limit);
     let reached = limited.root().visits();
-    assert!(limited.is_full() && reached < 1_000_000 && limited.allocated_bytes() <= memory_limit, "{reached} {}", limited.allocated_bytes());
+    assert!(
+        limited.is_full() && reached < 1_000_000 && limited.allocated_bytes() <= memory_limit,
+        "{reached} {}",
+        limited.allocated_bytes()
+    );
 
     let unlimited = shared_tree_after(START, &[]);
     shared_in_flight(&unlimited, reached, 2, &settings, None, &SharedNetwork::new(), usize::MAX);
@@ -393,15 +403,15 @@ fn shared_advanced(
 fn reusing_a_shared_tree_leaves_the_tree_a_tree_is_left() {
     let tables = tables();
     let (mut lines, mut stale, mut proven) = (0, 0, 0);
-    for (fen, moves, simulations, certainty, tables) in cases(&tables) {
-        let settings = settings(certainty);
+    //draws worth 0.5 take as much from a parent as they leave it: another value tells which of the two a sign took
+    let cases: Vec<_> = cases(&tables).into_iter().flat_map(|case| [(case, 0.5), (case, 0.35)]).collect();
+    for ((fen, moves, simulations, certainty, tables), draw) in cases {
+        let settings = SearchSettings { draw, ..settings(certainty) };
         let mut tree = tree_after(fen, moves);
         search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
         let shared = shared_tree_after(fen, moves);
         shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
         //one thread's search is Tree's, which the other test shows with rounds in flight: here one round at a time
-        let mut copy = shared.to_tree();
-        copy.pending.clear();
         assert_eq!(tree.root().visit_count, shared.root().visits());
         for line in reusable_lines(&tree) {
             let line_moves: Vec<Move> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
@@ -426,4 +436,35 @@ fn reusing_a_shared_tree_leaves_the_tree_a_tree_is_left() {
         }
     }
     assert!(lines >= 15 && stale > 0 && proven > 0, "{lines} lines, {stale} stale leaves, {proven} proven nodes");
+}
+
+//a proven node hides the leaves below it from the stale walk unless it is the new root, whose proof is dropped: advance's
+//candidates must leave and take out the same ones on a SharedTree as the walk does on a Tree, with the proofs set by hand
+#[test]
+fn proven_nodes_hide_stale_leaves_from_a_shared_trees_advance_as_from_the_walk() {
+    let settings = settings(true);
+    let mut tree = tree_after(LOCKED_PAWNS, &[]);
+    search(&mut tree, 10_000, usize::MAX, &settings, None, &mut Network::new());
+    let (line, path) = reusable_lines(&tree)
+        .into_iter()
+        .filter(|line| line.len() == 2)
+        .find_map(|line| {
+            let mut moved = copied(&tree);
+            moved.move_root(&line);
+            let mut stale = Vec::new();
+            moved.find_stale_leaves(&mut vec![moved.root], &mut Vec::new(), &settings, None, false, &mut stale).expect("no tables");
+            stale.into_iter().find(|path| path.len() >= 3).map(|path| (line, path))
+        })
+        .expect("a stale leaf two nodes below a reusable line");
+    let line_moves: Vec<Move> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+    let draw = Proof { outcome: Outcome::Draw, value: 0.5, plies: 0 };
+    for proven in [path[0], path[1]] {
+        let mut proved = copied(&tree);
+        proved.nodes[proven].proof = Some(draw);
+        let mut walked = copied(&proved);
+        walked.play_line(&line);
+        walked.drop_stale_leaves(&settings, None).expect("no tables");
+        let advanced = shared_advanced(&SharedTree::from_tree(&proved), &line_moves, 4, None, &settings, None);
+        assert_same_trees(&walked, &advanced.to_tree());
+    }
 }

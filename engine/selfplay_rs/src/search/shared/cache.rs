@@ -17,6 +17,7 @@ impl SharedCache {
     }
 
     //a Tree's cache, answer for answer, with room for `positions`
+    #[cfg(test)]
     pub fn from_cache(cache: &Cache, positions: usize) -> SharedCache {
         let shared = SharedCache::new(positions);
         for generation in [&cache.older, &cache.newer] {

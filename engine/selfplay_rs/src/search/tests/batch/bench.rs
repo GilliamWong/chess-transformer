@@ -87,6 +87,14 @@ impl StandIn {
         let seed = StandIn::seed(board);
         (0..ANSWER_WIDTH).map(|column| self.column(board, seed, column)).collect()
     }
+
+    //a row of `width` for a network with more moves ids than the stand-in's: logits for every column but the last, the value in it
+    fn row_of(&self, board: &[u8], width: usize) -> Vec<f32> {
+        let seed = StandIn::seed(board);
+        let mut row: Vec<f32> = (0..width - 1).map(|column| self.prior_scale * 8.0 * uniform(seed ^ column as u64).powi(2)).collect();
+        row.push(self.column(board, seed, ANSWER_WIDTH - 1));
+        row
+    }
 }
 
 #[derive(Default, Clone)]

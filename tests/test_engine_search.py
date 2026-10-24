@@ -1432,9 +1432,9 @@ def test_the_engine_plays_on_in_a_draw_left_to_be_claimed(fen, moves, leaves):
 #an engine's game of `moves` searches from board, each answered by the reply its search expects (or the given replies),
 #with uci.py's advance after each move or not, or with the kept tree dropped instead (an advance to another game; the
 #cache keeps its answers): the reports, the replies, the network's boards and the advances that had a tree to carry on
-def advancing_game(model, board: chess.Board, moves: int, way: str, replies: list[str] | None = None):
+def advancing_game(model, board: chess.Board, moves: int, way: str, replies: list[str] | None = None, **options):
     network = CountingNetwork(model)
-    search = EngineSearch(network, 16, smart_pruning=False)
+    search = EngineSearch(network, 16, smart_pruning=False, **options)
     reports, played, advanced = [], [], 0
     for ply in range(moves):
         report = search.search(board, simulations=600)
@@ -1858,3 +1858,142 @@ def test_collision_scaling_grows_the_collisions_with_the_tree():
     assert search.search(chess.Board(), simulations=6000).simulations == 6000
     collisions = search.searches.collisions
     assert collisions[0] == 1 and max(collisions) > 64
+
+
+#concurrent descents on one network are the plain search: the same reports and the same boards for the network, move for
+#move along a game whose tree is carried on, dropped or kept, in a middlegame, in a game whose shuffles go stale, and with
+#certainty's proofs
+def test_concurrent_descents_on_one_network_are_the_plain_search(carlsen_games):
+    middlegame = carlsen_games[0].board()
+    for move in list(carlsen_games[0].mainline_moves())[:16]:
+        middlegame.push(move)
+    for way in ("plain", "advance", "drop"):
+        reports, replies, boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, way)
+        concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True)
+        assert concurrent[0] == reports and concurrent[2] == boards and concurrent[3] == advanced
+
+    shuffles = ["g8f6", "f6g8", "a7a6", "g8f6", "f6g8", "a6a5", "b8c6", "c6b8", "h7h6", "h6h5"]
+    model = LikesMoves(KNIGHTS_OUT_AND_BACK + [("b1c3", chess.WHITE), ("c3b1", chess.WHITE)], 4.0)
+    for options in ({}, {"settings": {"certainty": True}}):
+        plain = advancing_game(model, chess.Board(), len(shuffles), "advance", shuffles, **options)
+        concurrent = advancing_game(model, chess.Board(), len(shuffles), "advance", shuffles, concurrent_descents=True, **options)
+        assert concurrent[0] == plain[0] and concurrent[3] == plain[3] == len(shuffles)
+
+
+#a position the concurrent search was not carried on to is searched afresh, and a new game starts a fresh tree
+def test_concurrent_descents_start_afresh_where_the_tree_does_not_follow():
+    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, concurrent_descents=True)
+    board = chess.Board()
+    report = search.search(board, simulations=300)
+    played, other = board.copy(), board.copy()
+    played.push(report.line[0])
+    assert search.advance(played)
+    other.push(next(move for move in board.legal_moves if move != report.line[0]))
+    other.push(next(iter(other.legal_moves)))
+    assert search.search(other, simulations=50).line[0] in other.legal_moves
+    search.new_game()
+    assert search.search(board, simulations=300) == report
+
+
+#threads on several networks search one tree at once: it ends at its simulations (by less than a leaf a thread over), with a legal
+#move, each network's two rounds out at once
+@pytest.mark.parametrize("networks, leaves", [(2, 16), (3, 16), (4, 16)])
+def test_concurrent_descents_on_several_networks_search_one_tree(networks, leaves):
+    group = SlowNetworks(networks, 0.002, BoardModel())
+    search = EngineSearch(group.networks, leaves, smart_pruning=False, concurrent_descents=True)
+    board = chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1")
+    report = search.search(board, simulations=3000)
+
+    assert 3000 <= report.simulations < 3000 + 3 * leaves * networks and report.line[0] in board.legal_moves
+    assert group.most_out == 2 * networks and all(network.rounds > 5 for network in group.networks)
+    again = search.search(board, simulations=report.simulations + 500)
+    assert again.simulations >= report.simulations + 500
+
+
+#certainty's proofs hold on threads: a mate is found and proven, and the search stops
+def test_concurrent_descents_prove_a_mate_on_several_networks():
+    search = EngineSearch(SlowNetworks(3, 0.003, UniformModel()).networks, 16, concurrent_descents=True, settings={"certainty": True})
+    proven = search.search(chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1"), simulations=20_000)
+
+    assert proven.line[0].uci() == "c6b6" and proven.score == 1.0 and proven.simulations < 5_000
+
+
+#a timed search on threads ends by its deadline, uci's stop reaches it, and a failing network ends it with its error
+def test_concurrent_descents_keep_to_the_deadline_stop_and_failures():
+    search = EngineSearch(SlowNetworks(3, 0.003, BoardModel()).networks, 16, smart_pruning=False, concurrent_descents=True)
+    started = time.perf_counter()
+    assert search.search(chess.Board(), seconds=0.3).simulations > 300 and time.perf_counter() - started < 0.3 + 0.1
+
+    stop = threading.Event()
+    threading.Timer(0.2, stop.set).start()
+    started = time.perf_counter()
+    assert search.search(chess.Board(), simulations=300_000, stop=stop).simulations > 100
+    assert 0.2 <= time.perf_counter() - started < 0.2 + 0.1
+
+    failing = EngineSearch(SlowNetworks(3, 0.003, BoardModel(), failing_collect=5).networks, 16, smart_pruning=False, concurrent_descents=True)
+    with pytest.raises(RuntimeError, match="fell over"):
+        failing.search(chess.Board(), simulations=100_000)
+
+
+#concurrent descents and gather workers are two ways to gather in parallel, and one leaf a round is no gather at all
+def test_concurrent_descents_exclude_gather_workers_and_one_leaf_rounds():
+    with pytest.raises(ValueError, match="gather_workers"):
+        EngineSearch(cpu_batches(BoardModel()), 16, concurrent_descents=True, gather_workers=2)
+    with pytest.raises(ValueError, match="leaves above 1"):
+        EngineSearch(cpu_batches(BoardModel()), 1, concurrent_descents=True)
+    with pytest.raises(ValueError, match="gather workers"):
+        selfplay_rs.Searches(**rust_search_settings(False), concurrent_descents=True, gather_workers=2)
+
+
+#uci.py's --concurrent-descents reaches the search, which has none without it; it is refused without the gpu search or with
+#gather workers
+@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+@pytest.mark.parametrize("arguments, expected", [([], False), (["--concurrent-descents"], True)])
+def test_the_engine_takes_concurrent_descents(monkeypatch, arguments, expected):
+    built = []
+
+    class Recorded(EngineSearch):
+        def __init__(self, *args, concurrent_descents=False, **kwargs):
+            super().__init__(*args, concurrent_descents=concurrent_descents, **kwargs)
+            built.append(concurrent_descents)
+    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision, fp16_blocks, device=None, blocking_wait=False: cpu_batches(BoardModel()))
+    monkeypatch.setattr(engine_search, "EngineSearch", Recorded)
+    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *arguments])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
+    runpy.run_module("engine.uci", run_name="__main__")
+    refused = [subprocess.run([sys.executable, "-m", "engine.uci", "unused.pt", "--select", "mcts", *more, "--concurrent-descents"], cwd=REPOSITORY,
+                              capture_output=True, text=True, input="") for more in ([], ["--gpu", "--gather-workers", "2"])]
+
+    assert built == [expected]
+    assert all(run.returncode == 2 and "--concurrent-descents needs" in run.stderr for run in refused)
+
+
+#Searches' own round loop on concurrent descents: on one network the python loop's search, report for report and tree for tree
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("blocking_wait, settings", [(False, {}), (True, {"smart_pruning": False})])
+def test_rust_rounds_with_concurrent_descents_search_as_the_python_loop(blocking_wait, settings):
+    board, reports = chess.Board(), {}
+    for rust_rounds in (False, True):
+        search = EngineSearch(lean_network(blocking_wait), 16, rust_rounds=rust_rounds, concurrent_descents=True, **settings)
+        found = []
+        for move in ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]:
+            found.append(search.search(board, simulations=600))
+            board.push_uci(move)
+        board = chess.Board()
+        reports[rust_rounds] = found
+    assert reports[True] == reports[False]
+    assert search.rust_counts[0] > 20
+
+
+#on two and four networks the loop in rust runs every thread at once in the one tree, and leaves every lane free
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("count", [2, 4])
+def test_rust_rounds_with_concurrent_descents_drive_every_network(count):
+    networks = [lean_network(True) for _ in range(count)]
+    search = EngineSearch(networks, 16, smart_pruning=False, rust_rounds=True, concurrent_descents=True)
+    board = chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1")
+    report = search.search(board, simulations=3000)
+    assert 3000 <= report.simulations < 3000 + 16 * count * 3 and report.line[0] in board.legal_moves
+    assert search.rust_counts[0] > 40 * count // 2 and all(not lane.pending for network in networks for lane in network.lanes)
+    assert search.search(board, simulations=report.simulations + 500).simulations >= report.simulations + 500
+
