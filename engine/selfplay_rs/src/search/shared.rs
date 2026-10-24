@@ -8,7 +8,8 @@
 //the network or is being expanded (its edges are published before its first visit). Edges are published (release) after
 //they are written, a visit is counted (release) after the node's value is added, and readers load both with acquire.
 //A reader may see a half backed up path, never a torn field. What a proof rewrites (a node's sum and its ancestors')
-//cannot be done beside backups, so proofs are made with the gate held exclusively
+//cannot be done beside backups, so a proof of a node with visits is made with the gate held exclusively (that of a leaf
+//nobody has visited rewrites nothing)
 mod arena;
 mod cache;
 mod reuse;
@@ -432,8 +433,7 @@ impl SharedTree {
         }
     }
 
-    //the parent's visited policy again, in edge order and python's summation. Threads that refresh one node at once
-    //repeat until none began another during their scan: the last store follows a scan that saw every visit
+    //the parent's visited policy again, in edge order and python's summation; refreshers repeat until none began meanwhile
     fn refresh_visited_policy(&self, id: usize) {
         let node = self.nodes.get(id);
         let mut seen = node.begin_refresh();

@@ -106,17 +106,18 @@ impl Node {
         f64::from_bits(self.visited_policy_sqrt.load(Ordering::Relaxed))
     }
 
+    //with the refresh counter below this is sequentially consistent: a store buffered past the counter's check is a lost one
     pub fn set_visited_policy_sqrt(&self, value: f64) {
-        self.visited_policy_sqrt.store(value.to_bits(), Ordering::Relaxed);
+        self.visited_policy_sqrt.store(value.to_bits(), Ordering::SeqCst);
     }
 
     //a refresh of the visited policy begins; returns the number of refreshes begun, itself included
     pub fn begin_refresh(&self) -> u32 {
-        self.refreshes.fetch_add(1, Ordering::AcqRel) + 1
+        self.refreshes.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     pub fn refreshes(&self) -> u32 {
-        self.refreshes.load(Ordering::Acquire)
+        self.refreshes.load(Ordering::SeqCst)
     }
 
     pub fn key(&self) -> u64 {

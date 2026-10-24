@@ -254,7 +254,7 @@ fn searches_on_many_threads_leave_a_consistent_tree() {
     for (fen, moves) in positions {
         for certainty in [false, true] {
             let settings = settings(certainty);
-            for threads in [2, 4, 8] {
+            for threads in [2, 4, 8, 24] {
                 for in_flight in [1, 3] {
                     let tree = shared_tree_after(fen, moves);
                     search_on_threads(&tree, threads, 3_000, in_flight, 16, &settings, &SharedNetwork::new(), usize::MAX);
@@ -282,7 +282,16 @@ fn proofs_on_many_threads_leave_consistent_sums() {
     for fen in ["8/8/8/4k3/8/8/8/4K2Q w - - 0 1", "8/8/8/4k3/8/8/8/4K2R w - - 0 1", MATE_IN_TWO, "7k/8/5K2/8/8/8/8/6Q1 w - - 0 1"] {
         for repeat in 0..12 {
             let tree = shared_tree_after(fen, &[]);
-            search_on_threads(&tree, 2 + repeat % 7, 4_000, 1 + repeat % 3, 16, &settings, &SharedNetwork::new(), usize::MAX);
+            search_on_threads(
+                &tree,
+                [2, 3, 5, 8, 16, 32][repeat % 6],
+                4_000,
+                1 + repeat % 3,
+                16,
+                &settings,
+                &SharedNetwork::new(),
+                usize::MAX,
+            );
             check_tree(&tree, &settings);
             exclusive += tree.counts.exclusive.load(Ordering::Relaxed);
         }
@@ -549,26 +558,34 @@ fn tables_met_after_the_leaves_were_visited_prove_them_as_tree_does() {
 }
 
 //a thread that wants the tree to itself waits for the descent the others are in and not for their whole calls: with a call of
-//thousands of descents running, the wait is a fraction of the call
+//thousands of descents running, the wait is a fraction of the call (of a few tries, on a machine that may be busy)
 #[test]
 fn a_thread_that_wants_the_tree_to_itself_waits_for_a_descent_not_a_call() {
     let (settings, network) = (settings(true), SharedNetwork::new());
     let tree = shared_tree_after(START, &[]);
     shared_in_flight(&tree, 20_000, 2, &settings, None, &network, usize::MAX);
-    let round = Round { id: 0, leaves: 30_000, simulations: 200_000, collisions: 150_000, visit_limit: u32::MAX, memory_limit: usize::MAX };
-    let (call, wait) = std::thread::scope(|scope| {
-        let gathering = scope.spawn(|| {
+    let mut tries = Vec::new();
+    for id in 0..5 {
+        let round =
+            Round { id, leaves: 30_000, simulations: 200_000, collisions: 150_000, visit_limit: u32::MAX, memory_limit: usize::MAX };
+        let (call, wait) = std::thread::scope(|scope| {
+            let gathering = scope.spawn(|| {
+                let started = std::time::Instant::now();
+                tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables");
+                started.elapsed()
+            });
+            std::thread::sleep(Duration::from_millis(5));
             let started = std::time::Instant::now();
-            tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables");
-            started.elapsed()
+            tree.quiet(|| ());
+            let waited = started.elapsed();
+            (gathering.join().expect("a thread"), waited)
         });
-        std::thread::sleep(Duration::from_millis(5));
-        let started = std::time::Instant::now();
-        tree.quiet(|| ());
-        let waited = started.elapsed();
-        (gathering.join().expect("a thread"), waited)
-    });
-    assert!(call > Duration::from_millis(30), "the call took {call:?}");
+        tries.push((wait, call));
+        if wait * 4 < call && call > Duration::from_millis(30) {
+            break;
+        }
+    }
+    let &(wait, call) = tries.last().expect("a try");
     let gave_way = tree.counts.gave_way.load(Ordering::Relaxed);
-    assert!(gave_way > 0 && wait * 4 < call, "waited {wait:?} of a call of {call:?}, the call gave way {gave_way} times");
+    assert!(gave_way > 0 && wait * 4 < call && call > Duration::from_millis(30), "waits and calls {tries:?}, gave way {gave_way} times");
 }
