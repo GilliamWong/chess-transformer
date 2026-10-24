@@ -534,9 +534,13 @@ def test_fused_blocks_compute_what_the_model_does(tmp_path, fp16):
 #to a key/value head (three fill no power of two of rows), query/key widths padded in the kernel or not, and more
 #positions than one bias buffer takes
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+@pytest.mark.parametrize("cuda", [False, True])
 @pytest.mark.parametrize("heads, kv_heads, dq", [(24, 12, 24), (24, 12, 8), (4, 4, 16), (6, 2, 16)])
-def test_template_attention_in_fp16(heads, kv_heads, dq):
+def test_template_attention_in_fp16(monkeypatch, cuda, heads, kv_heads, dq):
+    from model import attention_cuda
     from model.fused_blocks import BIAS_POSITIONS, template_attention
+    #cuda: the CUDA kernel where it takes the shapes and positions (tests/test_attention_cuda.py), the Triton kernels otherwise
+    monkeypatch.setattr(attention_cuda, "ENABLED", cuda)
     torch.manual_seed(0)
     B, T, dv, templates_count, eps = BIAS_POSITIONS + 5, TOKENS_PER_BOARD, 32, 8, 1e-5
     projected = torch.randn(B, T, heads * dq + kv_heads * dq + kv_heads * dv + heads * templates_count, device="cuda").half()
@@ -562,8 +566,9 @@ def test_template_attention_in_fp16(heads, kv_heads, dq):
 #give the bits of one chunk, as eager calls in chunks do
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_template_attention_in_cuda_graphs(monkeypatch):
-    from model import fused_blocks
+    from model import attention_cuda, fused_blocks
     from model.fused_blocks import GRAPHED_BIAS_POSITIONS, template_attention
+    monkeypatch.setattr(attention_cuda, "ENABLED", False)
     torch.manual_seed(0)
     heads, kv_heads, dq, dv, templates_count, eps = 24, 12, 24, 32, 8, 1e-5
     B = 2 * GRAPHED_BIAS_POSITIONS + 5

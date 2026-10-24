@@ -15,6 +15,7 @@ from torch import nn
 from triton.language.extra import libdevice
 from triton.language.extra.cuda import gdc_wait
 
+from model.attention_cuda import cuda_template_attention, prepare
 from model.encoding import TOKENS_PER_BOARD
 from model.model import EDGE, KING, KNIGHT, NO_PIECE, NUM_SQUARES, PAWN, QUEEN, THEIRS, ChessTransformer, TransformerBlock, value_bin_edges
 
@@ -121,6 +122,8 @@ SIDE_STREAMS: dict[torch.cuda.Stream, torch.cuda.Stream] = {}
 def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain: torch.Tensor, k_gain: torch.Tensor, heads: int, kv_heads: int,
                        dq: int, dv: int, templates_count: int, eps: float) -> torch.Tensor:
     projected = projected.contiguous()
+    if (found := cuda_template_attention(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_count, eps)) is not None:
+        return found
     B, T, _ = projected.shape
     q, k, v, c = projected.split([heads * dq, kv_heads * dq, kv_heads * dv, heads * templates_count], dim=-1)
     out = torch.empty(B, T, heads * dv, device=projected.device, dtype=projected.dtype)
@@ -915,6 +918,7 @@ class FusedTransformer(nn.Module):
         self.templates, self.ln, self.loops = model.templates, model.ln, model.loops
         self.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
         link_input_mixes(list(self.encoder))
+        prepare(model.templates)
         self.fused_heads = fused_ends(model.embed.weight.device)
         if self.fused_heads:
             self.eps = model.ln.eps if model.ln.eps is not None else torch.finfo(torch.float32).eps
