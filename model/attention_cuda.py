@@ -38,12 +38,12 @@ DEV float quad_max(float x) { x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 1)); r
 //a board: 64 squares then 6 metadata tokens. A CTA takes 8 of the 24 query heads: a warp a head, 2 heads to a key/value
 //head
 constexpr int TOKENS = 70, SQUARES = 64, DV = 32, TEMPLATES = 8, HEADS = 24, SLAB = 16, PHASES = SQUARES / SLAB + 1;
-constexpr int HB = 8, GROUPS = HB / 2, THREADS = HB * 32;
-//the keys in n8 tiles: 72, the 6 metadata tokens after the squares and 2 that are never real
-constexpr int KEY_TILES = 9;
-//halves in a value row (a key's 32 values, padded against bank conflicts) and in a bias row; a head has 17 rows of them
-//(the 16 squares of a slab and a pad) so that a warp's reads and the tensor cores' writes both fall in different banks
-constexpr int VALUE_ROW = 40, BIAS_ROW = 72, BIAS_ROWS = 17;
+constexpr int HB = @HB@, GROUPS = HB / 2, THREADS = HB * 32;
+//the keys in n8 tiles: 72, the 6 metadata tokens after the squares and 2 that are never real; in key steps of 16, KEYS
+constexpr int KEY_TILES = 9, KEYS = @KEYS@;
+//halves in a value row (a key's 32 values, padded against bank conflicts) and in a bias row; a head has BIAS_ROWS rows of
+//them (the 16 squares of a slab and a pad) so that a warp's reads and the tensor cores' writes both fall in different banks
+constexpr int VALUE_ROW = @VALUE_ROW@, BIAS_ROW = @BIAS_ROW@, BIAS_ROWS = @BIAS_ROWS@;
 
 //a board's row of projected is q (24 heads x DQ) | k (12 x DQ) | v (12 x DV) | the template mix (24 x TEMPLATES)
 //and the dims of a head, in blocks of 8: a tensor core takes 16 at a step, the second block of an odd count being zeros
@@ -113,8 +113,8 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
 {
     constexpr int BLOCKS = Row<DQ>::BLOCKS, STEPS = Row<DQ>::STEPS, WIDTH = Row<DQ>::WIDTH;
     extern __shared__ __align__(16) u16 shared[];
-    u16* values = shared;                                          //[group][80 keys][VALUE_ROW], keys padded with zeros
-    u16* bias = values + GROUPS * 80 * VALUE_ROW;                  //[head][BIAS_ROWS][BIAS_ROW]: a slab's squares, keys last
+    u16* values = shared;                                          //[group][KEYS][VALUE_ROW], keys padded with zeros
+    u16* bias = values + GROUPS * KEYS * VALUE_ROW;                  //[head][BIAS_ROWS][BIAS_ROW]: a slab's squares, keys last
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int b = blockIdx.y, head = blockIdx.x * HB + warp, group = warp >> 1, kv = blockIdx.x * GROUPS + group;
 
@@ -135,10 +135,10 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
     //every load of the prologue at once: the values of the CTA's key/value heads, copied to shared memory as the rest goes on
     //(the keys past the board zero), the keys of this warp's, the first queries and the first slab's bias operands
     #pragma unroll
-    for (int round = 0; round < GROUPS * 80 * 4 / THREADS; round++) {
+    for (int round = 0; round < GROUPS * KEYS * 4 / THREADS; round++) {
         const int item = threadIdx.x + round * THREADS;
-        const int part = item & 3, key = item / 4 % 80, row_group = item / 4 / 80;
-        u16* to = values + ((row_group * 80 + key) * VALUE_ROW + part * 8);
+        const int part = item & 3, key = item / 4 % KEYS, row_group = item / 4 / KEYS;
+        u16* to = values + ((row_group * KEYS + key) * VALUE_ROW + part * 8);
         if (key < TOKENS)
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"((u32)__cvta_generic_to_shared(to)),
                          "l"(board + key * WIDTH + Row<DQ>::V + (blockIdx.x * GROUPS + row_group) * DV + part * 8));
@@ -290,7 +290,7 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
             #pragma unroll
             for (int n = 0; n < DV / 8; n += 2) {
                 u32 b0, b1, b2, b3;
-                const u16* rows = values + (group * 80 + k * 16 + (lane >> 3 & 1) * 8 + (lane & 7)) * VALUE_ROW + n * 8 + (lane >> 4) * 8;
+                const u16* rows = values + (group * KEYS + k * 16 + (lane >> 3 & 1) * 8 + (lane & 7)) * VALUE_ROW + n * 8 + (lane >> 4) * 8;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
                              : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"((u32)__cvta_generic_to_shared(rows)));
                 mma(acc[n], p0, p1, p2, p3, b0, b1);
@@ -319,21 +319,25 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
 }
 """
 
+#what the source and the launch share: query heads a CTA takes (a warp each), keys a key/value head's values are kept for, and
+#the halves of a key's row of values and of a row and the rows of a head's bias in shared memory
+HEADS_PER_CTA, KEYS, VALUE_ROW, BIAS_ROW, BIAS_ROWS = 8, 80, 40, 72, 17
+for name, value in {"HB": HEADS_PER_CTA, "KEYS": KEYS, "VALUE_ROW": VALUE_ROW, "BIAS_ROW": BIAS_ROW, "BIAS_ROWS": BIAS_ROWS}.items():
+    SOURCE = SOURCE.replace(f"@{name}@", str(value))
+THREADS = HEADS_PER_CTA * 32
+#a key/value head's values for each 2 query heads, and a slab of bias for each
+SHARED_BYTES = 2 * (HEADS_PER_CTA // 2 * KEYS * VALUE_ROW + HEADS_PER_CTA * BIAS_ROWS * BIAS_ROW)
+
 #by (compute capability, multiprocessors): the gpus where the kernel was timed against the Triton kernels, with the fewest
-#positions it takes and the share of its CTA slots its last wave must fill. Below that the Triton kernels were faster:
-#the CTAs a position makes are few and each takes long, so that 47 to 51 positions, a wave and 4 CTAs, took as long as 64
+#positions it takes and the share of its CTA slots its last wave must fill (a few CTAs past a wave take as long as another)
 TIMED = {(12, 0, 70): (36, 0.55)}
 #CTAs a position makes (24 query heads over HEADS_PER_CTA), and the most that share a multiprocessor
-CTAS_PER_POSITION = 3
+CTAS_PER_POSITION = 24 // HEADS_PER_CTA
 CTAS_PER_MULTIPROCESSOR = 2
 DQS = (8, 16, 24)
 #off: the Triton kernels everywhere (the tests of those)
 ENABLED = True
 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
-#query heads a CTA takes (a warp each): the transposed values of its key/value heads, and a slab of bias
-HEADS_PER_CTA = 8
-THREADS = HEADS_PER_CTA * 32
-SHARED_BYTES = HEADS_PER_CTA // 2 * 80 * 40 * 2 + HEADS_PER_CTA * 17 * 72 * 2
 
 
 def kernel_name(dq: int) -> str:
@@ -377,7 +381,7 @@ class Kernels:
         attribute[0].id = int8_cuda.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
         attribute[0].value[0] = 1
         stream = torch.cuda.current_stream(projected.device).cuda_stream
-        launch = int8_cuda.LaunchConfig(24 // HEADS_PER_CTA, projected.shape[0], 1, THREADS, 1, 1, SHARED_BYTES, stream, attribute, 1)
+        launch = int8_cuda.LaunchConfig(CTAS_PER_POSITION, projected.shape[0], 1, THREADS, 1, 1, SHARED_BYTES, stream, attribute, 1)
         arguments = [ctypes.c_void_p(tensor.data_ptr()) for tensor in (projected, templates, q_gain, k_gain, out)]
         arguments += [ctypes.c_float(eps), ctypes.c_float(1 / math.sqrt(dq))]
         pointers = (ctypes.c_void_p * len(arguments))(*[ctypes.cast(ctypes.byref(argument), ctypes.c_void_p) for argument in arguments])
