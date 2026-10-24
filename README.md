@@ -212,6 +212,15 @@ time saved goes to the moves that are not decided. `--leaves 1` is `engine/mcts.
 after an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to
 answer `isready`, so start the engine once by hand before a match.
 
+`--gpus 0,1,...` searches on several GPUs at once, a thread driving each. That is the only setting: the rest is chosen
+from the GPUs and the CPU. On GPUs with lean lanes (sm_120: the 5070 Ti, the 5090) the rounds run in Rust with no Python
+between them, the same search as the Python loop that the A100 (sm_80) and the CPU keep. On several GPUs the threads
+descend in the one tree at once rather than in turn under its lock (2.3x the positions evaluated a second in an 8-GPU
+emulation; a thread alone is 16% slower that way, so one GPU keeps the lock), each sleeps while its GPU works, and each
+is pinned to a physical core of its own: all in one L3 if one has a core for each (a 9950X3D's CCD), else over the L3s
+in turn (a 9175F's have one core each), SMT siblings only once every core has a thread. The search on several GPUs is
+not the one-GPU search: more leaves are out at once, and it changes from run to run with the threads' timing.
+
 The engine reads its input on a thread of its own, so `stop`, `quit` and `isready` reach a running search, and a
 `position` it could not play (an illegal move, a bad FEN) is refused with an `info string`, the last position kept. Its
 UCI options are `SyzygyPath` and `SyzygyProbeLimit` (the tables, as `--tablebase` and `--tablebase-pieces`),
@@ -237,7 +246,9 @@ of the network's speed (0.8% of the nodes a second at 1000 nodes).
 rounded once per checkpoint (GPTQ, ~1 min) and kept in `~/.cache/chess_transformer/int8`;
 `python -m engine.quantization <model.pt>` rounds them ahead of a match, which `isready` would not wait for.
 
-On a tournament box (TCEC's: 2x EPYC 9175F, 768 GB, 8x RTX 5090), run `engine.uci <model.pt> --select mcts --gpu` with:
+On a tournament box (TCEC's: 2x EPYC 9175F, 768 GB, 8x RTX 5090), run
+`engine.uci <model.pt> --select mcts --gpu --gpus 0,1,2,3,4,5,6,7` (the Rust rounds, one tree for all eight, the sleeping
+waits and the pins follow from it) with:
 
 ```
 setoption name RamLimitMb value 350000        the tree's memory, ~1.7x at its peak with the kept tree's copy (~610 GB with the cache); 200000 on a shared box
@@ -247,7 +258,8 @@ setoption name MoveOverhead value 200         lc0's default: 0.2 s a move is not
 setoption name SyzygyPath value <folders>     the box's syzygy tables, ':' between folders, with SyzygyProbeLimit 6 (the most the engine reads)
 ```
 On the box itself before the first game, round the int8 weights (`python -m engine.quantization <model.pt>`, ~1 min) and start
-the engine once to `isready` (the graphs compile, ~25 s): both are cached, and the GUI's own `isready` then takes ~7 s.
+the engine once to `isready` (the graphs compile, ~25 s): both are cached, and the GUI's own `isready` then takes ~7 s on
+one GPU, an estimated ~35-40 s on eight (each GPU's network compiles in turn), so give the GUI a longer start timeout.
 
 ## Self-play (expert iteration)
 
