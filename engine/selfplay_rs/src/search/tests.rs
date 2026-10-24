@@ -283,6 +283,69 @@ fn tables() -> Option<Tables> {
     std::path::Path::new(folder).is_dir().then(|| Tables::open(folder, 5).expect("the tables"))
 }
 
+const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+const OPENING: &[&str] = &["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6", "c1g5", "f8e7", "e2e3", "e8g8", "g1f3", "b8d7"];
+const ROOKS: &str = "8/8/4k3/8/8/4K3/R7/7r w - - 0 1";
+const LOCKED_PAWNS: &str = "4k3/8/8/1p1p1p1p/1P1P1P1P/8/8/4K3 w - - 0 1";
+const MATE_IN_TWO: &str = "k7/8/2K5/8/8/8/8/7R w - - 0 1";
+const PAWNS_AND_ROOKS: &str = "8/8/4k3/3p4/3P4/4K3/R7/7r w - - 0 1";
+
+//the positions of the reuse test: a middlegame, endings with repeats, a mate certainty proves, and the tables' ending
+fn cases(tables: &Option<Tables>) -> Vec<(&'static str, &'static [&'static str], u32, bool, Option<&Tables>)> {
+    let mut cases = vec![
+        (START, OPENING, 6_000, true, None),
+        (ROOKS, &[][..], 4_000, true, None),
+        (ROOKS, &[], 4_000, false, None),
+        (LOCKED_PAWNS, &[], 4_000, true, None),
+        (MATE_IN_TWO, &[], 4_000, true, None),
+    ];
+    match tables {
+        Some(tables) => {
+            cases.extend([(PAWNS_AND_ROOKS, &[][..], 4_000, false, Some(tables)), (PAWNS_AND_ROOKS, &[], 4_000, true, Some(tables))])
+        }
+        None => eprintln!("no syzygy tables: the ending they score is left out"),
+    }
+    cases
+}
+
+//search's rounds, up to in_flight waiting, oldest finished first; every round's boards
+fn search_in_flight(
+    tree: &mut Tree,
+    simulations: u32,
+    in_flight: usize,
+    settings: &SearchSettings,
+    network: &mut Network,
+    mut gather: impl FnMut(&mut Tree, &Round, &Cache, &mut Vec<u8>) -> u32,
+) -> Vec<Vec<u8>> {
+    let (mut rounds, mut gathered) = (VecDeque::new(), Vec::new());
+    loop {
+        let room = tree.root().visit_count as usize + tree.pending() < simulations as usize && !tree.full;
+        if room && rounds.len() < in_flight {
+            let leaves = (tree.root().visit_count / 16).clamp(1, 64);
+            let round = Round {
+                id: gathered.len() as u64,
+                leaves,
+                simulations: 3 * leaves,
+                collisions: leaves,
+                visit_limit: simulations,
+                memory_limit: usize::MAX,
+            };
+            let mut boards = Vec::new();
+            let count = gather(tree, &round, &network.cache, &mut boards);
+            assert_eq!(boards.len(), count as usize * TOKENS_PER_BOARD);
+            gathered.push(boards.clone());
+            rounds.push_back((round.id, boards));
+            continue;
+        }
+        let Some((id, boards)) = rounds.pop_front() else { break };
+        for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
+            let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
+            tree.finish_leaf(id, |column| answer(board, seed, column), ANSWER_WIDTH, &network.move_ids, Some(&mut network.cache), settings);
+        }
+    }
+    gathered
+}
+
 //a middlegame after its opening, a rook ending and kings behind locked pawns whose shuffles repeat positions (the draws
 //that go stale), a mate in two that certainty proves, and a rook and pawn ending whose captures the tables score
 #[test]
@@ -438,6 +501,6 @@ fn a_search_ends_at_its_memory_limit_as_the_same_search() {
     assert!(!unlimited.full && limited.allocated_bytes() > memory_limit / 3);
 }
 
-mod batch;
+mod bench;
 
 mod shared;

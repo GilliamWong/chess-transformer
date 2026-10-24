@@ -84,7 +84,7 @@ struct Network {
     device: i32,
     blocking_wait: bool,
     lanes: Vec<Lane>,
-    cpu: Option<usize>, //its thread's, pinned (EngineSearch's thread_affinity)
+    cpu: Option<usize>, //its thread's, pinned (EngineSearch's pin_threads)
 }
 
 fn item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -190,12 +190,6 @@ pub(crate) struct LoopSettings {
     grow_leaves: u32,
     visits_per_leaf_out: u32,
     collisions: u32,
-    collision_cap: u32,
-    collision_scaling: bool,
-    collision_scaling_start: f64,
-    collision_scaling_end: f64,
-    collision_scaling_power: f64,
-    max_collision_visits: u32,
     simulations_per_leaf: u32,
     smart_pruning: bool,
     smart_pruning_factor: f64,
@@ -316,26 +310,6 @@ impl Rounds<'_> {
         (count, rounds)
     }
 
-    //round_collisions'
-    fn round_collisions(&self, count: u32, simulations: Option<u32>, visits: u32) -> u32 {
-        let settings = self.settings;
-        if !settings.collision_scaling {
-            return if settings.collision_cap > 0 { settings.collision_cap } else { settings.collisions.min(count) };
-        }
-        let done_or_left =
-            simulations.map_or(i64::from(visits), |simulations| i64::from(visits).min(i64::from(simulations) - i64::from(visits))) as f64;
-        let collisions = if done_or_left <= settings.collision_scaling_start {
-            1
-        } else if done_or_left >= settings.collision_scaling_end {
-            settings.max_collision_visits
-        } else {
-            let share =
-                (done_or_left - settings.collision_scaling_start) / (settings.collision_scaling_end - settings.collision_scaling_start);
-            (1.0 + f64::from(settings.max_collision_visits - 1) * share.powf(settings.collision_scaling_power)) as u32
-        };
-        if settings.collision_cap > 0 { collisions.min(settings.collision_cap) } else { collisions }
-    }
-
     //extra_for_fall's
     fn extra_for_fall(&self, (last, seconds): (i64, f64)) -> PyResult<f64> {
         let settings = self.settings;
@@ -380,7 +354,7 @@ impl Rounds<'_> {
         let room = network.room();
         loop {
             let mut name = None;
-            let (mut count, mut visits, mut answered, mut simulations) = (0, 0, 0, None);
+            let (mut count, mut answered) = (0, 0);
             {
                 let mut run = shared.lock()?;
                 if seen.is_some() {
@@ -404,9 +378,7 @@ impl Rounds<'_> {
                         shared.changed.notify_all();
                         break;
                     }
-                    visits = run.root.0;
-                    simulations = run.simulations;
-                    let (round_count, in_flight) = self.round_leaves(run.simulations, visits);
+                    let (round_count, in_flight) = self.round_leaves(run.simulations, run.root.0);
                     count = round_count;
                     let blocked = run.starved == Some(run.rounds_answered) && run.rounds_out > rounds.len();
                     if run.rounds_out < in_flight && rounds.len() < settings.rounds_in_flight && !blocked {
@@ -427,7 +399,6 @@ impl Rounds<'_> {
                 }
             }
             if let Some(name) = name {
-                let collisions = self.round_collisions(count, simulations, visits);
                 if count as usize > room {
                     return Err(PyValueError::new_err(format!("rounds of {count} leaves, past the lanes' {room}")));
                 }
@@ -440,7 +411,7 @@ impl Rounds<'_> {
                     lane.rows_host,
                     room,
                     count,
-                    collisions,
+                    settings.collisions.min(count),
                     settings.simulations_per_leaf * count,
                     name,
                     settings.game,

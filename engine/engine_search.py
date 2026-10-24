@@ -30,17 +30,6 @@ from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_table
 #judging 2,000 positions)
 LEAVES = 64
 COLLISIONS = 64
-#a round's collisions as they are, not COLLISIONS and at most its leaves, 0 for those
-COLLISION_CAP = 0
-#with collision_scaling a round's collisions grow with the visits done or left (the fewer) as lc0's do: 1 up to the
-#start, MAX_COLLISION_VISITS from the end, along the power between; at most COLLISION_CAP's if it is set
-COLLISION_SCALING = False
-COLLISION_SCALING_START, COLLISION_SCALING_END, COLLISION_SCALING_POWER = 28, 145_000, 1.25
-MAX_COLLISION_VISITS = 80_000
-#rounds gathered by search/batch.rs gather_batch on this many threads (a different search), 0 for gather; they spin
-#this long for the next round before they sleep
-GATHER_WORKERS = 0
-GATHER_SPIN_US = 50
 #a round is gathered while the last one is on the gpu (+9% simulations/s), and the two run at once (GraphedBatches)
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per GROW_LEAVES simulations done or left, as lc0 grows its batches with the tree; 0 for fixed
@@ -126,11 +115,11 @@ ENGINE_PRECISION = "int8"
 ENGINE_FP16_BLOCKS = 1
 
 
-#the cpus of count threads that work in one tree (the gather workers', then the networks'), from selfplay_rs.cpu_topology's
-#(l3s, cores) or the machine's: a physical core each, all in one L3 if one has a core for each (the largest such: a team
-#split over a 9950X3D's ccds was slower), else the L3s' cores the largest L3 first, and smt siblings only once every
-#physical core has a thread (a 9175F's L3s have one core each). None where the os gives no topology, or for more threads
-#than cpus, which pinned would share one
+#the cpus of count threads that work in one tree (the networks'), from selfplay_rs.cpu_topology's (l3s, cores) or the
+#machine's: a physical core each, all in one L3 if one has a core for each (the largest such: threads spread over a
+#9950X3D's two ccds were slower), else the L3s' cores the largest L3 first, and smt siblings only once every physical
+#core has a thread (a 9175F's L3s have one core each). None where the os gives no topology, or for more threads than
+#cpus, which pinned would share one
 def thread_cpus(count: int, topology: tuple | None = None) -> list[int]:
     if not count:
         return []
@@ -252,18 +241,15 @@ class EngineSearch:
     #and no python between them, the python loop's search exactly; None for it on networks of lean lanes, the only ones it
     #runs on (sm_120's), and the python loop on others. concurrent_descents: the networks' threads descend, finish and back
     #up in the tree at once (search/shared.rs) rather than one at a time under its lock, another search on several
-    #networks (the threads steer around each other by the simulations in flight) and not with gather_workers; None for it
-    #on several networks without gather workers, as one thread alone is 16% slower. pin_threads: the gather workers' and
-    #then the networks' threads each on a cpu of thread_cpus', the same search; None for it on several networks, and not on
-    #one, where it is level and other work on its cpu would hold it up
+    #networks (the threads steer around each other by the simulations in flight); None for it on several networks, as one
+    #thread alone is 16% slower. pin_threads: the networks' threads each on a cpu of thread_cpus', the same search; None
+    #for it on several networks, and not on one, where it is level and other work on its cpu would hold it up
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
                  stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT,
-                 collision_cap: int = COLLISION_CAP, gather_workers: int = GATHER_WORKERS, gather_spin_us: int = GATHER_SPIN_US,
-                 collision_scaling: bool = COLLISION_SCALING, rust_rounds: bool | None = None, concurrent_descents: bool | None = None,
-                 pin_threads: bool | None = None):
+                 rust_rounds: bool | None = None, concurrent_descents: bool | None = None, pin_threads: bool | None = None):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched, several = leaves > 1, len(self.networks) > 1
@@ -273,15 +259,13 @@ class EngineSearch:
         self.rust_rounds = lean if rust_rounds is None else rust_rounds
         if self.rust_rounds and not lean:
             raise ValueError("Searches' own round loop runs on networks of lean lanes (engine_network's on sm_120)")
-        self.concurrent_descents = several and not gather_workers if concurrent_descents is None else concurrent_descents
-        if self.concurrent_descents and (gather_workers or not batched):
-            raise ValueError("concurrent descents are another way to gather a round's leaves in parallel than gather_workers, and need leaves above 1")
+        self.concurrent_descents = several if concurrent_descents is None else concurrent_descents
+        if self.concurrent_descents and not batched:
+            raise ValueError("concurrent descents need leaves above 1: one leaf a round is mcts.py's search")
         #the batches and their boards Searches' own round loop launched, all its searches'
         self.rust_counts = [0, 0]
         self.round_simulations = SIMULATIONS_PER_LEAF * leaves
         self.collisions = COLLISIONS if batched else 0
-        self.collision_cap = collision_cap if batched else 0
-        self.collision_scaling = batched and collision_scaling
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1 #on each network
         self.grow_leaves = grow_leaves if batched else 0
         self.visits_per_leaf_out = visits_per_leaf_out if batched else 0
@@ -291,15 +275,10 @@ class EngineSearch:
         self.smart_pruning_factor, self.smart_pruning_wait = smart_pruning_factor, smart_pruning_wait
         self.stop_at_one_move_left = stop_at_one_move_left
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
-        #the caller of a round's gather is a network's thread, the gather's worker 0
-        pinned_workers = max(gather_workers - 1, 0) if batched else 0
         pinned = several if pin_threads is None else pin_threads
-        cpus = thread_cpus(pinned_workers + len(self.networks) if pinned and batched else 0)
-        gather_cpus, self.network_cpus = cpus[:pinned_workers], cpus[pinned_workers:]
+        self.network_cpus = thread_cpus(len(self.networks) if pinned and batched else 0)
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
-                                             advance_threads=advance_threads, gather_workers=gather_workers if batched else 0,
-                                             gather_spin_us=gather_spin_us, gather_cpus=gather_cpus,
-                                             **({"concurrent_descents": True} if self.concurrent_descents else {}))
+                                             advance_threads=advance_threads, **({"concurrent_descents": True} if self.concurrent_descents else {}))
         #reports give the score on the network's own scale, as a gui showed and adjudicated it before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
@@ -412,10 +391,8 @@ class EngineSearch:
     #rounds_on's settings, for Searches' own loop (rounds.rs LoopSettings)
     def rust_round_settings(self) -> dict:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
-                    visits_per_leaf_out=self.visits_per_leaf_out, collisions=self.collisions, collision_cap=self.collision_cap,
-                    collision_scaling=self.collision_scaling, collision_scaling_start=float(COLLISION_SCALING_START),
-                    collision_scaling_end=float(COLLISION_SCALING_END), collision_scaling_power=COLLISION_SCALING_POWER,
-                    max_collision_visits=MAX_COLLISION_VISITS, simulations_per_leaf=SIMULATIONS_PER_LEAF, smart_pruning=self.smart_pruning,
+                    visits_per_leaf_out=self.visits_per_leaf_out, collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF,
+                    smart_pruning=self.smart_pruning,
                     smart_pruning_factor=self.smart_pruning_factor, smart_pruning_wait=self.smart_pruning_wait,
                     stop_at_one_move_left=self.stop_at_one_move_left, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
                     speed_rounds=SPEED_ROUNDS, round_times_kept=ROUND_TIMES, fall_start_cp=float(FALL_START_CP), fall_full_cp=float(FALL_FULL_CP),
@@ -469,14 +446,13 @@ class EngineSearch:
                 if name is None and not rounds:
                     return
             if name is not None:
-                collisions = self.round_collisions(count, run.simulations, visits)
                 #the boards go straight into the lane's pinned buffer (GraphedBatches'), a lean lane's in rows with their
                 #answers' columns, or else an array of their own
                 lane = network.free_lane() if hasattr(network, "free_lane") else None
                 lean = getattr(lane, "lean", False)
                 boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.rows_array if lean else lane.boards_array
-                written, seen = self.searches.descend_into(boards, count, collisions, SIMULATIONS_PER_LEAF * count, round=name, root_of=GAME,
-                                                           legal_columns=lean)
+                written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count, round=name,
+                                                           root_of=GAME, legal_columns=lean)
                 if not written:
                     run.starved = answered
                 launched_at = time.perf_counter()
@@ -547,22 +523,6 @@ class EngineSearch:
         if self.visits_per_leaf_out:
             rounds = max(1, min(rounds, visits // (self.visits_per_leaf_out * count)))
         return count, rounds
-
-    #the collisions a round of count leaves may have: collision_cap's, COLLISIONS' at most its leaves, or with
-    #collision_scaling lc0's CalculateCollisionsLeft. visits: the root's, if known
-    def round_collisions(self, count: int, simulations: int | None, visits: int | None = None) -> int:
-        if not self.collision_scaling:
-            return self.collision_cap or min(self.collisions, count)
-        visits = self.searches.root_visits(GAME)[0] if visits is None else visits
-        done_or_left = visits if simulations is None else min(visits, simulations - visits)
-        if done_or_left <= COLLISION_SCALING_START:
-            collisions = 1
-        elif done_or_left >= COLLISION_SCALING_END:
-            collisions = MAX_COLLISION_VISITS
-        else:
-            share = (done_or_left - COLLISION_SCALING_START) / (COLLISION_SCALING_END - COLLISION_SCALING_START)
-            collisions = int(1 + (MAX_COLLISION_VISITS - 1) * share ** COLLISION_SCALING_POWER)
-        return min(collisions, self.collision_cap) if self.collision_cap else collisions
 
     #the simulations the search has left: those waiting for the network count as left, so a move is only decided if
     #they could not change it either. With a deadline, the time left at the speed of the last rounds

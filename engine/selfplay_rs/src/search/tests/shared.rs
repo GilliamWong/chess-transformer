@@ -1,6 +1,5 @@
 //the tree many threads search at once against Tree (one thread: the same search, number for number) and against its own
 //invariants after searches on many threads
-use super::batch::{LOCKED_PAWNS, MATE_IN_TWO, OPENING, PAWNS_AND_ROOKS, ROOKS, START, cases, search_in_flight};
 use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -52,7 +51,7 @@ fn finish_round(
 }
 
 //engine_search's rounds on one thread until the root has its simulations or the tree is full, up to in_flight waiting,
-//oldest finished first, as batch.rs search_in_flight; every round's boards
+//oldest finished first, as tests.rs search_in_flight; every round's boards
 fn shared_in_flight(
     tree: &SharedTree,
     simulations: u32,
@@ -100,7 +99,7 @@ fn one_thread_searches_as_tree_does() {
         for in_flight in [1, 2, 3] {
             let mut old = tree_after(fen, moves);
             let old_rounds =
-                search_in_flight(&mut old, simulations, in_flight, &settings, &mut Network::new(), None, |tree, round, cache, boards| {
+                search_in_flight(&mut old, simulations, in_flight, &settings, &mut Network::new(), |tree, round, cache, boards| {
                     tree.gather(round, &settings, tables, Some(cache), boards).expect("the tables")
                 });
             let new = shared_tree_after(fen, moves);
@@ -520,8 +519,8 @@ fn proofs_made_after_the_leaves_were_visited_rewrite_the_sums_as_tree_does() {
     let (without, with): (&'static SearchSettings, &'static SearchSettings) = (Box::leak(Box::new(without)), Box::leak(Box::new(with)));
     for fen in [MATE_IN_TWO, "8/8/8/4k3/8/8/8/4K2R w - - 0 1", "7k/8/5K2/8/8/8/8/6Q1 w - - 0 1"] {
         let mut old = tree_after(fen, &[]);
-        search_in_flight(&mut old, 3_000, 1, without, &mut Network::new(), None, gather_with(without));
-        search_in_flight(&mut old, 8_000, 1, with, &mut Network::new(), None, gather_with(with));
+        search_in_flight(&mut old, 3_000, 1, without, &mut Network::new(), gather_with(without));
+        search_in_flight(&mut old, 8_000, 1, with, &mut Network::new(), gather_with(with));
         let new = shared_tree_after(fen, &[]);
         shared_in_flight(&new, 3_000, 1, without, None, &SharedNetwork::new(), usize::MAX);
         shared_in_flight(&new, 8_000, 1, with, None, &SharedNetwork::new(), usize::MAX);
@@ -547,9 +546,9 @@ fn tables_met_after_the_leaves_were_visited_prove_them_as_tree_does() {
     };
     let tables: &'static Tables = Box::leak(Box::new(tables));
     let mut old = tree_after(PAWNS_AND_ROOKS, &[]);
-    search_in_flight(&mut old, 4_000, 1, &settings, &mut Network::new(), None, gather_with(None));
+    search_in_flight(&mut old, 4_000, 1, &settings, &mut Network::new(), gather_with(None));
     let before = old.nodes.iter().filter(|node| node.proof.is_some()).count();
-    search_in_flight(&mut old, 12_000, 1, &settings, &mut Network::new(), None, gather_with(Some(tables)));
+    search_in_flight(&mut old, 12_000, 1, &settings, &mut Network::new(), gather_with(Some(tables)));
     let new = shared_tree_after(PAWNS_AND_ROOKS, &[]);
     shared_in_flight(&new, 4_000, 1, &settings, None, &SharedNetwork::new(), usize::MAX);
     shared_in_flight(&new, 12_000, 1, &settings, Some(tables), &SharedNetwork::new(), usize::MAX);

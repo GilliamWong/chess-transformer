@@ -16,7 +16,7 @@ fn bench_shared_drivers() {
     let (stand_in, settings, move_ids) = (StandIn::from_environment(), settings(true), Network::new().move_ids);
     let (fen, moves, _) = POSITIONS[setting("BENCH_FIRST", 0usize)];
     let (mut base, mut base_cache) = (tree_after(fen, moves), Cache::new(5_000_000));
-    rounds(&mut base, &mut base_cache, Method::Gather, (usize::MAX, visits), 2, 0, stand_in, &settings, None, &move_ids);
+    rounds(&mut base, &mut base_cache, (usize::MAX, visits), 2, 0, stand_in, &settings, None, &move_ids);
     println!(
         "{fen}: {} nodes; {drivers} shared drivers {driver_cpus:?}, {in_flight} rounds out each, collisions {collisions}, {timed} rounds",
         base.nodes.len()

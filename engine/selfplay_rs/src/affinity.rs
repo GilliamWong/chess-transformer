@@ -157,9 +157,6 @@ mod os {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workers::Workers;
-    use std::sync::Mutex;
-    use std::time::Duration;
 
     //the cpu the calling thread runs on now
     #[cfg(windows)]
@@ -275,23 +272,5 @@ mod tests {
         })
         .join()
         .expect("the pinned thread");
-    }
-
-    //each worker but the caller runs its jobs on the cpu it was given
-    #[test]
-    fn pinned_workers_run_on_their_cpus() {
-        let cpus: Vec<usize> = allowed().iter().rev().take(3).copied().collect();
-        if cpus.len() < 3 {
-            return;
-        }
-        let workers = Workers::new(4, Duration::from_micros(50), &cpus);
-        let seen: Vec<Mutex<Vec<usize>>> = (0..4).map(|_| Mutex::new(Vec::new())).collect();
-        for _ in 0..200 {
-            workers.run(&|worker| seen[worker].lock().expect("a worker's cpus").push(current_cpu()));
-        }
-        for (worker, &cpu) in cpus.iter().enumerate() {
-            let seen = seen[worker + 1].lock().expect("a worker's cpus");
-            assert!(seen.len() == 200 && seen.iter().all(|&on| on == cpu), "worker {}: {seen:?} not {cpu}", worker + 1);
-        }
     }
 }

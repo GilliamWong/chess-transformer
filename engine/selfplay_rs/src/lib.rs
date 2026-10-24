@@ -6,7 +6,6 @@ mod games;
 mod rounds;
 mod rules;
 mod search;
-mod workers;
 
 use games::{FinishedGame, Game, GameSettings};
 use pyo3::buffer::{PyBuffer, ReadOnlyCell};
@@ -17,7 +16,7 @@ use rules::{
     MOVE_ID_TABLE_LENGTH, MoveIds, TOKENS_PER_BOARD, Tables, encode_board, final_result, game_result, legal_moves_in_python_order,
     position_key,
 };
-use search::{BatchCounts, Cache, Round, SearchSettings, SharedCache, SharedTree, Tree};
+use search::{Cache, Round, SearchSettings, SharedCache, SharedTree, Tree};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Position};
@@ -26,8 +25,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Duration;
-use workers::Workers;
 
 fn tablebase_error(error: SyzygyError) -> PyErr {
     PyRuntimeError::new_err(format!("syzygy tables: {error}"))
@@ -421,7 +418,6 @@ struct State {
     //by id: a new game under an id drops the last game's tree at its first search
     kept: HashMap<u64, KeptTree>,
     cache: Option<Cache>,
-    batch_counts: BatchCounts,
     //concurrent_descents' searches and kept trees, in place of searches and kept
     shared_searches: Vec<concurrent::SharedSearch>,
     shared_kept: HashMap<u64, KeptTree<Arc<SharedTree>>>,
@@ -438,8 +434,6 @@ struct Searches {
     tree_reuse: bool,
     memory_limit: usize, //bytes a search's tree may take (search.rs Round), usize::MAX for no limit
     advance_threads: usize,
-    //gather_batch's (search/batch.rs), None for gather
-    workers: Option<Workers>,
     //search/shared.rs: the searches are SharedTrees that the networks' threads work in at once, with this cache
     concurrent_descents: bool,
     shared_cache: Option<SharedCache>,
@@ -580,14 +574,8 @@ impl Searches {
                 visit_limit: search.simulations,
                 memory_limit: self.memory_limit,
             };
-            let (tables, cache) = (self.tables.as_ref(), state.cache.as_ref());
-            let gathered = match &self.workers {
-                Some(workers) => {
-                    search.tree.gather_batch(&limits, &self.settings, tables, cache, boards, workers, u32::MAX, &mut state.batch_counts)
-                }
-                None => search.tree.gather(&limits, &self.settings, tables, cache, boards),
-            }
-            .map_err(tablebase_error)?;
+            let gathered =
+                search.tree.gather(&limits, &self.settings, self.tables.as_ref(), state.cache.as_ref(), boards).map_err(tablebase_error)?;
             if gathered > 0 {
                 round_leaves.push((search.id, gathered));
             }
@@ -768,15 +756,12 @@ impl Searches {
     //the cache of network answers by position (search.rs Cache), 0 for none; value_sharpness see search.rs sharpen,
     //certainty search.rs SearchSettings'. memory_limit_mb (lc0's RamLimitMb, 0 for none) ends a search once its tree's
     //vectors would grow past that many megabytes; the cache comes on top, and so does advance's copy of the part of the
-    //tree it keeps. advance_threads: the threads advance walks and copies a kept tree on, off the clock. gather_workers
-    //n > 0 gathers by search/batch.rs gather_batch on n workers (a different search), each spinning gather_spin_us
-    //microseconds for the next round before it sleeps; gather_cpus: none, or the cpus (cpu_topology's) of the n - 1
-    //workers besides the caller, each pinned to its own
+    //tree it keeps. advance_threads: the threads advance walks and copies a kept tree on, off the clock. concurrent_descents:
+    //the trees are SharedTrees (search/shared.rs), which threads descend at once
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0, advance_threads=4, gather_workers=0, gather_spin_us=50, gather_cpus=Vec::new(),
-                        concurrent_descents=false))]
+                        memory_limit_mb=0, advance_threads=4, concurrent_descents=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -795,26 +780,12 @@ impl Searches {
         certainty: bool,
         memory_limit_mb: usize,
         advance_threads: usize,
-        gather_workers: usize,
-        gather_spin_us: u64,
-        gather_cpus: Vec<usize>,
         concurrent_descents: bool,
     ) -> PyResult<Searches> {
-        if concurrent_descents && gather_workers > 0 {
-            return Err(PyValueError::new_err("concurrent descents and gather workers are two ways to gather in parallel, not both"));
-        }
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
                 "value_sharpness multiplies the value's logit, it must be positive, not {value_sharpness}"
             )));
-        }
-        if !gather_cpus.is_empty() && gather_cpus.len() + 1 != gather_workers.max(1) {
-            return Err(PyValueError::new_err(format!(
-                "{gather_workers} gather workers take a cpu for each but the caller, not {gather_cpus:?}"
-            )));
-        }
-        if let Some(cpu) = gather_cpus.iter().find(|cpu| !affinity::allowed().contains(cpu)) {
-            return Err(PyValueError::new_err(format!("cpu {cpu} is not one this process may run on: {:?}", affinity::allowed())));
         }
         Ok(Searches {
             settings: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw, value_sharpness, certainty },
@@ -824,7 +795,6 @@ impl Searches {
             tree_reuse,
             memory_limit: if memory_limit_mb == 0 { usize::MAX } else { memory_limit_mb.saturating_mul(1_000_000) },
             advance_threads: advance_threads.max(1),
-            workers: (gather_workers > 0).then(|| Workers::new(gather_workers, Duration::from_micros(gather_spin_us), &gather_cpus)),
             concurrent_descents,
             shared_cache: (concurrent_descents && cache_positions > 0).then(|| SharedCache::new(cache_positions)),
             state: Mutex::new(State {
@@ -833,7 +803,6 @@ impl Searches {
                 rounds_descended: 0,
                 kept: HashMap::new(),
                 cache: (!concurrent_descents && cache_positions > 0).then(|| Cache::new(cache_positions)),
-                batch_counts: BatchCounts::default(),
                 shared_searches: Vec::new(),
                 shared_kept: HashMap::new(),
             }),
@@ -1119,25 +1088,6 @@ impl Searches {
             let search =
                 state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
             Ok(search.tree.moves_not_lost())
-        })
-    }
-
-    //gather_batch's totals (search/batch.rs BatchCounts): rounds, passes, items, picks, leaves, cached, scored, ...
-    fn gather_counts(&self, py: Python<'_>) -> PyResult<(u64, u64, u64, u64, u64, u64, u64, u64, u64)> {
-        py.detach(|| {
-            let state = self.lock()?;
-            let counts = &state.batch_counts;
-            Ok((
-                counts.rounds,
-                counts.passes,
-                counts.items,
-                counts.picks,
-                counts.leaves,
-                counts.cached,
-                counts.scored,
-                counts.collisions,
-                counts.unspent,
-            ))
         })
     }
 

@@ -164,13 +164,12 @@ def test_a_failed_search_settles_its_network():
 
 
 #Searches' own round loop (rust_rounds), the default on lean lanes, makes the python loop's search, report for report
-#and tree for tree (the next searches start from the kept trees), with smart pruning, gather_batch or a cap on the
-#leaves out, waiting by event or by the copy, and with one leaf a round (mcts.py's search, a fresh tree every move)
+#and tree for tree (the next searches start from the kept trees), with smart pruning or a cap on the leaves out, waiting
+#by event or by the copy, pinned, and with one leaf a round (mcts.py's search, a fresh tree every move)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 @pytest.mark.parametrize("blocking_wait, leaves, settings", [(False, 16, {}), (True, 16, {}), (False, 1, {}),
-                                                             (False, 16, {"gather_workers": 2, "collision_cap": 32}),
                                                              (False, 16, {"visits_per_leaf_out": 8, "smart_pruning": False}),
-                                                             (True, 16, {"gather_workers": 2, "collision_cap": 32, "pin_threads": True})])
+                                                             (True, 16, {"pin_threads": True})])
 def test_rust_rounds_search_as_the_python_loop(blocking_wait, leaves, settings):
     board, reports = chess.Board(), {}
     for rust_rounds in (False, None):
@@ -324,16 +323,14 @@ class CpuRecording:
         return self.network.collect(launched)
 
 
-#pinned threads search as the os's do, report for report over a game's moves (the tree kept), the network's thread on
-#its cpu for every round, the gather workers on the cpus before it. torch's openmp unpins a thread at its first parallel
-#region (the cpu model's here), which the next search's pin undoes: the first search's rounds are not counted
+#a pinned thread searches as the os's does, report for report over a game's moves (the tree kept), the network's thread
+#on its cpu for every round. torch's openmp unpins a thread at its first parallel region (the cpu model's here), which
+#the next search's pin undoes: the first search's rounds are not counted
 def test_pinning_changes_no_search():
     board, reports = chess.Board(), {}
     for pinned in (False, True):
         network = CpuRecording(cpu_batches(BoardModel()))
-        before = pinned_threads()
-        search = EngineSearch(network, 16, gather_workers=3, collision_cap=32, pin_threads=pinned)
-        workers = pinned_threads() - before
+        search = EngineSearch(network, 16, pin_threads=pinned)
         found = []
         for move in ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]:
             found.append(search.search(board, simulations=600))
@@ -342,10 +339,9 @@ def test_pinning_changes_no_search():
                 network.cpus.clear()
         board = chess.Board()
         reports[pinned] = found
-    cpus = engine_search.thread_cpus(3)
+    cpus = engine_search.thread_cpus(1)
     assert reports[True] == reports[False]
-    assert search.network_cpus == cpus[2:] and set(network.cpus) == set(cpus[2:]), (search.network_cpus, set(network.cpus))
-    assert workers == Counter(cpus[:2]), workers
+    assert search.network_cpus == cpus != [] and set(network.cpus) == set(cpus), (search.network_cpus, set(network.cpus))
 
 
 #on several networks the python loop's thread for each network is pinned to that network's cpu (thread_cpus') under the
@@ -360,23 +356,13 @@ def test_the_python_loops_threads_are_pinned():
         assert [set(network.cpus) for network in networks] == [{cpu} for cpu in search.network_cpus]
 
 
-#the threads are pinned by default on several networks (thread_cpus' cpus, the gather workers' first) and not on one,
-#where pinning is level; told, they are pinned or not
+#the threads are pinned by default on several networks (thread_cpus' cpus) and not on one, where pinning is level;
+#told, they are pinned or not
 def test_threads_are_pinned_by_default_on_several_networks():
     one, three = cpu_batches(BoardModel()), [cpu_batches(BoardModel()) for _ in range(3)]
-    assert EngineSearch(three, 16).network_cpus == engine_search.thread_cpus(3) and len(engine_search.thread_cpus(4)) == 4
-    assert EngineSearch(three, 16, gather_workers=2).network_cpus == engine_search.thread_cpus(4)[1:]
+    assert EngineSearch(three, 16).network_cpus == engine_search.thread_cpus(3) and len(engine_search.thread_cpus(3)) == 3
     assert EngineSearch(one, 16).network_cpus == EngineSearch(three, 16, pin_threads=False).network_cpus == []
     assert EngineSearch(one, 16, pin_threads=True).network_cpus == engine_search.thread_cpus(1)
-
-
-#the gather workers' cpus: one for each but the caller, each one the process may run on
-def test_gather_workers_cpus_are_checked():
-    settings = engine_search_settings(False)
-    with pytest.raises(ValueError, match="a cpu for each but the caller"):
-        selfplay_rs.Searches(**settings, gather_workers=3, gather_cpus=[0])
-    with pytest.raises(ValueError, match="may run on"):
-        selfplay_rs.Searches(**settings, gather_workers=2, gather_cpus=[100_000])
 
 
 #lean lanes by compute capability: the gpus of LEAN_CAPABILITIES, today's lanes on the others
@@ -1165,27 +1151,6 @@ def test_the_engine_takes_a_cap_on_the_leaves_out(monkeypatch, arguments, cap):
     assert built == [cap]
 
 
-#uci.py's --gather-workers, --gather-spin-us, --collision-cap and --collision-scaling reach the search, which has none of
-#them without
-@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
-@pytest.mark.parametrize("arguments, expected", [([], (0, 50, 0, False)), (["--gather-workers", "4", "--gather-spin-us", "500",
-                                                                          "--collision-cap", "256", "--collision-scaling"], (4, 500, 256, True))])
-def test_the_engine_takes_the_gathers_settings(monkeypatch, arguments, expected):
-    built = []
-
-    class Recorded(EngineSearch):
-        def __init__(self, *args, gather_workers=0, gather_spin_us=50, **kwargs):
-            super().__init__(*args, gather_workers=gather_workers, gather_spin_us=gather_spin_us, **kwargs)
-            built.append((gather_workers, gather_spin_us, self.collision_cap, self.collision_scaling))
-    monkeypatch.setattr(engine_search, "engine_network", lambda checkpoint, leaves, precision, fp16_blocks, device=None, blocking_wait=False: cpu_batches(BoardModel()))
-    monkeypatch.setattr(engine_search, "EngineSearch", Recorded)
-    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *arguments])
-    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
-    runpy.run_module("engine.uci", run_name="__main__")
-
-    assert built == [expected]
-
-
 #uci.py started without --precision builds the engine's network in int8 with the block whose int8 costs the policy most
 #kept in fp16 besides the last, and --fp16-blocks 0 every other block in int8 (self-play and labels stay fp16: they never
 #build it), spinning while it waits for its one gpu
@@ -1809,82 +1774,30 @@ def test_a_long_search_tells_the_gui_how_it_stands(monkeypatch):
     gui.close()
 
 
-#Searches' gather_workers (search/batch.rs): the engine's searches, on a kept tree too, the same for any number
-def test_gather_workers_make_the_same_search_for_any_number():
-    reports, counts = [], []
-    for workers in (1, 3):
-        search = EngineSearch(cpu_batches(BoardModel()), 64, smart_pruning=False, gather_workers=workers)
-        board = chess.Board()
-        first = search.search(board, simulations=3000)
-        board.push(first.line[0])
-        board.push(first.line[1])
-        reports.append((first, search.search(board, simulations=6000)))
-        counts.append(search.searches.gather_counts())
-    assert reports[0] == reports[1] and reports[0][1].simulations == 6000
-    #all but the items, which the workers share a pass's picks out in
-    rounds, passes, _, picks, leaves, cached = counts[0][:6]
-    assert counts[0][:2] + counts[0][3:] == counts[1][:2] + counts[1][3:] and passes > rounds and picks >= leaves > 0 and cached > 0
-
-
-#Searches with the collisions of every round it descends
+#Searches with the leaves and collisions of every round it descends
 class CollisionsRecorded:
     def __init__(self, searches: selfplay_rs.Searches):
-        self.searches, self.collisions = searches, []
+        self.searches, self.rounds = searches, []
 
     def descend_into(self, boards: np.ndarray, leaves: int, collisions: int, simulations: int, round: int | None = None,
                      root_of: int | None = None, legal_columns: bool = False) -> tuple:
-        self.collisions.append(collisions)
+        self.rounds.append((leaves, collisions))
         return self.searches.descend_into(boards, leaves, collisions, simulations, round=round, root_of=root_of, legal_columns=legal_columns)
 
     def __getattr__(self, name: str):
         return getattr(self.searches, name)
 
 
-#BoardModel with five times its logits: priors peaked enough for a round's leaves to collide
-class PeakedModel(BoardModel):
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits, values = super().forward(boards)
-        return 5 * logits, values
-
-
-#EngineSearch's collision_cap gives every round that many collisions, more than its leaves; 0 keeps COLLISIONS, at
-#most the round's leaves. gather_batch then counts more of them
-def test_a_collision_cap_lets_rounds_collide_more():
-    recorded = {}
-    for cap in (0, 1000):
-        search = EngineSearch(cpu_batches(PeakedModel()), 64, smart_pruning=False, collision_cap=cap, gather_workers=1)
-        search.searches = CollisionsRecorded(search.searches)
-        assert search.search(chess.Board(), simulations=3000).simulations == 3000
-        recorded[cap] = (search.searches.collisions, search.searches.gather_counts())
-    assert max(recorded[0][0]) == 64 and set(recorded[1000][0]) == {1000}
-    #collisions per leaf for the network
-    (_, counts), (_, capped) = recorded[0], recorded[1000]
-    assert capped[7] / capped[4] > counts[7] / counts[4]
-
-
-#with collision_scaling a round's collisions follow lc0's CalculateCollisionsLeft on the visits done or left (the
-#fewer), at most collision_cap's; without, collision_cap's or COLLISIONS' at most the round's leaves
-@pytest.mark.parametrize("scaling, cap, visits, simulations, expected", [
-    (False, 0, 1000, None, 40), (False, 300, 1000, None, 300), (True, 0, 28, None, 1), (True, 0, 1000, None, 154),
-    (True, 0, 10_000, None, 2819), (True, 0, 145_000, None, 80_000), (True, 1024, 10_000, None, 1024), (True, 0, 10_000, 10_100, 6)])
-def test_the_collisions_of_a_round(scaling, cap, visits, simulations, expected):
-    class Searches:
-        def root_visits(self, game):
-            return visits, 0, 0
-    search = EngineSearch(cpu_batches(BoardModel()), 64, collision_cap=cap, collision_scaling=scaling)
-    search.searches = Searches()
-
-    assert search.round_collisions(40, simulations) == expected
-
-
-#a search with collision_scaling gives its rounds few collisions while the tree is small and more as it grows
-def test_collision_scaling_grows_the_collisions_with_the_tree():
-    search = EngineSearch(cpu_batches(PeakedModel()), 64, smart_pruning=False, collision_scaling=True, gather_workers=1)
+#a round's collisions (its descents that may end on a leaf already out) are 64 at most and at most its leaves, as rounds
+#grow to 128 leaves
+def test_a_rounds_collisions_are_at_most_its_leaves():
+    search = EngineSearch(cpu_batches(BoardModel()), 128, smart_pruning=False)
     search.searches = CollisionsRecorded(search.searches)
 
     assert search.search(chess.Board(), simulations=6000).simulations == 6000
-    collisions = search.searches.collisions
-    assert collisions[0] == 1 and max(collisions) > 64
+    rounds = search.searches.rounds
+    assert all(collisions == min(64, leaves) for leaves, collisions in rounds)
+    assert min(rounds) == (1, 1) and max(rounds) == (128, 64), rounds
 
 
 #concurrent descents on one network are the plain search: the same reports and the same boards for the network, move for
@@ -1966,26 +1879,22 @@ def test_concurrent_descents_keep_to_the_deadline_stop_and_failures():
         failing.search(chess.Board(), simulations=100_000)
 
 
-#concurrent descents and gather workers are two ways to gather in parallel, and one leaf a round is no gather at all
-def test_concurrent_descents_exclude_gather_workers_and_one_leaf_rounds():
-    with pytest.raises(ValueError, match="gather_workers"):
-        EngineSearch(cpu_batches(BoardModel()), 16, concurrent_descents=True, gather_workers=2)
+#one leaf a round is mcts.py's search, without concurrent descents
+def test_concurrent_descents_want_leaves_above_1():
     with pytest.raises(ValueError, match="leaves above 1"):
         EngineSearch(cpu_batches(BoardModel()), 1, concurrent_descents=True)
-    with pytest.raises(ValueError, match="gather workers"):
-        selfplay_rs.Searches(**rust_search_settings(False), concurrent_descents=True, gather_workers=2)
 
 
-#concurrent descents are the default on several networks without gather workers, and not on one network, whose thread
-#alone is slower in them; told, they are on or off as told
+#concurrent descents are the default on several networks, and not on one network, whose thread alone is slower in
+#them; told, they are on or off as told
 def test_concurrent_descents_by_default_on_several_networks(monkeypatch):
     made, searches = [], selfplay_rs.Searches
     monkeypatch.setattr(engine_search.selfplay_rs, "Searches", lambda **settings: made.append(settings.get("concurrent_descents", False)) or searches(**settings))
     one, three = cpu_batches(BoardModel()), [cpu_batches(BoardModel()) for _ in range(3)]
     found = [EngineSearch(networks, 16, **options).concurrent_descents for networks, options in
-             ((one, {}), (three, {}), (three, {"gather_workers": 2}), (three, {"concurrent_descents": False}), (one, {"concurrent_descents": True}))]
+             ((one, {}), (three, {}), (three, {"concurrent_descents": False}), (one, {"concurrent_descents": True}))]
 
-    assert found == made == [False, True, False, False, True]
+    assert found == made == [False, True, False, True]
 
 
 #Searches' own round loop on concurrent descents: on one network the python loop's search, report for report and tree for tree

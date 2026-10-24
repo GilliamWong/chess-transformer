@@ -1,7 +1,7 @@
 //cargo test --release bench_replay -- --ignored --nocapture --test-threads 1: bench_drivers' drivers on the real network's
 //recorded answers (rust-selection's answers_all.pkl, exported by concurrent-descents/export_store.py to BENCH_STORE, and
-//BENCH_POSITIONS, one line a position: game, move, fen, moves), a Tree behind a lock (bench_replay_locked, gather or
-//gather_batch on BENCH_WORKERS workers) or a SharedTree (bench_replay_shared). BENCH_GAME and BENCH_MOVE choose the position,
+//BENCH_POSITIONS, one line a position: game, move, fen, moves), a Tree behind a lock (bench_replay_locked) or a
+//SharedTree (bench_replay_shared). BENCH_GAME and BENCH_MOVE choose the position,
 //BENCH_VISITS what one thread searches of it first; the rest is bench_drivers'. A board the recording lacks gets the
 //stand-in's answer, and "recorded" tells their share of the timed rounds
 use super::*;
@@ -72,14 +72,13 @@ trait Searcher: Sync {
     fn finish(&self, round: u64, rows: &[Vec<f32>]);
 }
 
-struct Locked<'w> {
+struct Locked {
     tree: Mutex<(Tree, Cache)>,
     settings: SearchSettings,
     move_ids: MoveIds,
-    workers: Option<&'w Workers>,
 }
 
-impl Searcher for Locked<'_> {
+impl Searcher for Locked {
     fn visits(&self) -> u32 {
         self.tree.lock().expect("the tree").0.root().visit_count
     }
@@ -88,13 +87,7 @@ impl Searcher for Locked<'_> {
         let mut boards = Vec::new();
         let mut guard = self.tree.lock().expect("the tree");
         let (tree, cache) = &mut *guard;
-        match self.workers {
-            Some(workers) => {
-                tree.gather_batch(round, &self.settings, None, Some(cache), &mut boards, workers, u32::MAX, &mut BatchCounts::default())
-            }
-            None => tree.gather(round, &self.settings, None, Some(cache), &mut boards),
-        }
-        .expect("no tables");
+        tree.gather(round, &self.settings, None, Some(cache), &mut boards).expect("no tables");
         boards
     }
 
@@ -180,9 +173,8 @@ fn position(game: usize, place: usize) -> (String, Vec<String>) {
 fn replay_drivers(shared: bool) {
     let (visits, timed) = (setting("BENCH_VISITS", 100_000u32), setting("BENCH_ROUNDS", 6_000u64));
     let (drivers, in_flight) = (setting("BENCH_DRIVERS", 8usize), setting("BENCH_IN_FLIGHT", 2usize));
-    let (collisions, worker_count) = (setting("BENCH_COLLISIONS", 0u32), setting("BENCH_WORKERS", 0usize));
+    let collisions = setting("BENCH_COLLISIONS", 0u32);
     let driver_cpus = if std::env::var("BENCH_DRIVER_CPUS").is_ok() { settings_list("BENCH_DRIVER_CPUS", "") } else { Vec::new() };
-    let workers = (worker_count > 0).then(|| Workers::new(worker_count, Duration::from_micros(setting("BENCH_SPIN_US", 50u64)), &[]));
     let (stand_in, search_settings) = (StandIn::from_environment(), settings(true));
     let replay = Replay::load(&std::env::var("BENCH_STORE").expect("BENCH_STORE"));
     let place = position(setting("BENCH_GAME", 0usize), setting("BENCH_MOVE", 0usize));
@@ -212,7 +204,6 @@ fn replay_drivers(shared: bool) {
             tree: Mutex::new((tree_with_room(&base, timed as usize), cache_with_room(&base_cache, timed as usize))),
             settings: search_settings,
             move_ids,
-            workers: workers.as_ref(),
         })
     };
     let searcher = &*searcher;

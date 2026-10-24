@@ -1321,8 +1321,6 @@ fn each_in_parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -
     })
 }
 
-mod batch;
-pub use batch::BatchCounts;
 mod shared;
 pub use shared::{SharedCache, SharedTree};
 
