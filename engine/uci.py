@@ -218,22 +218,21 @@ def load_engine_model(checkpoint_path: Path, gpu: bool) -> nn.Module:
 
 #the search for --select mcts: on the gpu `leaves` leaves a round, the network in `precision` (int8 with fp16_blocks), on
 #each of the cuda devices `gpus` if given (a thread driving each); on the cpu one, which is mcts.py's search. options are
-#EngineSearch's keyword arguments (smart pruning, the tables' pieces, changes to the search's settings). blocking_wait (see
-#inference.GraphedBatches) None: on for several gpus, whose threads would each spin a core, off for one
+#EngineSearch's keyword arguments (smart pruning, the tables' pieces, changes to the search's settings). On several gpus
+#the networks wait for the gpu asleep (inference.GraphedBatches' blocking_wait), where each thread would spin a core
 def load_engine_search(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, options: dict, precision: str,
-                       fp16_blocks: int, gpus: list[int] | None = None, blocking_wait: bool | None = None) -> EngineSearch:
+                       fp16_blocks: int, gpus: list[int] | None = None) -> EngineSearch:
     if gpu:
-        wait = blocking_wait if blocking_wait is not None else gpus is not None and len(gpus) > 1
-        network = engine_network(checkpoint_path, leaves, precision, fp16_blocks, blocking_wait=wait) if gpus is None else (
-            engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, wait))
+        network = engine_network(checkpoint_path, leaves, precision, fp16_blocks) if gpus is None else (
+            engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, len(gpus) > 1))
         return EngineSearch(network, leaves, use_tablebase=tablebase, **options)
     return EngineSearch(cpu_batches(load_model(checkpoint_path, DEVICE)), 1, use_tablebase=tablebase, **options)
 
 #what picks the moves: the search for --select mcts, else the model
 def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, tablebase: bool, search_options: dict,
-                precision: str, fp16_blocks: int, gpus: list[int] | None = None, blocking_wait: bool | None = None) -> nn.Module | EngineSearch:
+                precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> nn.Module | EngineSearch:
     if selection == "mcts":
-        return load_engine_search(checkpoint_path, gpu, leaves, tablebase, search_options, precision, fp16_blocks, gpus, blocking_wait)
+        return load_engine_search(checkpoint_path, gpu, leaves, tablebase, search_options, precision, fp16_blocks, gpus)
     return load_engine_model(checkpoint_path, gpu)
 
 
@@ -404,7 +403,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
          temperature: float = TEMPERATURE, sample_plies: int = SAMPLE_PLIES, simulations: int = SIMULATIONS,
          gpu: bool = False, leaves: int = LEAVES, tablebase: bool = False, search_log: Path | None = None, search_options: dict | None = None,
          precision: str = ENGINE_PRECISION, fp16_blocks: int = ENGINE_FP16_BLOCKS, clock_options: dict | None = None,
-         infinite_until_stop: bool = False, gpus: list[int] | None = None, blocking_wait: bool | None = None):
+         infinite_until_stop: bool = False, gpus: list[int] | None = None):
     torch.set_num_threads(1)
     search_options = search_options or {}
     clock_options = clock_options or {}
@@ -418,8 +417,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
 
     def load() -> nn.Module | EngineSearch:
         use_tablebase, set_options = options.search()
-        return load_player(checkpoint_path, selection, gpu, leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
-                           gpus, blocking_wait)
+        return load_player(checkpoint_path, selection, gpu, leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks, gpus)
 
     #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by
     #itself (a proven or only move), as UCI asks; a go ponder searches the opponent's time until ponderhit, then on as
@@ -524,9 +522,9 @@ if __name__ == "__main__":
                         help=f"for --select mcts --gpu: the network's precision (engine_search.PRECISIONS), default {ENGINE_PRECISION}")
     parser.add_argument("--gpus", type=lambda text: [int(device) for device in text.split(",")],
                         help="for --select mcts --gpu: the cuda devices to search on at once, e.g. 0,1,2,3, a thread driving each; "
-                             "default the current one. On more than one the search is another (more leaves out), for --leaves above 1")
-    parser.add_argument("--blocking-wait", action=argparse.BooleanOptionalAction,
-                        help="for --select mcts --gpu: wait for the gpu asleep instead of spinning a core; default on for several --gpus, off for one")
+                             "default the current one. On more than one, for --leaves above 1, the search is another (more leaves out): the "
+                             "threads descend in the one tree at once (without --gather-workers), each pinned to a cpu by the topology and "
+                             "asleep while its gpu works")
     parser.add_argument("--fp16-blocks", type=int,
                         help=f"for the int8 network: the blocks kept in fp16 besides the last, those whose int8 costs the policy most "
                              f"(engine/quantization.py), default {ENGINE_FP16_BLOCKS}; 0 for every other block in int8")
@@ -578,8 +576,6 @@ if __name__ == "__main__":
         parser.error("--smart-pruning-factor is positive; --no-smart-pruning for none")
     if arguments.gpus is not None and not (arguments.select == "mcts" and arguments.gpu and (len(arguments.gpus) == 1 or arguments.leaves > 1)):
         parser.error("--gpus needs --select mcts --gpu, and on more than one gpu --leaves above 1")
-    if arguments.blocking_wait is not None and not (arguments.select == "mcts" and arguments.gpu):
-        parser.error("--blocking-wait needs --select mcts --gpu")
     if arguments.fp16_blocks is not None and not (arguments.select == "mcts" and arguments.gpu and arguments.precision in (None, "int8")):
         parser.error("--fp16-blocks needs --select mcts --gpu and the int8 network")
     if arguments.fp16_blocks is not None and arguments.fp16_blocks < 0:
@@ -591,8 +587,7 @@ if __name__ == "__main__":
              selection=arguments.select, temperature=arguments.temperature, sample_plies=arguments.sample_plies,
              simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
              search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION, infinite_until_stop=arguments.infinite_until_stop,
-             gpus=arguments.gpus, blocking_wait=arguments.blocking_wait,
-             fp16_blocks=ENGINE_FP16_BLOCKS if arguments.fp16_blocks is None else arguments.fp16_blocks,
+             gpus=arguments.gpus, fp16_blocks=ENGINE_FP16_BLOCKS if arguments.fp16_blocks is None else arguments.fp16_blocks,
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
                              "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
