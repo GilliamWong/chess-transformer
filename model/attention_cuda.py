@@ -118,6 +118,8 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
     const int b = blockIdx.y, head = blockIdx.x * HB + warp, group = warp >> 1, kv = blockIdx.x * GROUPS + group;
 
     //the gains of the dims this thread holds: d = block * 8 + 2 t + e
+    //the queries' are held except at 24 dims, where registers run out and they are read where used
+    constexpr bool HOLD_QUERY_GAINS = DQ <= 16;
     float q_gains[BLOCKS][2], k_gains[BLOCKS][2];
     #pragma unroll
     for (int block = 0; block < BLOCKS; block++)
@@ -129,15 +131,18 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
     asm volatile("griddepcontrol.wait;" ::: "memory");
     const u16* board = projected + (size_t)b * TOKENS * WIDTH;
 
-    //every load of the prologue at once: the values of the CTA's key/value heads, the keys of this warp's, the first queries
-    //and the first slab's bias operands
-    uint4 loaded[GROUPS * 80 * 4 / THREADS];
+    //every load of the prologue at once: the values of the CTA's key/value heads, copied to shared memory as the rest goes on
+    //(the keys past the board zero), the keys of this warp's, the first queries and the first slab's bias operands
     #pragma unroll
     for (int round = 0; round < GROUPS * 80 * 4 / THREADS; round++) {
         const int item = threadIdx.x + round * THREADS;
         const int part = item & 3, key = item / 4 % 80, row_group = item / 4 / 80;
-        loaded[round] = key < TOKENS ? *reinterpret_cast<const uint4*>(board + key * WIDTH + Row<DQ>::V + (blockIdx.x * GROUPS + row_group) * DV + part * 8)
-                                     : make_uint4(0, 0, 0, 0);
+        u16* to = values + ((row_group * 80 + key) * VALUE_ROW + part * 8);
+        if (key < TOKENS)
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"((u32)__cvta_generic_to_shared(to)),
+                         "l"(board + key * WIDTH + Row<DQ>::V + (blockIdx.x * GROUPS + row_group) * DV + part * 8));
+        else
+            *reinterpret_cast<uint4*>(to) = make_uint4(0, 0, 0, 0);
     }
     u32 raw_keys[KEY_TILES][BLOCKS];
     #pragma unroll
@@ -151,14 +156,6 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
     load_queries<DQ>(board, head, 0, g, t, raw_queries);
     BiasOperands operands;
     load_bias_operands<DQ>(operands, board, templates, 0, warp, g, t);
-
-    //the values transposed into shared memory; the keys past the board are zero
-    #pragma unroll
-    for (int round = 0; round < GROUPS * 80 * 4 / THREADS; round++) {
-        const int item = threadIdx.x + round * THREADS;
-        const int part = item & 3, key = item / 4 % 80, row_group = item / 4 / 80;
-        *reinterpret_cast<uint4*>(values + ((row_group * 80 + key) * VALUE_ROW + part * 8)) = loaded[round];
-    }
 
     //the keys RMS-normalised, as the B operands of the scores
     u32 keys[KEY_TILES][BLOCKS];
@@ -178,6 +175,9 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
         for (int block = 0; block < BLOCKS; block++)
             keys[n][block] = pack(x[block][0] * inverse * k_gains[block][0], x[block][1] * inverse * k_gains[block][1]);
     }
+
+    //the values are in shared memory by the first barrier
+    asm volatile("cp.async.wait_all;" ::: "memory");
 
     //the squares 16 at a time, then the metadata tokens
     #pragma unroll 1
@@ -221,8 +221,11 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
         for (int half = 0; half < 2; half++) {
             const float inverse = rsqrt_approx(quad_sum(squares[half]) / DQ + eps);
             #pragma unroll
-            for (int block = 0; block < BLOCKS; block++)
-                queries[block][half] = pack(y[block][half][0] * inverse * q_gains[block][0], y[block][half][1] * inverse * q_gains[block][1]);
+            for (int block = 0; block < BLOCKS; block++) {
+                const u32 read = HOLD_QUERY_GAINS ? 0u : *reinterpret_cast<const u32*>(q_gain + block * 8 + 2 * t);
+                queries[block][half] = pack(y[block][half][0] * inverse * (HOLD_QUERY_GAINS ? q_gains[block][0] : low_half(read)),
+                                            y[block][half][1] * inverse * (HOLD_QUERY_GAINS ? q_gains[block][1] : high_half(read)));
+            }
         }
 
         //scores against the squares and the metadata tokens, 8 keys a tile
