@@ -238,8 +238,8 @@ class EngineSearch:
     #SyzygyPath) rather than the downloaded ones if it is given. settings: changes to engine_search_settings.
     #cache_positions: the answer cache's size; memory_limit_mb: Searches' (lc0's RamLimitMb), 0 for none; advance_threads:
     #ADVANCE_THREADS'. rust_rounds: the rounds in Searches' own loop (Searches.round_loop, rounds.rs), a thread a network
-    #and no python between them, the python loop's search exactly; None for it on networks of lean lanes, the only ones it
-    #runs on (sm_120's), and the python loop on others. concurrent_descents: the networks' threads descend, finish and back
+    #and no python between them, the python loop's search exactly; None for it on several networks of lean lanes, the only
+    #ones it runs on (sm_120's), and the python loop on others and on one gpu (~1% faster there at 1 s). concurrent_descents: the networks' threads descend, finish and back
     #up in the tree at once (search/shared.rs) rather than one at a time under its lock, another search on several
     #networks (the threads steer around each other by the simulations in flight); None for it on several networks, as one
     #thread alone is 16% slower. pin_threads: the networks' threads each on a cpu of thread_cpus', the same search; None
@@ -256,7 +256,7 @@ class EngineSearch:
         if several and not batched:
             raise ValueError("one leaf a round is mcts.py's search, which runs on one network")
         lean = all(getattr(network, "lean", False) for network in self.networks)
-        self.rust_rounds = lean if rust_rounds is None else rust_rounds
+        self.rust_rounds = lean and several if rust_rounds is None else rust_rounds
         if self.rust_rounds and not lean:
             raise ValueError("Searches' own round loop runs on networks of lean lanes (engine_network's on sm_120)")
         self.concurrent_descents = several if concurrent_descents is None else concurrent_descents

@@ -213,8 +213,9 @@ after an update compiles the network (~25 s, then ~7 s from torch's cache) and c
 answer `isready`, so start the engine once by hand before a match.
 
 `--gpus 0,1,...` searches on several GPUs at once, a thread driving each. That is the only setting: the rest is chosen
-from the GPUs and the CPU. On GPUs with lean lanes (sm_120: the 5070 Ti, the 5090) the rounds run in Rust with no Python
-between them, the same search as the Python loop that the A100 (sm_80) and the CPU keep. On several GPUs the threads
+from the GPUs and the CPU. On several GPUs with lean lanes (sm_120: the 5070 Ti, the 5090) the rounds run in Rust with no
+Python between them, the same search as the Python loop that one GPU (~1% faster there at 1 s a move), the A100 (sm_80)
+and the CPU keep. On several GPUs the threads
 descend in the one tree at once rather than in turn under its lock (2.3x the positions evaluated a second in an 8-GPU
 emulation; a thread alone is 16% slower that way, so one GPU keeps the lock), each sleeps while its GPU works, and each
 is pinned to a physical core of its own: all in one L3 if one has a core for each (a 9950X3D's CCD), else over the L3s

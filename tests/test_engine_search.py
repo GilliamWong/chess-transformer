@@ -163,16 +163,16 @@ def test_a_failed_search_settles_its_network():
     assert network.settled == 1
 
 
-#Searches' own round loop (rust_rounds), the default on lean lanes, makes the python loop's search, report for report
-#and tree for tree (the next searches start from the kept trees), with smart pruning or a cap on the leaves out, waiting
-#by event or by the copy, pinned, and with one leaf a round (mcts.py's search, a fresh tree every move)
+#Searches' own round loop (rust_rounds) makes the python loop's search, report for report and tree for tree (the next
+#searches start from the kept trees), with smart pruning or a cap on the leaves out, waiting by event or by the copy,
+#pinned, and with one leaf a round (mcts.py's search, a fresh tree every move)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 @pytest.mark.parametrize("blocking_wait, leaves, settings", [(False, 16, {}), (True, 16, {}), (False, 1, {}),
                                                              (False, 16, {"visits_per_leaf_out": 8, "smart_pruning": False}),
                                                              (True, 16, {"pin_threads": True})])
 def test_rust_rounds_search_as_the_python_loop(blocking_wait, leaves, settings):
     board, reports = chess.Board(), {}
-    for rust_rounds in (False, None):
+    for rust_rounds in (False, True):
         search = EngineSearch(lean_network(blocking_wait), leaves, rust_rounds=rust_rounds, **settings)
         found = []
         for move in ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]:
@@ -180,18 +180,18 @@ def test_rust_rounds_search_as_the_python_loop(blocking_wait, leaves, settings):
             board.push_uci(move)
         board = chess.Board()
         reports[rust_rounds] = found
-    assert reports[None] == reports[False]
+    assert reports[True] == reports[False]
     assert search.rust_counts[0] > 20 and search.rust_counts[1] >= search.rust_counts[0]
 
 
-#Searches' own round loop is the default on networks of lean lanes, every one of them, and takes no others; the python
-#loop runs the rest
+#Searches' own round loop is the default on several networks of lean lanes, every one of them, and takes no others; the
+#python loop runs the rest and one network, lean or not, unless told
 def test_rust_rounds_run_on_lean_lanes_only():
     lean, whole = Laned(cpu_batches(BoardModel()), [0, 0]), cpu_batches(BoardModel())
     lean.lean = True
-    assert EngineSearch(lean, 16).rust_rounds and EngineSearch([lean, lean], 16).rust_rounds
-    assert not EngineSearch(whole, 16).rust_rounds and not EngineSearch([lean, whole], 16).rust_rounds
-    assert not EngineSearch(lean, 16, rust_rounds=False).rust_rounds
+    assert EngineSearch([lean, lean], 16).rust_rounds and EngineSearch(lean, 16, rust_rounds=True).rust_rounds
+    assert not EngineSearch(lean, 16).rust_rounds and not EngineSearch(whole, 16).rust_rounds
+    assert not EngineSearch([lean, whole], 16).rust_rounds and not EngineSearch([lean, lean], 16, rust_rounds=False).rust_rounds
     with pytest.raises(ValueError, match="lean lanes"):
         EngineSearch([lean, whole], 16, rust_rounds=True)
 
@@ -1547,11 +1547,9 @@ def lean_network(blocking_wait: bool = False) -> GraphedBatches:
     model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).cuda().eval()
     return GraphedBatches(model, small_graph_sizes(16), 2, blocking_wait=blocking_wait, lean=True)
 
-#board_search's in Searches' own round loop (rust_rounds), the default on a gpu's lean lanes
+#board_search's in Searches' own round loop (rust_rounds), on a gpu
 def rust_search() -> EngineSearch:
-    search = EngineSearch(lean_network(), 16)
-    assert search.rust_rounds
-    return search
+    return EngineSearch(lean_network(), 16, rust_rounds=True)
 
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 #the uci tests below with the python loop, and with Searches' own
