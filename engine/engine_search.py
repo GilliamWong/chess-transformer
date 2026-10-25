@@ -30,6 +30,11 @@ from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_table
 #judging 2,000 positions)
 LEAVES = 64
 COLLISIONS = 64
+#on several gpus a round's collisions may run past its leaves, as lc0's MaxCollisionEvents (917) lets them: the rounds
+#out on every gpu hold so many leaves that 64 stop a round at ~26 of them, its gpu's fixed cost then on half a batch. On
+#8 emulated 5090s (tools/emulated_gpus.py, 0.6 ms + 0.036 ms a board) 1024 fill the rounds to ~61 leaves, 109k -> 169k
+#boards/s (2026-10-25); one gpu's rounds were ~54 leaves full with 64
+SEVERAL_GPUS_COLLISIONS = 1024
 #a round is gathered while the last one is on the gpu (+9% simulations/s), and the two run at once (GraphedBatches)
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per GROW_LEAVES simulations done or left, as lc0 grows its batches with the tree; 0 for fixed
@@ -267,7 +272,7 @@ class EngineSearch:
         #the batches and their boards Searches' own round loop launched, all its searches'
         self.rust_counts = [0, 0]
         self.round_simulations = SIMULATIONS_PER_LEAF * leaves
-        self.collisions = COLLISIONS if batched else 0
+        self.collisions = (SEVERAL_GPUS_COLLISIONS if several else COLLISIONS) if batched else 0
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1 #on each network
         self.grow_leaves = grow_leaves if batched else 0
         self.visits_per_leaf_out = visits_per_leaf_out if batched else 0
@@ -390,6 +395,10 @@ class EngineSearch:
         self.rust_counts[1] += boards
         run.report = report
 
+    #a round of `count` leaves' collisions: up to its leaves, or a cap above the leaves (several gpus') whatever its size
+    def round_collisions(self, count: int) -> int:
+        return self.collisions if self.collisions > self.leaves else min(self.collisions, count)
+
     #rounds_on's settings, for Searches' own loop (rounds.rs LoopSettings)
     def rust_round_settings(self) -> dict:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
@@ -453,7 +462,7 @@ class EngineSearch:
                 lane = network.free_lane() if hasattr(network, "free_lane") else None
                 lean = getattr(lane, "lean", False)
                 boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.rows_array if lean else lane.boards_array
-                written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count, round=name,
+                written, seen = self.searches.descend_into(boards, count, self.round_collisions(count), SIMULATIONS_PER_LEAF * count, round=name,
                                                            root_of=GAME, legal_columns=lean)
                 if not written:
                     run.starved = answered

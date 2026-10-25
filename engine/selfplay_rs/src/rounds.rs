@@ -411,7 +411,8 @@ impl Rounds<'_> {
                     lane.rows_host,
                     room,
                     count,
-                    settings.collisions.min(count),
+                    //a cap above the round's leaves (several gpus') holds whatever the round's size (EngineSearch's)
+                    if settings.collisions > settings.leaves { settings.collisions } else { settings.collisions.min(count) },
                     settings.simulations_per_leaf * count,
                     name,
                     settings.game,
