@@ -2,7 +2,8 @@
 //is, so a reference into one stays valid while other threads allocate. A node is one cache line of atomics and an edge
 //a prior and a move (PackedMove). As lc0 has them, a move gets a Link once a simulation goes through it: its node, its
 //own visits (with transpositions) and its place among the node's moves, in a list in the moves' order; a node with
-//SOLID_TREE_THRESHOLD visits has its list turned into an array of links, one a move (lc0's solid tree)
+//SOLID_TREE_THRESHOLD visits has its list turned into an array of slots, one a move (lc0's solid tree), each only a node
+//and visits, so that a busy node's scan reads no more than the moves' node and visit columns did
 use crate::rules::PackedMove;
 use crate::search::{NO_NODE, Outcome, Proof};
 use shakmaty::Move;
@@ -14,13 +15,19 @@ const NODE_CHUNK_BITS: u32 = if cfg!(test) { 6 } else { 16 };
 const NODE_CHUNKS: usize = 1 << 14;
 const EDGE_CHUNK_BITS: u32 = if cfg!(test) { 10 } else { 20 };
 const EDGE_CHUNKS: usize = 1 << 15;
-//a chunk holds a solid node's links (at most 218 moves); below 1 << 31, which the SOLID flag of a node's children takes
+//a slot chunk holds a solid node's slots (at most 218 moves); links and slots below 1 << 31, which SOLID takes
 const LINK_CHUNK_BITS: u32 = if cfg!(test) { 8 } else { 18 };
 const LINK_CHUNKS: usize = 1 << 13;
 
-//a node's children: none, the first link of its list, or with SOLID its solid links' first
+//a move with a node is named by its list link, or by SOLID with its solid slot; a node's children are none, its list's
+//first link, or its first slot
 pub const NO_LINK: u32 = 0;
 const SOLID: u32 = 1 << 31;
+
+//whether a move's name is a list link's (not a solid slot's)
+pub fn listed(link: u32) -> bool {
+    link & SOLID == 0
+}
 
 //one in-flight simulation in a node's count, which holds the visits below it
 pub const IN_FLIGHT: u64 = 1 << 32;
@@ -44,7 +51,7 @@ pub struct Node {
     children: AtomicU32,
 }
 
-//a node's links: a list in the moves' order, or once solid one a move from the first
+//a node's moves with a node: a list of links in the moves' order, or once solid a slot a move from the first
 #[derive(Clone, Copy)]
 pub enum Children {
     List(u32),
@@ -159,7 +166,7 @@ impl Node {
 
     pub fn children(&self) -> Children {
         let children = self.children.load(Ordering::Acquire);
-        if children & SOLID != 0 { Children::Solid(children & !SOLID) } else { Children::List(children) }
+        if listed(children) { Children::List(children) } else { Children::Solid(children) }
     }
 
     //the head of a list node's links, which a new first link is swapped into (Links::insert)
@@ -167,9 +174,10 @@ impl Node {
         &self.children
     }
 
-    //the node's links from now on the solid ones from `first`; with the tree to itself (or one not yet published)
+    //the node's moves from now on the solid slots from `first` (Links::solid's); with the tree to itself (or one not yet
+    //published)
     pub fn make_solid(&self, first: u32) {
-        self.children.store(first | SOLID, Ordering::Release);
+        self.children.store(first, Ordering::Release);
     }
 
     pub fn edges(&self) -> Range<usize> {
@@ -328,9 +336,9 @@ fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> us
     first
 }
 
-//a move with a node: the node, the move's own visits (with transpositions), the next link of its node's list, and its place
-//among the node's moves. A list's link is written before it is swapped in (release) and read after its predecessor's
-//`next` (acquire); a solid link's node is swapped in alone
+//a list's move with a node: the node, the move's own visits (with transpositions), the next link of its node's list, and its
+//place among the node's moves. A link is written before it is swapped in (release) and read after its predecessor's
+//`next` (acquire)
 pub struct Link {
     child: AtomicU32,
     visits: AtomicU32,
@@ -343,14 +351,8 @@ impl Link {
         Link { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0), next: AtomicU32::new(NO_LINK), place: AtomicU32::new(place) }
     }
 
-    //NO_NODE until a solid link's move has one
     pub fn child(&self) -> u32 {
         self.child.load(Ordering::Acquire)
-    }
-
-    //the move's node for a solid link, which may have one already: the node it has
-    pub fn claim(&self, child: u32) -> Result<u32, u32> {
-        self.child.compare_exchange(NO_NODE, child, Ordering::AcqRel, Ordering::Acquire).map(|_| child)
     }
 
     pub fn visits(&self) -> &AtomicU32 {
@@ -366,9 +368,33 @@ impl Link {
     }
 }
 
+//a solid node's move: its node (NO_NODE until it has one, which is swapped in) and its own visits
+pub struct Slot {
+    child: AtomicU32,
+    visits: AtomicU32,
+}
+
+impl Slot {
+    pub fn child(&self) -> u32 {
+        self.child.load(Ordering::Acquire)
+    }
+
+    pub fn visits(&self) -> &AtomicU32 {
+        &self.visits
+    }
+
+    //the move's node, which may have one already: the node it has
+    pub fn claim(&self, child: u32) -> Result<u32, u32> {
+        self.child.compare_exchange(NO_NODE, child, Ordering::AcqRel, Ordering::Acquire).map(|_| child)
+    }
+}
+
+//the list links and the solid slots of a tree's moves with a node
 pub struct Links {
     table: Table<Link>,
     next: AtomicUsize,
+    slots: Table<Slot>,
+    next_slot: AtomicUsize,
 }
 
 impl Links {
@@ -376,22 +402,53 @@ impl Links {
 
     //link 0 is NO_LINK's, never given out
     pub fn new() -> Links {
-        let links = Links { table: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS, 1), next: AtomicUsize::new(1) };
+        let links = Links {
+            table: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS, 1),
+            next: AtomicUsize::new(1),
+            slots: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS, 1),
+            next_slot: AtomicUsize::new(0),
+        };
         links.make(0);
         links
     }
 
-    //the links given out so far, the gaps at chunk ends included
+    //the links and the slots given out so far, the gaps at chunk ends included
     pub fn len(&self) -> usize {
         self.next.load(Ordering::Relaxed)
+    }
+
+    pub fn slots(&self) -> usize {
+        self.next_slot.load(Ordering::Relaxed)
     }
 
     fn make(&self, first: usize) {
         self.table.made(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Link::new(0)).collect());
     }
 
+    //a list's link
     pub fn get(&self, link: u32) -> &Link {
+        debug_assert!(listed(link), "a solid slot read as a link");
         self.table.get(link as usize)
+    }
+
+    //a solid node's slot
+    pub fn slot(&self, link: u32) -> &Slot {
+        self.slots.get((link & !SOLID) as usize)
+    }
+
+    //a solid node's slots, one a move from its first
+    pub fn solid_slots(&self, first: u32, moves: usize) -> &[Slot] {
+        if moves == 0 { &[] } else { self.slots.slice((first & !SOLID) as usize, 0, moves) }
+    }
+
+    //the move's node: NO_NODE for a solid slot without one
+    pub fn child(&self, link: u32) -> u32 {
+        if listed(link) { self.get(link).child() } else { self.slot(link).child() }
+    }
+
+    //the move's own visits (with transpositions)
+    pub fn visits(&self, link: u32) -> &AtomicU32 {
+        if listed(link) { &self.get(link).visits } else { &self.slot(link).visits }
     }
 
     //a list link for the move at `place` with its node, not yet in a list
@@ -405,18 +462,18 @@ impl Links {
         link as u32
     }
 
-    //a solid node's links, one a move from the first returned: none has a node yet
+    //a solid node's slots, one a move from the first returned (SOLID with its index): none has a node yet
     pub fn solid(&self, count: usize) -> u32 {
-        let first = alloc_run(&self.next, count, LINK_CHUNK_BITS, Self::CAPACITY);
-        self.make(first);
+        let first = alloc_run(&self.next_slot, count, LINK_CHUNK_BITS, Self::CAPACITY);
+        self.slots.made(first, || {
+            (0..1 << LINK_CHUNK_BITS).map(|_| Slot { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0) }).collect()
+        });
         for place in 0..count {
-            let link = self.table.get(first + place);
-            link.child.store(NO_NODE, Ordering::Relaxed);
-            link.visits.store(0, Ordering::Relaxed);
-            link.next.store(NO_LINK, Ordering::Relaxed);
-            link.place.store(place as u32, Ordering::Relaxed);
+            let slot = self.slots.get(first + place);
+            slot.child.store(NO_NODE, Ordering::Relaxed);
+            slot.visits.store(0, Ordering::Relaxed);
         }
-        first as u32
+        first as u32 | SOLID
     }
 
     //the link of the move at `place` in the list from `head`, or Err of the pointer a new link for it goes into (the head or
@@ -447,31 +504,31 @@ impl Links {
         self.get(link).next.store(next, Ordering::Relaxed);
     }
 
-    //a solid link's node and visits, before the node is published or with the tree to itself
+    //a solid slot's node and visits, before the node is published or with the tree to itself
     pub fn set_solid(&self, link: u32, child: u32, visits: u32) {
-        let link = self.get(link);
-        link.child.store(child, Ordering::Relaxed);
-        link.visits.store(visits, Ordering::Relaxed);
+        let slot = self.slot(link);
+        slot.child.store(child, Ordering::Relaxed);
+        slot.visits.store(visits, Ordering::Relaxed);
     }
 
     //the node's moves with a node, in their order
     pub fn linked<'a>(&'a self, node: &Node) -> Linked<'a> {
         let children = node.children();
-        let at = match children {
-            Children::List(head) => head,
-            Children::Solid(_) => 0,
+        let (at, solid) = match children {
+            Children::List(head) => (head, &[][..]),
+            Children::Solid(first) => (0, self.solid_slots(first, node.edges().len())),
         };
-        Linked { links: self, children, at, moves: node.edges().len() as u32 }
+        Linked { links: self, children, at, solid }
     }
 }
 
-//a node's moves with a node in their order, each as (its place among the node's moves, its link): the list's links, or the
-//solid links that have a node. A list's link put in meanwhile may be passed over, as a column read before it would be
+//a node's moves with a node in their order, each as (its place among the node's moves, its name): the list's links, or the
+//solid slots that have a node. A list's link put in meanwhile may be passed over, as a column read before it would be
 pub struct Linked<'a> {
     links: &'a Links,
     children: Children,
     at: u32, //a list's next link, a solid node's next place
-    moves: u32,
+    solid: &'a [Slot],
 }
 
 impl Iterator for Linked<'_> {
@@ -488,10 +545,10 @@ impl Iterator for Linked<'_> {
                 Some((record.place(), link))
             }
             Children::Solid(first) => {
-                while self.at < self.moves {
+                while let Some(slot) = self.solid.get(self.at as usize) {
                     let (place, link) = (self.at, first + self.at);
                     self.at += 1;
-                    if self.links.get(link).child() != NO_NODE {
+                    if slot.child() != NO_NODE {
                         return Some((place as usize, link));
                     }
                 }
@@ -511,7 +568,11 @@ impl Edges {
     pub const CAPACITY: usize = EDGE_CHUNKS << EDGE_CHUNK_BITS;
 
     pub fn new() -> Edges {
-        Edges { priors: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 1), moves: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 1), next: AtomicUsize::new(0) }
+        Edges {
+            priors: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 1),
+            moves: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 1),
+            next: AtomicUsize::new(0),
+        }
     }
 
     //the edges given out so far, the gaps at chunk ends included
@@ -611,8 +672,8 @@ mod tests {
                                 let link = links.push(worker * 1000 + turn as u32, place);
                                 loop {
                                     match links.find(head, place) {
-                                        Ok(found) => break (place, links.get(found).child()),
-                                        Err((pointer, at)) if links.insert(pointer, at, link) => break (place, links.get(link).child()),
+                                        Ok(found) => break (place, links.child(found)),
+                                        Err((pointer, at)) if links.insert(pointer, at, link) => break (place, links.child(link)),
                                         Err(_) => {}
                                     }
                                 }
@@ -626,7 +687,7 @@ mod tests {
         let mut list = Vec::new();
         let mut link = head.load(Ordering::Relaxed);
         while link != NO_LINK {
-            list.push((links.get(link).place(), links.get(link).child()));
+            list.push((links.get(link).place(), links.child(link)));
             link = links.get(link).next();
         }
         assert!(list.windows(2).all(|pair| pair[0].0 < pair[1].0), "a list out of order or with a move twice");

@@ -20,7 +20,7 @@ impl SharedNetwork {
     }
 }
 
-//the solid links of nodes with 8 visits, two queued at a time: the searches here make many and copy lists as others wait
+//the solid slots of nodes with 8 visits, two queued at a time: the searches here make many and copy lists as others wait
 fn shared_tree_after(fen: &str, moves: &[&str]) -> SharedTree {
     let tree = tree_after(fen, moves);
     SharedTree::new(tree.board, tree.keys).with_solid_links(8, 2)

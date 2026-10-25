@@ -74,7 +74,7 @@ impl SharedTree {
                 }
                 children.clear();
                 for (place, link) in self.links.linked(old) {
-                    let child = self.links.get(link).child() as usize;
+                    let child = self.links.child(link) as usize;
                     let child = if copied_as.is_empty() {
                         order.push(child);
                         (order.len() - 1) as u32
@@ -85,7 +85,7 @@ impl SharedTree {
                         }
                         copied_as[child]
                     };
-                    children.push((place, child, self.links.get(link).visits().load(Ordering::Relaxed)));
+                    children.push((place, child, self.links.visits(link).load(Ordering::Relaxed)));
                 }
                 set_links(&links, node, old_edges.len(), old.visits() >= self.solid_threshold, children.iter().copied());
                 node.publish_edges(first, old_edges.len());
@@ -103,10 +103,14 @@ impl SharedTree {
             *graph = fresh;
         }
         self.root = 0;
-        //what was queued for solid links: compact made them
+        //what was queued for solid slots: compact made them
         self.to_solidify.get_mut().expect("the solid queue").clear();
         *self.queued.get_mut() = 0;
-        Some((std::mem::replace(&mut self.nodes, nodes), std::mem::replace(&mut self.edges, edges), std::mem::replace(&mut self.links, links)))
+        Some((
+            std::mem::replace(&mut self.nodes, nodes),
+            std::mem::replace(&mut self.edges, edges),
+            std::mem::replace(&mut self.links, links),
+        ))
     }
 
     //Tree::drop_stale_leaves: a kept tree under a new root, the leaves a rule scored that held only from the old root
@@ -147,7 +151,7 @@ impl SharedTree {
             return Ok(());
         }
         for (place, link) in self.links.linked(self.nodes.get(node)) {
-            let child = self.links.get(link).child() as usize;
+            let child = self.links.child(link) as usize;
             if self.nodes.get(child).proof().is_some() {
                 continue;
             }
@@ -236,7 +240,7 @@ impl SharedTree {
             return;
         }
         for (place, link) in self.links.linked(self.nodes.get(node)) {
-            let child = self.links.get(link).child() as usize;
+            let child = self.links.child(link) as usize;
             places.push(place as u16);
             let node = self.nodes.get(child);
             if node.has_edges() {
@@ -261,7 +265,7 @@ impl SharedTree {
             return false;
         }
         for (place, link) in self.links.linked(self.nodes.get(node)) {
-            let child = self.links.get(link).child() as usize;
+            let child = self.links.child(link) as usize;
             places.push(place as u16);
             let node = self.nodes.get(child);
             if node.has_edges() {

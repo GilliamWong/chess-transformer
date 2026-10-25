@@ -1,7 +1,8 @@
 //cargo test --release bench_shared -- --ignored --nocapture --test-threads 1: bench_drivers' drivers on a SharedTree, no lock
 //around the tree (the same environment: BENCH_VISITS ROUNDS IN_FLIGHT DRIVERS REPEATS FIRST DRIVER_CPUS COLLISIONS and the
 //stand-in's), the line it prints is bench_drivers'. BENCH_TRANSPOSITIONS=1 searches with transpositions: the drivers grow
-//the graph from the position to BENCH_VISITS themselves (a Tree's copy has no graph), then the timed rounds
+//the graph from the position to BENCH_VISITS themselves (a Tree's copy has no graph), then the timed rounds.
+//BENCH_SOLID_THRESHOLD and BENCH_SOLID_BATCH set the tree's solid slots (with_solid_links)
 use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
 
@@ -106,25 +107,28 @@ fn bench_shared_drivers() {
         });
         (started.elapsed().as_secs_f64(), leaves.load(Ordering::Relaxed))
     };
+    let (threshold, batch) = (setting("BENCH_SOLID_THRESHOLD", 100u32), setting("BENCH_SOLID_BATCH", 32usize));
     for repeat in 0..repeats {
         let (tree, cache) = if transpositions {
-            let (tree, cache) = (SharedTree::new(base.board.clone(), base.keys.clone()).with_transpositions(true), SharedCache::new(5_000_000));
+            let tree = SharedTree::new(base.board.clone(), base.keys.clone()).with_transpositions(true).with_solid_links(threshold, batch);
+            let cache = SharedCache::new(5_000_000);
             drive(&tree, &cache, u64::MAX, visits);
             (tree, cache)
         } else {
-            (SharedTree::from_tree(&base), SharedCache::from_cache(&base_cache, 5_000_000))
+            (SharedTree::from_tree(&base).with_solid_links(threshold, batch), SharedCache::from_cache(&base_cache, 5_000_000))
         };
         let start = tree.root().visits();
         let (seconds, leaves) = drive(&tree, &cache, timed, u32::MAX);
         let simulations = tree.root().visits() - start;
         println!(
-            "SHARED\trepeat {repeat}\tevals_per_s {:.0}\tsims_per_s {:.0}\tus_per_eval {:.3}\tleaves_per_round {:.1}\torphans {}\texclusive {}\tvisits_at_start {start}",
+            "SHARED\trepeat {repeat}\tevals_per_s {:.0}\tsims_per_s {:.0}\tus_per_eval {:.3}\tleaves_per_round {:.1}\torphans {}\texclusive {}\tvisits_at_start {start}\tbytes_per_visit {:.0}",
             leaves as f64 / seconds,
             f64::from(simulations) / seconds,
             seconds * 1e6 / leaves as f64,
             leaves as f64 / timed as f64,
             tree.counts.orphans.load(Ordering::Relaxed),
-            tree.counts.exclusive.load(Ordering::Relaxed)
+            tree.counts.exclusive.load(Ordering::Relaxed),
+            tree.allocated_bytes() as f64 / f64::from(tree.root().visits())
         );
     }
 }
