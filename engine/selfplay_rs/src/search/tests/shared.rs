@@ -612,7 +612,6 @@ fn graph_shared_tree_after(fen: &str, moves: &[&str]) -> SharedTree {
 //than one move leads to
 fn check_graph(tree: &Tree) -> usize {
     let graph = tree.graph.as_ref().expect("a tree with transpositions");
-    assert_eq!(graph.edge_visits.len(), tree.moves.len(), "a visit count for every move");
     assert_eq!(graph.halfmoves.len(), tree.nodes.len(), "a fifty-move count for every node");
     let mut incoming = vec![0u32; tree.nodes.len()];
     let (mut seen, mut order) = (vec![false; tree.nodes.len()], vec![tree.root_index()]);
@@ -621,13 +620,14 @@ fn check_graph(tree: &Tree) -> usize {
         let node = &tree.nodes[id];
         assert_eq!(node.in_flight, 0, "a node with simulations in flight after the search");
         let mut moves = 0;
-        for edge in node.edges() {
-            let child = tree.children[edge];
-            if child == NO_NODE {
-                assert_eq!(graph.edge_visits[edge], 0, "a move without a node, visited");
-                continue;
-            }
-            moves += graph.edge_visits[edge];
+        if !listed(node.children) {
+            let first = (node.children & !SOLID) as usize;
+            let slots = &tree.slots[first..first + node.edges().len()];
+            assert!(slots.iter().all(|slot| slot.child != NO_NODE || slot.visits == 0), "a move without a node, visited");
+        }
+        for (_, link) in tree.linked(id) {
+            let child = tree.link_child(link);
+            moves += tree.move_visits(link);
             incoming[child as usize] += 1;
             if !std::mem::replace(&mut seen[child as usize], true) {
                 order.push(child as usize);
@@ -710,10 +710,10 @@ fn reachable(tree: &Tree, from: usize) -> usize {
     let mut order = vec![from];
     seen[from] = true;
     while let Some(id) = order.pop() {
-        for edge in tree.nodes[id].edges() {
-            let child = tree.children[edge];
-            if child != NO_NODE && !std::mem::replace(&mut seen[child as usize], true) {
-                order.push(child as usize);
+        for (_, link) in tree.linked(id) {
+            let child = tree.link_child(link) as usize;
+            if !std::mem::replace(&mut seen[child], true) {
+                order.push(child);
             }
         }
     }
@@ -726,7 +726,7 @@ fn line_after(tree: &Tree, line: &[PackedMove]) -> Vec<usize> {
     line.iter()
         .map(|&played| {
             let edge = tree.nodes[node].edges().find(|&edge| tree.chess_move(edge) == played).expect("the line's move");
-            node = tree.children[edge] as usize;
+            node = tree.child_index(node, edge).expect("the line's node");
             edge
         })
         .collect()
@@ -745,7 +745,7 @@ fn reusing_a_graph_keeps_it_whole() {
         search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
         for line in reusable_lines(&tree) {
             let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
-            let new_root = tree.children[*line.last().expect("a line")] as usize;
+            let new_root = line_end(&tree, &line);
             let (visits, value_sum) = (tree.nodes[new_root].visit_count, tree.nodes[new_root].value_sum);
             let mut at_once = copied(&tree);
             at_once.play_line(&line);

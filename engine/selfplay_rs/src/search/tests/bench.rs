@@ -37,7 +37,8 @@ fn tree_with_room(tree: &Tree, rounds: usize) -> Tree {
         node_keys: with_room(&tree.node_keys, nodes),
         moves: with_room(&tree.moves, edges),
         priors: with_room(&tree.priors, edges),
-        children: with_room(&tree.children, edges),
+        links: with_room(&tree.links, nodes),
+        slots: with_room(&tree.slots, nodes),
         ..copied(tree)
     }
 }
@@ -150,9 +151,11 @@ fn bench_drivers() {
     let (drivers, in_flight) = (setting("BENCH_DRIVERS", 8usize), setting("BENCH_IN_FLIGHT", 2usize));
     let collisions = setting("BENCH_COLLISIONS", 0u32);
     let driver_cpus = if std::env::var("BENCH_DRIVER_CPUS").is_ok() { settings_list("BENCH_DRIVER_CPUS", "") } else { Vec::new() };
-    let (stand_in, settings, move_ids) = (StandIn::from_environment(), settings(true), Network::new().move_ids);
+    let (stand_in, mut settings, move_ids) = (StandIn::from_environment(), settings(true), Network::new().move_ids);
+    //BENCH_TRANSPOSITIONS=1 searches with transpositions
+    settings.transpositions = setting("BENCH_TRANSPOSITIONS", 0u32) == 1;
     let (fen, moves, _) = POSITIONS[setting("BENCH_FIRST", 0usize)];
-    let (mut base, mut base_cache) = (tree_after(fen, moves), Cache::new(5_000_000));
+    let (mut base, mut base_cache) = (tree_after(fen, moves).with_transpositions(settings.transpositions), Cache::new(5_000_000));
     rounds(&mut base, &mut base_cache, (usize::MAX, visits), 2, 0, stand_in, &settings, None, &move_ids);
     println!(
         "{fen}: {} nodes; {drivers} drivers {driver_cpus:?}, {in_flight} rounds out each, collisions {collisions}, {timed} rounds",

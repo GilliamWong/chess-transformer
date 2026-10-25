@@ -18,7 +18,7 @@ mod arena;
 mod cache;
 mod reuse;
 
-use arena::{Children, Edges, Link, Links, NO_LINK, Node, Nodes, Slot, listed};
+use arena::{Children, Edges, Link, Links, Node, Nodes, Slot};
 pub use cache::SharedCache;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -57,9 +57,8 @@ const TABLE_ENTRY_BYTES: usize = 32;
 const DESCENT_NODE_BYTES: usize = NODE_BYTES + LINK_BYTES;
 const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + MOST_MOVES * EDGE_BYTES;
 
-//the visits that make a node's moves solid slots (lc0's solid-tree-threshold), and the nodes queued for it before a call takes
-//the tree to itself to make them so (with_solid_links' tests have their own)
-const SOLID_TREE_THRESHOLD: u32 = 100;
+//the nodes queued for their solid slots (SOLID_TREE_THRESHOLD's) before a call takes the tree to itself to make them so
+//(with_solid_links' tests have their own)
 const SOLID_BATCH: usize = 32;
 
 //the transposition table's shards, each behind its own lock: the table is only looked at when a move gets its node
@@ -1083,8 +1082,7 @@ impl SharedTree {
                 for (index, edge) in node.edges().enumerate() {
                     edges.set(first + index, tree.moves[edge], tree.priors[edge]);
                 }
-                let children =
-                    node.edges().enumerate().map(|(place, edge)| (place, tree.children[edge], 0)).filter(|&(_, child, _)| child != NO_NODE);
+                let children = tree.linked(id).map(|(place, link)| (place, tree.link_child(link), tree.own_visits(link)));
                 set_links(&links, copy, node.edges().len(), node.visit_count >= SOLID_TREE_THRESHOLD, children);
                 copy.publish_edges(first, node.edges().len());
             }
@@ -1148,39 +1146,41 @@ impl SharedTree {
             .collect();
         expanded.sort_unstable();
         let mut first_edge = vec![0; count];
-        let (mut moves, mut priors, mut children, mut edge_visits) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut moves, mut priors) = (Vec::new(), Vec::new());
         for &(_, id) in &expanded {
             first_edge[id] = moves.len();
-            let node = self.nodes.get(id);
-            for edge in node.edges() {
+            for edge in self.nodes.get(id).edges() {
                 moves.push(self.edges.chess_move(edge));
                 priors.push(self.edges.prior(edge));
-                let link = self.link_of(node, edge);
-                children.push(if link == NO_LINK { NO_NODE } else { self.links.child(link) });
-                if self.graph.is_some() {
-                    edge_visits.push(self.link_visits(link));
-                }
             }
         }
         //with transpositions the same graph: the table of its nodes, the moves' visits, the fifty-move counts
         let graph = self.graph.as_ref().map(|_| {
             let halfmoves: Vec<u16> = (0..count).map(|id| self.nodes.get(id).halfmoves()).collect();
             let table = (0..count).map(|id| (graph_key(self.nodes.get(id).key(), u32::from(halfmoves[id])), id as u32)).collect();
-            Graph { table, edge_visits: edge_visits.clone(), halfmoves }
+            Graph { table, halfmoves }
         });
+        let (mut links, mut slots) = (vec![super::UNLINKED], Vec::new());
         let nodes = (0..count)
             .map(|id| {
                 let node = self.nodes.get(id);
                 let (visit_count, in_flight) = node.counts();
                 let edges = node.edges();
-                super::Node {
+                let mut copy = super::Node {
                     visit_count,
                     in_flight,
                     value_sum: node.value_sum(),
                     visited_policy_sqrt: node.visited_policy_sqrt(),
                     edges_at: if edges.is_empty() { 0 } else { (first_edge[id] as u64) << 8 | edges.len() as u64 },
                     proof: node.proof(),
-                }
+                    children: NO_LINK,
+                };
+                let children = self
+                    .links
+                    .linked(node)
+                    .map(|(place, link)| (place, self.links.child(link), self.links.visits(link).load(Ordering::Relaxed)));
+                super::link_up(&mut copy, &mut links, &mut slots, visit_count >= SOLID_TREE_THRESHOLD, children);
+                copy
             })
             .collect();
         Tree {
@@ -1192,7 +1192,9 @@ impl SharedTree {
             moves,
             priors,
             noised_priors: Vec::new(),
-            children,
+            links,
+            slots,
+            memory_limit: usize::MAX,
             pending: Vec::new(),
             logits: Vec::new(),
             full: self.is_full(),

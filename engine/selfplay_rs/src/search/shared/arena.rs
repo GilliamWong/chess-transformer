@@ -5,7 +5,7 @@
 //SOLID_TREE_THRESHOLD visits has its list turned into an array of slots, one a move (lc0's solid tree), each only a node
 //and visits, so that a busy node's scan reads no more than the moves' node and visit columns did
 use crate::rules::PackedMove;
-use crate::search::{NO_NODE, Outcome, Proof};
+use crate::search::{NO_LINK, NO_NODE, Outcome, Proof, SOLID, listed};
 use shakmaty::Move;
 use std::ops::Range;
 use std::ptr::{null_mut, slice_from_raw_parts_mut};
@@ -18,16 +18,6 @@ const EDGE_CHUNKS: usize = 1 << 15;
 //a slot chunk holds a solid node's slots (at most 218 moves); links and slots below 1 << 31, which SOLID takes
 const LINK_CHUNK_BITS: u32 = if cfg!(test) { 8 } else { 18 };
 const LINK_CHUNKS: usize = 1 << 13;
-
-//a move with a node is named by its list link, or by SOLID with its solid slot; a node's children are none, its list's
-//first link, or its first slot
-pub const NO_LINK: u32 = 0;
-const SOLID: u32 = 1 << 31;
-
-//whether a move's name is a list link's (not a solid slot's)
-pub fn listed(link: u32) -> bool {
-    link & SOLID == 0
-}
 
 //one in-flight simulation in a node's count, which holds the visits below it
 pub const IN_FLIGHT: u64 = 1 << 32;

@@ -1,7 +1,8 @@
 //cargo test --release bench_shared -- --ignored --nocapture --test-threads 1: bench_drivers' drivers on a SharedTree, no lock
 //around the tree (the same environment: BENCH_VISITS ROUNDS IN_FLIGHT DRIVERS REPEATS FIRST DRIVER_CPUS COLLISIONS and the
 //stand-in's), the line it prints is bench_drivers'. BENCH_TRANSPOSITIONS=1 searches with transpositions: the drivers grow
-//the graph from the position to BENCH_VISITS themselves (a Tree's copy has no graph), then the timed rounds.
+//the graph from the position to BENCH_VISITS themselves (a Tree's copy has no graph), then the timed rounds; BENCH_GROW=1
+//grows a tree so too.
 //BENCH_SOLID_THRESHOLD and BENCH_SOLID_BATCH set the tree's solid slots (with_solid_links)
 use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
@@ -15,12 +16,14 @@ fn bench_shared_drivers() {
     let (drivers, in_flight) = (setting("BENCH_DRIVERS", 8usize), setting("BENCH_IN_FLIGHT", 2usize));
     let collisions = setting("BENCH_COLLISIONS", 0u32);
     let transpositions = setting("BENCH_TRANSPOSITIONS", 0u32) == 1;
+    //the drivers grow the tree from the position too (BENCH_GROW=1), as they always grow a graph
+    let grow = transpositions || setting("BENCH_GROW", 0u32) == 1;
     let driver_cpus = if std::env::var("BENCH_DRIVER_CPUS").is_ok() { settings_list("BENCH_DRIVER_CPUS", "") } else { Vec::new() };
     let (stand_in, mut settings, move_ids) = (StandIn::from_environment(), settings(true), Network::new().move_ids);
     settings.transpositions = transpositions;
     let (fen, moves, _) = POSITIONS[setting("BENCH_FIRST", 0usize)];
     let (mut base, mut base_cache) = (tree_after(fen, moves), Cache::new(5_000_000));
-    if !transpositions {
+    if !grow {
         rounds(&mut base, &mut base_cache, (usize::MAX, visits), 2, 0, stand_in, &settings, None, &move_ids);
     }
     println!(
@@ -109,8 +112,10 @@ fn bench_shared_drivers() {
     };
     let (threshold, batch) = (setting("BENCH_SOLID_THRESHOLD", 100u32), setting("BENCH_SOLID_BATCH", 32usize));
     for repeat in 0..repeats {
-        let (tree, cache) = if transpositions {
-            let tree = SharedTree::new(base.board.clone(), base.keys.clone()).with_transpositions(true).with_solid_links(threshold, batch);
+        let (tree, cache) = if grow {
+            let tree = SharedTree::new(base.board.clone(), base.keys.clone())
+                .with_transpositions(transpositions)
+                .with_solid_links(threshold, batch);
             let cache = SharedCache::new(5_000_000);
             drive(&tree, &cache, u64::MAX, visits);
             (tree, cache)

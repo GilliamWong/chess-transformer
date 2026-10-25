@@ -63,7 +63,7 @@ fn proof_rank(proof: &Proof) -> (Outcome, i64) {
 
 //mcts.Node's numbers, in one vector per tree with the root first. An expanded node's moves (its edges) are contiguous
 //in the tree's edge vectors, and a move gets a node only once a simulation goes through it, as lc0's edges do: a node
-//for each of a position's ~37 moves took 1.8 KB a simulation, most of them never visited
+//for each of a position's ~37 moves took 1.8 KB a simulation, most of them never visited (lc0's layout: NO_LINK's)
 #[derive(Clone, Copy)]
 pub struct Node {
     pub visit_count: u32,
@@ -75,14 +75,48 @@ pub struct Node {
     //until the node is expanded: edges outnumber nodes ~37 to 1, and u32 edge indices would end at ~115M nodes
     edges_at: u64,
     pub proof: Option<Proof>, //only with SearchSettings' certainty, and never at the root
+    children: u32,            //its moves with a node (NO_LINK's encoding)
 }
 
 //an edge without a node
 const NO_NODE: u32 = u32::MAX;
 
+//lc0's layout, both trees': a move gets a link once a simulation goes through it (its node, its own visits with
+//transpositions, the next link of its node's list, its place among the node's moves), in a list in the moves' order; a
+//node with SOLID_TREE_THRESHOLD visits (lc0's solid-tree-threshold) has its list made an array of slots, one a move, each
+//only a node and visits, so a busy node's scan reads what columns of nodes and visits would. A move with a node is named
+//by its list link, or by SOLID with its slot; a node's children are none (NO_LINK), its list's first link, or its first
+//slot. Link 0 is never given out
+pub const NO_LINK: u32 = 0;
+pub const SOLID: u32 = 1 << 31;
+pub const SOLID_TREE_THRESHOLD: u32 = 100;
+
+//whether a move's name is a list link's (not a solid slot's)
+pub fn listed(link: u32) -> bool {
+    link & SOLID == 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Link {
+    child: u32,
+    visits: u32,
+    next: u32,
+    place: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Slot {
+    child: u32,
+    visits: u32,
+}
+
+const UNVISITED_SLOT: Slot = Slot { child: NO_NODE, visits: 0 };
+//link 0's, never read as a move's
+const UNLINKED: Link = Link { child: NO_NODE, visits: 0, next: NO_LINK, place: 0 };
+
 impl Node {
     fn new() -> Node {
-        Node { visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, edges_at: 0, proof: None }
+        Node { visit_count: 0, in_flight: 0, value_sum: 0.0, visited_policy_sqrt: 0.0, edges_at: 0, proof: None, children: NO_LINK }
     }
 
     //the node's moves, as indices into the tree's edges
@@ -213,14 +247,13 @@ impl<'a> Repeats<'a> {
     }
 }
 
-//a tree's transpositions (SearchSettings' transpositions): the node of every position by graph_key, each edge's visits
-//(a node's count every path's to it), and each node's fifty-move count. The fifty-move count only grows along a path,
+//a tree's transpositions (SearchSettings' transpositions): the node of every position by graph_key and each node's
+//fifty-move count; a move's own visits are its link's (a node's count every path's to it). The fifty-move count only grows along a path,
 //so no path reaches a node twice: the graph has no cycles. A repeat of a position on a path is a draw on that path only
 //(Repeats), never in the numbers of the node the other paths share
 #[derive(Clone)]
 struct Graph {
     table: KeyMap<u32>,
-    edge_visits: Vec<u32>,
     halfmoves: Vec<u16>,
 }
 
@@ -228,12 +261,12 @@ impl Graph {
     fn new(root_key: u64, root_halfmoves: u32) -> Graph {
         let mut table = KeyMap::default();
         table.insert(graph_key(root_key, root_halfmoves), 0);
-        Graph { table, edge_visits: Vec::new(), halfmoves: vec![halfmove_count(root_halfmoves)] }
+        Graph { table, halfmoves: vec![halfmove_count(root_halfmoves)] }
     }
 
     fn bytes(&self) -> usize {
         //a table entry is its key, its node and a control byte, in a table at most 7/8 full
-        self.table.capacity() * 16 + self.edge_visits.capacity() * size_of::<u32>() + self.halfmoves.capacity() * size_of::<u16>()
+        self.table.capacity() * 16 + self.halfmoves.capacity() * size_of::<u16>()
     }
 }
 
@@ -343,8 +376,8 @@ fn reserve_to<T>(vector: &mut Vec<T>, capacity: usize) {
     }
 }
 
-//a tree's node and edge vectors, as compact returns the old ones to free
-pub type Vectors = (Vec<Node>, Vec<u64>, Vec<PackedMove>, Vec<f32>, Vec<u32>);
+//a tree's node, edge, link and slot vectors, as compact returns the old ones to free
+pub type Vectors = (Vec<Node>, Vec<u64>, Vec<PackedMove>, Vec<f32>, Vec<Link>, Vec<Slot>);
 
 //nodes a walk or copy that may be stopped (an abort flag) goes through between looks at the flag
 const ABORT_CHECKS: usize = 4096;
@@ -369,12 +402,15 @@ pub struct Tree {
     pub nodes: Vec<Node>,
     root: usize,         //the root's node: 0 but after move_root, until compact
     node_keys: Vec<u64>, //each node's position_key, made with the node
-    //the edges: every expanded node's moves in python-chess's order with their priors, and each move's node once it
-    //has one (NO_NODE before)
+    //the edges: every expanded node's moves in python-chess's order with their priors
     moves: Vec<PackedMove>,
     priors: Vec<f32>,        //as the network gives them, read as f64s
     noised_priors: Vec<f64>, //the root's once add_root_noise has mixed its noise in (no longer f32s); empty without
-    children: Vec<u32>,
+    //the moves with a node (NO_LINK's): the lists' links, link 0 never given out, and the solid nodes' slots
+    links: Vec<Link>,
+    slots: Vec<Slot>,
+    //the memory limit of the last round, which a node's slots stay within (make_solid)
+    memory_limit: usize,
     //the simulations waiting for the network by round (Round's id), each round's in the order of its boards. A round
     //whose leaves are all back keeps its room for a later one
     pending: Vec<(u64, VecDeque<PendingLeaf>)>,
@@ -397,7 +433,9 @@ impl Tree {
             moves: Vec::new(),
             priors: Vec::new(),
             noised_priors: Vec::new(),
-            children: Vec::new(),
+            links: vec![UNLINKED],
+            slots: Vec::new(),
+            memory_limit: usize::MAX,
             pending: Vec::new(),
             logits: Vec::new(),
             full: false,
@@ -417,7 +455,8 @@ impl Tree {
     //(those waiting for the network and this one), within the nodes' u32 indices and the memory limit. Under a limit
     //the vectors are grown here (grown_capacity), so that no push grows them past it
     fn make_room(&mut self, memory_limit: usize) -> bool {
-        if !node_fits(self.nodes.len()) {
+        self.memory_limit = memory_limit;
+        if !node_fits(self.nodes.len()) || self.links.len() >= SOLID as usize {
             return false;
         }
         if memory_limit == usize::MAX {
@@ -432,6 +471,12 @@ impl Tree {
         };
         reserve_to(&mut self.nodes, nodes);
         reserve_to(&mut self.node_keys, nodes);
+        //a link for this simulation's move and one for each waiting leaf's
+        let spare = memory_limit.saturating_sub(self.allocated_bytes());
+        let Some(links) = grown_capacity(self.links.capacity(), self.links.len() + self.pending() + 1, size_of::<Link>(), spare) else {
+            return false;
+        };
+        reserve_to(&mut self.links, links);
         if let Some(graph) = &mut self.graph {
             reserve_to(&mut graph.halfmoves, nodes);
         }
@@ -446,17 +491,17 @@ impl Tree {
             self.graph.as_mut().expect("the graph").table.reserve(more);
         }
         let spare = memory_limit.saturating_sub(self.allocated_bytes());
-        let graph_edge_bytes = if self.graph.is_some() { size_of::<u32>() } else { 0 };
-        let edge_bytes = size_of::<PackedMove>() + size_of::<f32>() + size_of::<u32>() + graph_edge_bytes;
-        let capacity = self.moves.capacity().min(self.priors.capacity()).min(self.children.capacity());
+        let edge_bytes = size_of::<PackedMove>() + size_of::<f32>();
+        let capacity = self.moves.capacity().min(self.priors.capacity());
         let Some(edges) = grown_capacity(capacity, self.moves.len() + (self.pending() + 1) * MOST_MOVES, edge_bytes, spare) else {
             return false;
         };
         reserve_to(&mut self.moves, edges);
         reserve_to(&mut self.priors, edges);
-        reserve_to(&mut self.children, edges);
-        if let Some(graph) = &mut self.graph {
-            reserve_to(&mut graph.edge_visits, edges);
+        //the slots of a node made solid: one more node's moves (make_solid makes none it has no room for)
+        let spare = memory_limit.saturating_sub(self.allocated_bytes());
+        if let Some(slots) = grown_capacity(self.slots.capacity(), self.slots.len() + MOST_MOVES, size_of::<Slot>(), spare) {
+            reserve_to(&mut self.slots, slots);
         }
         true
     }
@@ -467,7 +512,8 @@ impl Tree {
             + self.node_keys.capacity() * size_of::<u64>()
             + self.moves.capacity() * size_of::<PackedMove>()
             + self.priors.capacity() * size_of::<f32>()
-            + self.children.capacity() * size_of::<u32>()
+            + self.links.capacity() * size_of::<Link>()
+            + self.slots.capacity() * size_of::<Slot>()
             + self.graph.as_ref().map_or(0, Graph::bytes)
     }
 
@@ -494,17 +540,104 @@ impl Tree {
         self.moves[edge]
     }
 
-    //the edge's node, None until a simulation has gone through it
-    pub fn child(&self, edge: usize) -> Option<&Node> {
-        let child = self.children[edge];
-        (child != NO_NODE).then(|| &self.nodes[child as usize])
+    //a move's node by its name (NO_NODE for a solid slot without one)
+    fn link_child(&self, link: u32) -> u32 {
+        if listed(link) { self.links[link as usize].child } else { self.slots[(link & !SOLID) as usize].child }
     }
 
-    //the move's visits: its node's, or with transpositions the move's own (its node counts every path's)
-    pub fn visits(&self, edge: usize) -> u32 {
-        match &self.graph {
-            Some(graph) => graph.edge_visits[edge],
-            None => self.child(edge).map_or(0, |child| child.visit_count),
+    //a move's own visits by its name (with transpositions)
+    fn link_visits(&mut self, link: u32) -> &mut u32 {
+        if listed(link) { &mut self.links[link as usize].visits } else { &mut self.slots[(link & !SOLID) as usize].visits }
+    }
+
+    //the name of the node's move `edge` if it has a node, NO_LINK if not
+    fn link_of(&self, node: usize, edge: usize) -> u32 {
+        let place = edge - self.nodes[node].edges().start;
+        let children = self.nodes[node].children;
+        if !listed(children) {
+            let link = children + place as u32;
+            return if self.link_child(link) == NO_NODE { NO_LINK } else { link };
+        }
+        let mut link = children;
+        while link != NO_LINK && (self.links[link as usize].place as usize) < place {
+            link = self.links[link as usize].next;
+        }
+        if link != NO_LINK && self.links[link as usize].place as usize == place { link } else { NO_LINK }
+    }
+
+    //the node's moves with a node in their order, each as (its place among the node's moves, its name)
+    pub fn linked(&self, node: usize) -> TreeLinked<'_> {
+        let children = self.nodes[node].children;
+        let solid = if listed(children) {
+            &[][..]
+        } else {
+            let first = (children & !SOLID) as usize;
+            &self.slots[first..first + self.nodes[node].edges().len()]
+        };
+        TreeLinked { links: &self.links, children, at: if listed(children) { children } else { 0 }, solid }
+    }
+
+    //a move's visits by its name: its node's, or with transpositions the move's own (its node counts every path's)
+    fn move_visits(&self, link: u32) -> u32 {
+        match (link, &self.graph) {
+            (NO_LINK, _) => 0,
+            (_, Some(_)) => {
+                if listed(link) {
+                    self.links[link as usize].visits
+                } else {
+                    self.slots[(link & !SOLID) as usize].visits
+                }
+            }
+            (_, None) => self.nodes[self.link_child(link) as usize].visit_count,
+        }
+    }
+
+    //the node of the node's move `edge`, None until a simulation has gone through it
+    pub fn child_index(&self, node: usize, edge: usize) -> Option<usize> {
+        let link = self.link_of(node, edge);
+        (link != NO_LINK).then(|| self.link_child(link) as usize)
+    }
+
+    pub fn child(&self, node: usize, edge: usize) -> Option<&Node> {
+        self.child_index(node, edge).map(|child| &self.nodes[child])
+    }
+
+    //the visits of the node's move `edge`
+    pub fn visits(&self, node: usize, edge: usize) -> u32 {
+        self.move_visits(self.link_of(node, edge))
+    }
+
+    //the link a waiting leaf's path holds for a move of the node, in case the node was made solid since
+    fn current_link(&self, node: usize, link: u32) -> u32 {
+        let children = self.nodes[node].children;
+        if !listed(children) && listed(link) { children + self.links[link as usize].place } else { link }
+    }
+
+    //lc0's MakeSolid at SOLID_TREE_THRESHOLD visits: the node's slots one a move, its list's copied in. Under a memory
+    //limit only into the room make_room made
+    fn make_solid(&mut self, node: usize) {
+        let moves = self.nodes[node].edges().len();
+        let head = self.nodes[node].children;
+        if !listed(head) || moves == 0 || (self.memory_limit != usize::MAX && self.slots.len() + moves > self.slots.capacity()) {
+            return;
+        }
+        let first = self.slots.len();
+        self.slots.resize(first + moves, UNVISITED_SLOT);
+        let mut link = head;
+        while link != NO_LINK {
+            let Link { child, visits, next, place } = self.links[link as usize];
+            self.slots[first + place as usize] = Slot { child, visits };
+            link = next;
+        }
+        self.nodes[node].children = first as u32 | SOLID;
+    }
+
+    //a move's own visits as the move's name holds them (0 for none; without transpositions unused)
+    fn own_visits(&self, link: u32) -> u32 {
+        match link {
+            NO_LINK => 0,
+            _ if listed(link) => self.links[link as usize].visits,
+            _ => self.slots[(link & !SOLID) as usize].visits,
         }
     }
 
@@ -535,16 +668,17 @@ impl Tree {
         &mut self.pending[slot].1
     }
 
-    //a move whose child is a proven loss for the side making it
-    fn proven_lost(&self, edge: usize) -> bool {
-        self.child(edge).and_then(|child| child.proof).is_some_and(|proof| proof.outcome == Outcome::Loss)
+    //a move of the node whose child is a proven loss for the side making it
+    fn proven_lost(&self, node: usize, edge: usize) -> bool {
+        self.child(node, edge).and_then(|child| child.proof).is_some_and(|proof| proof.outcome == Outcome::Loss)
     }
 
     //the visits of the root's two most visited moves, 0 for a move it does not have. A proven loss is left out: the
     //move choice puts it last whatever its visits (most_visited_edge)
     pub fn two_most_visits(&self) -> (u32, u32) {
         let (mut most, mut second) = (0, 0);
-        for visits in self.root().edges().filter(|&edge| !self.proven_lost(edge)).map(|edge| self.visits(edge)) {
+        let root = self.root;
+        for visits in self.root().edges().filter(|&edge| !self.proven_lost(root, edge)).map(|edge| self.visits(root, edge)) {
             if visits > most {
                 (most, second) = (visits, most);
             } else if visits > second {
@@ -556,15 +690,16 @@ impl Tree {
 
     //the root's moves not proven lost: with one left the move choice is known (most_visited_edge puts losses last)
     pub fn moves_not_lost(&self) -> usize {
-        self.root().edges().filter(|&edge| !self.proven_lost(edge)).count()
+        self.root().edges().filter(|&edge| !self.proven_lost(self.root, edge)).count()
     }
 
     //mcts.select_child, with the simulations under a child that wait for the network counted in its visits for the
     //exploration term (lc0's n started); an edge without a node is a child without visits. A proven loss (certainty)
     //is passed over while any other move is left: its result is known, and its visits would only drag the node's mean,
     //and with it the first play urgency of the moves not yet tried, down. With transpositions a move that repeats a
-    //position of the path (`repeats`) is worth a draw, as a tree's repeat leaf is. Returns the edge
-    fn select_edge(&self, node: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> usize {
+    //position of the path (`repeats`) is worth a draw, as a tree's repeat leaf is. Returns the edge and its move's name
+    //(NO_LINK for a list's move without a node, a solid slot whether it has one or not)
+    fn select_edge(&self, node: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> (usize, u32) {
         let parent = &self.nodes[node];
         let c_puct =
             settings.c_puct + settings.c_puct_factor * ((f64::from(parent.visit_count) + settings.c_puct_base) / settings.c_puct_base).ln();
@@ -573,49 +708,73 @@ impl Tree {
         let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt;
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
-        let (mut best, mut best_u) = (0, f64::NEG_INFINITY);
         let noised = node == self.root && !self.noised_priors.is_empty();
-        //with transpositions a move's own visits, its node's mean (every path's)
-        let edge_visits = self.graph.as_ref().map(|graph| &graph.edge_visits[edges.clone()]);
-        for (index, (&prior, &child)) in self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate() {
+        let transpositions = self.graph.is_some();
+        //a move's value from its prior, its node (NO_NODE for none) and its own visits, and the node's edges (0 for none);
+        //None for a proven loss, never chosen
+        let value = |index: usize, prior: f32, child: u32, own_visits: u32| -> Option<(f64, u64)> {
             let prior = if noised { self.noised_priors[index] } else { f64::from(prior) };
-            let (u, child_edges) = match child {
+            if child == NO_NODE {
                 //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
-                NO_NODE => (first_play_urgency + (c_puct * prior * sqrt_children_visits), 0),
-                child => {
-                    let child = &self.nodes[child as usize];
-                    if child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss) {
-                        continue;
-                    }
-                    let repeat = repeats.is_some_and(|repeats| {
-                        let id = self.children[edges.start + index] as usize;
-                        repeats.repeats(self.node_keys[id], self.graph.as_ref().expect("the graph").halfmoves[id])
-                    });
-                    let q = if repeat {
-                        1.0 - settings.draw
-                    } else if child.visit_count > 0 {
-                        child.mean_score()
-                    } else {
-                        first_play_urgency
-                    };
-                    let started = edge_visits.map_or(child.visit_count, |visits| visits[index]) + child.in_flight;
-                    (q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started))), child.edges_at)
-                }
+                return Some((first_play_urgency + (c_puct * prior * sqrt_children_visits), 0));
+            }
+            let id = child as usize;
+            let child = &self.nodes[id];
+            if child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss) {
+                return None;
+            }
+            let repeat =
+                repeats.is_some_and(|repeats| repeats.repeats(self.node_keys[id], self.graph.as_ref().expect("the graph").halfmoves[id]));
+            let q = if repeat {
+                1.0 - settings.draw
+            } else if child.visit_count > 0 {
+                child.mean_score()
+            } else {
+                first_play_urgency
             };
-            if u > best_u {
-                (best, best_u) = (index, u);
-                //the descent goes on through the best child's moves: their cache lines are asked for while the scan
-                //goes on, rather than missed after it
+            //with transpositions a move's own visits, its node's mean (every path's)
+            let started = if transpositions { own_visits } else { child.visit_count } + child.in_flight;
+            Some((q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started))), child.edges_at))
+        };
+        let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
+        let mut consider = |index: usize, link: u32, found: Option<(f64, u64)>| {
+            if let Some((u, child_edges)) = found
+                && u > best_u
+            {
+                (best, best_u, best_link) = (index, u, link);
+                //the descent goes on through the best child's moves: their priors' cache line is asked for while the
+                //scan goes on, rather than missed after it
                 if child_edges & 255 > 0 {
                     self.prefetch_edges((child_edges >> 8) as usize);
                 }
             }
+        };
+        let priors = &self.priors[edges.clone()];
+        let children = parent.children;
+        if listed(children) {
+            //a list's links, met in their moves' order as the moves are: the next one's place known ahead
+            let place_of = |link: u32| if link == NO_LINK { usize::MAX } else { self.links[link as usize].place as usize };
+            let (mut next_link, mut next_place) = (children, place_of(children));
+            for (index, &prior) in priors.iter().enumerate() {
+                if index == next_place {
+                    let Link { child, visits, next, .. } = self.links[next_link as usize];
+                    consider(index, next_link, value(index, prior, child, visits));
+                    (next_link, next_place) = (next, place_of(next));
+                } else {
+                    consider(index, NO_LINK, value(index, prior, NO_NODE, 0));
+                }
+            }
+        } else {
+            //a solid node's slots, one a move
+            let first = (children & !SOLID) as usize;
+            for (index, (&prior, slot)) in priors.iter().zip(&self.slots[first..first + edges.len()]).enumerate() {
+                consider(index, children + index as u32, value(index, prior, slot.child, slot.visits));
+            }
         }
-        edges.start + best
+        (edges.start + best, best_link)
     }
 
-    //asks for the cache lines of the moves' priors and children from the edge on, a hint that never faults. One line
-    //each: two each were slower with four gather workers
+    //asks for the cache line of the moves' priors from the edge on, a hint that never faults
     #[inline(always)]
     fn prefetch_edges(&self, first: usize) {
         #[cfg(target_arch = "x86_64")]
@@ -624,31 +783,50 @@ impl Tree {
             //SAFETY: sse is part of x86_64, and a prefetch reads nothing the program sees
             unsafe {
                 _mm_prefetch::<_MM_HINT_T0>(self.priors.as_ptr().wrapping_add(first).cast());
-                _mm_prefetch::<_MM_HINT_T0>(self.children.as_ptr().wrapping_add(first).cast());
             }
         }
     }
 
-    //the edge's node, made if the edge has none yet; board is the node's position. With transpositions the node of the
-    //same position and fifty-move count (the table's) is the edge's if there is one
-    fn child_node(&mut self, edge: usize, board: &Chess) -> usize {
-        if self.children[edge] != NO_NODE {
-            return self.children[edge] as usize;
+    //the node of the parent's move `edge` (select_edge's name for it), made if the move has none yet, and the move's
+    //name; board is the node's position. With transpositions the node of the same position and fifty-move count (the
+    //table's) is the move's if there is one
+    fn child_node(&mut self, parent: usize, edge: usize, link: u32, board: &Chess) -> (usize, u32) {
+        if link != NO_LINK && self.link_child(link) != NO_NODE {
+            return (self.link_child(link) as usize, link);
         }
         let key = position_key(board);
-        if let Some(graph) = &mut self.graph {
-            let entry = graph_key(key, board.halfmoves());
-            if let Some(&shared) = graph.table.get(&entry) {
-                self.children[edge] = shared;
-                return shared as usize;
+        let mut child = self.nodes.len() as u32;
+        let shared = self.graph.as_ref().and_then(|graph| graph.table.get(&graph_key(key, board.halfmoves())).copied());
+        match (&mut self.graph, shared) {
+            (_, Some(shared)) => child = shared,
+            (Some(graph), None) => {
+                graph.halfmoves.push(halfmove_count(board.halfmoves()));
+                graph.table.insert(graph_key(key, board.halfmoves()), child);
             }
-            graph.halfmoves.push(halfmove_count(board.halfmoves()));
-            graph.table.insert(entry, self.nodes.len() as u32);
+            (None, None) => {}
         }
-        self.children[edge] = self.nodes.len() as u32;
-        self.nodes.push(Node::new());
-        self.node_keys.push(key);
-        self.children[edge] as usize
+        if shared.is_none() {
+            self.nodes.push(Node::new());
+            self.node_keys.push(key);
+        }
+        if !listed(link) {
+            self.slots[(link & !SOLID) as usize].child = child;
+            return (child as usize, link);
+        }
+        //a link for the move at its place in the list
+        let place = (edge - self.nodes[parent].edges().start) as u32;
+        let made = self.links.len() as u32;
+        let (mut previous, mut next) = (NO_LINK, self.nodes[parent].children);
+        while next != NO_LINK && self.links[next as usize].place < place {
+            (previous, next) = (next, self.links[next as usize].next);
+        }
+        self.links.push(Link { child, visits: 0, next, place });
+        if previous == NO_LINK {
+            self.nodes[parent].children = made;
+        } else {
+            self.links[previous as usize].next = made;
+        }
+        (child as usize, made)
     }
 
     //mcts.descend and finish until the round has its leaves or its simulations, the leaves' boards added to boards: a
@@ -666,7 +844,7 @@ impl Tree {
         let (mut simulations, mut gathered) = (0, 0);
         let mut collisions: Vec<Vec<usize>> = Vec::new();
         let mut path = Vec::new();
-        //with transpositions the edges between the path's nodes, the visits of a move being its own
+        //with transpositions the names of the moves between the path's nodes, the visits of a move being its own
         let mut edges = Vec::new();
         //the tables finish the nodes they cover below the root. Below a root they cover (the engine searches a size it
         //has no dtz tables for), only those right after a capture or pawn move, as lc0 probes: the network steers the
@@ -690,23 +868,24 @@ impl Tree {
             let mut stop = None;
             while self.nodes[node].has_edges() {
                 let halfmoves = board.halfmoves();
-                let edge = match self.graph {
+                let (edge, selected) = match self.graph {
                     Some(_) => self.select_edge(node, settings, Some(&Repeats::new(&self.keys, root_keys - 1, halfmoves))),
                     None => self.select_edge(node, settings, None),
                 };
                 board.play_unchecked(self.moves[edge].to_move(&board));
                 //a descent never ends without a visit or a simulation waiting, so the node is needed
-                node = self.child_node(edge, &board);
+                let link;
+                (node, link) = self.child_node(node, edge, selected, &board);
                 path.push(node);
                 if let Some(graph) = &self.graph {
-                    edges.push(edge);
+                    edges.push(link as usize);
                     //a repeat of this path's position, whatever the node is to other paths, or a node that knows more
                     //than its move
                     if Repeats::new(&self.keys, root_keys - 1, halfmoves).repeats(self.node_keys[node], graph.halfmoves[node]) {
                         stop = Some(Stop::Repeat);
                     } else if self.nodes[node].has_edges()
                         && self.nodes[node].proof.is_none()
-                        && graph.edge_visits[edge] < self.nodes[node].visit_count
+                        && self.move_visits(link) < self.nodes[node].visit_count
                     {
                         stop = Some(Stop::CatchUp);
                     }
@@ -858,10 +1037,6 @@ impl Tree {
             self.moves.push(PackedMove::new(chess_move));
             self.priors.push(prior);
         }
-        self.children.resize(self.moves.len(), NO_NODE);
-        if let Some(graph) = &mut self.graph {
-            graph.edge_visits.resize(self.moves.len(), 0);
-        }
         self.nodes[node].edges_at = (first_edge as u64) << 8 | (self.moves.len() - first_edge) as u64;
     }
 
@@ -882,6 +1057,9 @@ impl Tree {
             self.nodes[node].visit_count += 1;
             self.nodes[node].in_flight -= in_flight;
             self.nodes[node].value_sum += score;
+            if self.nodes[node].visit_count == SOLID_TREE_THRESHOLD {
+                self.make_solid(node);
+            }
             if self.nodes[node].visit_count == 1 && depth > 0 {
                 self.refresh_visited_policy(path[depth - 1]);
             }
@@ -889,9 +1067,9 @@ impl Tree {
         }
     }
 
-    //backup with or without transpositions. With them the edges are those between the path's nodes, and one more when
-    //the path ends above the node the descent stopped at (a repeat or a transposition visit): every edge counts the
-    //visit, and a node's visited policy is refreshed when one of its moves has its first
+    //backup with or without transpositions. With them `edges` names the moves between the path's nodes (their links),
+    //and one more when the path ends above the node the descent stopped at (a repeat or a transposition visit): every
+    //move counts the visit, and a node's visited policy is refreshed when one of its moves has its first
     fn back_up(&mut self, path: &[usize], edges: &[usize], value: f64, in_flight: u32) {
         if self.graph.is_none() {
             return self.backup(path, value, in_flight);
@@ -904,10 +1082,13 @@ impl Tree {
             self.nodes[node].visit_count += 1;
             self.nodes[node].in_flight -= in_flight;
             self.nodes[node].value_sum += score;
-            if let Some(&edge) = edges.get(depth) {
-                let graph = self.graph.as_mut().expect("the graph");
-                graph.edge_visits[edge] += 1;
-                if graph.edge_visits[edge] == 1 {
+            if self.nodes[node].visit_count == SOLID_TREE_THRESHOLD {
+                self.make_solid(node);
+            }
+            if let Some(&link) = edges.get(depth) {
+                let visits = self.link_visits(self.current_link(node, link as u32));
+                *visits += 1;
+                if *visits == 1 {
                     self.refresh_visited_policy(node);
                 }
             }
@@ -946,19 +1127,21 @@ impl Tree {
     //an expanded node's result from its moves' proofs: it is lost for the side that moved into it if a move wins (the
     //quickest), and otherwise known once every move's result is, the best of them
     fn proof_from_moves(&self, node: usize) -> Option<Proof> {
-        let edges = self.nodes[node].edges();
-        if edges.is_empty() {
+        let moves = self.nodes[node].edges().len();
+        if moves == 0 {
             return None;
         }
-        let mut best: Option<Proof> = None;
-        let mut all_proven = true;
-        for edge in edges {
-            match self.child(edge).and_then(|child| child.proof) {
-                Some(proof) if best.is_none_or(|best| proof_rank(&proof) > proof_rank(&best)) => best = Some(proof),
-                Some(_) => {}
-                None => all_proven = false,
+        //a move without a node has no proof
+        let (mut best, mut proven): (Option<Proof>, usize) = (None, 0);
+        for (_, link) in self.linked(node) {
+            if let Some(proof) = self.nodes[self.link_child(link) as usize].proof {
+                proven += 1;
+                if best.is_none_or(|best| proof_rank(&proof) > proof_rank(&best)) {
+                    best = Some(proof);
+                }
             }
         }
+        let all_proven = proven == moves;
         let best = best?;
         let outcome = match best.outcome {
             Outcome::Win => Outcome::Loss,
@@ -1015,13 +1198,13 @@ impl Tree {
             }
             return Ok(());
         }
-        for edge in edges {
-            let child = self.children[edge];
-            if child == NO_NODE || self.nodes[child as usize].proof.is_some() {
+        let children: Vec<(usize, u32)> = self.linked(node).map(|(place, link)| (place, self.link_child(link))).collect();
+        for (place, child) in children {
+            if self.nodes[child as usize].proof.is_some() {
                 continue;
             }
             path.push(child as usize);
-            line.push(edge);
+            line.push(edges.start + place);
             self.keys.push(self.node_keys[child as usize]);
             let found = self.find_stale_leaves(path, line, settings, tables, root_covered, stale);
             self.keys.pop();
@@ -1106,14 +1289,9 @@ impl Tree {
             parts.push(Part::Subtree(node, places.clone()));
             return;
         }
-        let edges = self.nodes[node].edges();
-        for edge in edges.clone() {
-            let child = self.children[edge];
-            if child == NO_NODE {
-                continue;
-            }
-            places.push((edge - edges.start) as u16);
-            let child = child as usize;
+        for (place, link) in self.linked(node) {
+            places.push(place as u16);
+            let child = self.link_child(link) as usize;
             if self.nodes[child].has_edges() {
                 self.split_for_walk(child, places, share, parts);
             } else if self.nodes[child].visit_count > 0 && self.nodes[child].proof.is_none() {
@@ -1135,14 +1313,9 @@ impl Tree {
         if looked.is_multiple_of(ABORT_CHECKS) && abort.load(Ordering::Relaxed) {
             return false;
         }
-        let edges = self.nodes[node].edges();
-        for edge in edges.clone() {
-            let child = self.children[edge];
-            if child == NO_NODE {
-                continue;
-            }
-            places.push((edge - edges.start) as u16);
-            let child = child as usize;
+        for (place, link) in self.linked(node) {
+            places.push(place as u16);
+            let child = self.link_child(link) as usize;
             if self.nodes[child].has_edges() {
                 if !self.find_candidates(child, places, candidates, looked, abort) {
                     return false;
@@ -1174,8 +1347,9 @@ impl Tree {
         'candidates: for places in candidates.iter().filter(|places| places.len() > line.len() && places.starts_with(line)) {
             let (mut path, mut edges) = (vec![self.root], Vec::new());
             for &place in &places[line.len()..] {
-                let edge = self.nodes[*path.last().expect("the root at least")].edges().start + usize::from(place);
-                let child = self.children[edge] as usize;
+                let parent = *path.last().expect("the root at least");
+                let edge = self.nodes[parent].edges().start + usize::from(place);
+                let child = self.child_index(parent, edge).expect("a candidate's moves have nodes");
                 //the walk passes over a proven node and what is below it
                 if self.nodes[child].proof.is_some() {
                     continue 'candidates;
@@ -1214,8 +1388,9 @@ impl Tree {
 
     fn refresh_visited_policy(&mut self, node: usize) {
         //Keep Python's summation order and compensation, including after noise on a reused root.
-        let edges = self.nodes[node].edges();
-        self.nodes[node].visited_policy_sqrt = python_sum(edges.filter(|&edge| self.visits(edge) > 0).map(|edge| self.prior(edge))).sqrt();
+        let first = self.nodes[node].edges().start;
+        let visited = self.linked(node).filter(|&(_, link)| self.move_visits(link) > 0);
+        self.nodes[node].visited_policy_sqrt = python_sum(visited.map(|(place, _)| self.prior(first + place))).sqrt();
     }
 
     //mcts.add_root_noise: dirichlet noise as gamma draws scaled to add up to 1, mixed in f64 as mcts.py mixes it
@@ -1232,9 +1407,11 @@ impl Tree {
     //win comes before every other move (the quickest first) and a proven loss after (the slowest first), as lc0 has it
     pub fn most_visited_edge(&self, node: usize) -> usize {
         let preference = |edge: usize| {
-            let visits = self.visits(edge);
-            let mean_score = if visits > 0 { self.nodes[self.children[edge] as usize].mean_score() } else { 0.0 };
-            let proven = match self.child(edge).and_then(|child| child.proof) {
+            let link = self.link_of(node, edge);
+            let visits = self.move_visits(link);
+            let child = (link != NO_LINK).then(|| &self.nodes[self.link_child(link) as usize]);
+            let mean_score = child.filter(|_| visits > 0).map_or(0.0, Node::mean_score);
+            let proven = match child.and_then(|child| child.proof) {
                 Some(proof) if proof.outcome != Outcome::Draw => proof_rank(&proof),
                 _ => (Outcome::Draw, 0),
             };
@@ -1255,14 +1432,14 @@ impl Tree {
         let (mut line, mut node) = (Vec::new(), self.root);
         while self.nodes[node].has_edges() {
             let edge = self.most_visited_edge(node);
-            if !line.is_empty() && self.visits(edge) == 0 {
+            if !line.is_empty() && self.visits(node, edge) == 0 {
                 break;
             }
             line.push(edge);
             //an edge without a node leads to a node without children
-            match self.children[edge] {
-                NO_NODE => break,
-                child => node = child as usize,
+            match self.child_index(node, edge) {
+                None => break,
+                Some(child) => node = child,
             }
         }
         line
@@ -1271,20 +1448,21 @@ impl Tree {
     //the root's edges, the most visited first and ties in their order (a stable sort)
     pub fn edges_by_visits(&self) -> Vec<usize> {
         let mut edges: Vec<usize> = self.root().edges().collect();
-        edges.sort_by(|&a, &b| self.visits(b).cmp(&self.visits(a)));
+        edges.sort_by(|&a, &b| self.visits(self.root, b).cmp(&self.visits(self.root, a)));
         edges
     }
 
     //plays the root's move and makes its node the root, with its subtree (tree reuse) or without
     pub fn play(&mut self, edge: usize, keep_subtree: bool) {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
-        if keep_subtree && self.children[edge] != NO_NODE {
+        if keep_subtree && self.child_index(self.root, edge).is_some() {
             self.move_root(&[edge]);
             self.compact(1, None);
         } else {
             self.board.play_unchecked(self.moves[edge].to_move(&self.board));
             self.keys.push(position_key(&self.board));
-            (self.nodes, self.moves, self.priors, self.children) = (vec![Node::new()], Vec::new(), Vec::new(), Vec::new());
+            (self.nodes, self.moves, self.priors) = (vec![Node::new()], Vec::new(), Vec::new());
+            (self.links, self.slots) = (vec![UNLINKED], Vec::new());
             self.node_keys = vec![*self.keys.last().expect("the root's key")];
             self.noised_priors.clear();
             self.full = false;
@@ -1311,10 +1489,10 @@ impl Tree {
     pub fn move_root(&mut self, line: &[usize]) {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         for &edge in line {
-            assert_ne!(self.children[edge], NO_NODE, "a line through the tree's nodes");
+            let child = self.child_index(self.root, edge).expect("a line through the tree's nodes");
             self.board.play_unchecked(self.moves[edge].to_move(&self.board));
             self.keys.push(position_key(&self.board));
-            self.root = self.children[edge] as usize;
+            self.root = child;
         }
         if !line.is_empty() {
             self.nodes[self.root].proof = None;
@@ -1352,17 +1530,29 @@ impl Tree {
             level = level.end..order.len();
         }
 
-        //the order in stretches, one a thread, each with its edges and where they and its children's numbers start
+        //the order in stretches, one a thread, each with its edges, links and slots and where they and its children's
+        //numbers start. A node with SOLID_TREE_THRESHOLD visits gets a slot a move, any other a link a move with a node
         let size = chunk_size(order.len(), threads);
         let positions: Vec<Range<usize>> = (0..order.len()).step_by(size).map(|start| start..(start + size).min(order.len())).collect();
-        let (mut first_edge, mut first_child) = (0, 1);
-        let starts: Vec<(usize, usize, usize)> = positions
+        let solid = |position: usize| tree.nodes[order[position] as usize].visit_count >= SOLID_TREE_THRESHOLD;
+        let (mut first_edge, mut first_child, mut first_link, mut first_slot) = (0, 1, 1, 0);
+        let starts: Vec<[usize; 8]> = positions
             .iter()
             .map(|positions| {
                 let edges = counts[positions.clone()].iter().map(|&(_, edges)| usize::from(edges)).sum();
-                let start = (edges, first_edge, first_child);
-                first_edge += edges;
-                first_child += counts[positions.clone()].iter().map(|&(with_node, _)| usize::from(with_node)).sum::<usize>();
+                let with_node: usize = counts[positions.clone()].iter().map(|&(with_node, _)| usize::from(with_node)).sum();
+                let (mut links, mut slots) = (0, 0);
+                for position in positions.clone() {
+                    let (with_node, edges) = counts[position];
+                    if solid(position) {
+                        slots += usize::from(edges);
+                    } else {
+                        links += usize::from(with_node);
+                    }
+                }
+                let start = [edges, links, slots, first_edge, first_child, first_link, first_slot, 0];
+                (first_edge, first_child, first_link, first_slot) =
+                    (first_edge + edges, first_child + with_node, first_link + links, first_slot + slots);
                 start
             })
             .collect();
@@ -1370,31 +1560,39 @@ impl Tree {
         //room for the whole tree, so the copy never regrows (that took twice the time); unwritten room takes no memory
         let (node_room, edge_room) = (tree.nodes.len(), tree.moves.len());
         let (mut nodes, mut node_keys) = (Vec::with_capacity(node_room), Vec::with_capacity(node_room));
-        let (mut moves, mut priors, mut children) =
-            (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
+        let (mut moves, mut priors) = (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
+        let (mut links, mut slots) = (Vec::with_capacity(first_link), Vec::with_capacity(first_slot));
+        links.push(UNLINKED);
         {
             let mut nodes_left = &mut nodes.spare_capacity_mut()[..order.len()];
             let mut keys_left = &mut node_keys.spare_capacity_mut()[..order.len()];
             let mut moves_left = &mut moves.spare_capacity_mut()[..first_edge];
             let mut priors_left = &mut priors.spare_capacity_mut()[..first_edge];
-            let mut children_left = &mut children.spare_capacity_mut()[..first_edge];
+            let mut links_left = &mut links.spare_capacity_mut()[..first_link - 1];
+            let mut slots_left = &mut slots.spare_capacity_mut()[..first_slot];
             let mut stretches = Vec::with_capacity(positions.len());
-            for (positions, &(edges, first_edge, first_child)) in positions.iter().zip(&starts) {
-                let (nodes, node_keys, moves, priors, children);
+            for (positions, &[edges, link_count, slot_count, first_edge, first_child, first_link, first_slot, _]) in
+                positions.iter().zip(&starts)
+            {
+                let (nodes, node_keys, moves, priors, links, slots);
                 (nodes, nodes_left) = std::mem::take(&mut nodes_left).split_at_mut(positions.len());
                 (node_keys, keys_left) = std::mem::take(&mut keys_left).split_at_mut(positions.len());
                 (moves, moves_left) = std::mem::take(&mut moves_left).split_at_mut(edges);
                 (priors, priors_left) = std::mem::take(&mut priors_left).split_at_mut(edges);
-                (children, children_left) = std::mem::take(&mut children_left).split_at_mut(edges);
+                (links, links_left) = std::mem::take(&mut links_left).split_at_mut(link_count);
+                (slots, slots_left) = std::mem::take(&mut slots_left).split_at_mut(slot_count);
                 stretches.push(Stretch {
                     positions: positions.clone(),
                     first_edge,
                     first_child,
+                    first_link,
+                    first_slot,
                     nodes,
                     node_keys,
                     moves,
                     priors,
-                    children,
+                    links,
+                    slots,
                 });
             }
             let order = &order;
@@ -1411,23 +1609,38 @@ impl Tree {
                 return None;
             }
         }
-        //SAFETY: the stretches split the first order.len() nodes and first_edge edges between them, and each wrote all
-        //of its own
+        //SAFETY: the stretches split the first order.len() nodes, first_edge edges, the links after link 0 and the slots
+        //between them, and each wrote all of its own
         unsafe {
             nodes.set_len(order.len());
             node_keys.set_len(order.len());
             moves.set_len(first_edge);
             priors.set_len(first_edge);
-            children.set_len(first_edge);
+            links.set_len(first_link);
+            slots.set_len(first_slot);
         }
         self.root = 0;
-        Some((
+        Some(self.replace_vectors(nodes, node_keys, moves, priors, links, slots))
+    }
+
+    //the tree's vectors swapped for a compact's, the old ones returned to free
+    fn replace_vectors(
+        &mut self,
+        nodes: Vec<Node>,
+        node_keys: Vec<u64>,
+        moves: Vec<PackedMove>,
+        priors: Vec<f32>,
+        links: Vec<Link>,
+        slots: Vec<Slot>,
+    ) -> Vectors {
+        (
             std::mem::replace(&mut self.nodes, nodes),
             std::mem::replace(&mut self.node_keys, node_keys),
             std::mem::replace(&mut self.moves, moves),
             std::mem::replace(&mut self.priors, priors),
-            std::mem::replace(&mut self.children, children),
-        ))
+            std::mem::replace(&mut self.links, links),
+            std::mem::replace(&mut self.slots, slots),
+        )
     }
 
     //the nodes the moves of a chunk of a level lead to (that part of the next level), in order, and of each node in the
@@ -1438,55 +1651,55 @@ impl Tree {
             if index.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
                 return None;
             }
-            let (before, edges) = (next.len(), self.nodes[node as usize].edges());
-            next.extend(self.children[edges.clone()].iter().filter(|&&child| child != NO_NODE));
-            counts.push(((next.len() - before) as u8, edges.len() as u8));
+            let before = next.len();
+            next.extend(self.linked(node as usize).map(|(_, link)| self.link_child(link)));
+            counts.push(((next.len() - before) as u8, self.nodes[node as usize].edges().len() as u8));
         }
         Some((next, counts))
     }
 
     //compact on one thread, in one pass: the nodes in breadth-first order, each one's moves as it comes, and the moves
-    //with a node getting theirs copied at the end
+    //with a node getting theirs copied at the end (their links or slots made again, solid with SOLID_TREE_THRESHOLD
+    //visits)
     fn compact_on_one_thread(&mut self, abort: Option<&AtomicBool>) -> Option<Vectors> {
         //room for the whole tree, so the copy never regrows (that took twice the time); unwritten room takes no memory
         let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
-        let mut nodes = Vec::with_capacity(node_room);
+        let (mut nodes, mut node_keys, mut old_of) =
+            (Vec::with_capacity(node_room), Vec::with_capacity(node_room), Vec::with_capacity(node_room));
         nodes.push(Node { proof: None, ..self.nodes[self.root] });
-        let mut node_keys = Vec::with_capacity(node_room);
         node_keys.push(self.node_keys[self.root]);
-        let (mut moves, mut priors, mut children) =
-            (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
+        old_of.push(self.root);
+        let (mut moves, mut priors) = (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
+        let (mut links, mut slots) = (Vec::with_capacity(self.links.len()), Vec::with_capacity(self.slots.len()));
+        links.push(UNLINKED);
+        let mut children = Vec::new();
         let mut index = 0;
         while index < nodes.len() {
             if index.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
                 return None;
             }
-            let edges = nodes[index].edges();
-            let first_edge = moves.len();
+            let old = old_of[index];
+            let edges = self.nodes[old].edges();
             //a node without moves keeps the first edge Node::new gives it
             if !edges.is_empty() {
-                nodes[index].edges_at = (first_edge as u64) << 8 | edges.len() as u64;
+                nodes[index].edges_at = (moves.len() as u64) << 8 | edges.len() as u64;
             }
             moves.extend_from_slice(&self.moves[edges.clone()]);
-            priors.extend_from_slice(&self.priors[edges.clone()]);
-            children.extend_from_slice(&self.children[edges]);
-            for child in &mut children[first_edge..] {
-                if *child != NO_NODE {
-                    nodes.push(self.nodes[*child as usize]);
-                    node_keys.push(self.node_keys[*child as usize]);
-                    *child = (nodes.len() - 1) as u32;
-                }
+            priors.extend_from_slice(&self.priors[edges]);
+            children.clear();
+            for (place, link) in self.linked(old) {
+                let child = self.link_child(link) as usize;
+                children.push((place, nodes.len() as u32, self.own_visits(link)));
+                nodes.push(self.nodes[child]);
+                node_keys.push(self.node_keys[child]);
+                old_of.push(child);
             }
+            let solid = self.nodes[old].visit_count >= SOLID_TREE_THRESHOLD;
+            link_up(&mut nodes[index], &mut links, &mut slots, solid, children.iter().copied());
             index += 1;
         }
         self.root = 0;
-        Some((
-            std::mem::replace(&mut self.nodes, nodes),
-            std::mem::replace(&mut self.node_keys, node_keys),
-            std::mem::replace(&mut self.moves, moves),
-            std::mem::replace(&mut self.priors, priors),
-            std::mem::replace(&mut self.children, children),
-        ))
+        Some(self.replace_vectors(nodes, node_keys, moves, priors, links, slots))
     }
 
     //compact with transpositions, on one thread: the nodes the root reaches in breadth-first order, a node that several
@@ -1501,8 +1714,10 @@ impl Tree {
         let mut nodes = Vec::with_capacity(node_room);
         let mut node_keys = Vec::with_capacity(node_room);
         let mut halfmoves = Vec::with_capacity(node_room);
-        let (mut moves, mut priors, mut children, mut edge_visits) =
-            (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
+        let (mut moves, mut priors) = (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
+        let (mut links, mut slots) = (Vec::with_capacity(self.links.len()), Vec::with_capacity(self.slots.len()));
+        links.push(UNLINKED);
+        let mut children = Vec::new();
         let mut index = 0;
         while index < order.len() {
             if index.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
@@ -1518,24 +1733,22 @@ impl Tree {
             if !edges.is_empty() {
                 node.edges_at = (moves.len() as u64) << 8 | edges.len() as u64;
             }
-            nodes.push(node);
             node_keys.push(self.node_keys[old]);
             halfmoves.push(graph.halfmoves[old]);
             moves.extend_from_slice(&self.moves[edges.clone()]);
-            priors.extend_from_slice(&self.priors[edges.clone()]);
-            edge_visits.extend_from_slice(&graph.edge_visits[edges.clone()]);
-            for &child in &self.children[edges] {
-                children.push(match child {
-                    NO_NODE => NO_NODE,
-                    _ => {
-                        if copied_as[child as usize] == NO_NODE {
-                            copied_as[child as usize] = order.len() as u32;
-                            order.push(child as usize);
-                        }
-                        copied_as[child as usize]
-                    }
-                });
+            priors.extend_from_slice(&self.priors[edges]);
+            children.clear();
+            for (place, link) in self.linked(old) {
+                let child = self.link_child(link) as usize;
+                if copied_as[child] == NO_NODE {
+                    copied_as[child] = order.len() as u32;
+                    order.push(child);
+                }
+                children.push((place, copied_as[child], self.own_visits(link)));
             }
+            let solid = node.visit_count >= SOLID_TREE_THRESHOLD;
+            link_up(&mut node, &mut links, &mut slots, solid, children.iter().copied());
+            nodes.push(node);
             index += 1;
         }
         let mut table = KeyMap::default();
@@ -1543,23 +1756,19 @@ impl Tree {
         for (node, (&key, &count)) in node_keys.iter().zip(&halfmoves).enumerate() {
             table.insert(graph_key(key, u32::from(count)), node as u32);
         }
-        self.graph = Some(Graph { table, edge_visits, halfmoves });
+        self.graph = Some(Graph { table, halfmoves });
         self.root = 0;
-        Some((
-            std::mem::replace(&mut self.nodes, nodes),
-            std::mem::replace(&mut self.node_keys, node_keys),
-            std::mem::replace(&mut self.moves, moves),
-            std::mem::replace(&mut self.priors, priors),
-            std::mem::replace(&mut self.children, children),
-        ))
+        Some(self.replace_vectors(nodes, node_keys, moves, priors, links, slots))
     }
 
     //compact's copy of a stretch of the breadth-first order: each node with its moves at their new edges, and the moves'
-    //nodes numbered as the order has them. False once abort is set
+    //nodes numbered as the order has them in its links or slots (solid with SOLID_TREE_THRESHOLD visits). False once
+    //abort is set
     fn copy_stretch(&self, stretch: Stretch, order: &[u32], abort: Option<&AtomicBool>) -> bool {
         let (mut edge, mut child) = (stretch.first_edge, stretch.first_child);
-        for (slot, position) in stretch.positions.clone().enumerate() {
-            if slot.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
+        let (mut link, mut slot) = (stretch.first_link, stretch.first_slot);
+        for (copied, position) in stretch.positions.clone().enumerate() {
+            if copied.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
                 return false;
             }
             let old = order[position] as usize;
@@ -1572,23 +1781,104 @@ impl Tree {
             if !edges.is_empty() {
                 node.edges_at = (edge as u64) << 8 | edges.len() as u64;
             }
-            stretch.nodes[slot].write(node);
-            stretch.node_keys[slot].write(self.node_keys[old]);
-            for old_edge in edges {
+            for old_edge in edges.clone() {
                 let at = edge - stretch.first_edge;
                 stretch.moves[at].write(self.moves[old_edge]);
                 stretch.priors[at].write(self.priors[old_edge]);
-                stretch.children[at].write(match self.children[old_edge] {
-                    NO_NODE => NO_NODE,
-                    _ => {
-                        child += 1;
-                        (child - 1) as u32
-                    }
-                });
                 edge += 1;
             }
+            if node.visit_count >= SOLID_TREE_THRESHOLD {
+                let first = slot;
+                for at in first..first + edges.len() {
+                    stretch.slots[at - stretch.first_slot].write(UNVISITED_SLOT);
+                }
+                for (place, old_link) in self.linked(old) {
+                    stretch.slots[first + place - stretch.first_slot]
+                        .write(Slot { child: child as u32, visits: self.own_visits(old_link) });
+                    child += 1;
+                }
+                node.children = first as u32 | SOLID;
+                slot += edges.len();
+            } else {
+                node.children = NO_LINK;
+                let mut previous = None;
+                for (place, old_link) in self.linked(old) {
+                    if previous.is_none() {
+                        node.children = link as u32;
+                    }
+                    let next = Link { child: child as u32, visits: self.own_visits(old_link), next: NO_LINK, place: place as u32 };
+                    if let Some(previous) = previous.replace((link, next)) {
+                        let (at, mut written): (usize, Link) = previous;
+                        written.next = link as u32;
+                        stretch.links[at - stretch.first_link].write(written);
+                    }
+                    child += 1;
+                    link += 1;
+                }
+                if let Some((at, last)) = previous {
+                    stretch.links[at - stretch.first_link].write(last);
+                }
+            }
+            stretch.nodes[position - stretch.positions.start].write(node);
+            stretch.node_keys[position - stretch.positions.start].write(self.node_keys[old]);
         }
         true
+    }
+}
+
+//a node's moves with a node in their order, as (place, node, own visits), made whole on the end of the links or slots of
+//a tree being made: solid (a slot a move) or a list
+fn link_up(node: &mut Node, links: &mut Vec<Link>, slots: &mut Vec<Slot>, solid: bool, children: impl Iterator<Item = (usize, u32, u32)>) {
+    if solid {
+        let first = slots.len();
+        slots.resize(first + node.edges().len(), UNVISITED_SLOT);
+        for (place, child, visits) in children {
+            slots[first + place] = Slot { child, visits };
+        }
+        node.children = first as u32 | SOLID;
+        return;
+    }
+    node.children = NO_LINK;
+    for (place, child, visits) in children {
+        let link = links.len() as u32;
+        if node.children == NO_LINK {
+            node.children = link;
+        } else {
+            links[link as usize - 1].next = link;
+        }
+        links.push(Link { child, visits, next: NO_LINK, place: place as u32 });
+    }
+}
+
+//a node's moves with a node in their order, each as (its place among the node's moves, its name): the list's links, or
+//the solid slots that have a node (Tree::linked)
+pub struct TreeLinked<'a> {
+    links: &'a [Link],
+    children: u32,
+    at: u32, //a list's next link, a solid node's next place
+    solid: &'a [Slot],
+}
+
+impl Iterator for TreeLinked<'_> {
+    type Item = (usize, u32);
+
+    fn next(&mut self) -> Option<(usize, u32)> {
+        if listed(self.children) {
+            if self.at == NO_LINK {
+                return None;
+            }
+            let link = self.at;
+            self.at = self.links[link as usize].next;
+            return Some((self.links[link as usize].place as usize, link));
+        }
+        while let Some(slot) = self.solid.get(self.at as usize) {
+            let place = self.at;
+            self.at += 1;
+            if slot.child != NO_NODE {
+                return Some((place as usize, self.children + place));
+            }
+        }
+        None
     }
 }
 
@@ -1596,17 +1886,20 @@ impl Tree {
 //its moves with a node and its moves
 type Level = (Vec<u32>, Vec<(u8, u8)>);
 
-//a stretch of the breadth-first order for one of compact's threads: its positions, where its edges and the numbers of
-//its moves' nodes start, and its parts of the new vectors
+//a stretch of the breadth-first order for one of compact's threads: its positions, where its edges, links, slots and the
+//numbers of its moves' nodes start, and its parts of the new vectors
 struct Stretch<'a> {
     positions: Range<usize>,
     first_edge: usize,
     first_child: usize,
+    first_link: usize,
+    first_slot: usize,
     nodes: &'a mut [MaybeUninit<Node>],
     node_keys: &'a mut [MaybeUninit<u64>],
     moves: &'a mut [MaybeUninit<PackedMove>],
     priors: &'a mut [MaybeUninit<f32>],
-    children: &'a mut [MaybeUninit<u32>],
+    links: &'a mut [MaybeUninit<Link>],
+    slots: &'a mut [MaybeUninit<Slot>],
 }
 
 //the items in a chunk for compact's threads: a `threads`th of them each, or all in one below PARALLEL_ITEMS

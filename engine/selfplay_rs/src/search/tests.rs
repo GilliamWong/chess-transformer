@@ -106,7 +106,9 @@ fn copied(tree: &Tree) -> Tree {
         moves: tree.moves.clone(),
         priors: tree.priors.clone(),
         noised_priors: tree.noised_priors.clone(),
-        children: tree.children.clone(),
+        links: tree.links.clone(),
+        slots: tree.slots.clone(),
+        memory_limit: tree.memory_limit,
         pending: Vec::new(),
         logits: Vec::new(),
         full: tree.full,
@@ -141,14 +143,11 @@ fn stale_leaves_by_positions(
         return;
     }
     for edge in edges {
-        let child = tree.children[edge];
-        if child == NO_NODE || tree.nodes[child as usize].proof.is_some() {
-            continue;
-        }
+        let Some(child) = tree.child_index(node, edge).filter(|&child| tree.nodes[child].proof.is_none()) else { continue };
         let mut child_board = board.clone();
         child_board.play_unchecked(tree.moves[edge].to_move(board));
-        path.push(child as usize);
-        tree.keys.push(tree.node_keys[child as usize]);
+        path.push(child);
+        tree.keys.push(tree.node_keys[child]);
         stale_leaves_by_positions(tree, &child_board, path, settings, tables, root_covered, stale);
         tree.keys.pop();
         path.pop();
@@ -179,6 +178,18 @@ fn assert_same<T: PartialEq + Debug>(what: &str, old: &[T], new: &[T]) {
     }
 }
 
+//each node's moves with a node, in their order, as (place, node, visits): what the links and slots hold, whichever holds it
+fn moves_with_nodes(tree: &Tree) -> Vec<Vec<(usize, u32, u32)>> {
+    (0..tree.nodes.len())
+        .map(|node| tree.linked(node).map(|(place, link)| (place, tree.link_child(link), tree.move_visits(link))).collect())
+        .collect()
+}
+
+//the node a line of moves from the root ends on
+fn line_end(tree: &Tree, line: &[usize]) -> usize {
+    line.iter().fold(tree.root_index(), |node, &edge| tree.child_index(node, edge).expect("a line through the tree's nodes"))
+}
+
 //every number of the two trees, the floats by their bits
 fn assert_same_trees(old: &Tree, new: &Tree) {
     let fen = |tree: &Tree| Fen::from_position(&tree.board, EnPassantMode::Legal).to_string();
@@ -199,11 +210,10 @@ fn assert_same_trees(old: &Tree, new: &Tree) {
     assert_same("moves", &old.moves, &new.moves);
     let bits = |priors: &[f32]| -> Vec<u32> { priors.iter().map(|prior| prior.to_bits()).collect() };
     assert_same("priors", &bits(&old.priors), &bits(&new.priors));
-    assert_same("children", &old.children, &new.children);
-    //with transpositions the same graph: the moves' visits, the fifty-move counts and the table
+    assert_same("children", &moves_with_nodes(old), &moves_with_nodes(new));
+    //with transpositions the same graph: the fifty-move counts and the table (the moves' visits are the children's)
     assert_eq!(old.graph.is_some(), new.graph.is_some(), "one tree with transpositions, the other without");
     if let (Some(old), Some(new)) = (&old.graph, &new.graph) {
-        assert_same("edge visits", &old.edge_visits, &new.edge_visits);
         assert_same("fifty-move counts", &old.halfmoves, &new.halfmoves);
         let table = |graph: &Graph| -> Vec<(u64, u32)> {
             let mut entries: Vec<(u64, u32)> = graph.table.iter().map(|(&entry, &node)| (entry, node)).collect();
@@ -220,14 +230,17 @@ fn assert_same_trees(old: &Tree, new: &Tree) {
 fn reusable_lines(tree: &Tree) -> Vec<Vec<usize>> {
     let expected = tree.principal_variation();
     let mut lines: Vec<Vec<usize>> = (1..=expected.len().min(3)).map(|plies| expected[..plies].to_vec()).collect();
-    if let Some(reply_node) = tree.child(expected[0]) {
-        let mut replies: Vec<usize> = reply_node.edges().filter(|&edge| tree.visits(edge) > 0).collect();
-        replies.sort_by_key(|&edge| std::cmp::Reverse(tree.visits(edge)));
+    if let Some(reply_node) = tree.child_index(tree.root_index(), expected[0]) {
+        let mut replies: Vec<usize> = tree.nodes[reply_node].edges().filter(|&edge| tree.visits(reply_node, edge) > 0).collect();
+        replies.sort_by_key(|&edge| std::cmp::Reverse(tree.visits(reply_node, edge)));
         lines.extend(replies.get(1).map(|&reply| vec![expected[0], reply]));
     }
     lines.retain(|line| {
-        line.iter().all(|&edge| tree.children[edge] != NO_NODE)
-            && tree.nodes[tree.children[*line.last().expect("a move")] as usize].has_edges()
+        let mut node = Some(tree.root_index());
+        for &edge in line {
+            node = node.and_then(|node| tree.child_index(node, edge));
+        }
+        node.is_some_and(|node| tree.nodes[node].has_edges())
     });
     lines
 }
@@ -248,7 +261,7 @@ fn advanced(
         .iter()
         .map(|&edge| {
             let place = (edge - tree.nodes[node].edges().start) as u16;
-            node = tree.children[edge] as usize;
+            node = tree.child_index(node, edge).expect("the line's node");
             place
         })
         .collect();
@@ -263,7 +276,7 @@ fn advanced(
     for &place in &places[1..] {
         let edge = advanced.nodes[node].edges().start + usize::from(place);
         rest.push(edge);
-        node = advanced.children[edge] as usize;
+        node = advanced.child_index(node, edge).expect("the line's node");
     }
     advanced.move_root(&rest);
     assert!(advanced.nodes[advanced.root].proof.is_none(), "a root is never proven");

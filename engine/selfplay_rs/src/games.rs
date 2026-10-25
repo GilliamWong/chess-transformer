@@ -86,14 +86,20 @@ impl Game {
         let root = *self.tree.root();
         let turn = self.tree.board.turn();
         //the most visited first, ties in the children's order (np.argsort's stable sort)
-        let most_visited: Vec<usize> =
-            self.tree.edges_by_visits().into_iter().take(settings.top_moves).filter(|&edge| self.tree.visits(edge) > 0).collect();
-        let visits: u32 = most_visited.iter().map(|&edge| self.tree.visits(edge)).sum();
+        let root_index = self.tree.root_index();
+        let most_visited: Vec<usize> = self
+            .tree
+            .edges_by_visits()
+            .into_iter()
+            .take(settings.top_moves)
+            .filter(|&edge| self.tree.visits(root_index, edge) > 0)
+            .collect();
+        let visits: u32 = most_visited.iter().map(|&edge| self.tree.visits(root_index, edge)).sum();
         for slot in 0..settings.top_moves {
             match most_visited.get(slot) {
                 Some(&edge) => {
                     self.record.visit_moves.push(move_ids.id(self.tree.chess_move(edge).to_move(&self.tree.board), turn) as i16);
-                    self.record.visit_shares.push((f64::from(self.tree.visits(edge)) / f64::from(visits)) as f32);
+                    self.record.visit_shares.push((f64::from(self.tree.visits(root_index, edge)) / f64::from(visits)) as f32);
                 }
                 None => {
                     self.record.visit_moves.push(settings.no_move);
@@ -116,14 +122,14 @@ impl Game {
 
     //a root's edge drawn with the chance of its share of the visits (random.choice(p=visits / visits.sum()))
     fn sample_by_visits(&mut self) -> usize {
-        let edges = self.tree.root().edges();
-        let total: u32 = edges.clone().map(|edge| self.tree.visits(edge)).sum();
+        let (root, edges) = (self.tree.root_index(), self.tree.root().edges());
+        let total: u32 = edges.clone().map(|edge| self.tree.visits(root, edge)).sum();
         let mut draw = self.random.random_range(0..total);
         for edge in edges {
-            if draw < self.tree.visits(edge) {
+            if draw < self.tree.visits(root, edge) {
                 return edge;
             }
-            draw -= self.tree.visits(edge);
+            draw -= self.tree.visits(root, edge);
         }
         unreachable!("the draw is below the total")
     }

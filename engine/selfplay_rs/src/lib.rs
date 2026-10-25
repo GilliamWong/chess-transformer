@@ -336,12 +336,12 @@ impl Search {
         let tree = &self.tree;
         let line = tree.principal_variation();
         //one simulation visits no child: then the root's score for its side to move
-        let score = match tree.child(line[0]) {
+        let score = match tree.child(tree.root_index(), line[0]) {
             Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
             _ => 1.0 - tree.root().mean_score(),
         };
         let moves = |edges: &[usize]| -> Vec<String> { edges.iter().map(|&edge| uci(tree.chess_move(edge))).collect() };
-        let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(edge)));
+        let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(tree.root_index(), edge)));
         (self.id, moves(&line), score, root_moves.collect(), tree.root().visit_count)
     }
 }
@@ -447,7 +447,7 @@ type RootNumbers = (u32, u32, u32);
 //root_score's: the chosen move's score, or the root's for its side to move before the move has a visit
 fn root_score_of(search: &Search) -> f64 {
     let tree = &search.tree;
-    match tree.principal_variation().first().and_then(|&edge| tree.child(edge)) {
+    match tree.principal_variation().first().and_then(|&edge| tree.child(tree.root_index(), edge)) {
         Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
         _ => 1.0 - tree.root().mean_score(),
     }
@@ -740,15 +740,15 @@ impl Searches {
 //the moves since (uci) as the edges from the tree's root down to the position after them, and as their places among
 //their nodes' moves, when every move has its node and the last node has moves (a search reports from its root's)
 fn line_to(tree: &Tree, moves: &[String]) -> Option<(Vec<usize>, Vec<u16>)> {
-    let (mut line, mut places, mut root) = (Vec::new(), Vec::new(), tree.root());
+    let (mut line, mut places, mut root) = (Vec::new(), Vec::new(), tree.root_index());
     for played in moves {
-        let edges = root.edges();
+        let edges = tree.nodes[root].edges();
         let edge = edges.clone().find(|&edge| uci(tree.chess_move(edge)) == *played)?;
-        root = tree.child(edge)?;
+        root = tree.child_index(root, edge)?;
         line.push(edge);
         places.push((edge - edges.start) as u16);
     }
-    (!root.edges().is_empty()).then_some((line, places))
+    (!tree.nodes[root].edges().is_empty()).then_some((line, places))
 }
 
 #[pymethods]
