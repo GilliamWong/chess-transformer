@@ -501,6 +501,8 @@ impl SharedTree {
     //node's position. Of two threads that make one, one node is kept and the other's stays unused. With transpositions the
     //table's node of the position (Tree::child_node): one thread makes it under the shard's lock and the others find it
     fn child_node(&self, parent: usize, edge: usize, link: u32, board: &Chess) -> (usize, u32) {
+        //select_edge names no move when it chose none (every move a proven loss, the first taken): its node if it has one
+        let link = if link == NO_LINK { self.link_of(self.nodes.get(parent), edge) } else { link };
         if link != NO_LINK && self.links.child(link) != NO_NODE {
             return (self.links.child(link) as usize, link);
         }
@@ -526,7 +528,10 @@ impl SharedTree {
         let parent = self.nodes.get(parent);
         let place = edge - parent.edges().start;
         let kept = match parent.children() {
-            Children::Solid(_) => self.links.slot(link).claim(made as u32).map(|_| (made, link)).map_err(|other| (other as usize, link)),
+            Children::Solid(first) => {
+                let link = first + place as u32;
+                self.links.slot(link).claim(made as u32).map(|_| (made, link)).map_err(|other| (other as usize, link))
+            }
             //a link for the move, put in at its place unless another thread's is there first
             Children::List(_) => {
                 let mut mine = NO_LINK;

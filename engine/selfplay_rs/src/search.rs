@@ -820,6 +820,8 @@ impl Tree {
     //name; board is the node's position. With transpositions the node of the same position and fifty-move count (the
     //table's) is the move's if there is one
     fn child_node(&mut self, parent: usize, edge: usize, link: u32, board: &Chess) -> (usize, u32) {
+        //select_edge names no move when it chose none (every move a proven loss, the first taken): its node if it has one
+        let link = if link == NO_LINK { self.link_of(parent, edge) } else { link };
         if link != NO_LINK && self.link_child(link) != NO_NODE {
             return (self.link_child(link) as usize, link);
         }
@@ -838,12 +840,13 @@ impl Tree {
             self.nodes.push(Node::new());
             self.node_keys.push(key);
         }
-        if !listed(link) {
-            self.slots[(link & !SOLID) as usize].child = child;
-            return (child as usize, link);
+        let place = (edge - self.nodes[parent].edges().start) as u32;
+        let children = self.nodes[parent].children;
+        if !listed(children) {
+            self.slots[(children & !SOLID) as usize + place as usize].child = child;
+            return (child as usize, children + place);
         }
         //a link for the move at its place in the list
-        let place = (edge - self.nodes[parent].edges().start) as u32;
         let made = self.links.len() as u32;
         let (mut previous, mut next) = (NO_LINK, self.nodes[parent].children);
         while next != NO_LINK && self.links[next as usize].place < place {

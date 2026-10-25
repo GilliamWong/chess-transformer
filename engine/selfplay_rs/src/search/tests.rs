@@ -531,3 +531,41 @@ fn a_search_ends_at_its_memory_limit_as_the_same_search() {
 mod bench;
 
 mod shared;
+
+//a node whose every move is a proven loss chooses none, and the descent takes its first move (select_edge names no move
+//then): to that move's own node, as a list or as solid slots, never a second link or another move's slot
+#[test]
+fn a_node_whose_every_move_is_lost_descends_to_its_first_moves_node() {
+    let lost = Proof { outcome: Outcome::Loss, value: 0.0, plies: 1 };
+    for solid in [false, true] {
+        let mut tree = tree_after(START, &[]);
+        let moves = tree.board.legal_moves();
+        let priors = vec![1.0 / moves.len() as f32; moves.len()];
+        tree.expand(0, &moves, &priors);
+        tree.nodes[0].visit_count = SOLID_TREE_THRESHOLD;
+        tree.nodes[0].value_sum = 0.5 * f64::from(SOLID_TREE_THRESHOLD);
+        let after = |tree: &Tree, edge: usize| {
+            let mut board = tree.board.clone();
+            board.play_unchecked(tree.moves[edge].to_move(&tree.board));
+            board
+        };
+        let mut nodes_of = Vec::new();
+        for edge in tree.nodes[0].edges() {
+            let board = after(&tree, edge);
+            let (node, _) = tree.child_node(0, edge, NO_LINK, &board);
+            tree.nodes[node].proof = Some(lost);
+            nodes_of.push(node);
+        }
+        if solid {
+            tree.make_solid(0);
+            assert!(!listed(tree.nodes[0].children), "the root made solid");
+        }
+        let (links, slots, nodes) = (tree.links.len(), tree.slots.len(), tree.nodes.len());
+        let (edge, link) = tree.select_edge(0, &settings(true), None);
+        assert_eq!(edge, tree.nodes[0].edges().start, "the first move when every move is lost");
+        let board = after(&tree, edge);
+        let (node, _) = tree.child_node(0, edge, link, &board);
+        assert_eq!(node, nodes_of[0], "the first move's own node");
+        assert_eq!((tree.links.len(), tree.slots.len(), tree.nodes.len()), (links, slots, nodes), "nothing made for a move with a node");
+    }
+}
