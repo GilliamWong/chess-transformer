@@ -2,6 +2,7 @@
 //searches (Searches). A round is descend (the leaves that need the network come back as boards), then finish
 mod affinity;
 mod concurrent;
+mod fake_cuda;
 mod games;
 mod rounds;
 mod rules;
@@ -1144,6 +1145,8 @@ fn selfplay_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<rounds::RoundLoop>()?;
     module.add_function(wrap_pyfunction!(cpu_topology, module)?)?;
     module.add_function(wrap_pyfunction!(pin_thread, module)?)?;
+    module.add_function(wrap_pyfunction!(fake_cuda::fake_cuda_addresses, module)?)?;
+    module.add_function(wrap_pyfunction!(fake_cuda::fake_cuda_graph, module)?)?;
     module.add("LEAN_COLUMNS", LEAN_COLUMNS)?;
     module.add("LEAN_ROW", LEAN_ROW)?;
     Ok(())
