@@ -20,9 +20,10 @@ impl SharedNetwork {
     }
 }
 
+//the solid links of nodes with 8 visits, two queued at a time: the searches here make many and copy lists as others wait
 fn shared_tree_after(fen: &str, moves: &[&str]) -> SharedTree {
     let tree = tree_after(fen, moves);
-    SharedTree::new(tree.board, tree.keys)
+    SharedTree::new(tree.board, tree.keys).with_solid_links(8, 2)
 }
 
 fn seed_of(board: &[u8]) -> u64 {
@@ -134,7 +135,7 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, root_k
     assert_eq!(in_flight, 0, "a node with simulations in flight after the search");
     assert!(visits > 0, "a node of the tree without a visit");
     let edges = node.edges();
-    let children: Vec<(usize, usize)> = edges.clone().filter_map(|edge| tree.child_index(edge).map(|child| (edge, child))).collect();
+    let children: Vec<(usize, usize)> = edges.clone().filter_map(|edge| tree.child_index(node, edge).map(|child| (edge, child))).collect();
     if edges.is_empty() {
         //a game's end or a repeat, reached again and again: every visit scored its result
         let legal_moves = board.legal_moves();
@@ -178,7 +179,7 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, root_k
         let mut best = None::<Proof>;
         let mut all_proven = true;
         for edge in edges.clone() {
-            match tree.child(edge).and_then(|child| child.proof()) {
+            match tree.child(node, edge).and_then(|child| child.proof()) {
                 Some(found) if best.is_none_or(|best| proof_rank(&found) > proof_rank(&best)) => best = Some(found),
                 Some(_) => {}
                 None => all_proven = false,
@@ -265,6 +266,9 @@ fn searches_on_many_threads_leave_a_consistent_tree() {
                     );
                     check_tree(&tree, &settings);
                     collided += tree.counts.orphans.load(Ordering::Relaxed);
+                    //lc0's layout both ways: the busy nodes' links made solid during the search, the rest lists
+                    let (lists, solids) = tree.lists_and_solids();
+                    assert!(lists > 0 && solids > 0, "{lists} lists, {solids} solid");
                 }
             }
         }
@@ -361,7 +365,7 @@ fn edges_of(tree: &SharedTree, line: &[PackedMove]) -> Vec<usize> {
     line.iter()
         .map(|&played| {
             let edge = tree.node(node).edges().find(|&edge| tree.chess_move(edge) == played).expect("the line's move");
-            node = tree.child_index(edge).expect("the line's node");
+            node = tree.child_index(tree.node(node), edge).expect("the line's node");
             edge
         })
         .collect()
@@ -385,7 +389,7 @@ fn shared_advanced(
         .iter()
         .map(|&edge| {
             let place = (edge - advanced.node(node).edges().start) as u16;
-            node = advanced.child_index(edge).expect("the line's node");
+            node = advanced.child_index(advanced.node(node), edge).expect("the line's node");
             place
         })
         .collect();

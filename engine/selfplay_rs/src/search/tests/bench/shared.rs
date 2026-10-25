@@ -1,6 +1,7 @@
 //cargo test --release bench_shared -- --ignored --nocapture --test-threads 1: bench_drivers' drivers on a SharedTree, no lock
 //around the tree (the same environment: BENCH_VISITS ROUNDS IN_FLIGHT DRIVERS REPEATS FIRST DRIVER_CPUS COLLISIONS and the
-//stand-in's), the line it prints is bench_drivers'
+//stand-in's), the line it prints is bench_drivers'. BENCH_TRANSPOSITIONS=1 searches with transpositions: the drivers grow
+//the graph from the position to BENCH_VISITS themselves (a Tree's copy has no graph), then the timed rounds
 use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
 
@@ -12,24 +13,26 @@ fn bench_shared_drivers() {
         (setting("BENCH_VISITS", 750_000u32), setting("BENCH_ROUNDS", 12_000u64), setting("BENCH_REPEATS", 3usize));
     let (drivers, in_flight) = (setting("BENCH_DRIVERS", 8usize), setting("BENCH_IN_FLIGHT", 2usize));
     let collisions = setting("BENCH_COLLISIONS", 0u32);
+    let transpositions = setting("BENCH_TRANSPOSITIONS", 0u32) == 1;
     let driver_cpus = if std::env::var("BENCH_DRIVER_CPUS").is_ok() { settings_list("BENCH_DRIVER_CPUS", "") } else { Vec::new() };
-    let (stand_in, settings, move_ids) = (StandIn::from_environment(), settings(true), Network::new().move_ids);
+    let (stand_in, mut settings, move_ids) = (StandIn::from_environment(), settings(true), Network::new().move_ids);
+    settings.transpositions = transpositions;
     let (fen, moves, _) = POSITIONS[setting("BENCH_FIRST", 0usize)];
     let (mut base, mut base_cache) = (tree_after(fen, moves), Cache::new(5_000_000));
-    rounds(&mut base, &mut base_cache, (usize::MAX, visits), 2, 0, stand_in, &settings, None, &move_ids);
+    if !transpositions {
+        rounds(&mut base, &mut base_cache, (usize::MAX, visits), 2, 0, stand_in, &settings, None, &move_ids);
+    }
     println!(
-        "{fen}: {} nodes; {drivers} shared drivers {driver_cpus:?}, {in_flight} rounds out each, collisions {collisions}, {timed} rounds",
+        "{fen}: {} nodes; {drivers} shared drivers {driver_cpus:?}, {in_flight} rounds out each, collisions {collisions}, {timed} rounds, transpositions {transpositions}",
         base.nodes.len()
     );
-    for repeat in 0..repeats {
-        let tree = SharedTree::from_tree(&base);
-        let cache = SharedCache::from_cache(&base_cache, 5_000_000);
+    //the drivers' rounds until `rounds` have started or the root has `stop_at` visits: their seconds and leaves
+    let drive = |tree: &SharedTree, cache: &SharedCache, rounds: u64, stop_at: u32| -> (f64, u64) {
         let (run, leaves) = ((Mutex::new(DriversRun::default()), Condvar::new()), AtomicU64::new(0));
-        let start = base.root().visit_count;
         let started = Instant::now();
         std::thread::scope(|scope| {
             for driver in 0..drivers {
-                let (tree, cache, leaves, settings, move_ids, run) = (&tree, &cache, &leaves, &settings, &move_ids, &run);
+                let (tree, cache, leaves, settings, move_ids, run) = (tree, cache, &leaves, &settings, &move_ids, &run);
                 let cpu = (!driver_cpus.is_empty()).then(|| driver_cpus[driver % driver_cpus.len()]);
                 scope.spawn(move || {
                     if let Some(cpu) = cpu {
@@ -41,13 +44,14 @@ fn bench_shared_drivers() {
                         let next_round = {
                             let mut state = run.0.lock().expect("the run");
                             loop {
+                                let more = state.started < rounds && tree.root().visits() < stop_at;
                                 let blocked = state.starved == Some(state.answered) && state.out > waiting.len();
-                                if state.started < timed && waiting.len() < in_flight && !blocked {
+                                if more && waiting.len() < in_flight && !blocked {
                                     state.started += 1;
                                     state.out += 1;
                                     break Some((state.started - 1, state.answered));
                                 }
-                                if waiting.is_empty() && state.started < timed {
+                                if waiting.is_empty() && more {
                                     state = run.1.wait(state).expect("the run");
                                     continue;
                                 }
@@ -100,11 +104,21 @@ fn bench_shared_drivers() {
                 });
             }
         });
-        let seconds = started.elapsed().as_secs_f64();
+        (started.elapsed().as_secs_f64(), leaves.load(Ordering::Relaxed))
+    };
+    for repeat in 0..repeats {
+        let (tree, cache) = if transpositions {
+            let (tree, cache) = (SharedTree::new(base.board.clone(), base.keys.clone()).with_transpositions(true), SharedCache::new(5_000_000));
+            drive(&tree, &cache, u64::MAX, visits);
+            (tree, cache)
+        } else {
+            (SharedTree::from_tree(&base), SharedCache::from_cache(&base_cache, 5_000_000))
+        };
+        let start = tree.root().visits();
+        let (seconds, leaves) = drive(&tree, &cache, timed, u32::MAX);
         let simulations = tree.root().visits() - start;
-        let leaves = leaves.load(Ordering::Relaxed);
         println!(
-            "SHARED\trepeat {repeat}\tevals_per_s {:.0}\tsims_per_s {:.0}\tus_per_eval {:.3}\tleaves_per_round {:.1}\torphans {}\texclusive {}",
+            "SHARED\trepeat {repeat}\tevals_per_s {:.0}\tsims_per_s {:.0}\tus_per_eval {:.3}\tleaves_per_round {:.1}\torphans {}\texclusive {}\tvisits_at_start {start}",
             leaves as f64 / seconds,
             f64::from(simulations) / seconds,
             seconds * 1e6 / leaves as f64,

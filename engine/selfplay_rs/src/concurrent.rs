@@ -38,12 +38,12 @@ impl SharedSearch {
         let tree = &self.tree;
         let line = tree.principal_variation();
         //one simulation visits no child: then the root's score for its side to move
-        let score = match tree.child(line[0]) {
+        let score = match tree.child(tree.root(), line[0]) {
             Some(chosen) if chosen.visits() > 0 => chosen.mean_score(chosen.visits()),
             _ => 1.0 - tree.root().mean_score(tree.root().visits()),
         };
         let moves = |edges: &[usize]| -> Vec<String> { edges.iter().map(|&edge| uci(tree.chess_move(edge))).collect() };
-        let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(edge)));
+        let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(tree.root(), edge)));
         (self.id, moves(&line), score, root_moves.collect(), tree.root().visits())
     }
 }
@@ -51,7 +51,7 @@ impl SharedSearch {
 //the root's score of a running search (root_score_of's)
 fn shared_root_score(search: &SharedSearch) -> f64 {
     let tree = &search.tree;
-    match tree.principal_variation().first().and_then(|&edge| tree.child(edge)) {
+    match tree.principal_variation().first().and_then(|&edge| tree.child(tree.root(), edge)) {
         Some(chosen) if chosen.visits() > 0 => chosen.mean_score(chosen.visits()),
         _ => 1.0 - tree.root().mean_score(tree.root().visits()),
     }
@@ -368,7 +368,7 @@ fn shared_line_to(tree: &SharedTree, moves: &[String]) -> Option<(Vec<usize>, Ve
     for played in moves {
         let edges = root.edges();
         let edge = edges.clone().find(|&edge| uci(tree.chess_move(edge)) == *played)?;
-        root = tree.child(edge)?;
+        root = tree.child(root, edge)?;
         line.push(edge);
         places.push((edge - edges.start) as u16);
     }

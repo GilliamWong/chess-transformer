@@ -17,7 +17,7 @@ enum Part {
 }
 
 //a tree's storage, as compact returns the old one to free
-pub type Storage = (Nodes, Edges);
+pub type Storage = (Nodes, Edges, Links);
 
 impl SharedTree {
     //plays a line of moves from the root (edges, each of the node the last one leads to) and makes the node it ends on the
@@ -26,11 +26,10 @@ impl SharedTree {
     pub fn move_root(&mut self, line: &[usize]) {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         for &edge in line {
-            let child = self.edges.child(edge).load(Ordering::Relaxed);
-            assert_ne!(child, NO_NODE, "a line through the tree's nodes");
+            let child = self.child_index(self.nodes.get(self.root), edge).expect("a line through the tree's nodes");
             self.board.play_unchecked(self.edges.chess_move(edge).to_move(&self.board));
             self.keys.push(position_key(&self.board));
-            self.root = child as usize;
+            self.root = child;
         }
         if !line.is_empty() {
             self.nodes.get(self.root).clear_proof();
@@ -46,11 +45,12 @@ impl SharedTree {
     }
 
     //the root's part of the tree copied out of the rest as a tree of its own, in breadth-first order from the root, as
-    //Tree::compact has it. With transpositions a node that several moves lead to is copied once (Tree::compact_graph's),
-    //with the moves' visits, and the table made again of the copied nodes. Returns the old storage to free, or None once
-    //abort is set (the tree then as it was)
+    //Tree::compact has it, each node's links made again (solid with the threshold's visits). With transpositions a node
+    //that several moves lead to is copied once (Tree::compact_graph's), with the moves' visits, and the table made again of
+    //the copied nodes. Returns the old storage to free, or None once abort is set (the tree then as it was)
     pub fn compact(&mut self, abort: Option<&AtomicBool>) -> Option<Storage> {
-        let (nodes, edges) = (Nodes::new(), Edges::with_visits(self.graph.is_some()));
+        let (nodes, edges, links) = (Nodes::new(), Edges::new(), Links::new());
+        let mut children = Vec::new();
         let mut order = vec![self.root];
         //with transpositions each copied node's new number
         let mut copied_as = if self.graph.is_some() { vec![NO_NODE; self.nodes.len()] } else { Vec::new() };
@@ -71,23 +71,23 @@ impl SharedTree {
                 let first = edges.alloc(old_edges.len());
                 for (place, edge) in old_edges.clone().enumerate() {
                     edges.set(first + place, self.edges.chess_move(edge), self.edges.prior(edge));
-                    let child = self.edges.child(edge).load(Ordering::Relaxed);
-                    let child = if child == NO_NODE {
-                        NO_NODE
-                    } else if copied_as.is_empty() {
-                        order.push(child as usize);
+                }
+                children.clear();
+                for (place, link) in self.links.linked(old) {
+                    let child = self.links.get(link).child() as usize;
+                    let child = if copied_as.is_empty() {
+                        order.push(child);
                         (order.len() - 1) as u32
                     } else {
-                        let edge_visits = self.edges.edge_visits(edge).load(Ordering::Relaxed);
-                        edges.edge_visits(first + place).store(edge_visits, Ordering::Relaxed);
-                        if copied_as[child as usize] == NO_NODE {
-                            copied_as[child as usize] = order.len() as u32;
-                            order.push(child as usize);
+                        if copied_as[child] == NO_NODE {
+                            copied_as[child] = order.len() as u32;
+                            order.push(child);
                         }
-                        copied_as[child as usize]
+                        copied_as[child]
                     };
-                    edges.child(first + place).store(child, Ordering::Relaxed);
+                    children.push((place, child, self.links.get(link).visits().load(Ordering::Relaxed)));
                 }
+                set_links(&links, node, old_edges.len(), old.visits() >= self.solid_threshold, children.iter().copied());
                 node.publish_edges(first, old_edges.len());
             }
             index += 1;
@@ -103,7 +103,10 @@ impl SharedTree {
             *graph = fresh;
         }
         self.root = 0;
-        Some((std::mem::replace(&mut self.nodes, nodes), std::mem::replace(&mut self.edges, edges)))
+        //what was queued for solid links: compact made them
+        self.to_solidify.get_mut().expect("the solid queue").clear();
+        *self.queued.get_mut() = 0;
+        Some((std::mem::replace(&mut self.nodes, nodes), std::mem::replace(&mut self.edges, edges), std::mem::replace(&mut self.links, links)))
     }
 
     //Tree::drop_stale_leaves: a kept tree under a new root, the leaves a rule scored that held only from the old root
@@ -143,10 +146,13 @@ impl SharedTree {
             }
             return Ok(());
         }
-        for edge in edges {
-            let Some(child) = self.child_index(edge).filter(|&child| self.nodes.get(child).proof().is_none()) else { continue };
+        for (place, link) in self.links.linked(self.nodes.get(node)) {
+            let child = self.links.get(link).child() as usize;
+            if self.nodes.get(child).proof().is_some() {
+                continue;
+            }
             path.push(child);
-            line.push(edge);
+            line.push(edges.start + place);
             keys.push(self.nodes.get(child).key());
             let found = self.find_stale_leaves(path, line, keys, settings, tables, root_covered, stale);
             keys.pop();
@@ -229,10 +235,9 @@ impl SharedTree {
             parts.push(Part::Subtree(node, places.clone()));
             return;
         }
-        let edges = self.nodes.get(node).edges();
-        for edge in edges.clone() {
-            let Some(child) = self.child_index(edge) else { continue };
-            places.push((edge - edges.start) as u16);
+        for (place, link) in self.links.linked(self.nodes.get(node)) {
+            let child = self.links.get(link).child() as usize;
+            places.push(place as u16);
             let node = self.nodes.get(child);
             if node.has_edges() {
                 self.split_for_walk(child, places, share, parts);
@@ -255,10 +260,9 @@ impl SharedTree {
         if looked.is_multiple_of(ABORT_CHECKS) && abort.load(Ordering::Relaxed) {
             return false;
         }
-        let edges = self.nodes.get(node).edges();
-        for edge in edges.clone() {
-            let Some(child) = self.child_index(edge) else { continue };
-            places.push((edge - edges.start) as u16);
+        for (place, link) in self.links.linked(self.nodes.get(node)) {
+            let child = self.links.get(link).child() as usize;
+            places.push(place as u16);
             let node = self.nodes.get(child);
             if node.has_edges() {
                 if !self.find_candidates(child, places, candidates, looked, abort) {
@@ -292,8 +296,9 @@ impl SharedTree {
         'candidates: for places in candidates.iter().filter(|places| places.len() > line.len() && places.starts_with(line)) {
             let (mut path, mut edges) = (vec![self.root], Vec::new());
             for &place in &places[line.len()..] {
-                let edge = self.nodes.get(*path.last().expect("the root at least")).edges().start + usize::from(place);
-                let child = self.child_index(edge).expect("a candidate's moves have nodes");
+                let parent = self.nodes.get(*path.last().expect("the root at least"));
+                let edge = parent.edges().start + usize::from(place);
+                let child = self.child_index(parent, edge).expect("a candidate's moves have nodes");
                 //the walk passes over a proven node and what is below it
                 if self.nodes.get(child).proof().is_some() {
                     continue 'candidates;
