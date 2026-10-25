@@ -110,6 +110,7 @@ fn copied(tree: &Tree) -> Tree {
         pending: Vec::new(),
         logits: Vec::new(),
         full: tree.full,
+        graph: tree.graph.clone(),
     }
 }
 
@@ -199,6 +200,18 @@ fn assert_same_trees(old: &Tree, new: &Tree) {
     let bits = |priors: &[f32]| -> Vec<u32> { priors.iter().map(|prior| prior.to_bits()).collect() };
     assert_same("priors", &bits(&old.priors), &bits(&new.priors));
     assert_same("children", &old.children, &new.children);
+    //with transpositions the same graph: the moves' visits, the fifty-move counts and the table
+    assert_eq!(old.graph.is_some(), new.graph.is_some(), "one tree with transpositions, the other without");
+    if let (Some(old), Some(new)) = (&old.graph, &new.graph) {
+        assert_same("edge visits", &old.edge_visits, &new.edge_visits);
+        assert_same("fifty-move counts", &old.halfmoves, &new.halfmoves);
+        let table = |graph: &Graph| -> Vec<(u64, u32)> {
+            let mut entries: Vec<(u64, u32)> = graph.table.iter().map(|(&entry, &node)| (entry, node)).collect();
+            entries.sort_unstable();
+            entries
+        };
+        assert_same("table", &table(old), &table(new));
+    }
 }
 
 //lines a game may have played since a search, for which Searches reuses the tree (every move has its node, and the
@@ -274,6 +287,7 @@ fn settings(certainty: bool) -> SearchSettings {
         repetitions_for_a_draw: 3,
         value_sharpness: 3.0,
         certainty,
+        transpositions: false,
     }
 }
 

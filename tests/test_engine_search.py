@@ -1971,3 +1971,40 @@ def test_concurrent_searches_end_under_stops_at_any_moment():
         searches.advance(0, fen, [move.uci() for move in board.move_stack])
     assert len(ended) == 40 and sum(ended) > 40 * 20
 
+#transpositions (search.rs SearchSettings'): one network's search on the shared tree is the plain tree's, move for move
+#along a game whose graph is carried on, dropped or kept, in a middlegame, and in a game whose shuffles repeat positions
+#(draws on their paths only) with and without certainty; the setting reaches the search, which shares the positions it
+#reaches twice and so searches otherwise
+def test_transpositions_on_one_network_are_the_same_on_both_trees(carlsen_games):
+    middlegame = carlsen_games[0].board()
+    for move in list(carlsen_games[0].mainline_moves())[:16]:
+        middlegame.push(move)
+    graph = {"settings": {"transpositions": True}}
+    for way in ("plain", "advance", "drop"):
+        reports, replies, boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, way, **graph)
+        concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True, **graph)
+        assert concurrent[0] == reports and concurrent[2] == boards and concurrent[3] == advanced
+    assert advancing_game(BoardModel(), middlegame.copy(), 8, "plain", replies)[0] != reports
+
+    shuffles = ["g8f6", "f6g8", "a7a6", "g8f6", "f6g8", "a6a5", "b8c6", "c6b8", "h7h6", "h6h5"]
+    model = LikesMoves(KNIGHTS_OUT_AND_BACK + [("b1c3", chess.WHITE), ("c3b1", chess.WHITE)], 4.0)
+    for certainty in (False, True):
+        options = {"settings": {"transpositions": True, "certainty": certainty}}
+        plain = advancing_game(model, chess.Board(), len(shuffles), "advance", shuffles, **options)
+        concurrent = advancing_game(model, chess.Board(), len(shuffles), "advance", shuffles, concurrent_descents=True, **options)
+        assert concurrent[0] == plain[0] and concurrent[3] == plain[3] == len(shuffles)
+
+
+#transpositions on threads of several networks: the search ends at its simulations with a legal move, and certainty's
+#proofs still find and prove a mate
+def test_transpositions_on_several_networks():
+    group = SlowNetworks(3, 0.002, BoardModel())
+    search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, settings={"transpositions": True})
+    board = chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1")
+    report = search.search(board, simulations=3000)
+    assert 3000 <= report.simulations < 3000 + 3 * 16 * 3 and report.line[0] in board.legal_moves
+
+    mate = EngineSearch(SlowNetworks(3, 0.003, UniformModel()).networks, 16, concurrent_descents=True,
+                        settings={"certainty": True, "transpositions": True})
+    proven = mate.search(chess.Board("k7/8/2K5/8/8/8/8/7R w - - 0 1"), simulations=20_000)
+    assert proven.line[0].uci() == "c6b6" and proven.score == 1.0 and proven.simulations < 5_000

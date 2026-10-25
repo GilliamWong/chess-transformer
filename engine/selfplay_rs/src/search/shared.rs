@@ -43,11 +43,33 @@ impl Hold<'_> {
     }
 }
 
-//the bytes a node and an edge take, for the memory limit
+//the bytes a node and an edge take, for the memory limit; with transpositions an edge's visits on top, and a table entry
 const NODE_BYTES: usize = size_of::<Node>();
 const EDGE_BYTES: usize = 3 * size_of::<u32>();
+const EDGE_VISIT_BYTES: usize = size_of::<u32>();
+const TABLE_ENTRY_BYTES: usize = 32;
 //what a descent may need: its node, and the moves of its leaf
 const DESCENT_BYTES: usize = NODE_BYTES + MOST_MOVES * EDGE_BYTES;
+
+//the transposition table's shards, each behind its own lock: the table is only looked at when a move gets its node
+const TABLE_SHARDS: usize = 256;
+
+//a SharedTree's transpositions (search.rs Graph): the node of each position by graph_key, in shards. The edges' visits
+//are a column of Edges, a node's fifty-move count is its own
+struct SharedGraph {
+    shards: Box<[Mutex<KeyMap<u32>>]>,
+    entries: AtomicUsize,
+}
+
+impl SharedGraph {
+    fn new() -> SharedGraph {
+        SharedGraph { shards: (0..TABLE_SHARDS).map(|_| Mutex::new(KeyMap::default())).collect(), entries: AtomicUsize::new(0) }
+    }
+
+    fn shard(&self, entry: u64) -> &Mutex<KeyMap<u32>> {
+        &self.shards[(entry >> 56) as usize % TABLE_SHARDS]
+    }
+}
 
 //where a descent ended
 enum Arrival {
@@ -57,6 +79,10 @@ enum Arrival {
     Collision,
     //a node to evaluate: a new leaf the descent owns, or a game's end or repeat reached again
     Leaf,
+    //with transpositions, above the node the path's last move leads to (not counted in flight there): a repeat of a
+    //position on the path, or a move with fewer visits than its node (search.rs Stop)
+    Repeat,
+    CatchUp,
 }
 
 //what one call of gather has so far
@@ -95,6 +121,8 @@ pub struct SharedTree {
     //threads waiting for the tree to themselves
     writers: AtomicUsize,
     pub counts: Counts,
+    //the transpositions, with SearchSettings' (with_transpositions); None for a tree
+    graph: Option<SharedGraph>,
 }
 
 //whether the tests that look for races have the threads yield between a protocol's steps (jitter)
@@ -145,7 +173,23 @@ impl SharedTree {
             gate: RwLock::new(()),
             writers: AtomicUsize::new(0),
             counts: Counts::default(),
+            graph: None,
         }
+    }
+
+    //the tree with transpositions (SearchSettings' transpositions) if `transpositions`; a new tree, nothing expanded
+    pub fn with_transpositions(mut self, transpositions: bool) -> SharedTree {
+        assert_eq!(self.nodes.len(), 1, "transpositions from a tree's start");
+        if transpositions {
+            self.edges = Edges::with_visits(true);
+            self.graph = Some(SharedGraph::new());
+            self.root().set_halfmoves(halfmove_count(self.board.halfmoves()));
+            let entry = graph_key(self.root().key(), self.board.halfmoves());
+            let graph = self.graph.as_ref().expect("the graph");
+            graph.shard(entry).lock().expect("a table shard").insert(entry, self.root as u32);
+            graph.entries.fetch_add(1, Ordering::Relaxed);
+        }
+        self
     }
 
     pub fn root(&self) -> &Node {
@@ -156,9 +200,13 @@ impl SharedTree {
         self.full.load(Ordering::Relaxed)
     }
 
-    //the bytes the tree's nodes and edges take
+    //the bytes the tree's nodes and edges take, and its transpositions'
     pub fn allocated_bytes(&self) -> usize {
-        self.nodes.len() * NODE_BYTES + self.edges.len() * EDGE_BYTES
+        let graph = self
+            .graph
+            .as_ref()
+            .map_or(0, |graph| self.edges.len() * EDGE_VISIT_BYTES + graph.entries.load(Ordering::Relaxed) * TABLE_ENTRY_BYTES);
+        self.nodes.len() * NODE_BYTES + self.edges.len() * EDGE_BYTES + graph
     }
 
     //network leaves gathered and not backed up yet
@@ -213,7 +261,11 @@ impl SharedTree {
         (child != NO_NODE).then(|| self.nodes.get(child as usize))
     }
 
+    //the move's visits: its node's, or with transpositions the move's own (Tree::visits)
     pub fn visits(&self, edge: usize) -> u32 {
+        if self.graph.is_some() {
+            return self.edges.edge_visits(edge).load(Ordering::Acquire);
+        }
         self.child(edge).map_or(0, |child| child.visits())
     }
 
@@ -243,7 +295,8 @@ impl SharedTree {
     pub fn most_visited_edge(&self, node: usize) -> usize {
         let preference = |edge: usize| {
             let visits = self.visits(edge);
-            let mean_score = self.child(edge).filter(|_| visits > 0).map_or(0.0, |child| child.mean_score(visits));
+            //the node's own mean: with transpositions a move's visits are not its node's
+            let mean_score = self.child(edge).filter(|_| visits > 0).map_or(0.0, |child| child.mean_score(child.visits()));
             let proven = match self.child(edge).and_then(|child| child.proof()) {
                 Some(proof) if proof.outcome != Outcome::Draw => proof_rank(&proof),
                 _ => (Outcome::Draw, 0),
@@ -313,8 +366,9 @@ impl SharedTree {
         self.proof_from_moves(self.root).is_some()
     }
 
-    //Tree::select_edge: the exploration term counts the simulations in flight below a child as visits. Returns the edge
-    fn select_edge(&self, id: usize, settings: &SearchSettings) -> usize {
+    //Tree::select_edge: the exploration term counts the simulations in flight below a child as visits; with transpositions
+    //a move that repeats a position of the path is worth a draw. Returns the edge
+    fn select_edge(&self, id: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> usize {
         let parent = self.nodes.get(id);
         let (parent_visits, _) = parent.counts();
         let c_puct =
@@ -325,6 +379,8 @@ impl SharedTree {
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
         let (mut best, mut best_u) = (0, f64::NEG_INFINITY);
+        //with transpositions a move's own visits, its node's mean (every path's)
+        let edge_visits = self.graph.as_ref().map(|_| self.edges.visits(edges.clone()));
         for (index, (prior, child)) in self.edges.priors(edges.clone()).iter().zip(self.edges.children(edges.clone())).enumerate() {
             let prior = f64::from(f32::from_bits(prior.load(Ordering::Relaxed)));
             let u = match child.load(Ordering::Acquire) {
@@ -336,8 +392,14 @@ impl SharedTree {
                         continue;
                     }
                     let (visits, in_flight) = child.counts();
-                    let q = if visits > 0 { child.mean_score(visits) } else { first_play_urgency };
-                    let started = visits + in_flight;
+                    let q = if repeats.is_some_and(|repeats| repeats.repeats(child.key(), child.halfmoves())) {
+                        1.0 - settings.draw
+                    } else if visits > 0 {
+                        child.mean_score(visits)
+                    } else {
+                        first_play_urgency
+                    };
+                    let started = edge_visits.map_or(visits, |edge_visits| edge_visits[index].load(Ordering::Acquire)) + in_flight;
                     q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started)))
                 }
             };
@@ -349,14 +411,32 @@ impl SharedTree {
     }
 
     //the edge's node, made if the edge has none yet; board is the node's position. Of two threads that make one, one
-    //node is kept and the other's stays unused
+    //node is kept and the other's stays unused. With transpositions the table's node of the position (Tree::child_node):
+    //one thread makes it under the shard's lock and the others find it
     fn child_node(&self, edge: usize, board: &Chess) -> usize {
         let slot = self.edges.child(edge);
         let existing = slot.load(Ordering::Acquire);
         if existing != NO_NODE {
             return existing as usize;
         }
-        let made = self.nodes.push(position_key(board));
+        let key = position_key(board);
+        let made = match &self.graph {
+            None => self.nodes.push(key),
+            Some(graph) => {
+                let entry = graph_key(key, board.halfmoves());
+                let mut shard = graph.shard(entry).lock().expect("a table shard");
+                match shard.get(&entry) {
+                    Some(&shared) => shared as usize,
+                    None => {
+                        let made = self.nodes.push(key);
+                        self.nodes.get(made).set_halfmoves(halfmove_count(board.halfmoves()));
+                        shard.insert(entry, made as u32);
+                        graph.entries.fetch_add(1, Ordering::Relaxed);
+                        made
+                    }
+                }
+            }
+        };
         jitter();
         match slot.compare_exchange(NO_NODE, made as u32, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => made,
@@ -381,18 +461,47 @@ impl SharedTree {
         if node.has_edges() { Arrival::Inner } else { Arrival::Leaf }
     }
 
-    //one simulation down to a leaf, every node on the way counted in flight; the path ends on the node it reached
-    fn descend(&self, settings: &SearchSettings, board: &mut Chess, keys: &mut Vec<u64>, path: &mut Vec<usize>) -> Arrival {
+    //one simulation down to a leaf, every node on the way counted in flight; the path ends on the node it reached. With
+    //transpositions `edges` gets the moves between the path's nodes, and the descent may stop above a shared node (a
+    //repeat or a transposition visit, as Tree::gather's), that node the path's last but not counted in flight
+    fn descend(
+        &self,
+        settings: &SearchSettings,
+        board: &mut Chess,
+        keys: &mut Vec<u64>,
+        path: &mut Vec<usize>,
+        edges: &mut Vec<usize>,
+    ) -> Arrival {
+        let path_start = keys.len() - 1;
         let mut node = self.root;
         path.push(node);
         loop {
             match self.arrive(node) {
                 Arrival::Inner => {
-                    let edge = self.select_edge(node, settings);
+                    let repeats = self.graph.as_ref().map(|_| Repeats::new(keys, path_start, board.halfmoves()));
+                    let edge = self.select_edge(node, settings, repeats.as_ref());
                     board.play_unchecked(self.edges.chess_move(edge));
                     node = self.child_node(edge, board);
                     path.push(node);
-                    keys.push(self.nodes.get(node).key());
+                    let child = self.nodes.get(node);
+                    let mut stop = None;
+                    if let Some(repeats) = &repeats {
+                        edges.push(edge);
+                        //a repeat of this path's position, whatever the node is to other paths, or a node that knows
+                        //more than its move
+                        if repeats.repeats(child.key(), child.halfmoves()) {
+                            stop = Some(Arrival::Repeat);
+                        } else if child.has_edges()
+                            && child.proof().is_none()
+                            && self.edges.edge_visits(edge).load(Ordering::Acquire) < child.visits()
+                        {
+                            stop = Some(Arrival::CatchUp);
+                        }
+                    }
+                    keys.push(child.key());
+                    if let Some(stop) = stop {
+                        return stop;
+                    }
                 }
                 other => return other,
             }
@@ -413,6 +522,30 @@ impl SharedTree {
         self.edges.write(first, moves, priors);
         jitter();
         self.nodes.get(id).publish_edges(first, moves.len());
+    }
+
+    //backup with or without transpositions (Tree::back_up): with them every edge counts the visit, and a node's visited
+    //policy is refreshed when one of its moves has its first
+    fn back_up(&self, path: &[usize], edges: &[usize], value: f64) {
+        if self.graph.is_none() {
+            return self.backup(path, value);
+        }
+        let mut score = 1.0 - value;
+        for (depth, &id) in path.iter().enumerate().rev() {
+            let node = self.nodes.get(id);
+            if let Some(proof) = node.proof() {
+                score = proof.value;
+            }
+            node.add_value(score);
+            jitter();
+            node.visit(1);
+            if let Some(&edge) = edges.get(depth)
+                && self.edges.edge_visits(edge).fetch_add(1, Ordering::AcqRel) == 0
+            {
+                self.refresh_visited_policy(id);
+            }
+            score = 1.0 - score;
+        }
     }
 
     //mcts.backup along the path, for a simulation that was in flight there. A node counts the visit after its value
@@ -440,11 +573,16 @@ impl SharedTree {
         loop {
             let edges = node.edges();
             let children = self.edges.children(edges.clone()).iter();
-            let visited = children.zip(self.edges.priors(edges)).filter(|(child, _)| {
-                let child = child.load(Ordering::Acquire);
-                child != NO_NODE && self.nodes.get(child as usize).visits() > 0
+            //with transpositions a move is visited once it has a visit of its own
+            let edge_visits = self.graph.as_ref().map(|_| self.edges.visits(edges.clone()));
+            let visited = children.zip(self.edges.priors(edges)).enumerate().filter(|(index, (child, _))| match edge_visits {
+                Some(edge_visits) => edge_visits[*index].load(Ordering::Acquire) > 0,
+                None => {
+                    let child = child.load(Ordering::Acquire);
+                    child != NO_NODE && self.nodes.get(child as usize).visits() > 0
+                }
             });
-            let sum = python_sum(visited.map(|(_, prior)| f64::from(f32::from_bits(prior.load(Ordering::Relaxed)))));
+            let sum = python_sum(visited.map(|(_, (_, prior))| f64::from(f32::from_bits(prior.load(Ordering::Relaxed)))));
             jitter();
             node.set_visited_policy_sqrt(sum.sqrt());
             let now = node.refreshes();
@@ -456,7 +594,8 @@ impl SharedTree {
     }
 
     //proves the path's last node: its visits so far count the proven score instead of theirs, in its ancestors too (up
-    //to a proven one). A node already proven keeps its proof. Needs the tree to itself
+    //to a proven one). A node already proven keeps its proof. With transpositions only the node's own (Tree::prove).
+    //Needs the tree to itself
     fn prove(&self, path: &[usize], proof: Proof) {
         let (&id, ancestors) = path.split_last().expect("a node to prove");
         let node = self.nodes.get(id);
@@ -467,6 +606,9 @@ impl SharedTree {
         jitter();
         node.add_value(change);
         node.set_proof(proof);
+        if self.graph.is_some() {
+            return;
+        }
         for (distance, &ancestor) in ancestors.iter().rev().enumerate() {
             let ancestor = self.nodes.get(ancestor);
             //a simulation that descended before an ancestor was proven: its visits all count the proven score, and
@@ -578,6 +720,8 @@ impl SharedTree {
         let mut keys = self.keys.clone();
         let root_keys = keys.len();
         let mut path = Vec::new();
+        //with transpositions the edges between the path's nodes
+        let mut edges = Vec::new();
         let mut priors = Vec::new();
         while call.leaves.len() < round.leaves as usize && call.simulations < round.simulations && self.has_room(round.visit_limit) {
             hold.give_way();
@@ -590,7 +734,8 @@ impl SharedTree {
             let mut board = self.board.clone();
             keys.truncate(root_keys);
             path.clear();
-            let arrival = self.descend(settings, &mut board, &mut keys, &mut path);
+            edges.clear();
+            let arrival = self.descend(settings, &mut board, &mut keys, &mut path, &mut edges);
             let give_back = |waiting: bool| {
                 if reserved {
                     self.release(round.memory_limit, waiting);
@@ -602,7 +747,21 @@ impl SharedTree {
                 Arrival::Proven(proof) => {
                     give_back(false);
                     call.simulations += 1;
-                    self.backup(&path, 1.0 - proof.value);
+                    self.back_up(&path, &edges, 1.0 - proof.value);
+                    continue;
+                }
+                //a repeat is a draw for this path, a transposition visit the shared node's mean: the visit is the
+                //move's, the node's numbers stay as they are
+                Arrival::Repeat | Arrival::CatchUp => {
+                    give_back(false);
+                    call.simulations += 1;
+                    let shared = self.nodes.get(path.pop().expect("the shared node"));
+                    //a mean read while other threads back up through the node may be off by their values: kept a score
+                    let value = match arrival {
+                        Arrival::Repeat => 1.0 - settings.draw,
+                        _ => shared.mean_score(shared.visits()).clamp(0.0, 1.0),
+                    };
+                    self.back_up(&path, &edges, value);
                     continue;
                 }
                 Arrival::Collision => {
@@ -634,6 +793,7 @@ impl SharedTree {
             };
             //a repeat inside the search is a draw, but not a proven one: the game need not repeat
             let (&leaf_key, path_keys) = keys[root_keys - 1..].split_last().expect("the root's key");
+            //with transpositions a leaf is no repeat inside the search (Tree::gather's)
             let value = game_over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
             call.simulations += 1;
             if let Some(value) = value {
@@ -653,20 +813,20 @@ impl SharedTree {
                         if self.nodes.get(node).visits() == 0 {
                             //a leaf nobody has visited, and nobody can before its proof is seen: it rewrites no sum
                             self.nodes.get(node).set_proof(proof);
-                            self.backup(&path, value);
+                            self.back_up(&path, &edges, value);
                             if self.proves_parent(&path) {
                                 self.exclusive(hold, || self.propagate_proofs(&path));
                             }
                         } else {
                             self.exclusive(hold, || {
                                 self.prove(&path, proof);
-                                self.backup(&path, value);
+                                self.back_up(&path, &edges, value);
                                 self.propagate_proofs(&path);
                             });
                         }
                     }
                     _ => {
-                        self.backup(&path, value);
+                        self.back_up(&path, &edges, value);
                         if settings.certainty && self.proves_parent(&path) {
                             self.exclusive(hold, || self.propagate_proofs(&path));
                         }
@@ -682,12 +842,12 @@ impl SharedTree {
                 Some(value) => {
                     give_back(false);
                     self.expand(node, &moves, &priors);
-                    self.backup(&path, f64::from(value));
+                    self.back_up(&path, &edges, f64::from(value));
                 }
                 None => {
                     encode_board(&board, boards);
                     self.waiting.fetch_add(1, Ordering::AcqRel);
-                    call.leaves.push(PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() });
+                    call.leaves.push(PendingLeaf { path: path.clone(), edges: edges.clone(), key: leaf_key, moves, turn: board.turn() });
                     give_back(true);
                 }
             }
@@ -715,7 +875,7 @@ impl SharedTree {
         let value = sharpen(answer(answer_width - 1), settings.value_sharpness);
         let node = *leaf.path.last().expect("the root at least");
         self.expand(node, &leaf.moves, logits);
-        self.backup(&leaf.path, f64::from(value));
+        self.back_up(&leaf.path, &leaf.edges, f64::from(value));
         if let Some(cache) = cache {
             cache.insert(leaf.key, logits, value);
         }
@@ -769,6 +929,7 @@ impl SharedTree {
             gate: RwLock::new(()),
             writers: AtomicUsize::new(0),
             counts: Counts::default(),
+            graph: None,
         }
     }
 
@@ -793,15 +954,24 @@ impl SharedTree {
             .collect();
         expanded.sort_unstable();
         let mut first_edge = vec![0; count];
-        let (mut moves, mut priors, mut children) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut moves, mut priors, mut children, mut edge_visits) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for &(_, id) in &expanded {
             first_edge[id] = moves.len();
             for edge in self.nodes.get(id).edges() {
                 moves.push(self.edges.chess_move(edge));
                 priors.push(self.edges.prior(edge));
                 children.push(self.edges.child(edge).load(Ordering::Relaxed));
+                if self.graph.is_some() {
+                    edge_visits.push(self.edges.edge_visits(edge).load(Ordering::Relaxed));
+                }
             }
         }
+        //with transpositions the same graph: the table of its nodes, the moves' visits, the fifty-move counts
+        let graph = self.graph.as_ref().map(|_| {
+            let halfmoves: Vec<u16> = (0..count).map(|id| self.nodes.get(id).halfmoves()).collect();
+            let table = (0..count).map(|id| (graph_key(self.nodes.get(id).key(), u32::from(halfmoves[id])), id as u32)).collect();
+            Graph { table, edge_visits: edge_visits.clone(), halfmoves }
+        });
         let nodes = (0..count)
             .map(|id| {
                 let node = self.nodes.get(id);
@@ -830,6 +1000,7 @@ impl SharedTree {
             pending: Vec::new(),
             logits: Vec::new(),
             full: self.is_full(),
+            graph,
         }
     }
 }

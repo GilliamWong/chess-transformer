@@ -46,10 +46,17 @@ impl SharedTree {
     }
 
     //the root's part of the tree copied out of the rest as a tree of its own, in breadth-first order from the root, as
-    //Tree::compact has it. Returns the old storage to free, or None once abort is set (the tree then as it was)
+    //Tree::compact has it. With transpositions a node that several moves lead to is copied once (Tree::compact_graph's),
+    //with the moves' visits, and the table made again of the copied nodes. Returns the old storage to free, or None once
+    //abort is set (the tree then as it was)
     pub fn compact(&mut self, abort: Option<&AtomicBool>) -> Option<Storage> {
-        let (nodes, edges) = (Nodes::new(), Edges::new());
+        let (nodes, edges) = (Nodes::new(), Edges::with_visits(self.graph.is_some()));
         let mut order = vec![self.root];
+        //with transpositions each copied node's new number
+        let mut copied_as = if self.graph.is_some() { vec![NO_NODE; self.nodes.len()] } else { Vec::new() };
+        if let Some(first) = copied_as.get_mut(self.root) {
+            *first = 0;
+        }
         let mut index = 0;
         while index < order.len() {
             if index.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
@@ -67,9 +74,17 @@ impl SharedTree {
                     let child = self.edges.child(edge).load(Ordering::Relaxed);
                     let child = if child == NO_NODE {
                         NO_NODE
-                    } else {
+                    } else if copied_as.is_empty() {
                         order.push(child as usize);
                         (order.len() - 1) as u32
+                    } else {
+                        let edge_visits = self.edges.edge_visits(edge).load(Ordering::Relaxed);
+                        edges.edge_visits(first + place).store(edge_visits, Ordering::Relaxed);
+                        if copied_as[child as usize] == NO_NODE {
+                            copied_as[child as usize] = order.len() as u32;
+                            order.push(child as usize);
+                        }
+                        copied_as[child as usize]
                     };
                     edges.child(first + place).store(child, Ordering::Relaxed);
                 }
@@ -77,13 +92,26 @@ impl SharedTree {
             }
             index += 1;
         }
+        if let Some(graph) = &mut self.graph {
+            let fresh = SharedGraph::new();
+            for number in 0..order.len() {
+                let node = nodes.get(number);
+                let entry = graph_key(node.key(), u32::from(node.halfmoves()));
+                fresh.shard(entry).lock().expect("a table shard").insert(entry, number as u32);
+                fresh.entries.fetch_add(1, Ordering::Relaxed);
+            }
+            *graph = fresh;
+        }
         self.root = 0;
         Some((std::mem::replace(&mut self.nodes, nodes), std::mem::replace(&mut self.edges, edges)))
     }
 
     //Tree::drop_stale_leaves: a kept tree under a new root, the leaves a rule scored that held only from the old root
-    //taken out, their visits off their ancestors
+    //taken out, their visits off their ancestors. With transpositions nothing is taken out (Tree's)
     pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) -> Result<(), SyzygyError> {
+        if self.graph.is_some() {
+            return Ok(());
+        }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut stale = Vec::new();
         let mut keys = self.keys.clone();
@@ -156,8 +184,11 @@ impl SharedTree {
     //(Searches' advance, while the opponent thinks): every leaf below the root with visits, no moves and no proof of its
     //own, in the walk's order, each as the places of its line's moves among their nodes' moves, which hold across
     //compact. The walk runs on `threads` threads, each taking the next of the tree's parts, their candidates joined in
-    //the parts' order. None once abort is set
+    //the parts' order. None once abort is set. With transpositions none: nothing is taken out (drop_stale_leaves)
     pub fn stale_candidates(&self, threads: usize, abort: &AtomicBool) -> Option<Vec<Vec<u16>>> {
+        if self.graph.is_some() {
+            return (!abort.load(Ordering::Relaxed)).then(Vec::new);
+        }
         let share = (self.root().visits() / (threads * PARTS_A_THREAD).max(1) as u32).max(1);
         let mut parts = Vec::new();
         self.split_for_walk(self.root, &mut Vec::new(), share, &mut parts);
@@ -250,6 +281,10 @@ impl SharedTree {
         settings: &SearchSettings,
         tables: Option<&Tables>,
     ) -> Result<(), SyzygyError> {
+        //with transpositions nothing is taken out (drop_stale_leaves)
+        if self.graph.is_some() {
+            return Ok(());
+        }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut keys = self.keys.clone();
         let root_keys = keys.len();

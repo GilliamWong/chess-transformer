@@ -75,7 +75,9 @@ impl Searches {
         if board.legal_moves().is_empty() {
             return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
         }
-        let tree = self.shared_reused_tree(&mut state, id, fen, &moves).unwrap_or_else(|| SharedTree::new(board, keys));
+        let tree = self
+            .shared_reused_tree(&mut state, id, fen, &moves)
+            .unwrap_or_else(|| SharedTree::new(board, keys).with_transpositions(self.settings.transpositions));
         let tree = Arc::new(tree);
         state.shared_searches.push(SharedSearch { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
         Ok(())

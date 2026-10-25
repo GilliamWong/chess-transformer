@@ -1,6 +1,6 @@
 //the storage of a tree that many threads grow at once: chunks made on first use and never moved or freed before the tree
 //is, so a reference into one stays valid while other threads allocate. A node is one cache line of atomics, an edge three
-//u32 columns (prior, child, move)
+//u32 columns (prior, child, move), and a fourth (its visits) with transpositions
 use crate::search::{NO_NODE, Outcome, Proof};
 use shakmaty::{Move, Role, Square};
 use std::ops::Range;
@@ -27,6 +27,8 @@ pub struct Node {
     proof_meta: AtomicU64, //0 without a proof, else the plies above the low 2 bits and the outcome in them (1 loss, 2 draw, 3 win)
     key: AtomicU64,
     refreshes: AtomicU32,
+    //with transpositions the node's fifty-move count, and whether the table has it (search.rs Graph's halfmoves)
+    halfmoves: AtomicU32,
 }
 
 impl Node {
@@ -83,6 +85,7 @@ impl Node {
         target.proof_value.store(self.proof_value.load(Ordering::Relaxed), Ordering::Relaxed);
         target.proof_meta.store(self.proof_meta.load(Ordering::Relaxed), Ordering::Relaxed);
         target.key.store(self.key.load(Ordering::Relaxed), Ordering::Relaxed);
+        target.halfmoves.store(self.halfmoves.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub fn value_sum(&self) -> f64 {
@@ -122,6 +125,15 @@ impl Node {
 
     pub fn key(&self) -> u64 {
         self.key.load(Ordering::Relaxed)
+    }
+
+    pub fn halfmoves(&self) -> u16 {
+        self.halfmoves.load(Ordering::Relaxed) as u16
+    }
+
+    //set by the thread that makes the node, before its index is given out
+    pub fn set_halfmoves(&self, halfmoves: u16) {
+        self.halfmoves.store(u32::from(halfmoves), Ordering::Relaxed);
     }
 
     pub fn edges(&self) -> Range<usize> {
@@ -264,10 +276,11 @@ impl Nodes {
     }
 }
 
-//the edges' columns of a chunk, in one slice: priors, children, moves
+//the edges' columns of a chunk, in one slice: priors, children, moves, and with transpositions the edges' visits
 const PRIORS: usize = 0;
 const CHILDREN: usize = 1;
 const MOVES: usize = 2;
+const VISITS: usize = 3;
 
 pub struct Edges {
     table: Table<AtomicU32>,
@@ -278,7 +291,12 @@ impl Edges {
     pub const CAPACITY: usize = EDGE_CHUNKS << EDGE_CHUNK_BITS;
 
     pub fn new() -> Edges {
-        Edges { table: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 3), next: AtomicUsize::new(0) }
+        Edges::with_visits(false)
+    }
+
+    //the edges, with a column of their visits if `visits` (transpositions)
+    pub fn with_visits(visits: bool) -> Edges {
+        Edges { table: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, if visits { 4 } else { 3 }), next: AtomicUsize::new(0) }
     }
 
     //the edges given out so far, the gaps at chunk ends included
@@ -299,9 +317,10 @@ impl Edges {
             }
         };
         assert!(first + count <= Self::CAPACITY, "the tree is past its edges");
+        let columns = self.table.columns;
         self.table.made(first, || {
             let chunk = 1usize << EDGE_CHUNK_BITS;
-            (0..3 * chunk).map(|slot| AtomicU32::new(if slot / chunk == CHILDREN { NO_NODE } else { 0 })).collect()
+            (0..columns * chunk).map(|slot| AtomicU32::new(if slot / chunk == CHILDREN { NO_NODE } else { 0 })).collect()
         });
         first
     }
@@ -328,6 +347,15 @@ impl Edges {
 
     pub fn child(&self, edge: usize) -> &AtomicU32 {
         &self.children(edge..edge + 1)[0]
+    }
+
+    //the edges' visits (with transpositions only)
+    pub fn visits(&self, edges: Range<usize>) -> &[AtomicU32] {
+        self.column(edges, VISITS)
+    }
+
+    pub fn edge_visits(&self, edge: usize) -> &AtomicU32 {
+        &self.visits(edge..edge + 1)[0]
     }
 
     pub fn chess_move(&self, edge: usize) -> Move {

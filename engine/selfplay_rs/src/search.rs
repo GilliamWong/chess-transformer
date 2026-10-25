@@ -24,6 +24,12 @@ pub struct SearchSettings {
     //a proven result, and so is a node with a winning move or with every move's result proven; a two-fold repetition
     //stays an unproven draw. A proven node's visits all count its result, and descents stop there. mcts.py has none
     pub certainty: bool,
+    //transpositions (lc0's DAG search): a position reached again by another order of moves, with the same fifty-move
+    //count, gets the node made for it first, so that every path shares its subtree and its numbers. The exploration
+    //term counts a move's own visits (Graph's edge visits); a move with fewer visits than the node it leads to takes the
+    //node's mean as a visit without descending (lc0's transposition visit), so its parent learns what the other paths
+    //found. A repeat of a position on the descent's path is a draw for that path only, and never a proof. mcts.py has none
+    pub transpositions: bool,
 }
 
 //a result the search has proven, for the side that played into the node (as the node's value_sum)
@@ -129,9 +135,11 @@ pub fn sharpen(value: f32, sharpness: f64) -> f32 {
     (1.0 / (1.0 + ((1.0 - value) / value).powf(sharpness))) as f32
 }
 
-//a simulation waiting for the network: its nodes from the root down, and its leaf's position and legal moves
+//a simulation waiting for the network: its nodes from the root down, the edges between them (with transpositions only),
+//and its leaf's position and legal moves
 pub struct PendingLeaf {
     pub path: Vec<usize>,
+    pub edges: Vec<usize>,
     pub key: u64,
     pub moves: MoveList,
     pub turn: Color,
@@ -163,6 +171,78 @@ impl Hasher for KeyHasher {
 }
 
 type KeyMap<V> = HashMap<u64, V, BuildHasherDefault<KeyHasher>>;
+
+//a node's position and fifty-move count as one key, the transposition table's: positions that differ only in the count
+//are not shared, so a draw by the fifty-move rule holds for every path to a node (lc0's key has the count too)
+pub fn graph_key(key: u64, halfmoves: u32) -> u64 {
+    key ^ u64::from(halfmoves + 1).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
+}
+
+//a node's fifty-move count as Graph keeps it: past 65535 the same, a count the fifty-move rule's draw ends long before
+pub fn halfmove_count(halfmoves: u32) -> u16 {
+    halfmoves.min(u32::from(u16::MAX)) as u16
+}
+
+//the positions of a descent's path that a move from its last node could repeat (a two-fold repetition inside the
+//search, with transpositions): the same side to move, four plies or more before the move's position (two plies cannot
+//undo two moves of both sides), and no capture or pawn move between. `keys` holds the game's positions and the path's
+//from `path_start` on, the last node's last; `halfmoves` is the last node's count. The filter of their keys' top bits
+//turns most other keys away before the scan. A move whose position has a count of 0 repeats nothing
+pub struct Repeats<'a> {
+    candidates: &'a [u64],
+    filter: u128,
+}
+
+impl<'a> Repeats<'a> {
+    pub fn new(keys: &'a [u64], path_start: usize, halfmoves: u32) -> Repeats<'a> {
+        let position = keys.len();
+        let lowest = position.saturating_sub(halfmoves as usize + 1).max(path_start);
+        //from the position four plies back down to the lowest, every other one (rev().step_by(2) in `repeats`)
+        let candidates = if position >= lowest + 4 { &keys[lowest..position - 3] } else { &[] };
+        let filter = candidates.iter().rev().step_by(2).fold(0, |filter, &key| filter | Self::bit(key));
+        Repeats { candidates, filter }
+    }
+
+    fn bit(key: u64) -> u128 {
+        1 << (key >> 57)
+    }
+
+    //whether the position after a move (its key and fifty-move count) is one of the path's
+    pub fn repeats(&self, key: u64, halfmoves: u16) -> bool {
+        halfmoves != 0 && self.filter & Self::bit(key) != 0 && self.candidates.iter().rev().step_by(2).any(|&earlier| earlier == key)
+    }
+}
+
+//a tree's transpositions (SearchSettings' transpositions): the node of every position by graph_key, each edge's visits
+//(a node's count every path's to it), and each node's fifty-move count. The fifty-move count only grows along a path,
+//so no path reaches a node twice: the graph has no cycles. A repeat of a position on a path is a draw on that path only
+//(Repeats), never in the numbers of the node the other paths share
+#[derive(Clone)]
+struct Graph {
+    table: KeyMap<u32>,
+    edge_visits: Vec<u32>,
+    halfmoves: Vec<u16>,
+}
+
+impl Graph {
+    fn new(root_key: u64, root_halfmoves: u32) -> Graph {
+        let mut table = KeyMap::default();
+        table.insert(graph_key(root_key, root_halfmoves), 0);
+        Graph { table, edge_visits: Vec::new(), halfmoves: vec![halfmove_count(root_halfmoves)] }
+    }
+
+    fn bytes(&self) -> usize {
+        //a table entry is its key, its node and a control byte, in a table at most 7/8 full
+        self.table.capacity() * 16 + self.edge_visits.capacity() * size_of::<u32>() + self.halfmoves.capacity() * size_of::<u16>()
+    }
+}
+
+//where a descent with transpositions stopped above a node: at a repeat of a position on its path, or at a move with
+//fewer visits than its node (a transposition visit)
+enum Stop {
+    Repeat,
+    CatchUp,
+}
 
 //the priors a cached position is given room for, above the ~37 legal moves of a middlegame's
 const PRIORS_A_POSITION: usize = 40;
@@ -301,6 +381,8 @@ pub struct Tree {
     logits: Vec<f32>,
     //no room for another simulation (make_room): the search ends as at its simulations, until a move is played
     pub full: bool,
+    //the transpositions, with SearchSettings' (with_transpositions); None for a tree
+    graph: Option<Graph>,
 }
 
 impl Tree {
@@ -319,7 +401,16 @@ impl Tree {
             pending: Vec::new(),
             logits: Vec::new(),
             full: false,
+            graph: None,
         }
+    }
+
+    //the tree with transpositions (SearchSettings' transpositions) if `transpositions`; a new tree, nothing expanded
+    pub fn with_transpositions(mut self, transpositions: bool) -> Tree {
+        assert_eq!(self.nodes.len(), 1, "transpositions from a tree's start");
+        let root_key = self.node_keys[0];
+        self.graph = transpositions.then(|| Graph::new(root_key, self.board.halfmoves()));
+        self
     }
 
     //room for one more simulation: its node, and the moves of every leaf that may be expanded before the next look
@@ -333,15 +424,30 @@ impl Tree {
             return true;
         }
         let spare = memory_limit.saturating_sub(self.allocated_bytes());
-        let node_bytes = size_of::<Node>() + size_of::<u64>();
+        let graph_node_bytes = if self.graph.is_some() { size_of::<u16>() } else { 0 };
+        let node_bytes = size_of::<Node>() + size_of::<u64>() + graph_node_bytes;
         let Some(nodes) = grown_capacity(self.nodes.capacity().min(self.node_keys.capacity()), self.nodes.len() + 1, node_bytes, spare)
         else {
             return false;
         };
         reserve_to(&mut self.nodes, nodes);
         reserve_to(&mut self.node_keys, nodes);
+        if let Some(graph) = &mut self.graph {
+            reserve_to(&mut graph.halfmoves, nodes);
+        }
+        //the table doubles when full, its new room made while the old is held
+        if let Some((entries, room)) = self.graph.as_ref().map(|graph| (graph.table.len(), graph.table.capacity()))
+            && entries == room
+        {
+            let more = room.max(1024);
+            if memory_limit.saturating_sub(self.allocated_bytes()) < 2 * more * 16 {
+                return false;
+            }
+            self.graph.as_mut().expect("the graph").table.reserve(more);
+        }
         let spare = memory_limit.saturating_sub(self.allocated_bytes());
-        let edge_bytes = size_of::<Move>() + size_of::<f32>() + size_of::<u32>();
+        let graph_edge_bytes = if self.graph.is_some() { size_of::<u32>() } else { 0 };
+        let edge_bytes = size_of::<Move>() + size_of::<f32>() + size_of::<u32>() + graph_edge_bytes;
         let capacity = self.moves.capacity().min(self.priors.capacity()).min(self.children.capacity());
         let Some(edges) = grown_capacity(capacity, self.moves.len() + (self.pending() + 1) * MOST_MOVES, edge_bytes, spare) else {
             return false;
@@ -349,16 +455,20 @@ impl Tree {
         reserve_to(&mut self.moves, edges);
         reserve_to(&mut self.priors, edges);
         reserve_to(&mut self.children, edges);
+        if let Some(graph) = &mut self.graph {
+            reserve_to(&mut graph.edge_visits, edges);
+        }
         true
     }
 
-    //the bytes the tree's node and edge vectors have allocated
+    //the bytes the tree's node and edge vectors (and its transpositions') have allocated
     pub fn allocated_bytes(&self) -> usize {
         self.nodes.capacity() * size_of::<Node>()
             + self.node_keys.capacity() * size_of::<u64>()
             + self.moves.capacity() * size_of::<Move>()
             + self.priors.capacity() * size_of::<f32>()
             + self.children.capacity() * size_of::<u32>()
+            + self.graph.as_ref().map_or(0, Graph::bytes)
     }
 
     pub fn root(&self) -> &Node {
@@ -389,8 +499,12 @@ impl Tree {
         (child != NO_NODE).then(|| &self.nodes[child as usize])
     }
 
+    //the move's visits: its node's, or with transpositions the move's own (its node counts every path's)
     pub fn visits(&self, edge: usize) -> u32 {
-        self.child(edge).map_or(0, |child| child.visit_count)
+        match &self.graph {
+            Some(graph) => graph.edge_visits[edge],
+            None => self.child(edge).map_or(0, |child| child.visit_count),
+        }
     }
 
     //simulations waiting for the network
@@ -447,8 +561,9 @@ impl Tree {
     //mcts.select_child, with the simulations under a child that wait for the network counted in its visits for the
     //exploration term (lc0's n started); an edge without a node is a child without visits. A proven loss (certainty)
     //is passed over while any other move is left: its result is known, and its visits would only drag the node's mean,
-    //and with it the first play urgency of the moves not yet tried, down. Returns the edge
-    fn select_edge(&self, node: usize, settings: &SearchSettings) -> usize {
+    //and with it the first play urgency of the moves not yet tried, down. With transpositions a move that repeats a
+    //position of the path (`repeats`) is worth a draw, as a tree's repeat leaf is. Returns the edge
+    fn select_edge(&self, node: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> usize {
         let parent = &self.nodes[node];
         let c_puct =
             settings.c_puct + settings.c_puct_factor * ((f64::from(parent.visit_count) + settings.c_puct_base) / settings.c_puct_base).ln();
@@ -459,6 +574,8 @@ impl Tree {
 
         let (mut best, mut best_u) = (0, f64::NEG_INFINITY);
         let noised = node == self.root && !self.noised_priors.is_empty();
+        //with transpositions a move's own visits, its node's mean (every path's)
+        let edge_visits = self.graph.as_ref().map(|graph| &graph.edge_visits[edges.clone()]);
         for (index, (&prior, &child)) in self.priors[edges.clone()].iter().zip(&self.children[edges.clone()]).enumerate() {
             let prior = if noised { self.noised_priors[index] } else { f64::from(prior) };
             let (u, child_edges) = match child {
@@ -469,8 +586,18 @@ impl Tree {
                     if child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss) {
                         continue;
                     }
-                    let q = if child.visit_count > 0 { child.mean_score() } else { first_play_urgency };
-                    let started = child.visit_count + child.in_flight;
+                    let repeat = repeats.is_some_and(|repeats| {
+                        let id = self.children[edges.start + index] as usize;
+                        repeats.repeats(self.node_keys[id], self.graph.as_ref().expect("the graph").halfmoves[id])
+                    });
+                    let q = if repeat {
+                        1.0 - settings.draw
+                    } else if child.visit_count > 0 {
+                        child.mean_score()
+                    } else {
+                        first_play_urgency
+                    };
+                    let started = edge_visits.map_or(child.visit_count, |visits| visits[index]) + child.in_flight;
                     (q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started))), child.edges_at)
                 }
             };
@@ -501,13 +628,25 @@ impl Tree {
         }
     }
 
-    //the edge's node, made if the edge has none yet; board is the node's position
+    //the edge's node, made if the edge has none yet; board is the node's position. With transpositions the node of the
+    //same position and fifty-move count (the table's) is the edge's if there is one
     fn child_node(&mut self, edge: usize, board: &Chess) -> usize {
-        if self.children[edge] == NO_NODE {
-            self.children[edge] = self.nodes.len() as u32;
-            self.nodes.push(Node::new());
-            self.node_keys.push(position_key(board));
+        if self.children[edge] != NO_NODE {
+            return self.children[edge] as usize;
         }
+        let key = position_key(board);
+        if let Some(graph) = &mut self.graph {
+            let entry = graph_key(key, board.halfmoves());
+            if let Some(&shared) = graph.table.get(&entry) {
+                self.children[edge] = shared;
+                return shared as usize;
+            }
+            graph.halfmoves.push(halfmove_count(board.halfmoves()));
+            graph.table.insert(entry, self.nodes.len() as u32);
+        }
+        self.children[edge] = self.nodes.len() as u32;
+        self.nodes.push(Node::new());
+        self.node_keys.push(key);
         self.children[edge] as usize
     }
 
@@ -526,6 +665,8 @@ impl Tree {
         let (mut simulations, mut gathered) = (0, 0);
         let mut collisions: Vec<Vec<usize>> = Vec::new();
         let mut path = Vec::new();
+        //with transpositions the edges between the path's nodes, the visits of a move being its own
+        let mut edges = Vec::new();
         //the tables finish the nodes they cover below the root. Below a root they cover (the engine searches a size it
         //has no dtz tables for), only those right after a capture or pawn move, as lc0 probes: the network steers the
         //moves between, and the tables' result, which starts the fifty move count there, is exact
@@ -543,24 +684,62 @@ impl Tree {
             let root_keys = self.keys.len();
             path.clear();
             path.push(self.root);
+            edges.clear();
             let mut node = self.root;
+            let mut stop = None;
             while self.nodes[node].has_edges() {
-                let edge = self.select_edge(node, settings);
+                let halfmoves = board.halfmoves();
+                let edge = match self.graph {
+                    Some(_) => self.select_edge(node, settings, Some(&Repeats::new(&self.keys, root_keys - 1, halfmoves))),
+                    None => self.select_edge(node, settings, None),
+                };
                 board.play_unchecked(self.moves[edge]);
                 //a descent never ends without a visit or a simulation waiting, so the node is needed
                 node = self.child_node(edge, &board);
                 path.push(node);
+                if let Some(graph) = &self.graph {
+                    edges.push(edge);
+                    //a repeat of this path's position, whatever the node is to other paths, or a node that knows more
+                    //than its move
+                    if Repeats::new(&self.keys, root_keys - 1, halfmoves).repeats(self.node_keys[node], graph.halfmoves[node]) {
+                        stop = Some(Stop::Repeat);
+                    } else if self.nodes[node].has_edges()
+                        && self.nodes[node].proof.is_none()
+                        && graph.edge_visits[edge] < self.nodes[node].visit_count
+                    {
+                        stop = Some(Stop::CatchUp);
+                    }
+                }
                 self.keys.push(self.node_keys[node]);
-                if self.nodes[node].proof.is_some() {
+                if self.nodes[node].proof.is_some() || stop.is_some() {
                     break;
                 }
+            }
+
+            //a repeat is a draw for this path, a transposition visit the shared node's mean: the visit is the move's,
+            //its node's numbers stay as they are
+            if let Some(stop) = stop {
+                self.keys.truncate(root_keys);
+                simulations += 1;
+                let value = match stop {
+                    Stop::Repeat => 1.0 - settings.draw,
+                    //as a SharedTree keeps it (a mean read there beside other backups may be off): a score
+                    Stop::CatchUp => self.nodes[node].mean_score().clamp(0.0, 1.0),
+                };
+                path.pop();
+                self.back_up(&path, &edges, value, 0);
+                continue;
             }
 
             //a proven result is known without going further
             if let Some(proof) = self.nodes[node].proof {
                 self.keys.truncate(root_keys);
                 simulations += 1;
-                self.backup(&path, 1.0 - proof.value, 0);
+                if self.graph.is_some() {
+                    self.back_up(&path, &edges, 1.0 - proof.value, 0);
+                } else {
+                    self.backup(&path, 1.0 - proof.value, 0);
+                }
                 continue;
             }
 
@@ -585,6 +764,8 @@ impl Tree {
             //a repeat inside the search is a draw, but not a proven one: the game need not repeat (lc0 gives two-fold
             //draws no bounds either)
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
+            //with transpositions a descent stops above a repeat of its path, so a leaf is no repeat inside the search, and
+            //a repetition the rules count holds for every path to it (the game's history repeats it)
             let value = game_over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
             self.keys.truncate(root_keys);
 
@@ -606,7 +787,7 @@ impl Tree {
                     };
                     self.prove(&path, Proof { outcome, value: 1.0 - result, plies });
                 }
-                self.backup(&path, value, 0);
+                self.back_up(&path, &edges, value, 0);
                 if settings.certainty {
                     self.propagate_proofs(&path);
                 }
@@ -618,12 +799,13 @@ impl Tree {
             match cache.and_then(|cache| cache.get(leaf_key)).filter(|answer| answer.priors.len() == moves.len()) {
                 Some(answer) => {
                     self.expand(node, &moves, answer.priors);
-                    self.backup(&path, f64::from(answer.value), 0);
+                    self.back_up(&path, &edges, f64::from(answer.value), 0);
                 }
                 None => {
                     encode_board(&board, boards);
                     self.add_in_flight(&path);
-                    self.round_leaves(round.id).push_back(PendingLeaf { path: path.clone(), key: leaf_key, moves, turn: board.turn() });
+                    let leaf = PendingLeaf { path: path.clone(), edges: edges.clone(), key: leaf_key, moves, turn: board.turn() };
+                    self.round_leaves(round.id).push_back(leaf);
                     gathered += 1;
                 }
             }
@@ -661,7 +843,7 @@ impl Tree {
         let node = *leaf.path.last().expect("the root at least");
         let priors = std::mem::take(&mut self.logits);
         self.expand(node, &leaf.moves, &priors);
-        self.backup(&leaf.path, f64::from(value), 1);
+        self.back_up(&leaf.path, &leaf.edges, f64::from(value), 1);
         if let Some(cache) = cache {
             cache.insert(leaf.key, &priors, value);
         }
@@ -676,6 +858,9 @@ impl Tree {
             self.priors.push(prior);
         }
         self.children.resize(self.moves.len(), NO_NODE);
+        if let Some(graph) = &mut self.graph {
+            graph.edge_visits.resize(self.moves.len(), 0);
+        }
         self.nodes[node].edges_at = (first_edge as u64) << 8 | (self.moves.len() - first_edge) as u64;
     }
 
@@ -703,13 +888,45 @@ impl Tree {
         }
     }
 
+    //backup with or without transpositions. With them the edges are those between the path's nodes, and one more when
+    //the path ends above the node the descent stopped at (a repeat or a transposition visit): every edge counts the
+    //visit, and a node's visited policy is refreshed when one of its moves has its first
+    fn back_up(&mut self, path: &[usize], edges: &[usize], value: f64, in_flight: u32) {
+        if self.graph.is_none() {
+            return self.backup(path, value, in_flight);
+        }
+        let mut score = 1.0 - value;
+        for (depth, &node) in path.iter().enumerate().rev() {
+            if let Some(proof) = self.nodes[node].proof {
+                score = proof.value;
+            }
+            self.nodes[node].visit_count += 1;
+            self.nodes[node].in_flight -= in_flight;
+            self.nodes[node].value_sum += score;
+            if let Some(&edge) = edges.get(depth) {
+                let graph = self.graph.as_mut().expect("the graph");
+                graph.edge_visits[edge] += 1;
+                if graph.edge_visits[edge] == 1 {
+                    self.refresh_visited_policy(node);
+                }
+            }
+            score = 1.0 - score;
+        }
+    }
+
     //proves the path's last node: its visits so far count the proven score instead of theirs, in its ancestors too
-    //(lc0's AdjustForTerminal). A visit's score s goes to the node and 1 - s to the parent, so the change alternates
+    //(lc0's AdjustForTerminal). A visit's score s goes to the node and 1 - s to the parent, so the change alternates.
+    //With transpositions only the node's own: a path's ancestors had only some of its visits, at scores of their own
+    //(the transposition visits' means, the repeats' draws), and they come round as their next visits back the proven
+    //score up, a descent stopping there
     fn prove(&mut self, path: &[usize], proof: Proof) {
         let (&node, ancestors) = path.split_last().expect("a node to prove");
         let change = f64::from(self.nodes[node].visit_count) * proof.value - self.nodes[node].value_sum;
         self.nodes[node].value_sum += change;
         self.nodes[node].proof = Some(proof);
+        if self.graph.is_some() {
+            return;
+        }
         for (distance, &ancestor) in ancestors.iter().rev().enumerate() {
             self.nodes[ancestor].value_sum += if distance % 2 == 0 { -change } else { change };
         }
@@ -761,7 +978,14 @@ impl Tree {
     //two-fold draw whose first position is no longer in the search. That is a repeat inside the search whose first
     //position is now before the root, where the game needs a third, and a tables' result the new root's probing would
     //not look up. Leaves below a proven node stay: no descent reaches them
+    //
+    //With transpositions nothing is taken out, as lc0's DAG search keeps a re-rooted repeat's visits: a leaf has no moves,
+    //so its next visit scores it by the rules again from its own path, and expands it if they no longer hold. Taking its
+    //visits out of one path's ancestors would miscount a node that other paths share
     pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) -> Result<(), SyzygyError> {
+        if self.graph.is_some() {
+            return Ok(());
+        }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut stale = Vec::new();
         self.find_stale_leaves(&mut vec![self.root], &mut Vec::new(), settings, tables, root_covered, &mut stale)?;
@@ -835,8 +1059,11 @@ impl Tree {
     //proof of its own, in the walk's order, each as the places of its line's moves among their nodes' moves, which hold
     //across compact. Leaves below a node proven now are kept too, as a later root's own proof is dropped. The walk
     //runs on `threads` threads, each taking the next of the tree's parts (split_for_walk), their candidates joined in
-    //the parts' order. None once abort is set
+    //the parts' order. None once abort is set. With transpositions none: nothing is taken out (drop_stale_leaves)
     pub fn stale_candidates(&self, threads: usize, abort: &AtomicBool) -> Option<Vec<Vec<u16>>> {
+        if self.graph.is_some() {
+            return (!abort.load(Ordering::Relaxed)).then(Vec::new);
+        }
         let share = (self.root().visit_count / (threads * PARTS_A_THREAD).max(1) as u32).max(1);
         let mut parts = Vec::new();
         self.split_for_walk(self.root, &mut Vec::new(), share, &mut parts);
@@ -936,6 +1163,10 @@ impl Tree {
         settings: &SearchSettings,
         tables: Option<&Tables>,
     ) -> Result<(), SyzygyError> {
+        //with transpositions nothing is taken out (drop_stale_leaves)
+        if self.graph.is_some() {
+            return Ok(());
+        }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let root_keys = self.keys.len();
         let mut stale = Vec::new();
@@ -1057,6 +1288,9 @@ impl Tree {
             self.noised_priors.clear();
             self.full = false;
             self.root = 0;
+            if self.graph.is_some() {
+                self.graph = Some(Graph::new(self.node_keys[0], self.board.halfmoves()));
+            }
         }
     }
 
@@ -1095,6 +1329,9 @@ impl Tree {
     //pages that thread is the first to touch: the same tree. Returns the old tree's vectors to free, or None once abort
     //is set (the tree then left as it was)
     pub fn compact(&mut self, threads: usize, abort: Option<&AtomicBool>) -> Option<Vectors> {
+        if self.graph.is_some() {
+            return self.compact_graph(abort);
+        }
         if threads <= 1 {
             return self.compact_on_one_thread(abort);
         }
@@ -1241,6 +1478,71 @@ impl Tree {
             }
             index += 1;
         }
+        self.root = 0;
+        Some((
+            std::mem::replace(&mut self.nodes, nodes),
+            std::mem::replace(&mut self.node_keys, node_keys),
+            std::mem::replace(&mut self.moves, moves),
+            std::mem::replace(&mut self.priors, priors),
+            std::mem::replace(&mut self.children, children),
+        ))
+    }
+
+    //compact with transpositions, on one thread: the nodes the root reaches in breadth-first order, a node that several
+    //moves lead to copied once (at the first) and every one of those moves given its new number, each move's visits with
+    //it; then the table again, of the copied nodes
+    fn compact_graph(&mut self, abort: Option<&AtomicBool>) -> Option<Vectors> {
+        let graph = self.graph.as_ref().expect("the graph");
+        let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
+        let mut copied_as = vec![NO_NODE; node_room];
+        let mut order = vec![self.root];
+        copied_as[self.root] = 0;
+        let mut nodes = Vec::with_capacity(node_room);
+        let mut node_keys = Vec::with_capacity(node_room);
+        let mut halfmoves = Vec::with_capacity(node_room);
+        let (mut moves, mut priors, mut children, mut edge_visits) =
+            (Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room), Vec::with_capacity(edge_room));
+        let mut index = 0;
+        while index < order.len() {
+            if index.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed)) {
+                return None;
+            }
+            let old = order[index];
+            let mut node = self.nodes[old];
+            if index == 0 {
+                node.proof = None;
+            }
+            let edges = node.edges();
+            //a node without moves keeps the first edge Node::new gives it
+            if !edges.is_empty() {
+                node.edges_at = (moves.len() as u64) << 8 | edges.len() as u64;
+            }
+            nodes.push(node);
+            node_keys.push(self.node_keys[old]);
+            halfmoves.push(graph.halfmoves[old]);
+            moves.extend_from_slice(&self.moves[edges.clone()]);
+            priors.extend_from_slice(&self.priors[edges.clone()]);
+            edge_visits.extend_from_slice(&graph.edge_visits[edges.clone()]);
+            for &child in &self.children[edges] {
+                children.push(match child {
+                    NO_NODE => NO_NODE,
+                    _ => {
+                        if copied_as[child as usize] == NO_NODE {
+                            copied_as[child as usize] = order.len() as u32;
+                            order.push(child as usize);
+                        }
+                        copied_as[child as usize]
+                    }
+                });
+            }
+            index += 1;
+        }
+        let mut table = KeyMap::default();
+        table.reserve(nodes.len());
+        for (node, (&key, &count)) in node_keys.iter().zip(&halfmoves).enumerate() {
+            table.insert(graph_key(key, u32::from(count)), node as u32);
+        }
+        self.graph = Some(Graph { table, edge_visits, halfmoves });
         self.root = 0;
         Some((
             std::mem::replace(&mut self.nodes, nodes),

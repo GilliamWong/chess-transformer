@@ -161,6 +161,7 @@ impl SelfPlayGames {
                     repetitions_for_a_draw,
                     value_sharpness: 1.0,
                     certainty: false,
+                    transpositions: false,
                 },
                 simulations,
                 sampled_plies,
@@ -757,11 +758,12 @@ impl Searches {
     //certainty search.rs SearchSettings'. memory_limit_mb (lc0's RamLimitMb, 0 for none) ends a search once its tree's
     //vectors would grow past that many megabytes; the cache comes on top, and so does advance's copy of the part of the
     //tree it keeps. advance_threads: the threads advance walks and copies a kept tree on, off the clock. concurrent_descents:
-    //the trees are SharedTrees (search/shared.rs), which threads descend at once
+    //the trees are SharedTrees (search/shared.rs), which threads descend at once. transpositions: search.rs
+    //SearchSettings'
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0, advance_threads=4, concurrent_descents=false))]
+                        memory_limit_mb=0, advance_threads=4, concurrent_descents=false, transpositions=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -781,6 +783,7 @@ impl Searches {
         memory_limit_mb: usize,
         advance_threads: usize,
         concurrent_descents: bool,
+        transpositions: bool,
     ) -> PyResult<Searches> {
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -788,7 +791,17 @@ impl Searches {
             )));
         }
         Ok(Searches {
-            settings: SearchSettings { c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw, value_sharpness, certainty },
+            settings: SearchSettings {
+                c_puct,
+                c_puct_factor,
+                c_puct_base,
+                fpu_reduction,
+                draw,
+                repetitions_for_a_draw,
+                value_sharpness,
+                certainty,
+                transpositions,
+            },
             move_ids: move_ids(move_id_table)?,
             answer_width,
             tables: open_tables(tablebase_folder, tablebase_pieces)?,
@@ -828,7 +841,9 @@ impl Searches {
             if board.legal_moves().is_empty() {
                 return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
             }
-            let tree = self.reused_tree(&mut state, id, fen, &moves).unwrap_or_else(|| Tree::new(board, keys));
+            let tree = self
+                .reused_tree(&mut state, id, fen, &moves)
+                .unwrap_or_else(|| Tree::new(board, keys).with_transpositions(self.settings.transpositions));
             state.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
             Ok(())
         })
