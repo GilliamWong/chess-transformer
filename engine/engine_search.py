@@ -78,8 +78,10 @@ ADVANCE_THREADS = 4
 #towards narrow search. value_sharpness 3: the value labels' human scale is ~3x flatter than stockfish's win rate, and
 #the d768 sharpened 3x scored +42 +- 29 elo against BT4 at 1000 nodes in lc0's search (2026-10-11). certainty: search.rs
 #SearchSettings' (with smart pruning a search whose root is proven stops); without it a mate the search had found lost
-#to a move with more visits (2026-10-13)
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True}
+#to a move with more visits (2026-10-13). transpositions: search.rs SearchSettings' (lc0's DAG search): at 32M nodes a
+#tree spent 58-81% of its visits on positions it already had, and the DAG was no slower with 20-40% less memory at 10M
+#(2026-10-24); on by the user's call before a match measured it
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
 
 
 #search.rs sharpen: the value's logit times sharpness; 1 / sharpness undoes it, and 1 leaves the score exactly as it was
