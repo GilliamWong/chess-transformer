@@ -92,7 +92,7 @@ impl Game {
         for slot in 0..settings.top_moves {
             match most_visited.get(slot) {
                 Some(&edge) => {
-                    self.record.visit_moves.push(move_ids.id(self.tree.chess_move(edge), turn) as i16);
+                    self.record.visit_moves.push(move_ids.id(self.tree.chess_move(edge).to_move(&self.tree.board), turn) as i16);
                     self.record.visit_shares.push((f64::from(self.tree.visits(edge)) / f64::from(visits)) as f32);
                 }
                 None => {

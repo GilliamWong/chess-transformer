@@ -13,8 +13,8 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use rules::{
-    MOVE_ID_TABLE_LENGTH, MoveIds, TOKENS_PER_BOARD, Tables, encode_board, final_result, game_result, legal_moves_in_python_order,
-    position_key,
+    MOVE_ID_TABLE_LENGTH, MoveIds, PackedMove, TOKENS_PER_BOARD, Tables, encode_board, final_result, game_result,
+    legal_moves_in_python_order, position_key,
 };
 use search::{Cache, Round, SearchSettings, SharedCache, SharedTree, Tree};
 use shakmaty::fen::Fen;
@@ -89,8 +89,8 @@ fn answers_for<N: Number>(answers: &[N], boards: usize, answer_width: usize) -> 
     Ok(answers)
 }
 
-fn uci(chess_move: shakmaty::Move) -> String {
-    chess_move.to_uci(CastlingMode::Standard).to_string()
+fn uci(chess_move: PackedMove) -> String {
+    chess_move.to_uci().to_string()
 }
 
 #[pyclass(unsendable)]

@@ -1,7 +1,8 @@
 //the rules exactly as the python has them: python-chess, encoding.py, mcts.game_result and final_result in
 //tests/reference_selfplay.py (tests/test_selfplay_rs.py holds the two together)
+use shakmaty::uci::UciMove;
 use shakmaty::zobrist::Zobrist64;
-use shakmaty::{Bitboard, Board, CastlingSide, Chess, Color, EnPassantMode, Move, MoveList, Position, Role, Square};
+use shakmaty::{Bitboard, Board, CastlingSide, Chess, Color, EnPassantMode, File, Move, MoveList, Position, Role, Square};
 use shakmaty_syzygy::{SyzygyError, Tablebase, Wdl};
 
 pub const TOKENS_PER_BOARD: usize = 70;
@@ -76,6 +77,80 @@ fn python_chess_squares(chess_move: Move) -> (usize, usize, usize) {
             chess_move.to().to_usize(),
             chess_move.promotion().map_or(0, |role| role as usize),
         ),
+    }
+}
+
+//a tree edge's move in 2 bytes rather than shakmaty's 5, read in the position it is played from, which has the moved
+//piece and the capture: from 0..6, to 6..12 (a castle's rook), the kind 12..16 (0 a plain move, 1 to 4 a promotion to a
+//knight, bishop, rook or queen, EN_PASSANT, CASTLE)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PackedMove(u16);
+
+const EN_PASSANT: u16 = 5;
+const CASTLE: u16 = 6;
+
+impl PackedMove {
+    pub fn new(chess_move: Move) -> PackedMove {
+        let squares = |from: Square, to: Square| from.to_u32() | to.to_u32() << 6;
+        let code = match chess_move {
+            Move::Normal { from, to, promotion, .. } => squares(from, to) | promotion.map_or(0, |role| u32::from(role) - 1) << 12,
+            Move::EnPassant { from, to } => squares(from, to) | u32::from(EN_PASSANT) << 12,
+            Move::Castle { king, rook } => squares(king, rook) | u32::from(CASTLE) << 12,
+            Move::Put { .. } => unreachable!("no drops in chess"),
+        };
+        PackedMove(code as u16)
+    }
+
+    //the 16 bits, for storage that holds them as they are (SharedTree's atomics)
+    pub fn from_bits(bits: u16) -> PackedMove {
+        PackedMove(bits)
+    }
+
+    pub fn bits(self) -> u16 {
+        self.0
+    }
+
+    fn from(self) -> Square {
+        Square::new(u32::from(self.0 & 63))
+    }
+
+    fn to(self) -> Square {
+        Square::new(u32::from(self.0 >> 6 & 63))
+    }
+
+    fn kind(self) -> u16 {
+        self.0 >> 12
+    }
+
+    fn promotion(self) -> Option<Role> {
+        (1..=4).contains(&self.kind()).then(|| Role::ALL[usize::from(self.kind())])
+    }
+
+    //the move in `board`, the position it was packed in
+    pub fn to_move(self, board: &Chess) -> Move {
+        let (from, to) = (self.from(), self.to());
+        match self.kind() {
+            EN_PASSANT => Move::EnPassant { from, to },
+            CASTLE => Move::Castle { king: from, rook: to },
+            _ => Move::Normal {
+                role: board.board().role_at(from).expect("the moved piece"),
+                from,
+                capture: board.board().role_at(to),
+                to,
+                promotion: self.promotion(),
+            },
+        }
+    }
+
+    //Move::to_uci(CastlingMode::Standard)'s uci, no position needed: a castle as the king's two steps
+    pub fn to_uci(self) -> UciMove {
+        let (from, to) = (self.from(), self.to());
+        match self.kind() {
+            CASTLE => {
+                UciMove::Normal { from, to: Square::from_coords(if to > from { File::G } else { File::C }, from.rank()), promotion: None }
+            }
+            _ => UciMove::Normal { from, to, promotion: self.promotion() },
+        }
     }
 }
 
@@ -258,4 +333,40 @@ fn threefold_after_a_move(board: &Chess, keys: &[u64], legal_moves: &MoveList) -
         let key = position_key(&after(board, chess_move));
         since_zeroing.iter().filter(|&&earlier| earlier == key).count() >= THREEFOLD - 1
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shakmaty::CastlingMode;
+    use shakmaty::fen::Fen;
+
+    //positions with every kind of move: castles, en passant, promotions to each piece with and without captures, checks
+    const POSITIONS: [&str; 6] = [
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
+        "rnbqkbnr/ppp1pppp/8/8/3pP3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 3",
+        "1k6/6P1/8/8/8/8/8/K7 w - - 0 1",
+        "r3k2r/8/8/3pP3/8/8/8/R3K2R w KQkq d6 0 1",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    ];
+
+    //every legal move of positions with all kinds of moves comes back from its packing in its position, its uci without
+    //it, and no two of a position's moves share a packing
+    #[test]
+    fn a_move_comes_back_from_its_packing() {
+        let mut kinds = [0; 7];
+        for fen in POSITIONS {
+            let board: Chess = fen.parse::<Fen>().expect("a fen").into_position(CastlingMode::Standard).expect("a position");
+            let mut packings = std::collections::HashSet::new();
+            for chess_move in board.legal_moves() {
+                let packed = PackedMove::new(chess_move);
+                assert_eq!(packed.to_move(&board), chess_move);
+                assert_eq!(packed.to_uci(), chess_move.to_uci(CastlingMode::Standard));
+                assert!(packings.insert(packed), "{chess_move:?} shares its packing");
+                kinds[usize::from(packed.kind())] += 1;
+            }
+        }
+        assert!(kinds.iter().all(|&kind| kind > 0), "{kinds:?}");
+    }
 }

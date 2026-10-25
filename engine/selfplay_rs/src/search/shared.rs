@@ -45,7 +45,7 @@ impl Hold<'_> {
 
 //the bytes a node and an edge take, for the memory limit; with transpositions an edge's visits on top, and a table entry
 const NODE_BYTES: usize = size_of::<Node>();
-const EDGE_BYTES: usize = 3 * size_of::<u32>();
+const EDGE_BYTES: usize = 2 * size_of::<u32>() + size_of::<PackedMove>();
 const EDGE_VISIT_BYTES: usize = size_of::<u32>();
 const TABLE_ENTRY_BYTES: usize = 32;
 //what a descent may need: its node, and the moves of its leaf
@@ -245,7 +245,8 @@ impl SharedTree {
         work()
     }
 
-    pub fn chess_move(&self, edge: usize) -> Move {
+    //the edge's move, as the position it is played from reads it (PackedMove::to_move)
+    pub fn chess_move(&self, edge: usize) -> PackedMove {
         self.edges.chess_move(edge)
     }
 
@@ -480,7 +481,8 @@ impl SharedTree {
                 Arrival::Inner => {
                     let repeats = self.graph.as_ref().map(|_| Repeats::new(keys, path_start, board.halfmoves()));
                     let edge = self.select_edge(node, settings, repeats.as_ref());
-                    board.play_unchecked(self.edges.chess_move(edge));
+                    let chess_move = self.edges.chess_move(edge).to_move(board);
+                    board.play_unchecked(chess_move);
                     node = self.child_node(edge, board);
                     path.push(node);
                     let child = self.nodes.get(node);

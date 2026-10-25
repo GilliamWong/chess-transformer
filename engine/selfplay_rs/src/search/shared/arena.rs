@@ -1,11 +1,12 @@
 //the storage of a tree that many threads grow at once: chunks made on first use and never moved or freed before the tree
-//is, so a reference into one stays valid while other threads allocate. A node is one cache line of atomics, an edge three
-//u32 columns (prior, child, move), and a fourth (its visits) with transpositions
+//is, so a reference into one stays valid while other threads allocate. A node is one cache line of atomics, an edge two
+//u32 columns (prior, child) and a third (its visits) with transpositions, and its move (PackedMove) in a u16 table
+use crate::rules::PackedMove;
 use crate::search::{NO_NODE, Outcome, Proof};
-use shakmaty::{Move, Role, Square};
+use shakmaty::Move;
 use std::ops::Range;
 use std::ptr::{null_mut, slice_from_raw_parts_mut};
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const NODE_CHUNK_BITS: u32 = if cfg!(test) { 6 } else { 16 };
 const NODE_CHUNKS: usize = 1 << 14;
@@ -276,14 +277,14 @@ impl Nodes {
     }
 }
 
-//the edges' columns of a chunk, in one slice: priors, children, moves, and with transpositions the edges' visits
+//the edges' u32 columns of a chunk, in one slice: priors, children, and with transpositions the edges' visits
 const PRIORS: usize = 0;
 const CHILDREN: usize = 1;
-const MOVES: usize = 2;
-const VISITS: usize = 3;
+const VISITS: usize = 2;
 
 pub struct Edges {
     table: Table<AtomicU32>,
+    moves: Table<AtomicU16>,
     next: AtomicUsize,
 }
 
@@ -296,7 +297,11 @@ impl Edges {
 
     //the edges, with a column of their visits if `visits` (transpositions)
     pub fn with_visits(visits: bool) -> Edges {
-        Edges { table: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, if visits { 4 } else { 3 }), next: AtomicUsize::new(0) }
+        Edges {
+            table: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, if visits { 3 } else { 2 }),
+            moves: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 1),
+            next: AtomicUsize::new(0),
+        }
     }
 
     //the edges given out so far, the gaps at chunk ends included
@@ -322,6 +327,7 @@ impl Edges {
             let chunk = 1usize << EDGE_CHUNK_BITS;
             (0..columns * chunk).map(|slot| AtomicU32::new(if slot / chunk == CHILDREN { NO_NODE } else { 0 })).collect()
         });
+        self.moves.made(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
         first
     }
 
@@ -358,88 +364,34 @@ impl Edges {
         &self.visits(edge..edge + 1)[0]
     }
 
-    pub fn chess_move(&self, edge: usize) -> Move {
-        decode(self.column(edge..edge + 1, MOVES)[0].load(Ordering::Relaxed))
+    //the edge's move, as the position it is played from reads it (PackedMove::to_move)
+    pub fn chess_move(&self, edge: usize) -> PackedMove {
+        PackedMove::from_bits(self.moves.get(edge).load(Ordering::Relaxed))
     }
 
     //a node's moves and priors from edge `first`, written by the thread that owns the node before its edges are published
     pub fn write(&self, first: usize, moves: &[Move], priors: &[f32]) {
+        if moves.is_empty() {
+            return;
+        }
         let edges = first..first + moves.len();
-        let slots = self.column(edges.clone(), MOVES).iter().zip(self.priors(edges));
+        let slots = self.moves.slice(first, 0, moves.len()).iter().zip(self.priors(edges));
         for ((move_slot, prior_slot), (&chess_move, &prior)) in slots.zip(moves.iter().zip(priors)) {
-            move_slot.store(encode(chess_move), Ordering::Relaxed);
+            move_slot.store(PackedMove::new(chess_move).bits(), Ordering::Relaxed);
             prior_slot.store(prior.to_bits(), Ordering::Relaxed);
         }
     }
 
     //an edge's move and prior
-    pub fn set(&self, edge: usize, chess_move: Move, prior: f32) {
-        self.write(edge, &[chess_move], &[prior]);
-    }
-}
-
-//a move in 23 bits: kind (normal, en passant, castle) 21..23, promotion 18..21, capture 15..18, role 12..15, to 6..12, from 0..6
-fn encode(chess_move: Move) -> u32 {
-    let role = |role: Option<Role>| role.map_or(0, u32::from);
-    match chess_move {
-        Move::Normal { role: moved, from, capture, to, promotion } => {
-            from.to_u32() | to.to_u32() << 6 | u32::from(moved) << 12 | role(capture) << 15 | role(promotion) << 18
-        }
-        Move::EnPassant { from, to } => from.to_u32() | to.to_u32() << 6 | 1 << 21,
-        Move::Castle { king, rook } => king.to_u32() | rook.to_u32() << 6 | 2 << 21,
-        Move::Put { .. } => unreachable!("no drops in chess"),
-    }
-}
-
-fn decode(code: u32) -> Move {
-    let role = |bits: u32| (bits != 0).then(|| Role::ALL[bits as usize - 1]);
-    let (from, to) = (Square::new(code & 63), Square::new(code >> 6 & 63));
-    match code >> 21 {
-        0 => Move::Normal {
-            role: Role::ALL[(code >> 12 & 7) as usize - 1],
-            from,
-            capture: role(code >> 15 & 7),
-            to,
-            promotion: role(code >> 18 & 7),
-        },
-        1 => Move::EnPassant { from, to },
-        _ => Move::Castle { king: from, rook: to },
+    pub fn set(&self, edge: usize, chess_move: PackedMove, prior: f32) {
+        self.moves.get(edge).store(chess_move.bits(), Ordering::Relaxed);
+        self.priors(edge..edge + 1)[0].store(prior.to_bits(), Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shakmaty::fen::Fen;
-    use shakmaty::{CastlingMode, Chess, Position};
-
-    //a position with every kind of move: castles, en passant, promotions with and without captures, checks
-    const POSITIONS: [&str; 6] = [
-        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
-        "rnbqkbnr/ppp1pppp/8/8/3pP3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 3",
-        "1k6/6P1/8/8/8/8/8/K7 w - - 0 1",
-        "r3k2r/8/8/3pP3/8/8/8/R3K2R w KQkq d6 0 1",
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-    ];
-
-    //every legal move of positions with all kinds of moves comes back from its code, and no two share one
-    #[test]
-    fn a_move_comes_back_from_its_code() {
-        let mut codes = std::collections::HashSet::new();
-        let mut kinds = [0; 3];
-        for fen in POSITIONS {
-            let board: Chess = fen.parse::<Fen>().expect("a fen").into_position(CastlingMode::Standard).expect("a position");
-            for chess_move in board.legal_moves() {
-                assert_eq!(decode(encode(chess_move)), chess_move);
-                kinds[(encode(chess_move) >> 21) as usize] += 1;
-                if !codes.insert((fen, encode(chess_move))) {
-                    panic!("{chess_move:?} shares its code");
-                }
-            }
-        }
-        assert!(kinds.iter().all(|&kind| kind > 0), "{kinds:?}");
-    }
 
     //edges are given out in runs that never cross a chunk, to threads that never get the same edge twice
     #[test]

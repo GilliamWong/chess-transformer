@@ -28,7 +28,7 @@ impl SharedTree {
         for &edge in line {
             let child = self.edges.child(edge).load(Ordering::Relaxed);
             assert_ne!(child, NO_NODE, "a line through the tree's nodes");
-            self.board.play_unchecked(self.edges.chess_move(edge));
+            self.board.play_unchecked(self.edges.chess_move(edge).to_move(&self.board));
             self.keys.push(position_key(&self.board));
             self.root = child as usize;
         }
@@ -171,7 +171,7 @@ impl SharedTree {
         //as gather scores a leaf
         let mut board = self.board.clone();
         for &edge in line {
-            board.play_unchecked(self.edges.chess_move(edge));
+            board.play_unchecked(self.edges.chess_move(edge).to_move(&board));
         }
         let legal_moves = board.legal_moves();
         let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);

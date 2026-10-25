@@ -146,7 +146,7 @@ fn stale_leaves_by_positions(
             continue;
         }
         let mut child_board = board.clone();
-        child_board.play_unchecked(tree.moves[edge]);
+        child_board.play_unchecked(tree.moves[edge].to_move(board));
         path.push(child as usize);
         tree.keys.push(tree.node_keys[child as usize]);
         stale_leaves_by_positions(tree, &child_board, path, settings, tables, root_covered, stale);
@@ -157,7 +157,7 @@ fn stale_leaves_by_positions(
 
 //Searches' tree reuse as it was: the moves played one at a time, each copying the subtree, then the stale leaves
 //taken out. Returns how many were
-fn reused_move_by_move(tree: &mut Tree, moves: &[Move], settings: &SearchSettings, tables: Option<&Tables>) -> usize {
+fn reused_move_by_move(tree: &mut Tree, moves: &[PackedMove], settings: &SearchSettings, tables: Option<&Tables>) -> usize {
     for &played in moves {
         let edge = tree.root().edges().find(|&edge| tree.chess_move(edge) == played).expect("the line's move");
         tree.play(edge, true);
@@ -393,7 +393,7 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
         search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
         for line in reusable_lines(&tree) {
             let mut old = copied(&tree);
-            let line_moves: Vec<Move> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+            let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
             stale += reused_move_by_move(&mut old, &line_moves, &settings, tables);
             let mut new = copied(&tree);
             new.play_line(&line);

@@ -195,7 +195,7 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, root_k
     }
     for (edge, child) in children {
         let mut next = board.clone();
-        next.play_unchecked(tree.chess_move(edge));
+        next.play_unchecked(tree.chess_move(edge).to_move(&next));
         keys.push(tree.node(child).key());
         walk(tree, child, &next, keys, root_keys, settings, nodes);
         keys.pop();
@@ -356,7 +356,7 @@ fn the_shared_cache_gives_back_what_threads_put_in() {
 }
 
 //the edges in a SharedTree that a line of moves goes down from the root
-fn edges_of(tree: &SharedTree, line: &[Move]) -> Vec<usize> {
+fn edges_of(tree: &SharedTree, line: &[PackedMove]) -> Vec<usize> {
     let mut node = tree.root_index();
     line.iter()
         .map(|&played| {
@@ -372,7 +372,7 @@ fn edges_of(tree: &SharedTree, line: &[Move]) -> Vec<usize> {
 //under it (a walk without them), compacted to be compared node for node
 fn shared_advanced(
     tree: &SharedTree,
-    line: &[Move],
+    line: &[PackedMove],
     threads: usize,
     stopped: Option<&str>,
     settings: &SearchSettings,
@@ -423,7 +423,7 @@ fn reusing_a_shared_tree_leaves_the_tree_a_tree_is_left() {
         //one thread's search is Tree's, which the other test shows with rounds in flight: here one round at a time
         assert_eq!(tree.root().visit_count, shared.root().visits());
         for line in reusable_lines(&tree) {
-            let line_moves: Vec<Move> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+            let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
             let mut old = copied(&tree);
             stale += reused_move_by_move(&mut old, &line_moves, &settings, tables);
 
@@ -465,7 +465,7 @@ fn proven_nodes_hide_stale_leaves_from_a_shared_trees_advance_as_from_the_walk()
             stale.into_iter().find(|path| path.len() >= 3).map(|path| (line, path))
         })
         .expect("a stale leaf two nodes below a reusable line");
-    let line_moves: Vec<Move> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+    let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
     let draw = Proof { outcome: Outcome::Draw, value: 0.5, plies: 0 };
     for proven in [path[0], path[1]] {
         let mut proved = copied(&tree);
@@ -664,7 +664,7 @@ fn one_thread_with_transpositions_searches_as_tree_does() {
             assert!(old_rounds == new_rounds, "{fen}, {in_flight} in flight: the rounds' boards");
             assert_eq!(new.counts.orphans.load(Ordering::Relaxed), 0);
             //the move choice too, whose ties a node's own mean breaks (not its move's visits)
-            let line = |moves: Vec<usize>, chess_move: &dyn Fn(usize) -> Move| moves.into_iter().map(chess_move).collect::<Vec<Move>>();
+            let line = |moves: Vec<usize>, chess_move: &dyn Fn(usize) -> PackedMove| moves.into_iter().map(chess_move).collect::<Vec<_>>();
             assert_eq!(
                 line(new.principal_variation(), &|edge| new.chess_move(edge)),
                 line(old.principal_variation(), &|edge| old.chess_move(edge))
@@ -717,7 +717,7 @@ fn reachable(tree: &Tree, from: usize) -> usize {
 }
 
 //the edges from a tree's root along the moves
-fn line_after(tree: &Tree, line: &[Move]) -> Vec<usize> {
+fn line_after(tree: &Tree, line: &[PackedMove]) -> Vec<usize> {
     let mut node = tree.root_index();
     line.iter()
         .map(|&played| {
@@ -740,7 +740,7 @@ fn reusing_a_graph_keeps_it_whole() {
         let mut tree = graph_tree_after(fen, moves);
         search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
         for line in reusable_lines(&tree) {
-            let line_moves: Vec<Move> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+            let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
             let new_root = tree.children[*line.last().expect("a line")] as usize;
             let (visits, value_sum) = (tree.nodes[new_root].visit_count, tree.nodes[new_root].value_sum);
             let mut at_once = copied(&tree);

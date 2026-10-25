@@ -1,6 +1,6 @@
 //mcts.py's search with the same order of operations and arithmetic, so that it visits the same nodes. A round may also
 //gather many leaves for one network call (gather), as lc0 does; one leaf a round is mcts.py's search exactly
-use crate::rules::{MoveIds, Tables, encode_board, game_result, position_key, sort_moves_in_python_order};
+use crate::rules::{MoveIds, PackedMove, Tables, encode_board, game_result, position_key, sort_moves_in_python_order};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Gamma};
 use shakmaty::{Chess, Color, Move, MoveList, Position};
@@ -344,7 +344,7 @@ fn reserve_to<T>(vector: &mut Vec<T>, capacity: usize) {
 }
 
 //a tree's node and edge vectors, as compact returns the old ones to free
-pub type Vectors = (Vec<Node>, Vec<u64>, Vec<Move>, Vec<f32>, Vec<u32>);
+pub type Vectors = (Vec<Node>, Vec<u64>, Vec<PackedMove>, Vec<f32>, Vec<u32>);
 
 //nodes a walk or copy that may be stopped (an abort flag) goes through between looks at the flag
 const ABORT_CHECKS: usize = 4096;
@@ -371,7 +371,7 @@ pub struct Tree {
     node_keys: Vec<u64>, //each node's position_key, made with the node
     //the edges: every expanded node's moves in python-chess's order with their priors, and each move's node once it
     //has one (NO_NODE before)
-    moves: Vec<Move>,
+    moves: Vec<PackedMove>,
     priors: Vec<f32>,        //as the network gives them, read as f64s
     noised_priors: Vec<f64>, //the root's once add_root_noise has mixed its noise in (no longer f32s); empty without
     children: Vec<u32>,
@@ -447,7 +447,7 @@ impl Tree {
         }
         let spare = memory_limit.saturating_sub(self.allocated_bytes());
         let graph_edge_bytes = if self.graph.is_some() { size_of::<u32>() } else { 0 };
-        let edge_bytes = size_of::<Move>() + size_of::<f32>() + size_of::<u32>() + graph_edge_bytes;
+        let edge_bytes = size_of::<PackedMove>() + size_of::<f32>() + size_of::<u32>() + graph_edge_bytes;
         let capacity = self.moves.capacity().min(self.priors.capacity()).min(self.children.capacity());
         let Some(edges) = grown_capacity(capacity, self.moves.len() + (self.pending() + 1) * MOST_MOVES, edge_bytes, spare) else {
             return false;
@@ -465,7 +465,7 @@ impl Tree {
     pub fn allocated_bytes(&self) -> usize {
         self.nodes.capacity() * size_of::<Node>()
             + self.node_keys.capacity() * size_of::<u64>()
-            + self.moves.capacity() * size_of::<Move>()
+            + self.moves.capacity() * size_of::<PackedMove>()
             + self.priors.capacity() * size_of::<f32>()
             + self.children.capacity() * size_of::<u32>()
             + self.graph.as_ref().map_or(0, Graph::bytes)
@@ -489,7 +489,8 @@ impl Tree {
         }
     }
 
-    pub fn chess_move(&self, edge: usize) -> Move {
+    //the edge's move, as the position it is played from reads it (PackedMove::to_move)
+    pub fn chess_move(&self, edge: usize) -> PackedMove {
         self.moves[edge]
     }
 
@@ -693,7 +694,7 @@ impl Tree {
                     Some(_) => self.select_edge(node, settings, Some(&Repeats::new(&self.keys, root_keys - 1, halfmoves))),
                     None => self.select_edge(node, settings, None),
                 };
-                board.play_unchecked(self.moves[edge]);
+                board.play_unchecked(self.moves[edge].to_move(&board));
                 //a descent never ends without a visit or a simulation waiting, so the node is needed
                 node = self.child_node(edge, &board);
                 path.push(node);
@@ -854,7 +855,7 @@ impl Tree {
     fn expand(&mut self, node: usize, moves: &MoveList, priors: &[f32]) {
         let first_edge = self.moves.len();
         for (&chess_move, &prior) in moves.iter().zip(priors) {
-            self.moves.push(chess_move);
+            self.moves.push(PackedMove::new(chess_move));
             self.priors.push(prior);
         }
         self.children.resize(self.moves.len(), NO_NODE);
@@ -1045,7 +1046,7 @@ impl Tree {
         //as gather scores a leaf
         let mut board = self.board.clone();
         for &edge in line {
-            board.play_unchecked(self.moves[edge]);
+            board.play_unchecked(self.moves[edge].to_move(&board));
         }
         let legal_moves = board.legal_moves();
         let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
@@ -1281,7 +1282,7 @@ impl Tree {
             self.move_root(&[edge]);
             self.compact(1, None);
         } else {
-            self.board.play_unchecked(self.moves[edge]);
+            self.board.play_unchecked(self.moves[edge].to_move(&self.board));
             self.keys.push(position_key(&self.board));
             (self.nodes, self.moves, self.priors, self.children) = (vec![Node::new()], Vec::new(), Vec::new(), Vec::new());
             self.node_keys = vec![*self.keys.last().expect("the root's key")];
@@ -1311,7 +1312,7 @@ impl Tree {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         for &edge in line {
             assert_ne!(self.children[edge], NO_NODE, "a line through the tree's nodes");
-            self.board.play_unchecked(self.moves[edge]);
+            self.board.play_unchecked(self.moves[edge].to_move(&self.board));
             self.keys.push(position_key(&self.board));
             self.root = self.children[edge] as usize;
         }
@@ -1603,7 +1604,7 @@ struct Stretch<'a> {
     first_child: usize,
     nodes: &'a mut [MaybeUninit<Node>],
     node_keys: &'a mut [MaybeUninit<u64>],
-    moves: &'a mut [MaybeUninit<Move>],
+    moves: &'a mut [MaybeUninit<PackedMove>],
     priors: &'a mut [MaybeUninit<f32>],
     children: &'a mut [MaybeUninit<u32>],
 }
