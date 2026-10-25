@@ -65,6 +65,7 @@ fn proof_rank(proof: &Proof) -> (Outcome, i64) {
 //in the tree's edge vectors, and a move gets a node only once a simulation goes through it, as lc0's edges do: a node
 //for each of a position's ~37 moves took 1.8 KB a simulation, most of them never visited (lc0's layout: NO_LINK's)
 #[derive(Clone, Copy)]
+#[repr(align(64))]
 pub struct Node {
     pub visit_count: u32,
     //simulations through this node waiting for the network, and while a round is gathered its collisions
@@ -708,44 +709,26 @@ impl Tree {
         let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt;
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
-        let noised = node == self.root && !self.noised_priors.is_empty();
-        let transpositions = self.graph.is_some();
-        //a move's value from its prior, its node (NO_NODE for none) and its own visits, and the node's edges (0 for none);
-        //None for a proven loss, never chosen
-        let value = |index: usize, prior: f32, child: u32, own_visits: u32| -> Option<(f64, u64)> {
-            let prior = if noised { self.noised_priors[index] } else { f64::from(prior) };
-            if child == NO_NODE {
-                //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
-                return Some((first_play_urgency + (c_puct * prior * sqrt_children_visits), 0));
-            }
-            let id = child as usize;
-            let child = &self.nodes[id];
-            if child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss) {
-                return None;
-            }
-            let repeat =
-                repeats.is_some_and(|repeats| repeats.repeats(self.node_keys[id], self.graph.as_ref().expect("the graph").halfmoves[id]));
-            let q = if repeat {
-                1.0 - settings.draw
-            } else if child.visit_count > 0 {
-                child.mean_score()
-            } else {
-                first_play_urgency
-            };
-            //with transpositions a move's own visits, its node's mean (every path's)
-            let started = if transpositions { own_visits } else { child.visit_count } + child.in_flight;
-            Some((q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + started))), child.edges_at))
+        let scan = Scan {
+            c_puct,
+            sqrt_children_visits,
+            first_play_urgency,
+            noised: node == self.root && !self.noised_priors.is_empty(),
+            transpositions: self.graph.is_some(),
+            draw: settings.draw,
         };
+        let value =
+            |index: usize, prior: f32, child: u32, own_visits: u32| self.move_value(&scan, repeats, index, prior, child, own_visits);
         let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
-        let mut consider = |index: usize, link: u32, found: Option<(f64, u64)>| {
-            if let Some((u, child_edges)) = found
+        let mut consider = |index: usize, link: u32, found: Option<(f64, u64, u32)>| {
+            if let Some((u, child_edges, child_moves)) = found
                 && u > best_u
             {
                 (best, best_u, best_link) = (index, u, link);
-                //the descent goes on through the best child's moves: their priors' cache line is asked for while the
-                //scan goes on, rather than missed after it
+                //the descent goes on through the best child's moves: their priors' cache line and their first link's or
+                //slots' are asked for while the scan goes on, rather than missed after it
                 if child_edges & 255 > 0 {
-                    self.prefetch_edges((child_edges >> 8) as usize);
+                    self.prefetch_edges((child_edges >> 8) as usize, child_moves);
                 }
             }
         };
@@ -774,15 +757,61 @@ impl Tree {
         (edges.start + best, best_link)
     }
 
-    //asks for the cache line of the moves' priors from the edge on, a hint that never faults
+    //select_edge's value of a move from its prior (its place's among the node's moves), its node (NO_NODE for none) and its
+    //own visits, with the node's edges and moves with a node (0 for none); None for a proven loss, never chosen. A method
+    //rather than the scan's closure, which was left a call a move
     #[inline(always)]
-    fn prefetch_edges(&self, first: usize) {
+    fn move_value(
+        &self,
+        scan: &Scan,
+        repeats: Option<&Repeats>,
+        index: usize,
+        prior: f32,
+        child: u32,
+        own_visits: u32,
+    ) -> Option<(f64, u64, u32)> {
+        let prior = if scan.noised { self.noised_priors[index] } else { f64::from(prior) };
+        if child == NO_NODE {
+            //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
+            return Some((scan.first_play_urgency + (scan.c_puct * prior * scan.sqrt_children_visits), 0, NO_LINK));
+        }
+        let id = child as usize;
+        let child = &self.nodes[id];
+        if child.proof.is_some_and(|proof| proof.outcome == Outcome::Loss) {
+            return None;
+        }
+        let repeat =
+            repeats.is_some_and(|repeats| repeats.repeats(self.node_keys[id], self.graph.as_ref().expect("the graph").halfmoves[id]));
+        let q = if repeat {
+            1.0 - scan.draw
+        } else if child.visit_count > 0 {
+            child.mean_score()
+        } else {
+            scan.first_play_urgency
+        };
+        //with transpositions a move's own visits, its node's mean (every path's)
+        let started = if scan.transpositions { own_visits } else { child.visit_count } + child.in_flight;
+        Some((q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + started))), child.edges_at, child.children))
+    }
+
+    //asks for the cache lines of the moves' priors from the edge on and of their first link or slots (`moves`, a node's
+    //children), a hint that never faults
+    #[inline(always)]
+    fn prefetch_edges(&self, first: usize, moves: u32) {
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            //SAFETY: sse is part of x86_64, and a prefetch reads nothing the program sees
+            let line: *const i8 = if listed(moves) {
+                self.links.as_ptr().wrapping_add(moves as usize).cast()
+            } else {
+                self.slots.as_ptr().wrapping_add((moves & !SOLID) as usize).cast()
+            };
+            //SAFETY: sse is part of x86_64, and a prefetch reads nothing the program sees, a pointer past the vectors too
             unsafe {
                 _mm_prefetch::<_MM_HINT_T0>(self.priors.as_ptr().wrapping_add(first).cast());
+                if moves != NO_LINK {
+                    _mm_prefetch::<_MM_HINT_T0>(line);
+                }
             }
         }
     }
@@ -1880,6 +1909,16 @@ impl Iterator for TreeLinked<'_> {
         }
         None
     }
+}
+
+//what select_edge's scan values every move of a node by (Tree::move_value)
+struct Scan {
+    c_puct: f64,
+    sqrt_children_visits: f64,
+    first_play_urgency: f64,
+    noised: bool,
+    transpositions: bool,
+    draw: f64,
 }
 
 //a part of a level of compact's breadth-first order: the nodes its chunk's moves lead to, and of each node of the chunk

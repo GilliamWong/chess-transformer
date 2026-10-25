@@ -423,30 +423,15 @@ impl SharedTree {
         let first_play_urgency = (1.0 - parent.mean_score(parent_visits)) - settings.fpu_reduction * parent.visited_policy_sqrt();
         let sqrt_children_visits = f64::from(children_visits).sqrt();
 
-        //a move's value from its prior, its node (NO_NODE for none) and its own visits; None for a proven loss, never chosen
-        let transpositions = self.graph.is_some();
-        let value = |prior: &AtomicU32, child: u32, own_visits: &AtomicU32| -> Option<f64> {
-            let prior = f64::from(f32::from_bits(prior.load(Ordering::Relaxed)));
-            if child == NO_NODE {
-                //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
-                return Some(first_play_urgency + (c_puct * prior * sqrt_children_visits));
-            }
-            let child = self.nodes.get(child as usize);
-            if child.proves_a_loss() {
-                return None;
-            }
-            let (visits, in_flight) = child.counts();
-            let q = if repeats.is_some_and(|repeats| repeats.repeats(child.key(), child.halfmoves())) {
-                1.0 - settings.draw
-            } else if visits > 0 {
-                child.mean_score(visits)
-            } else {
-                first_play_urgency
-            };
-            //with transpositions a move's own visits, its node's mean (every path's)
-            let own = if transpositions { own_visits.load(Ordering::Acquire) } else { visits };
-            Some(q + (c_puct * prior * (sqrt_children_visits / f64::from(1 + own + in_flight))))
+        let scan = Scan {
+            c_puct,
+            sqrt_children_visits,
+            first_play_urgency,
+            noised: false,
+            transpositions: self.graph.is_some(),
+            draw: settings.draw,
         };
+        let value = |prior: &AtomicU32, child: u32, own_visits: &AtomicU32| self.move_value(&scan, repeats, prior, child, own_visits);
         let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
         let priors = self.edges.priors(edges.clone());
         match parent.children() {
@@ -484,6 +469,32 @@ impl SharedTree {
             }
         }
         (edges.start + best, best_link)
+    }
+
+    //select_edge's value of a move from its prior, its node (NO_NODE for none) and its own visits; None for a proven loss,
+    //never chosen. A method rather than the scan's closure, which may be left a call a move (Tree::move_value)
+    #[inline(always)]
+    fn move_value(&self, scan: &Scan, repeats: Option<&Repeats>, prior: &AtomicU32, child: u32, own_visits: &AtomicU32) -> Option<f64> {
+        let prior = f64::from(f32::from_bits(prior.load(Ordering::Relaxed)));
+        if child == NO_NODE {
+            //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
+            return Some(scan.first_play_urgency + (scan.c_puct * prior * scan.sqrt_children_visits));
+        }
+        let child = self.nodes.get(child as usize);
+        if child.proves_a_loss() {
+            return None;
+        }
+        let (visits, in_flight) = child.counts();
+        let q = if repeats.is_some_and(|repeats| repeats.repeats(child.key(), child.halfmoves())) {
+            1.0 - scan.draw
+        } else if visits > 0 {
+            child.mean_score(visits)
+        } else {
+            scan.first_play_urgency
+        };
+        //with transpositions a move's own visits, its node's mean (every path's)
+        let own = if scan.transpositions { own_visits.load(Ordering::Acquire) } else { visits };
+        Some(q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + own + in_flight))))
     }
 
     //the node of the parent's move `edge` (select_edge's link), made if the move has none yet, and its link; board is the
