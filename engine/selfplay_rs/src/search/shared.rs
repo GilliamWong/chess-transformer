@@ -430,6 +430,7 @@ impl SharedTree {
             noised: false,
             transpositions: self.graph.is_some(),
             draw: settings.draw,
+            virtual_loss: settings.virtual_loss,
         };
         let value = |prior: &AtomicU32, child: u32, own_visits: &AtomicU32| self.move_value(&scan, repeats, prior, child, own_visits);
         let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
@@ -492,6 +493,7 @@ impl SharedTree {
         } else {
             scan.first_play_urgency
         };
+        let q = with_virtual_loss(q, visits, in_flight, scan.virtual_loss);
         //with transpositions a move's own visits, its node's mean (every path's)
         let own = if scan.transpositions { own_visits.load(Ordering::Acquire) } else { visits };
         Some(q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + own + in_flight))))

@@ -90,13 +90,15 @@ fn shared_in_flight(
 }
 
 //one thread's search is Tree's: the same boards in the same rounds and the same tree, number for number, with rounds in
-//flight (collisions, cache hits), certainty (proofs), the tables and repeats
+//flight (collisions, cache hits), certainty (proofs), the tables and repeats, with virtual loss or without
 #[test]
 fn one_thread_searches_as_tree_does() {
     let tables = tables();
     let (mut collided, mut proven) = (0, 0);
-    for (fen, moves, simulations, certainty, tables) in cases(&tables) {
-        let settings = settings(certainty);
+    for ((fen, moves, simulations, certainty, tables), virtual_loss) in
+        cases(&tables).into_iter().flat_map(|case| [(case, 0.0), (case, 1.0)])
+    {
+        let settings = SearchSettings { virtual_loss, ..settings(certainty) };
         for in_flight in [1, 2, 3] {
             let mut old = tree_after(fen, moves);
             let old_rounds =

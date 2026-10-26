@@ -72,6 +72,11 @@ RUST_WAIT_SECONDS = 0.005
 CACHE_POSITIONS = 5_000_000
 #the threads advance walks and copies the kept tree on after a move, while the opponent thinks (Searches' advance_threads)
 ADVANCE_THREADS = 4
+#the networks, each a round loop thread, on each gpu when there are several (uci.py --threads-per-gpu): in a long search
+#one thread a gpu is busy descending all the time (98% of a core each on 8 5090s at 20 s a search, 2026-10-25), and two
+#gave 1.22x the simulations a second there (1.09x at 3 s), filling a 16-core socket (a 9175F's) with 8 gpus. One gpu
+#keeps one thread, whose search is one gpu's (the lock and the python loop's rounds)
+THREADS_PER_GPU = 2
 #the engine's own changes to mcts.py's search, which self-play keeps (tools/play/variant_match.py tunes them). One leaf
 #a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. c_puct 0.4 won +78 elo at 4k nodes a move and +46 at
 #30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
@@ -80,8 +85,10 @@ ADVANCE_THREADS = 4
 #SearchSettings' (with smart pruning a search whose root is proven stops); without it a mate the search had found lost
 #to a move with more visits (2026-10-13). transpositions: search.rs SearchSettings' (lc0's DAG search): at 32M nodes a
 #tree spent 58-81% of its visits on positions it already had, and the DAG was no slower with 20-40% less memory at 10M
-#(2026-10-24); on by the user's call before a match measured it
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
+#(2026-10-24); on by the user's call before a match measured it. virtual_loss: search.rs SearchSettings', off until a
+#match measures it: on 8 5090s 1 filled the rounds from ~35 leaves to ~47, 1.18x the boards a second at 20 s a search
+#with as many simulations (2026-10-25)
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True, "virtual_loss": 0.0}
 
 
 #search.rs sharpen: the value's logit times sharpness; 1 / sharpness undoes it, and 1 leaves the score exactly as it was
@@ -151,10 +158,11 @@ def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: st
         return network_graphs(network_model(checkpoint_path, precision, fp16_blocks), max_batch, blocking_wait, lean)
 
 
-#engine_network on each gpu of devices (their lanes lean by default), the int8 weights read once for all: the models
-#load at once, a thread each, as little of it holds the gil (the checkpoint's reads and copies, the small-batch
-#kernels' nvrtc compile); their graphs are recorded one network after another, as dynamo compiles one frame at a time
-#and a graph's recording forbids other threads' allocations
+#engine_network for each gpu of devices (their lanes lean by default), a gpu listed once for each network it runs (a
+#round loop thread each, THREADS_PER_GPU's), the int8 weights read once for all: the models load at once, a thread a
+#gpu, as little of it holds the gil (the checkpoint's reads and copies, the small-batch kernels' nvrtc compile), and a
+#gpu's networks share its model, each with graphs and lanes of its own; the graphs are recorded one network after
+#another, as dynamo compiles one frame at a time and a graph's recording forbids other threads' allocations
 def engine_networks(checkpoint_path: Path, max_batch: int, precision: str, fp16_blocks: int, devices: list[int],
                     blocking_wait: bool) -> list[GraphedBatches]:
     #imported here, as int8_model imports it: it needs Triton
@@ -166,12 +174,13 @@ def engine_networks(checkpoint_path: Path, max_batch: int, precision: str, fp16_
     def load(device: int) -> torch.nn.Module:
         with torch.cuda.device(device):
             return network_model(checkpoint_path, precision, fp16_blocks, weights)
-    with ThreadPoolExecutor(len(devices)) as pool:
-        models = list(pool.map(load, devices))
+    gpus = list(dict.fromkeys(devices))
+    with ThreadPoolExecutor(len(gpus)) as pool:
+        models = dict(zip(gpus, pool.map(load, gpus)))
     networks = []
-    for model, device in zip(models, devices):
+    for device in devices:
         with torch.cuda.device(device):
-            networks.append(network_graphs(model, max_batch, blocking_wait, None))
+            networks.append(network_graphs(models[device], max_batch, blocking_wait, None))
     return networks
 
 

@@ -1132,6 +1132,30 @@ def test_the_engine_takes_gpus(monkeypatch, tmp_path):
     assert all(run.returncode == 2 and "--gpus needs --select mcts --gpu" in run.stderr for run in refused)
 
 
+#uci.py's --threads-per-gpu: several gpus get THREADS_PER_GPU networks each by default (each waited for asleep), one gpu
+#one, and either as many as asked
+@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+@pytest.mark.parametrize("arguments, devices", [(["--gpus", "0,1"], [0] * engine_search.THREADS_PER_GPU + [1] * engine_search.THREADS_PER_GPU),
+                                                (["--gpus", "0"], [0]), (["--gpus", "0", "--threads-per-gpu", "3"], [0, 0, 0])])
+def test_the_engine_takes_threads_per_gpu(monkeypatch, arguments, devices):
+    built = []
+    monkeypatch.setattr(engine_search, "engine_networks", lambda checkpoint, leaves, precision, fp16_blocks, devices, blocking_wait:
+                        built.append((devices, blocking_wait)) or [cpu_batches(BoardModel()) for _ in devices])
+    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *arguments])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("isready\nquit\n"))
+    runpy.run_module("engine.uci", run_name="__main__")
+
+    assert built == [(devices, len(devices) > 1)]
+
+
+#--threads-per-gpu is refused without --gpus, or below 1
+def test_the_engine_refuses_threads_per_gpu_without_gpus():
+    refused = [subprocess.run([sys.executable, "-m", "engine.uci", "unused.pt", "--select", "mcts", "--gpu", *arguments], cwd=REPOSITORY,
+                              capture_output=True, text=True, input="") for arguments in (["--threads-per-gpu", "2"], ["--gpus", "0", "--threads-per-gpu", "0"])]
+
+    assert all(run.returncode == 2 and "--threads-per-gpu needs --gpus, and is 1 or more" in run.stderr for run in refused)
+
+
 #uci.py's --visits-per-leaf-out reaches the search, which has no cap without it
 @pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
 @pytest.mark.parametrize("arguments, cap", [([], 0), (["--visits-per-leaf-out", "16"], 16)])
