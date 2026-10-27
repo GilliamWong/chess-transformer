@@ -10,6 +10,7 @@ from datetime import datetime
 from itertools import islice
 from pathlib import Path
 from training.data import ARTIFACTS_DIR, BLUNDER_THRESHOLD, RESULT_WEIGHT, VISIT_TEMPERATURE, MixedLoader, datasets_to_dataloaders, load_training_set
+from training.muon import BatchedMuon
 import torch
 import torch.nn.functional as F
 import math
@@ -359,12 +360,13 @@ def make_optimizers(model: ChessTransformer, learn_rate: float, device: torch.de
     elsewhere = {id(parameter) for parameter in block_matrices + undecayed + embeddings}
     rest = [parameter for parameter in model.parameters() if id(parameter) not in elsewhere]
     #a tensor: compile_muon_step's graph would bake a float in and recompile whenever the schedule changes it
-    muon = torch.optim.Muon(block_matrices, lr=torch.tensor(learn_rate, device=device), weight_decay=weight_decay, momentum=muon_momentum, adjust_lr_fn="match_rms_adamw") #type: ignore[arg-type]
+    muon = BatchedMuon(block_matrices, lr=torch.tensor(learn_rate, device=device), weight_decay=weight_decay, momentum=muon_momentum, adjust_lr_fn="match_rms_adamw") #type: ignore[arg-type]
     groups = [{"params": rest}, {"params": undecayed, "weight_decay": 0.0},
               {"params": embeddings, "lr": learn_rate * embed_lr_multiplier, "weight_decay": weight_decay / embed_lr_multiplier}]
     return [torch.optim.AdamW(groups, lr=learn_rate, weight_decay=weight_decay, fused=device.type == "cuda"), muon]
 
 #Muon's step as one compiled cuda graph: eager 28 ms next to an 80 ms d256 training step, graphed 5 ms.
+#With several processes the gather inside the step splits it into two graphs (training.muon).
 #Call after making the schedulers, which wrap optimizer.step and need it to still be a method
 def compile_muon_step(optimizers: list[torch.optim.Optimizer]) -> None:
     for optimizer in optimizers:

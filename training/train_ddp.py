@@ -170,7 +170,8 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
                 penalty = penalty + part_penalty.detach() / micro_batches
             master_weights.gradients_to_master()
             gradient_norm = torch.nn.utils.clip_grad_norm_(master_weights.parameters, 1.0)
-            #the gradients are averaged after backward, so every rank steps all of the weights itself, Muon's too
+            #the gradients are averaged after backward, so every rank steps all of the weights itself; Muon's orthogonalising
+            #is shared out between them (training.muon)
             for optimizer in optimizers:
                 optimizer.step()
             master_weights.weights_to_compute()

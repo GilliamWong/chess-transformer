@@ -21,6 +21,7 @@ from training import train as single
 from model.encoding import BOARD_VOCAB_SIZE, NUM_PIECE_CODES, NUM_SQUARES, TOKENS_PER_BOARD
 from model.model import ChessTransformer
 from training import train_ddp
+from training.muon import BatchedMuon
 from tools.budget import Budget
 from tools.checkpoint import load_checkpoint
 
@@ -367,3 +368,49 @@ def test_distributed_gradients_budgets_and_complete_training(tmp_path, world_siz
     assert settings["optimizer"] == "muon"
     assert settings["finished_at"] and settings["final_val_value_loss"] >= 0
     assert (tmp_path / "progress.html").exists()
+
+
+#shapes with 4, 2 and 1 matrices once the tall ones are transposed: none of them splits evenly between 3 processes, and the
+#last has fewer matrices than there are processes
+SHARDED_MUON_SHAPES = [(24, 40), (40, 24), (32, 32), (24, 40), (40, 24), (32, 32), (8, 40)]
+
+
+def sharded_muon_worker(rank, folder, world_size):
+    torch.set_num_threads(1)
+    folder = Path(folder)
+    dist.init_process_group("gloo", init_method=(folder / "rendezvous").as_uri(),
+                            rank=rank, world_size=world_size, timeout=timedelta(seconds=90))
+    try:
+        torch.manual_seed(0)
+        weights = [torch.randn(shape) for shape in SHARDED_MUON_SHAPES]
+        reference_parameters = [nn.Parameter(weight.clone()) for weight in weights]
+        sharded_parameters = [nn.Parameter(weight.clone()) for weight in weights]
+        settings = dict(weight_decay=0.5, momentum=0.9, adjust_lr_fn="match_rms_adamw")
+        reference = torch.optim.Muon(reference_parameters, lr=torch.tensor(1e-2), **settings)
+        sharded = BatchedMuon(sharded_parameters, lr=torch.tensor(1e-2), **settings)
+        assert sharded.world_size == world_size > 1
+
+        #every rank has the same gradients, as after DDP's all-reduce
+        generator = torch.Generator().manual_seed(1)
+        for _ in range(3):
+            for expected, actual in zip(reference_parameters, sharded_parameters):
+                expected.grad = torch.randn(expected.shape, generator=generator) * 10 ** (3 * torch.rand(1, generator=generator).item())
+                actual.grad = expected.grad.clone()
+            reference.step()
+            sharded.step()
+
+        for expected, actual, weight in zip(reference_parameters, sharded_parameters, weights):
+            assert (actual - expected).norm() <= 1e-2 * (expected - weight).norm()
+        everyone = [None] * world_size
+        dist.all_gather_object(everyone, [parameter.detach() for parameter in sharded_parameters])
+        assert all(torch.equal(theirs, ours) for others in everyone[1:] for theirs, ours in zip(others, everyone[0]))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
+@pytest.mark.parametrize("world_size", [2, 3])
+def test_muon_matrices_shared_out_between_processes_step_like_one_process_and_alike_on_every_rank(tmp_path, world_size):
+    #catches shares that are gathered in the wrong order or padded wrong (against torch's Muon), and ranks that end with
+    #different weights, which DDP's training would never notice in its loss
+    mp.spawn(sharded_muon_worker, args=(str(tmp_path), world_size), nprocs=world_size)
