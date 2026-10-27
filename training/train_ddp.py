@@ -101,7 +101,7 @@ def step_budget(budget: Budget, clock: Budget | None, device: torch.device) -> N
         budget.seconds = seconds.item()
 
 
-def make_scheduler(optimizer, budget: Budget, schedule: str):
+def make_scheduler(optimizer, budget: Budget, schedule: str, decay_fraction: float = single.DECAY_FRACTION):
     #where the decay starts: known in advance for a budget of positions (so a resumed run carries on), measured for minutes
     warmup_end = 0.0 if budget.timed else min(1.0, single.WARMUP_STEPS / budget.max_steps)
 
@@ -110,9 +110,9 @@ def make_scheduler(optimizer, budget: Budget, schedule: str):
         if step <= single.WARMUP_STEPS:
             if budget.timed:
                 warmup_end = budget.progress()
-            return single.lr_multiplier(step, 0.0, schedule)
+            return single.lr_multiplier(step, 0.0, schedule, decay_fraction)
         progress = (budget.progress() - warmup_end) / max(1 - warmup_end, 1e-12)
-        return single.lr_multiplier(step, progress, schedule)
+        return single.lr_multiplier(step, progress, schedule, decay_fraction)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
@@ -252,6 +252,8 @@ def run(args, device: torch.device):
     clock = make_budget(args) if rank == 0 else None  #see step_budget
     if not budget.timed and budget.max_steps <= single.WARMUP_STEPS:
         raise ValueError(f"the position budget must exceed {single.WARMUP_STEPS} global warmup steps")
+    if not 0 < args.decay_fraction <= 1:
+        raise ValueError(f"--decay-fraction is a share of the run, above 0 and at most 1, got {args.decay_fraction}")
     if budget.timed and (not math.isfinite(args.minutes) or args.minutes < 1):
         raise ValueError("--minutes must be finite and at least 1")
     resumed = None
@@ -322,7 +324,7 @@ def run(args, device: torch.device):
         model = torch.compile(model) if args.compile_mode == "default" else torch.compile(model, mode=args.compile_mode)
     optimizers = single.make_optimizers(raw_model, args.lr, device, args.weight_decay, args.muon_momentum, args.embed_lr_multiplier)
     #the schedulers first: making one sets its optimizer's learning rate for step 0, which the saved states then replace
-    schedulers = [make_scheduler(optimizer, budget, args.schedule) for optimizer in optimizers]
+    schedulers = [make_scheduler(optimizer, budget, args.schedule, args.decay_fraction) for optimizer in optimizers]
     best_val_loss = float("inf")
     if resumed is not None:
         for optimizer, state in zip(optimizers, resumed["optimizers"]):
@@ -361,7 +363,7 @@ def run(args, device: torch.device):
             else:
                 settings = dict(
                     model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
-                    peak_learn_rate=args.lr, schedule=args.schedule, embed_lr_multiplier=args.embed_lr_multiplier, seed=args.seed,
+                    peak_learn_rate=args.lr, schedule=args.schedule, decay_fraction=args.decay_fraction, embed_lr_multiplier=args.embed_lr_multiplier, seed=args.seed,
                     value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight, blunder_threshold=args.blunder_threshold,
                     weight_decay=args.weight_decay, muon_momentum=args.muon_momentum, mirror=args.mirror,
                     blunder_labels=getattr(train_dataset, "worst_moves", None) is not None,
@@ -459,7 +461,8 @@ def parse_args(argv=None):
     parser.add_argument("--value-bins", type=int, default=single.VALUE_BINS, help="bins of the expected score the eval head predicts a distribution over, 1 for a single logit")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="query/key width as a multiple of the values', one for every block or one per block")
     parser.add_argument("--lr", type=float, default=single.PEAK_LEARN_RATE)
-    parser.add_argument("--schedule", choices=("cosine", "hold", "constant"), default=single.SCHEDULE)
+    parser.add_argument("--schedule", choices=("cosine", "hold", "hold_sqrt", "constant"), default=single.SCHEDULE)
+    parser.add_argument("--decay-fraction", type=float, default=single.DECAY_FRACTION, help="for hold and hold_sqrt: the share of the run the decay takes")
     parser.add_argument("--embed-lr-multiplier", type=float, default=single.EMBED_LR_MULTIPLIER, help="the input embeddings' learning rate as a multiple of the rest's (train.make_optimizers)")
     parser.add_argument("--seed", type=int, default=single.SEED)
     parser.add_argument("--training-set", default=single.TRAINING_SET)

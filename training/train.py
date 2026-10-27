@@ -43,6 +43,7 @@ WARMUP_STEPS = 500
 #after the warmup:
 #   cosine    half a cosine from the peak to zero over the whole run
 #   hold      the peak, then a straight line to zero over the last DECAY_FRACTION of the run
+#   hold_sqrt the peak, then 1 - sqrt(t) to zero over the last DECAY_FRACTION (t: the share of the decay done)
 #   constant  the peak throughout
 SCHEDULE = "cosine"
 #4-minute d128 runs: 0.2 was the worst of 0.2 / 0.4 / 0.6, and 0.6 tied cosine
@@ -327,14 +328,16 @@ def warm_file_cache(*datasets) -> None:
 
 
 #progress is how much of the run after the warmup is done, from 0 to 1
-def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE) -> float:
+def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE, decay_fraction: float = DECAY_FRACTION) -> float:
     if step <= WARMUP_STEPS:
         return (step + 1) / WARMUP_STEPS
 
     if schedule == "cosine":
         multiplier = 0.5 * (1 + math.cos(math.pi * progress))
     elif schedule == "hold":
-        multiplier = min(1.0, (1 - progress) / DECAY_FRACTION)
+        multiplier = min(1.0, (1 - progress) / decay_fraction)
+    elif schedule == "hold_sqrt":
+        multiplier = 1 - math.sqrt(min(1.0, max(0.0, (progress - 1 + decay_fraction) / decay_fraction)))
     elif schedule == "constant":
         multiplier = 1.0
     else:
@@ -426,6 +429,7 @@ def main(
     training_set: str = TRAINING_SET,
     value_loss_weight: float = VALUE_LOSS_WEIGHT,
     schedule: str = SCHEDULE,
+    decay_fraction: float = DECAY_FRACTION,
     seed: int = SEED,
     mlp_ratio: float | None = None,
     target_temperature: float = TARGET_TEMPERATURE,
@@ -511,8 +515,8 @@ def main(
         nonlocal warmup_end
         if step <= WARMUP_STEPS:
             warmup_end = budget.progress()
-            return lr_multiplier(step, 0.0, schedule)
-        return lr_multiplier(step, (budget.progress() - warmup_end) / (1 - warmup_end), schedule)
+            return lr_multiplier(step, 0.0, schedule, decay_fraction)
+        return lr_multiplier(step, (budget.progress() - warmup_end) / (1 - warmup_end), schedule, decay_fraction)
 
     schedulers = [torch.optim.lr_scheduler.LambdaLR(optimizer, current_lr_multiplier) for optimizer in optimizers]
     if device.type == "cuda":
@@ -533,6 +537,7 @@ def main(
         "parameters": num_parameters,
         "peak_learn_rate": peak_learn_rate,
         "schedule": schedule,
+        "decay_fraction": decay_fraction,
         "embed_lr_multiplier": embed_lr_multiplier,
         "seed": seed,
         "value_loss_weight": value_loss_weight,
@@ -635,7 +640,8 @@ if __name__ == "__main__":
     parser.add_argument("--blunder-threshold", type=float, default=BLUNDER_THRESHOLD, help="a labelled move losing at least this much expected score is a blunder. Default %(default)s")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="for Muon and AdamW both, default %(default)s")
     parser.add_argument("--muon-momentum", type=float, default=MUON_MOMENTUM, help="default %(default)s")
-    parser.add_argument("--schedule", choices=["cosine", "hold", "constant"], default=SCHEDULE, help="the learning rate after the warmup, see SCHEDULE. Default %(default)s")
+    parser.add_argument("--schedule", choices=["cosine", "hold", "hold_sqrt", "constant"], default=SCHEDULE, help="the learning rate after the warmup, see SCHEDULE. Default %(default)s")
+    parser.add_argument("--decay-fraction", type=float, default=DECAY_FRACTION, help="for hold and hold_sqrt: the share of the run the decay takes, default %(default)s")
     parser.add_argument("--embed-lr-multiplier", type=float, default=EMBED_LR_MULTIPLIER, help="the input embeddings' learning rate as a multiple of the rest's, see make_optimizers. Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
     parser.add_argument("--mlp-ratio", type=float, help="hidden size of the swiglu mlp as a multiple of d-model, rounded down to a multiple of 32. Default 8/3")
@@ -672,6 +678,7 @@ if __name__ == "__main__":
          training_set=arguments.training_set,
          value_loss_weight=arguments.value_weight,
          schedule=arguments.schedule,
+         decay_fraction=arguments.decay_fraction,
          seed=arguments.seed,
          mlp_ratio=arguments.mlp_ratio,
          target_temperature=arguments.target_temperature,
