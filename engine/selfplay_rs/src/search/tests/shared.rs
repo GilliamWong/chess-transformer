@@ -562,6 +562,33 @@ fn tables_met_after_the_leaves_were_visited_prove_them_as_tree_does() {
     assert!(old.nodes.iter().filter(|node| node.proof.is_some()).count() > before + 5);
 }
 
+//a search that ends while a call gathers (end's quiet lets the writer in between two descents) gets no leaf from that
+//call after its tree is closed: such a leaf's round came back to a search already gone from Searches ("a search of the
+//round is gone", an 8-network engine at 20k nodes a move, 2026-10-27)
+#[test]
+fn a_call_takes_no_leaf_once_its_search_has_ended() {
+    let (settings, network) = (settings(true), SharedNetwork::new());
+    let round = Round { id: 0, leaves: 30_000, simulations: 200_000, collisions: 150_000, visit_limit: u32::MAX, memory_limit: usize::MAX };
+    //the close comes between two descents at a moment the threads' timing picks: a few tries, as the race is not every time's
+    for _ in 0..8 {
+        let tree = shared_tree_after(START, &[]);
+        shared_in_flight(&tree, 20_000, 2, &settings, None, &network, usize::MAX);
+        let (gathered, at_close) = std::thread::scope(|scope| {
+            let gathering =
+                scope.spawn(|| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables").len());
+            std::thread::sleep(Duration::from_millis(5));
+            let at_close = tree.quiet(|| {
+                tree.close();
+                tree.pending()
+            });
+            (gathering.join().expect("a thread"), at_close)
+        });
+        eprintln!("DEBUG gathered {gathered} at_close {at_close} pending {} gave_way {}", tree.pending(), tree.counts.gave_way.load(Ordering::Relaxed));
+    assert!(gathered < round.leaves as usize, "the call ended before the search did: {gathered} leaves");
+        assert_eq!(tree.pending(), at_close, "leaves taken after the close");
+    }
+}
+
 //a thread that wants the tree to itself waits for the descent the others are in and not for their whole calls: with a call of
 //thousands of descents running, the wait is a fraction of the call (of a few tries, on a machine that may be busy)
 #[test]

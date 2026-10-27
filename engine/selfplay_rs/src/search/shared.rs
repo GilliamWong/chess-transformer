@@ -888,9 +888,14 @@ impl SharedTree {
         //with transpositions the edges between the path's nodes
         let mut edges = Vec::new();
         let mut priors = Vec::new();
-        while call.leaves.len() < round.leaves as usize && call.simulations < round.simulations && self.has_room(round.visit_limit) {
+        loop {
+            //a writer let in here may have ended the search and closed the tree (end's quiet), so the room is looked at
+            //after: a leaf taken in a closed tree belongs to a search that is gone
             hold.give_way();
             self.solidify_queued(hold);
+            if !(call.leaves.len() < round.leaves as usize && call.simulations < round.simulations && self.has_room(round.visit_limit)) {
+                break;
+            }
             //the root's own evaluation always fits, so that a full search still has moves to report
             let reserved = self.root().has_edges();
             if reserved && !self.reserve(round.memory_limit) {
