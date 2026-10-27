@@ -463,8 +463,7 @@ def answers_by_lane_and_size(network, boards: np.ndarray) -> list[np.ndarray]:
 
 
 #engine_networks (several gpus: the int8 weights read once, the models loaded at once on a thread each) gives each gpu
-#the network engine_network builds alone, to the bit at every graph size on both lanes; here twice on this gpu, the two
-#networks sharing its model (--threads-per-gpu)
+#the network engine_network builds alone, to the bit at every graph size on both lanes; here twice on this gpu
 @gpu
 def test_the_engine_networks_answer_as_engine_networks(tmp_path, small_calibration):
     from engine.engine_search import ENGINE_FP16_BLOCKS, engine_network, engine_networks

@@ -163,7 +163,6 @@ impl SelfPlayGames {
                     value_sharpness: 1.0,
                     certainty: false,
                     transpositions: false,
-                    virtual_loss: 0.0,
                 },
                 simulations,
                 sampled_plies,
@@ -760,12 +759,12 @@ impl Searches {
     //certainty search.rs SearchSettings'. memory_limit_mb (lc0's RamLimitMb, 0 for none) ends a search once its tree's
     //vectors would grow past that many megabytes; the cache comes on top, and so does advance's copy of the part of the
     //tree it keeps. advance_threads: the threads advance walks and copies a kept tree on, off the clock. concurrent_descents:
-    //the trees are SharedTrees (search/shared.rs), which threads descend at once. transpositions and virtual_loss:
-    //search.rs SearchSettings'
+    //the trees are SharedTrees (search/shared.rs), which threads descend at once. transpositions: search.rs
+    //SearchSettings'
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0, advance_threads=4, concurrent_descents=false, transpositions=false, virtual_loss=0.0))]
+                        memory_limit_mb=0, advance_threads=4, concurrent_descents=false, transpositions=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -786,16 +785,11 @@ impl Searches {
         advance_threads: usize,
         concurrent_descents: bool,
         transpositions: bool,
-        virtual_loss: f64,
     ) -> PyResult<Searches> {
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
                 "value_sharpness multiplies the value's logit, it must be positive, not {value_sharpness}"
             )));
-        }
-        //a negative one would draw the descents onto the leaves already in flight, each a collision
-        if !(virtual_loss >= 0.0) {
-            return Err(PyValueError::new_err(format!("virtual_loss counts lost visits, it is 0 or more, not {virtual_loss}")));
         }
         Ok(Searches {
             settings: SearchSettings {
@@ -808,7 +802,6 @@ impl Searches {
                 value_sharpness,
                 certainty,
                 transpositions,
-                virtual_loss,
             },
             move_ids: move_ids(move_id_table)?,
             answer_width,

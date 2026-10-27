@@ -301,7 +301,6 @@ fn settings(certainty: bool) -> SearchSettings {
         value_sharpness: 3.0,
         certainty,
         transpositions: false,
-        virtual_loss: 0.0,
     }
 }
 
@@ -372,24 +371,6 @@ fn search_in_flight(
         }
     }
     gathered
-}
-
-//virtual loss steers a round's descents off the leaves already in flight: the same search's leaves come in fewer, fuller
-//rounds, the rounds' collisions spent on fewer of them
-#[test]
-fn virtual_loss_gathers_fuller_rounds() {
-    let rounds: Vec<usize> = [0.0, 1.0]
-        .into_iter()
-        .map(|virtual_loss| {
-            let settings = SearchSettings { virtual_loss, ..settings(false) };
-            let mut tree = tree_after(START, OPENING);
-            search_in_flight(&mut tree, 4000, 3, &settings, &mut Network::new(), |tree, round, cache, boards| {
-                tree.gather(round, &settings, None, Some(cache), boards).expect("no tables")
-            })
-            .len()
-        })
-        .collect();
-    assert!(rounds[1] < rounds[0], "rounds without and with virtual loss: {rounds:?}");
 }
 
 //a middlegame after its opening, a rook ending and kings behind locked pawns whose shuffles repeat positions (the draws

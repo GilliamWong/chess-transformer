@@ -30,21 +30,6 @@ pub struct SearchSettings {
     //node's mean as a visit without descending (lc0's transposition visit), so its parent learns what the other paths
     //found. A repeat of a position on the descent's path is a draw for that path only, and never a proof. mcts.py has none
     pub transpositions: bool,
-    //virtual loss (Leela Zero's): each simulation in flight below a move counts in its score as this much of a lost
-    //visit, so that a round's descents spread over more leaves rather than colliding; 0 counts them only in the
-    //exploration term, as lc0 and mcts.py do (with_virtual_loss)
-    pub virtual_loss: f64,
-}
-
-//a move's score q with its simulations in flight counted as virtual_loss lost visits each beside its node's visits, of
-//which a node without any has one: its score is then the first play urgency, which stands for a visit
-#[inline(always)]
-fn with_virtual_loss(q: f64, visits: u32, in_flight: u32, virtual_loss: f64) -> f64 {
-    if virtual_loss == 0.0 || in_flight == 0 {
-        return q;
-    }
-    let visits = f64::from(visits.max(1));
-    q * visits / (visits + virtual_loss * f64::from(in_flight))
 }
 
 //a result the search has proven, for the side that played into the node (as the node's value_sum)
@@ -731,7 +716,6 @@ impl Tree {
             noised: node == self.root && !self.noised_priors.is_empty(),
             transpositions: self.graph.is_some(),
             draw: settings.draw,
-            virtual_loss: settings.virtual_loss,
         };
         let value =
             |index: usize, prior: f32, child: u32, own_visits: u32| self.move_value(&scan, repeats, index, prior, child, own_visits);
@@ -805,7 +789,6 @@ impl Tree {
         } else {
             scan.first_play_urgency
         };
-        let q = with_virtual_loss(q, child.visit_count, child.in_flight, scan.virtual_loss);
         //with transpositions a move's own visits, its node's mean (every path's)
         let started = if scan.transpositions { own_visits } else { child.visit_count } + child.in_flight;
         Some((q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + started))), child.edges_at, child.children))
@@ -1939,7 +1922,6 @@ struct Scan {
     noised: bool,
     transpositions: bool,
     draw: f64,
-    virtual_loss: f64,
 }
 
 //a part of a level of compact's breadth-first order: the nodes its chunk's moves lead to, and of each node of the chunk

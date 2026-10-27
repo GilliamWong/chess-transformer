@@ -21,7 +21,7 @@ from torch import nn
 from engine.inference import cpu_batches
 from tools.checkpoint import latest_checkpoint
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS,
-                                  SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, THREADS_PER_GPU, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks,
+                                  SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks,
                                   engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
@@ -217,10 +217,9 @@ def load_engine_model(checkpoint_path: Path, gpu: bool) -> nn.Module:
     return load_model(checkpoint_path, DEVICE)
 
 #the search for --select mcts: on the gpu `leaves` leaves a round, the network in `precision` (int8 with fp16_blocks), on
-#each of the cuda devices `gpus` if given, a device once for each of its networks (a thread driving each); on the cpu
-#one, which is mcts.py's search. options are EngineSearch's keyword arguments (smart pruning, the tables' pieces, changes
-#to the search's settings). With several networks they wait for the gpu asleep (inference.GraphedBatches'
-#blocking_wait), where each thread would spin a core
+#each of the cuda devices `gpus` if given (a thread driving each); on the cpu one, which is mcts.py's search. options are
+#EngineSearch's keyword arguments (smart pruning, the tables' pieces, changes to the search's settings). On several gpus
+#the networks wait for the gpu asleep (inference.GraphedBatches' blocking_wait), where each thread would spin a core
 def load_engine_search(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, options: dict, precision: str,
                        fp16_blocks: int, gpus: list[int] | None = None) -> EngineSearch:
     if gpu:
@@ -525,9 +524,6 @@ if __name__ == "__main__":
                         help="for --select mcts --gpu: the cuda devices to search on at once, e.g. 0,1,2,3, a thread driving each; "
                              "default the current one. On more than one, for --leaves above 1, the search is another (more leaves out): the "
                              "threads descend in the one tree at once, each pinned to a cpu by the topology and asleep while its gpu works")
-    parser.add_argument("--threads-per-gpu", type=int,
-                        help=f"for --gpus: the networks on each, a thread driving each, default {THREADS_PER_GPU} on more than one gpu "
-                             "and 1 on one; a gpu with more than one is searched as several gpus are")
     parser.add_argument("--fp16-blocks", type=int,
                         help=f"for the int8 network: the blocks kept in fp16 besides the last, those whose int8 costs the policy most "
                              f"(engine/quantization.py), default {ENGINE_FP16_BLOCKS}; 0 for every other block in int8")
@@ -567,13 +563,8 @@ if __name__ == "__main__":
         parser.error("--precision needs --select mcts --gpu")
     if arguments.smart_pruning_factor <= 0:
         parser.error("--smart-pruning-factor is positive; --no-smart-pruning for none")
-    if arguments.threads_per_gpu is not None and (arguments.gpus is None or arguments.threads_per_gpu < 1):
-        parser.error("--threads-per-gpu needs --gpus, and is 1 or more")
-    #a device once for each of its networks
-    network_gpus = None if arguments.gpus is None else [gpu for gpu in arguments.gpus for _ in range(
-        arguments.threads_per_gpu or (THREADS_PER_GPU if len(arguments.gpus) > 1 else 1))]
-    if network_gpus is not None and not (arguments.select == "mcts" and arguments.gpu and (len(network_gpus) == 1 or arguments.leaves > 1)):
-        parser.error("--gpus needs --select mcts --gpu, and on more than one network --leaves above 1")
+    if arguments.gpus is not None and not (arguments.select == "mcts" and arguments.gpu and (len(arguments.gpus) == 1 or arguments.leaves > 1)):
+        parser.error("--gpus needs --select mcts --gpu, and on more than one gpu --leaves above 1")
     if arguments.fp16_blocks is not None and not (arguments.select == "mcts" and arguments.gpu and arguments.precision in (None, "int8")):
         parser.error("--fp16-blocks needs --select mcts --gpu and the int8 network")
     if arguments.fp16_blocks is not None and arguments.fp16_blocks < 0:
@@ -585,7 +576,7 @@ if __name__ == "__main__":
              selection=arguments.select, temperature=arguments.temperature, sample_plies=arguments.sample_plies,
              simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
              search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION, infinite_until_stop=arguments.infinite_until_stop,
-             gpus=network_gpus, fp16_blocks=ENGINE_FP16_BLOCKS if arguments.fp16_blocks is None else arguments.fp16_blocks,
+             gpus=arguments.gpus, fp16_blocks=ENGINE_FP16_BLOCKS if arguments.fp16_blocks is None else arguments.fp16_blocks,
              search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
                              "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
                              "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,

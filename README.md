@@ -212,11 +212,8 @@ time saved goes to the moves that are not decided. `--leaves 1` is `engine/mcts.
 after an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to
 answer `isready`, so start the engine once by hand before a match.
 
-`--gpus 0,1,...` searches on several GPUs at once, a thread driving each. `--threads-per-gpu 2` gives each GPU two
-(each thread a network with its own CUDA graphs on the GPU's one copy of the model): on 8 RTX 5090s that was 1.22x the
-nodes a second at 20 s a search, but at 20k nodes a move it lost ~74 Elo to one thread a GPU, so it is off until a
-test at more nodes. The rest is chosen from the GPUs and the CPU. On several GPUs with lean
-lanes (sm_120: the 5070 Ti, the 5090) the rounds run in Rust with no
+`--gpus 0,1,...` searches on several GPUs at once, a thread driving each. That is the only setting: the rest is chosen
+from the GPUs and the CPU. On several GPUs with lean lanes (sm_120: the 5070 Ti, the 5090) the rounds run in Rust with no
 Python between them, the same search as the Python loop that one GPU (~1% faster there at 1 s a move), the A100 (sm_80)
 and the CPU keep. On several GPUs the threads
 descend in the one tree at once rather than in turn under its lock (2.3x the positions evaluated a second in an 8-GPU
@@ -224,9 +221,6 @@ emulation; a thread alone is 16% slower that way, so one GPU keeps the lock), ea
 is pinned to a physical core of its own: all in one L3 if one has a core for each (a 9950X3D's CCD), else over the L3s
 in turn (a 9175F's have one core each), SMT siblings only once every core has a thread. The search on several GPUs is
 not the one-GPU search: more leaves are out at once, and it changes from run to run with the threads' timing.
-`--search-settings virtual_loss=1` also counts each simulation out on a GPU as a lost visit in its move's score, so a
-round's descents spread over more leaves: on 8 RTX 5090s it filled the rounds from ~35 leaves to ~47, 1.18x the
-positions evaluated a second at as many nodes, but at 20k nodes a move it lost ~235 Elo (often mated), so it is off.
 
 The engine reads its input on a thread of its own, so `stop`, `quit` and `isready` reach a running search, and a
 `position` it could not play (an illegal move, a bad FEN) is refused with an `info string`, the last position kept. Its
