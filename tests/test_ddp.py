@@ -18,7 +18,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from training import data
 from training import train as single
-from model.encoding import BOARD_VOCAB_SIZE, NUM_PIECE_CODES, NUM_SQUARES, TOKENS_PER_BOARD
+from model.encoding import BLACK_QUEENSIDE_INDEX, BOARD_VOCAB_SIZE, CASTLING_TOKEN_OFFSET, NUM_PIECE_CODES, NUM_SQUARES, TOKENS_PER_BOARD, WHITE_KINGSIDE_INDEX
 from model.model import ChessTransformer
 from training import train_ddp
 from training.muon import BatchedMuon
@@ -187,12 +187,16 @@ def distributed_worker(rank, folder, world_size):
         dist.destroy_process_group()
 
 
-def write_varied_set(folder, name, seed=11):
-    #different rows and blunder labels, so a resumed run that trained on the wrong batches ends with different weights
+def write_varied_set(folder, name, seed=11, castling_free=False):
+    #different rows and blunder labels, so a resumed run that trained on the wrong batches ends with different weights.
+    #castling_free: no row has a castling right, so every row can be mirrored
     rows = np.random.default_rng(seed)
     for split, size in (("train", 32), ("val", 10)):
+        boards = random_boards(rows, size)
+        if castling_free:
+            boards[:, WHITE_KINGSIDE_INDEX:BLACK_QUEENSIDE_INDEX + 1] = CASTLING_TOKEN_OFFSET
         arrays = dict(
-            boards=random_boards(rows, size),
+            boards=boards,
             stockfish_moves=rows.integers(0, 1968, (size, 2)).astype(np.int16),
             stockfish_evals=rows.integers(-300, 300, (size, 2)).astype(np.int16),
             worst_moves=np.where(rows.random((size, 4)) < 0.5, rows.integers(0, 1968, (size, 4)), -1).astype(np.int16),
@@ -207,7 +211,7 @@ class Preempted(Exception):
     pass
 
 
-def resume_worker(rank, folder, world_size, mix):
+def resume_worker(rank, folder, world_size, mix, mirror):
     torch.set_num_threads(1)
     folder = Path(folder)
     dist.init_process_group("gloo", init_method=(folder / "rendezvous").as_uri(),
@@ -227,7 +231,14 @@ def resume_worker(rank, folder, world_size, mix):
         #with a mix set, 4 of the 16 come from c: 8 batches an epoch there, so the stop is in c's first epoch and the
         #resumed run has to carry on into its second
         flags += ["--mix-set", "c", "--mix-share", "0.25"] if mix else []
-        train_ddp.run(train_ddp.parse_args(flags + ["--name", "whole"]), torch.device("cpu"))
+        if mirror:
+            #the same run without mirroring, to tell that the flag changed what the others trained on
+            train_ddp.run(train_ddp.parse_args(flags + ["--name", "plain"]), torch.device("cpu"))
+            flags += ["--mirror"]
+        with patch.object(train_ddp, "TrainingSampler", wraps=train_ddp.TrainingSampler) as samplers:
+            train_ddp.run(train_ddp.parse_args(flags + ["--name", "whole"]), torch.device("cpu"))
+        #the training set's sampler and the mix set's both get the flag, or both don't
+        assert [call.args[-1] for call in samplers.call_args_list] == [mirror] * (2 if mix else 1)
 
         batches_on_device = single.batches_on_device
         def stopped_before_step_8(batches, device):
@@ -245,13 +256,14 @@ def resume_worker(rank, folder, world_size, mix):
 
 
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
-@pytest.mark.parametrize("mix", [False, True])
-def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopped(tmp_path, mix):
+@pytest.mark.parametrize("mix, mirror", [(False, False), (True, False), (True, True)])
+def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopped(tmp_path, mix, mirror):
     #catches anything the saved state misses: optimizer moments, schedule, position in the epoch (in both sets with a
-    #mix set), best evaluation, and snapshots from before the stop and after it
-    write_varied_set(tmp_path, "b")
-    write_varied_set(tmp_path, "c", seed=12)
-    mp.spawn(resume_worker, args=(str(tmp_path), 2, mix), nprocs=2)
+    #mix set), best evaluation, and snapshots from before the stop and after it. With mirror, the coins of the mirrored
+    #positions, which come from the epoch the resume restores (the stop is in the middle of the fourth)
+    write_varied_set(tmp_path, "b", castling_free=mirror)
+    write_varied_set(tmp_path, "c", seed=12, castling_free=mirror)
+    mp.spawn(resume_worker, args=(str(tmp_path), 2, mix, mirror), nprocs=2)
     runs = tmp_path / "runs"
     snapshots = ["snapshot_80.pt", "snapshot_160.pt", "snapshot_240.pt", "snapshot_320.pt"]  #every 5 of the 20 steps
     for run in ("whole", "stopped"):
@@ -264,6 +276,11 @@ def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopp
     settings = json.loads((runs / "stopped" / "settings.json").read_text())
     assert [entry["step"] for entry in settings["resumed"]] == [7]
     assert settings["positions_seen"] == 320 and settings["blunder_labels"]
+    assert settings["mirror"] == mirror and [entry["mirror"] for entry in settings["resumed"]] == [mirror]
+    if mirror:
+        plain = torch.load(runs / "plain" / "final.pt")["state_dict"]
+        whole = torch.load(runs / "whole" / "final.pt")["state_dict"]
+        assert not all(torch.equal(plain[name], whole[name]) for name in whole)
     assert not (runs / "stopped" / train_ddp.RESUME_FILE).exists()
     if mix:
         assert settings["mix_set"] == "c" and settings["mix_share"] == 0.25 and settings["mix_blunder_labels"]

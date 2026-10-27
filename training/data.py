@@ -1,7 +1,8 @@
 from pathlib import Path
 from model.encoding import TOKENS_PER_BOARD
 from tools.label_with_stockfish import NO_MOVE
-from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, SequentialSampler
+from training.mirror import MirrorRows, draw_mirrors, mirror_moves, read_boards
+from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, Sampler, SequentialSampler
 import numpy as np
 import torch
 import warnings
@@ -98,11 +99,12 @@ class ChessGamesDataset(Dataset):
         teacher = tuple(self.teacher.values()) if self.teacher is not None else ()
         return self.boards, self.stockfish_moves, self.stockfish_evals, *blunder_labels, *teacher
 
-    #labelled moves at or above the blunder threshold, NO_MOVE elsewhere; one NO_MOVE column without blunder labels
-    def blunders_of(self, index: int | list[int]) -> torch.Tensor:
+    #labelled moves at or above the blunder threshold, NO_MOVE elsewhere; one NO_MOVE column without blunder labels.
+    #mirrored is a bool per position, see training.mirror
+    def blunders_of(self, index: int | list[int], mirrored: torch.Tensor | None = None) -> torch.Tensor:
         if self.worst_moves is None:
             return torch.full_like(self.stockfish_moves[index][..., :1], NO_MOVE, dtype=torch.long)
-        return labelled_blunders(self.worst_moves, self.worst_losses, index, self.blunder_threshold)
+        return mirror_moves(labelled_blunders(self.worst_moves, self.worst_losses, index, self.blunder_threshold), mirrored)
 
     #stockfish's eval of the position (first column) as an expected score from 0 to 1, mixed with the teacher's
     def value_target_of(self, index: int | list[int]) -> torch.Tensor:
@@ -117,22 +119,23 @@ class ChessGamesDataset(Dataset):
     #(moves, probabilities): a softmax over the expected score after each move / target_temperature.
     #Empty places are move 0 at probability 0. With a teacher, its moves follow stockfish's: a move in both lists
     #gets both shares, which the cross entropy adds up
-    def policy_target(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor]:
-        moves = self.stockfish_moves[index].long()
+    def policy_target(self, index: int | list[int], mirrored: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        moves = mirror_moves(self.stockfish_moves[index].long(), mirrored)
         no_move = moves == NO_MOVE
         expected_scores = torch.sigmoid(EXPECTED_SCORE_PER_CENTIPAWN * self.stockfish_evals[index].float())
         probabilities = torch.softmax((expected_scores / self.target_temperature).masked_fill(no_move, -torch.inf), dim=-1)
         moves = moves.masked_fill(no_move, 0)
         if self.teacher is None:
             return moves, probabilities
-        return (torch.cat([moves, self.teacher["teacher_moves"][index].long()], dim=-1),
+        return (torch.cat([moves, mirror_moves(self.teacher["teacher_moves"][index].long(), mirrored)], dim=-1),
                 torch.cat([(1 - self.teacher_weight) * probabilities, self.teacher_weight * self.teacher["teacher_probabilities"][index].float()], dim=-1))
 
-    #index is one position or a list of positions returned as one batch: boards, target moves, target probabilities,
-    #value target, blunders
-    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        target_moves, target_probabilities = self.policy_target(index)
-        return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index), self.blunders_of(index)
+    #index is one position, a list of positions returned as one batch, or such a batch with a coin for each position to
+    #show it mirrored (training.mirror): boards, target moves, target probabilities, value target, blunders
+    def __getitem__(self, index: int | list[int] | MirrorRows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        index, boards, mirrored = read_boards(self.boards, index)
+        target_moves, target_probabilities = self.policy_target(index, mirrored)
+        return boards, target_moves, target_probabilities, self.value_target_of(index), self.blunders_of(index, mirrored)
 
 
 #selfplay.py's positions: the policy learns the search's visit shares, the value head a blend of result and root score.
@@ -168,10 +171,10 @@ class SelfPlayDataset(Dataset):
         return self.boards, self.visit_moves, self.visit_shares, self.outcomes, self.root_scores, *blunder_labels
 
     #labelled moves at or above the blunder threshold, NO_MOVE elsewhere; one NO_MOVE column without blunder labels
-    def blunders_of(self, index: int | list[int]) -> torch.Tensor:
+    def blunders_of(self, index: int | list[int], mirrored: torch.Tensor | None = None) -> torch.Tensor:
         if self.worst_moves is None:
             return torch.full_like(self.visit_moves[index][..., :1], NO_MOVE, dtype=torch.long)
-        return labelled_blunders(self.worst_moves, self.worst_losses, index, self.blunder_threshold)
+        return mirror_moves(labelled_blunders(self.worst_moves, self.worst_losses, index, self.blunder_threshold), mirrored)
 
     def __len__(self):
         return len(self.boards)
@@ -180,18 +183,19 @@ class SelfPlayDataset(Dataset):
         return self.result_weight * self.outcomes[index] + (1 - self.result_weight) * self.root_scores[index]
 
     #empty places are move 0 at share 0
-    def policy_target(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor]:
-        moves = self.visit_moves[index].long()
+    def policy_target(self, index: int | list[int], mirrored: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        moves = mirror_moves(self.visit_moves[index].long(), mirrored)
         no_move = moves == NO_MOVE
         shares = self.visit_shares[index].masked_fill(no_move, 0.0)
         if self.visit_temperature != 1:
             shares = sharpened(shares, self.visit_temperature)
         return moves.masked_fill(no_move, 0), shares
 
-    #the same five tensors as ChessGamesDataset
-    def __getitem__(self, index: int | list[int]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        target_moves, target_probabilities = self.policy_target(index)
-        return self.boards[index].long(), target_moves, target_probabilities, self.value_target_of(index), self.blunders_of(index)
+    #the same five tensors as ChessGamesDataset, from the same kinds of index
+    def __getitem__(self, index: int | list[int] | MirrorRows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        index, boards, mirrored = read_boards(self.boards, index)
+        target_moves, target_probabilities = self.policy_target(index, mirrored)
+        return boards, target_moves, target_probabilities, self.value_target_of(index), self.blunders_of(index, mirrored)
 
 
 #shares ** (1 / temperature), renormalised. Divided by the max first so a low temperature does not underflow to 0;
@@ -236,20 +240,43 @@ def concatenate_batches(first: tuple[torch.Tensor, ...], second: tuple[torch.Ten
     return torch.cat(boards), torch.cat(moves), torch.cat(probabilities), torch.cat(values), torch.cat(blunders)
 
 
+#another sampler's batches, each with the coins that show its rows mirrored at random in this pass over the set (the
+#epoch, counted here by the passes started). train.py's loader has no epoch of its own, unlike train_ddp.TrainingSampler
+class MirroringBatches(Sampler):
+    def __init__(self, batches: Sampler, seed: int):
+        self.batches = batches
+        self.seed = seed
+        self.epoch = 0
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __iter__(self):
+        epoch, self.epoch = self.epoch, self.epoch + 1
+        for rows in self.batches:
+            yield draw_mirrors(torch.tensor(rows), self.seed, epoch)
+
+
 #the samplers hand the dataset a whole batch of indices (batch_size=None turns off the loader's own batching):
-#one tensor lookup per batch instead of a __getitem__ per position plus a collate, 15x faster
+#one tensor lookup per batch instead of a __getitem__ per position plus a collate, 15x faster.
+#mirror shows the train positions without castling rights mirrored at random (training.mirror), a new draw every pass
 def datasets_to_dataloaders(
     train_dataset: TrainingDataset,
     val_dataset: TrainingDataset,
     train_batch_size: int = 256,
     val_batch_size: int = 512,
-    seed: int | None = None
+    seed: int | None = None,
+    mirror: bool = False
 ) -> tuple[DataLoader, DataLoader]:
+    if mirror and seed is None:
+        raise ValueError("mirroring draws its coins from the seed")
 
     #with a seed the train order has its own generator, so it doesn't depend on how many random numbers building the
     #model drew
     generator = torch.Generator().manual_seed(seed) if seed is not None else None
     train_sampler = BatchSampler(RandomSampler(train_dataset, generator=generator), batch_size=train_batch_size, drop_last=False)
+    if mirror:
+        train_sampler = MirroringBatches(train_sampler, seed)
     val_sampler = BatchSampler(SequentialSampler(val_dataset), batch_size=val_batch_size, drop_last=False)
 
     train_loader = DataLoader(train_dataset, sampler=train_sampler, batch_size=None)

@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 from training import train as single
 from training.data import concatenate_batches
+from training.mirror import draw_mirrors
 from model.model import ChessTransformer, mlp_hidden_width
 from tools.budget import Budget
 from tools.checkpoint import RUNS_DIR, save_checkpoint, warm_start
@@ -33,9 +34,11 @@ CLOCK_EVERY = 20
 RESUME_FILE = "resume.pt"
 
 
-#equal local batches, disjoint across processes, reshuffled every epoch
+#equal local batches, disjoint across processes, reshuffled every epoch. With mirror every row comes with its coin for
+#being shown mirrored (training.mirror): a function of (seed, epoch, row) alone, so a resumed run, which restores the
+#epoch, draws the coins an unstopped one would, whatever its process count
 class TrainingSampler(Sampler):
-    def __init__(self, dataset, batch_size: int, rank: int, world_size: int, seed: int):
+    def __init__(self, dataset, batch_size: int, rank: int, world_size: int, seed: int, mirror: bool = False):
         if batch_size <= 0 or batch_size % world_size:
             raise ValueError("global batch size must be positive and divisible by the process count")
         if len(dataset) < batch_size:
@@ -44,6 +47,7 @@ class TrainingSampler(Sampler):
         self.batch_size = batch_size // world_size
         self.global_batch_size = batch_size
         self.rank, self.world_size, self.seed = rank, world_size, seed
+        self.mirror = mirror
         self.epoch = 0
         self.skip = 0  #batches of this epoch a resumed run already trained on
 
@@ -57,7 +61,8 @@ class TrainingSampler(Sampler):
         first, self.skip = self.skip, 0
         for start in range(first * self.global_batch_size, len(self) * self.global_batch_size, self.global_batch_size):
             local_start = start + self.rank * self.batch_size
-            yield order[local_start:local_start + self.batch_size].long()
+            rows = order[local_start:local_start + self.batch_size].long()
+            yield draw_mirrors(rows, self.seed, self.epoch) if self.mirror else rows
 
 
 def endless_batches(loader: DataLoader):
@@ -289,14 +294,14 @@ def run(args, device: torch.device):
     dist.barrier()
     if not len(val_loader.dataset):
         raise ValueError("validation needs at least one position")
-    sampler = TrainingSampler(train_dataset, args.batch_size - mix_batch_size, rank, world_size, args.seed)
+    sampler = TrainingSampler(train_dataset, args.batch_size - mix_batch_size, rank, world_size, args.seed, args.mirror)
     #not pinned here: batches_on_device pins them in its thread
     train_loader = DataLoader(train_dataset, batch_size=None, sampler=sampler,
                               generator=torch.Generator().manual_seed(args.seed + rank))
     mix_sampler = mix_loader = None
     if args.mix_set is not None:
         #its own order: the same seed would draw the same rows of both sets
-        mix_sampler = TrainingSampler(mix_train_dataset, mix_batch_size, rank, world_size, args.seed + 1)
+        mix_sampler = TrainingSampler(mix_train_dataset, mix_batch_size, rank, world_size, args.seed + 1, args.mirror)
         mix_loader = DataLoader(mix_train_dataset, batch_size=None, sampler=mix_sampler)
 
     model_settings = dict(d_model=args.d_model, num_layers=args.layers, n_heads=args.heads,
@@ -352,13 +357,13 @@ def run(args, device: torch.device):
             if resumed is not None:
                 settings = json.loads(settings_path.read_text(encoding="utf-8"))
                 settings["resumed"] = settings.get("resumed", []) + [dict(step=budget.steps, at=datetime.now().isoformat(timespec="seconds"),
-                                                                          world_size=world_size, micro_batches=micro_batches)]
+                                                                          world_size=world_size, micro_batches=micro_batches, mirror=args.mirror)]
             else:
                 settings = dict(
                     model_settings=model_settings, parameters=sum(p.numel() for p in raw_model.parameters()),
                     peak_learn_rate=args.lr, schedule=args.schedule, embed_lr_multiplier=args.embed_lr_multiplier, seed=args.seed,
                     value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight, blunder_threshold=args.blunder_threshold,
-                    weight_decay=args.weight_decay, muon_momentum=args.muon_momentum,
+                    weight_decay=args.weight_decay, muon_momentum=args.muon_momentum, mirror=args.mirror,
                     blunder_labels=getattr(train_dataset, "worst_moves", None) is not None,
                     budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=local_batch, micro_batches=micro_batches,
                     training_set=args.training_set, target_temperature=args.target_temperature,
@@ -472,6 +477,9 @@ def parse_args(argv=None):
                         help="a labelled move losing at least this much expected score is a blunder")
     parser.add_argument("--weight-decay", type=float, default=single.WEIGHT_DECAY, help="for Muon and AdamW both")
     parser.add_argument("--muon-momentum", type=float, default=single.MUON_MOMENTUM)
+    parser.add_argument("--mirror", action="store_true",
+                        help="show train positions (the mix set's too) without castling rights mirrored left-right at random, "
+                             "a new draw every epoch that a --resume run repeats exactly. Val is never mirrored")
     return parser.parse_args(argv)
 
 
