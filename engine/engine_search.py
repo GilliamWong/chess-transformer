@@ -72,11 +72,11 @@ RUST_WAIT_SECONDS = 0.005
 CACHE_POSITIONS = 5_000_000
 #the threads advance walks and copies the kept tree on after a move, while the opponent thinks (Searches' advance_threads)
 ADVANCE_THREADS = 4
-#the networks, each a round loop thread, on each gpu when there are several (uci.py --threads-per-gpu): in a long search
-#one thread a gpu is busy descending all the time (98% of a core each on 8 5090s at 20 s a search, 2026-10-25), and two
-#gave 1.22x the simulations a second there (1.09x at 3 s), filling a 16-core socket (a 9175F's) with 8 gpus. One gpu
-#keeps one thread, whose search is one gpu's (the lock and the python loop's rounds)
-THREADS_PER_GPU = 2
+#the networks, each a round loop thread, on each gpu when there are several (uci.py --threads-per-gpu). Two a gpu gave
+#1.22x the simulations a second on 8 5090s at 20 s a search (2026-10-25), but at 20k nodes a move, 16 networks against 8
+#lost -74 Elo (-135..-14) to the same search with its leaves out on half as many (2026-10-27, one gpu listing gpu 0): more
+#leaves in flight cost more than the speed bought there. One gpu keeps one thread whatever this is
+THREADS_PER_GPU = 1
 #the engine's own changes to mcts.py's search, which self-play keeps (tools/play/variant_match.py tunes them). One leaf
 #a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. c_puct 0.4 won +78 elo at 4k nodes a move and +46 at
 #30k in self-play, but against stockfish it was -9 [-48, +30] and against lc0 it trailed (2026-09-29): self-play's bias
@@ -85,9 +85,9 @@ THREADS_PER_GPU = 2
 #SearchSettings' (with smart pruning a search whose root is proven stops); without it a mate the search had found lost
 #to a move with more visits (2026-10-13). transpositions: search.rs SearchSettings' (lc0's DAG search): at 32M nodes a
 #tree spent 58-81% of its visits on positions it already had, and the DAG was no slower with 20-40% less memory at 10M
-#(2026-10-24); on by the user's call before a match measured it. virtual_loss: search.rs SearchSettings', off until a
-#match measures it: on 8 5090s 1 filled the rounds from ~35 leaves to ~47, 1.18x the boards a second at 20 s a search
-#with as many simulations (2026-10-25)
+#(2026-10-24); on by the user's call before a match measured it. virtual_loss: search.rs SearchSettings', off: on 8 5090s
+#1 filled the rounds from ~35 leaves to ~47, 1.18x the boards a second at 20 s a search with as many simulations
+#(2026-10-25), but at 20k nodes a move it lost -235 Elo (-289..-188) with 8 networks' leaves in flight (2026-10-27)
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True, "virtual_loss": 0.0}
 
 
