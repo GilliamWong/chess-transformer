@@ -583,8 +583,7 @@ fn a_call_takes_no_leaf_once_its_search_has_ended() {
             });
             (gathering.join().expect("a thread"), at_close)
         });
-        eprintln!("DEBUG gathered {gathered} at_close {at_close} pending {} gave_way {}", tree.pending(), tree.counts.gave_way.load(Ordering::Relaxed));
-    assert!(gathered < round.leaves as usize, "the call ended before the search did: {gathered} leaves");
+        assert!(gathered < round.leaves as usize, "the call ended before the search did: {gathered} leaves");
         assert_eq!(tree.pending(), at_close, "leaves taken after the close");
     }
 }
