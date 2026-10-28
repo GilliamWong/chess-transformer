@@ -329,8 +329,10 @@ THREADS = HEADS_PER_CTA * 32
 SHARED_BYTES = 2 * (HEADS_PER_CTA // 2 * KEYS * VALUE_ROW + HEADS_PER_CTA * BIAS_ROWS * BIAS_ROW)
 
 #by (compute capability, multiprocessors): the gpus where the kernel was timed against the Triton kernels, with the fewest
-#positions it takes and the share of its CTA slots its last wave must fill (a few CTAs past a wave take as long as another)
-TIMED = {(12, 0, 70): (36, 0.55)}
+#positions it takes and the share of its CTA slots its last wave must fill (a few CTAs past a wave take as long as another).
+#RTX 5090: the kernel ran at 0.4-0.75x Triton's speed up to 16 positions, 0.96-1.33x at 32, 1.2-1.98x at 36-64 and
+#1.6-2.5x from 128 (dq 8-24); a last wave's fill made no difference there
+TIMED = {(12, 0, 70): (36, 0.55), (12, 0, 170): (32, 0.0)}
 #CTAs a position makes (24 query heads over HEADS_PER_CTA), and the most that share a multiprocessor
 CTAS_PER_POSITION = 24 // HEADS_PER_CTA
 CTAS_PER_MULTIPROCESSOR = 2
