@@ -52,6 +52,15 @@ def test_a_move_that_gives_the_draw_away_leaves_the_target(tablebase):
     assert stockfish_wdls == [-2, 0]
 
 
+#a quiet move whose win needs 101 plies to the next capture or pawn move is a cursed win, as the root probe says
+@pytest.mark.parametrize("fen", ["8/8/4k3/4bb2/2K5/2N5/8/8 b - - 7 79", "8/8/8/2nk1K2/8/4B3/4B3/8 w - - 11 67", "6B1/3kn3/8/8/8/2B1K3/8/8 w - - 7 84"])
+def test_the_best_move_keeps_the_roots_result_at_the_50_move_edge(tablebase, fen):
+    board = chess.Board(fen)
+    assert tablebase.probe_wdl(board) == 1
+
+    assert ranked_moves(tablebase, board)[0].wdl == 1
+
+
 #black's moves are labelled mirrored, and a lost position gets a lost value target
 def test_a_lost_position_for_black(tablebase):
     board = chess.Board("k7/8/1K6/8/8/8/8/7R b - - 0 1")
