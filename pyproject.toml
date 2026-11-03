@@ -3,6 +3,8 @@ name = "chess-transformer"
 version = "0.1.0"
 description = "A transformer that plays chess, trained on Stockfish's moves and evals, with MCTS and self-play"
 requires-python = ">=3.10"
+#GPL as python-chess, shakmaty and shakmaty-syzygy are
+license = "GPL-3.0-or-later"
 dependencies = [
     "chess>=1.11",
     "matplotlib>=3.8", # tools/plot_templates.py
