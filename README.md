@@ -3,6 +3,71 @@
 A transformer that plays chess. It is trained on Stockfish's moves and evals, plays on its own (the policy) or with
 Monte Carlo tree search, and can be improved further by self-play (expert iteration).
 
+## Run the engine
+
+On Linux with an NVIDIA GPU (driver 580 or newer, for CUDA 13.0), git, curl and a C compiler (`build-essential`):
+
+```
+git clone https://github.com/GilliamWong/chess-transformer.git
+chess-transformer/linux/build.sh
+chess-transformer/linux/engine.sh
+```
+
+`linux/build.sh` installs uv and Rust for the user if they are missing (Rust without touching the shell's profile),
+builds the Python environment from `uv.lock` (Python 3.12, PyTorch's CUDA 13.0 build, the Rust search compiled for
+release), downloads the network into `weights/` and rounds its int8 weights on the GPU (~1 min, cached in
+`~/.cache/chess_transformer/int8`; `SKIP_INT8=1` leaves that to the engine's first `isready`). Run it again after a
+`git pull`: it skips what is done. `linux/update.sh [folder]` clones the repository into `folder` (default
+`chess-transformer`) or pulls it there, then builds it: a tournament's update script.
+
+The network is `fry-final-117` (453 MB), attached to the
+[fry-final-117 release](https://github.com/GilliamWong/chess-transformer/releases/tag/fry-final-117); `build.sh` checks
+its SHA-256, `fed2722da0085ef3299eeb72e9f06712a9426b38503aa8889bcf87affc5c0bed`.
+
+`linux/engine.sh` is the UCI engine: `fry-final-117` with the search on every GPU the machine has (`--gpus all`).
+Further arguments go to `engine/uci.py` (`--help` lists them). The first start compiles the network (~25 s), later
+starts take ~7 s on one GPU and an estimated ~35-40 s on eight (each GPU's network compiles in turn), so give the GUI
+that long for `isready`, or start the engine once by hand before the first game. `id name` gives the version as
+pyproject.toml's and the commit, e.g. `ChessTransformer 0.1.0-7698b9f`.
+
+### UCI options
+
+| Option | Default | What it sets |
+|---|---|---|
+| `SyzygyPath` | `<empty>` | Syzygy table folders, `:` between them (`;` on Windows); empty for none |
+| `SyzygyProbeLimit` | 5 | The most pieces the tables are used for, 5 or 6 |
+| `MoveOverhead` | 20 | Milliseconds kept back from each move's time for the GUI's lag |
+| `CachePositions` | 5000000 | Network answers kept by position, ~190-260 bytes each |
+| `RamLimitMb` | 0 | MB the search tree may take, 0 for no limit. A full tree ends the search, and while a kept tree stays full the next searches move at once. The cache and the copy a kept tree makes when the root moves come on top, so set it to about (the engine's memory - the cache) / 1.7 |
+| `AdvanceThreads` | 4 | Threads that carry the kept tree on to the next move once `bestmove` is sent |
+| `Leaves` | 64 | Positions gathered for each network call on each GPU |
+| `GPUs` | the command line's | `all`, or CUDA devices by number (`0,1,2,3`); several need `Leaves` above 1 |
+| `SmartPruningFactor` | 1 | A search stops once its most visited move leads the second by more than the simulations left / this; 0 searches all of its time (lc0's 1.33) |
+| `FirstMoveBonus` | 0 | A game's first search on the clock gets 1 + this + `BookPlyBonus` x its ply (at most 12) times its share, as it starts without a kept tree (lc0's 1.8) |
+| `BookPlyBonus` | 0 | See `FirstMoveBonus` (lc0's 0.25) |
+| `SearchSettings` | `<empty>` | Changes to the search's constants, `name=value,...` (e.g. `c_puct=0.6,value_sharpness=3`); a wrong name gets the list of names |
+
+`Leaves`, `GPUs` and `SmartPruningFactor` are the GPU search's (`--gpu`). Every option but `MoveOverhead`,
+`FirstMoveBonus` and `BookPlyBonus` is read when the engine loads at its first `isready` or `go`, and needs a restart
+after that. A value the engine cannot take is refused with an `info string`, the option left as it was. There is no
+`Hash` or `Threads`: the tree's memory is `RamLimitMb`, and the threads follow from the GPUs (one each, pinned to cores
+by the topology) and `AdvanceThreads`. The engine names no ponder move, so GUIs do not ponder with it.
+
+### Tournament settings
+
+`linux/tcec.json` is the engine's entry for cutechess-cli (`-engine conf=...`) or a tournament manager, tuned for TCEC's
+GPU server (2x EPYC 9175F, 8x RTX 5090, 768 GB, at most 320 GiB of RAM for an engine): `linux/engine.sh` on all eight
+GPUs (the rounds in Rust, one tree for all eight, the threads asleep while their GPU works and pinned to cores), with
+
+| Option | Value | Why |
+|---|---|---|
+| `SyzygyPath` | the box's tables | `:` between folders |
+| `SyzygyProbeLimit` | 6 | The most the engine reads |
+| `RamLimitMb` | 180000 | ~1.7x that at its peak with the kept tree's copy, ~320 GB with the cache: inside TCEC's limit |
+| `CachePositions` | 50000000 | ~9.5 GB, more than a move's answers (~0.25-0.5 a node): one 10x smaller halved the speed, a bigger one gained nothing |
+| `AdvanceThreads` | 16 | The cores are idle while the opponent thinks, and a reply that comes before the kept tree is ready waits for it |
+| `MoveOverhead` | 200 | lc0's default: 0.2 s a move is nothing at TCEC's time controls, and a loss on time is the game |
+
 ## Setup
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and [Rust](https://rustup.rs), then:
@@ -212,7 +277,7 @@ time saved goes to the moves that are not decided. `--leaves 1` is `engine/mcts.
 after an update compiles the network (~25 s, then ~7 s from torch's cache) and cutechess-cli gives an engine 15 s to
 answer `isready`, so start the engine once by hand before a match.
 
-`--gpus 0,1,...` searches on several GPUs at once, a thread driving each. That is the only setting: the rest is chosen
+`--gpus 0,1,...` (or `all`) searches on several GPUs at once, a thread driving each. That is the only setting: the rest is chosen
 from the GPUs and the CPU. On several GPUs with lean lanes (sm_120: the 5070 Ti, the 5090) the rounds run in Rust with no
 Python between them, the same search as the Python loop that one GPU (~1% faster there at 1 s a move), the A100 (sm_80)
 and the CPU keep. On several GPUs the threads
@@ -224,13 +289,8 @@ not the one-GPU search: more leaves are out at once, and it changes from run to 
 
 The engine reads its input on a thread of its own, so `stop`, `quit` and `isready` reach a running search, and a
 `position` it could not play (an illegal move, a bad FEN) is refused with an `info string`, the last position kept. Its
-UCI options are `SyzygyPath` and `SyzygyProbeLimit` (the tables, as `--tablebase` and `--tablebase-pieces`),
-`MoveOverhead` (ms, default 20), `CachePositions` (the answer cache, 5M positions and ~1-1.3 GB by default),
-`RamLimitMb` (the tree's memory, 0 for no limit: a full tree ends the search, and while a kept tree stays full the next
-searches move at once) and `AdvanceThreads` (the threads that carry the kept tree on to the next move once `bestmove`
-is sent, default 4); all but `MoveOverhead` are read when the engine loads at `isready`, and need a restart after
-that. `RamLimitMb` leaves out the cache and the copy a kept tree makes when the root moves, so set it to about (the
-engine's memory - the cache) / 1.7. `go infinite` runs `--simulations`, as cutechess-cli's `tc=inf` games need; with
+UCI options are listed under [Run the engine](#uci-options); each one's command-line flag (`--tablebase`, `--leaves`,
+`--gpus`, `--search-settings`, ...) sets its default. `go infinite` runs `--simulations`, as cutechess-cli's `tc=inf` games need; with
 `--infinite-until-stop` it searches until `stop`, as analysis GUIs expect. `go ponder` searches until `ponderhit`
 (GUIs do not ponder with the engine, which names no ponder move), and `searchmoves` is ignored.
 
@@ -247,20 +307,8 @@ of the network's speed (0.8% of the nodes a second at 1000 nodes).
 rounded once per checkpoint (GPTQ, ~1 min) and kept in `~/.cache/chess_transformer/int8`;
 `python -m engine.quantization <model.pt>` rounds them ahead of a match, which `isready` would not wait for.
 
-On a tournament box (TCEC's: 2x EPYC 9175F, 768 GB, 8x RTX 5090), run
-`engine.uci <model.pt> --select mcts --gpu --gpus 0,1,2,3,4,5,6,7` (the Rust rounds, one tree for all eight, the sleeping
-waits and the pins follow from it) with:
-
-```
-setoption name RamLimitMb value 350000        the tree's memory, ~1.7x at its peak with the kept tree's copy (~610 GB with the cache); 200000 on a shared box
-setoption name CachePositions value 50000000  ~9.5 GB, more than a move's answers (~0.25-0.5 a node): one 10x smaller halved the speed, a bigger one gains nothing
-setoption name AdvanceThreads value 16        the cores are idle while the opponent thinks, and a reply that comes before the kept tree is ready waits for it
-setoption name MoveOverhead value 200         lc0's default: 0.2 s a move is nothing at TCEC's time controls, a loss on time is the game
-setoption name SyzygyPath value <folders>     the box's syzygy tables, ':' between folders, with SyzygyProbeLimit 6 (the most the engine reads)
-```
-On the box itself before the first game, round the int8 weights (`python -m engine.quantization <model.pt>`, ~1 min) and start
-the engine once to `isready` (the graphs compile, ~25 s): both are cached, and the GUI's own `isready` then takes ~7 s on
-one GPU, an estimated ~35-40 s on eight (each GPU's network compiles in turn), so give the GUI a longer start timeout.
+On a tournament box, see [Tournament settings](#tournament-settings): `linux/build.sh` rounds the int8 weights, and
+`linux/tcec.json` has the options.
 
 ## Self-play (expert iteration)
 
@@ -301,4 +349,22 @@ uv run pytest
 | `tools/` | Not in git, local only. Labelling, puzzles, attention probes and maps (`plot_attention.py`, like `plot_templates.py`), the scaling grid's and attention report's figures, and `play/` (matches against other engines, match analysis, the Elo log) |
 | `artifacts/` | Data, checkpoints, runs, engines, results and reports. Code here is only the scripts and source snapshots an experiment or audit ran with, kept beside its results. Dated folders hold one experiment each, `plots/` the attention, template and embedding pictures, `reports/` the write-ups that span several, `patches/` code for experiments that were not merged, and `elo_results.jsonl` the match log. Not in git, local only. Among the write-ups are `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget), `reports/selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish), `attention_lookups_20260927/` (weight decay for long runs, the block-1 attention collapse, and what every head looks up, with charts) and `mlp_layers_20261001/` (what each MLP layer does, and what dropping some costs in quality and buys in speed) |
 | `tests/` | `uv run pytest` (with `tools/tests/` where `tools/` is there) |
+| `linux/` | `build.sh` (the engine built on Linux), `update.sh` (clone or pull, then build), `engine.sh` (the engine as tournaments run it) and `tcec.json` (its tournament entry) |
 | `notes.txt` | Not in git, local only. Running notes: ideas to try and small experiments' results |
+
+## License
+
+GPL-3.0-or-later ([LICENSE](LICENSE)). The engine is built on python-chess, shakmaty and shakmaty-syzygy, which are
+GPL-3.0-or-later themselves.
+
+## Credits
+
+- Games: the [Lichess Elite Database](https://database.nikonoel.fr/) (from the [Lichess database](https://database.lichess.org/)),
+  Stockfish games from the UHO opening books, and `engine/Carlsen.pgn` (Magnus Carlsen's games: match openings, test
+  games and the int8 calibration positions).
+- Labels: [Stockfish](https://stockfishchess.org/) (moves and evals at depths 8 to 24), the
+  [Syzygy tablebases](https://syzygy-tables.info/), and [Leela Chess Zero](https://lczero.org/)'s BT4 network, whose
+  move priors the final fine-tunes distil.
+- Code: [python-chess](https://github.com/niklasf/python-chess), [shakmaty and shakmaty-syzygy](https://github.com/niklasf/shakmaty),
+  [PyTorch](https://pytorch.org/), [Triton](https://github.com/triton-lang/triton) and [PyO3](https://pyo3.rs/). The
+  search follows lc0's where noted in the code (PUCT, smart pruning, certainty propagation, the time manager).
