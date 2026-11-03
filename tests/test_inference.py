@@ -352,15 +352,14 @@ def test_the_board_embedding_finds_the_feature_rows_of_square_features(monkeypat
 
 
 @gpu
-@pytest.mark.parametrize("value_bins", [16, 1])
 #71 boards take several eval-head programs
 @pytest.mark.parametrize("boards", [1, 5, 71])
-def test_the_fused_heads_compute_the_models_heads(monkeypatch, value_bins, boards):
+def test_the_fused_heads_compute_the_models_heads(monkeypatch, boards):
     from model import fused_blocks
     monkeypatch.setattr(fused_blocks, "fused_ends", lambda device: True)
     torch.manual_seed(0)
     d = 64
-    model = ChessTransformer(d_model=d, num_layers=1, n_heads=2, value_bins=value_bins).cuda().eval()
+    model = ChessTransformer(d_model=d, num_layers=1, n_heads=2, value_bins=16).cuda().eval()
     with torch.no_grad():
         #sixteenths and gains of powers of two, so that fp16 holds the matmul's weights
         model.from_projection.weight.copy_(torch.randint(-2, 3, (d, d)) / 16)

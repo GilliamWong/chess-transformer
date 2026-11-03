@@ -3,9 +3,6 @@ import torch
 
 from training.train import value_correct, value_error, value_loss, value_target_bins
 from model.model import ChessTransformer, expected_score
-from model.checkpoint import load_checkpoint, save_checkpoint
-
-CPU = torch.device("cpu")
 
 
 def test_the_target_over_the_bins_is_a_gaussian_around_the_score():
@@ -30,8 +27,6 @@ def test_the_bins_loss_is_lowest_on_the_target_itself():
     flat = torch.zeros(2, bins)
 
     assert value_loss(on_target, targets) < value_loss(flat, targets)
-    one_logit = torch.logit(targets).unsqueeze(-1)
-    assert value_loss(one_logit, targets) < value_loss(torch.zeros(2, 1), targets)
 
 
 def test_the_expected_score_is_the_head_output_as_a_score():
@@ -47,17 +42,7 @@ def test_the_expected_score_is_the_head_output_as_a_score():
     assert value_error(bin_logits, targets) < 1e-2
 
 
-def test_a_checkpoint_without_value_bins_loads_with_one_logit(tmp_path):
-    #without mlp_hidden in the settings the mlp loads at the old width, 88
-    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2, mlp_hidden=88, value_bins=1)
-    save_checkpoint(model, {"d_model": 32, "num_layers": 1, "n_heads": 2}, tmp_path / "model.pt")
-
-    loaded, loaded_settings = load_checkpoint(tmp_path / "model.pt", CPU)
-
-    assert loaded_settings["value_bins"] == 1
-    assert loaded.eval_head[-1].out_features == 1
-
-
-def test_no_bins_is_rejected():
+@pytest.mark.parametrize("value_bins", [0, 1])
+def test_no_bins_is_rejected(value_bins):
     with pytest.raises(ValueError):
-        ChessTransformer(d_model=32, num_layers=1, n_heads=2, value_bins=0)
+        ChessTransformer(d_model=32, num_layers=1, n_heads=2, value_bins=value_bins)

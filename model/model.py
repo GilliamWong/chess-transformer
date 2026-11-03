@@ -15,14 +15,16 @@ def mlp_hidden_width(d_model: int, mlp_ratio: float | None = None) -> int:
 def value_bin_edges(bins: int, device: torch.device) -> torch.Tensor:
     return torch.linspace(0, 1, bins + 1, device=device)
 
+def value_bin_centres(bins: int, device: torch.device) -> torch.Tensor:
+    edges = value_bin_edges(bins, device)
+    return (edges[:-1] + edges[1:]) / 2
+
 #0 to 1: a win scores 1, a draw 0.5
 def expected_score(value_logits: torch.Tensor) -> torch.Tensor:
     bins = value_logits.shape[-1]
-    if bins == 1:
+    if bins == 1: #only the fake models in tests/ have a one-logit head, ChessTransformer needs 2 bins
         return torch.sigmoid(value_logits[..., 0].float())
-    edges = value_bin_edges(bins, value_logits.device)
-    centres = (edges[:-1] + edges[1:]) / 2
-    return torch.softmax(value_logits.float(), dim=-1) @ centres
+    return torch.softmax(value_logits.float(), dim=-1) @ value_bin_centres(bins, value_logits.device)
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_hidden: int):
@@ -176,14 +178,11 @@ class SquareFeatures(nn.Module):
 
 
 class ChessTransformer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_hidden: int | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, loops: int = 1, value_bins: int = VALUE_BINS):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, n_heads: int = 4, position_templates: int = 8, mlp_hidden: int | None = None, qk_ratio: float | list[float] = 1.0, kv_heads: int | None = None, value_bins: int = VALUE_BINS):
         super().__init__()
-        if loops < 1:
-            raise ValueError(f"loops is how many times the blocks run, at least 1, got {loops}")
-        if value_bins < 1:
-            raise ValueError(f"value_bins is the eval head's bins over the expected score, at least 1, got {value_bins}")
+        if value_bins < 2:
+            raise ValueError(f"value_bins is the eval head's bins over the expected score, at least 2, got {value_bins}")
         self.d_model = d_model
-        self.loops = loops
 
         self.embed = nn.Embedding(BOARD_VOCAB_SIZE, d_model)
 
@@ -252,9 +251,8 @@ class ChessTransformer(nn.Module):
         embed_state = self.embed(board_state) + self.position_embed + F.pad(self.square_features(board_state), (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
         original_board_embed = embed_state
 
-        for _ in range(self.loops):
-            for block in self.encoder:
-                embed_state = block(embed_state, self.templates, original_board_embed)
+        for block in self.encoder:
+            embed_state = block(embed_state, self.templates, original_board_embed)
         model_output = self.ln(embed_state)
 
         with torch.autocast(device_type=board_state.device.type, enabled=False):

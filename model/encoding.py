@@ -91,24 +91,6 @@ def encode_board(board: chess.Board) -> list[int]:
     ]
     return encoding
 
-def decode_board(encoding: list[int]) -> chess.Board:
-    board = chess.Board.empty()
-
-    ep_square = encoding[EN_PASSANT_INDEX] - EN_PASSANT_TOKEN_OFFSET
-    board.ep_square = None if ep_square == 0 else ep_square
-
-    castling_slots = ((WHITE_KINGSIDE_INDEX, "K"), (WHITE_QUEENSIDE_INDEX, "Q"), (BLACK_KINGSIDE_INDEX, "k"), (BLACK_QUEENSIDE_INDEX, "q"))
-    castling = "".join(letter for index, letter in castling_slots if encoding[index] == CASTLING_TOKEN_OFFSET + 1)
-    board.set_castling_fen(castling or "-")
-
-    for square in range(NUM_SQUARES):
-        board.set_piece_at(square, integer_to_piece(encoding[square]))
-
-    if encoding[TURN_INDEX] == TURN_TOKEN_OFFSET:
-        board = board.mirror() #also hands the turn to black
-
-    return board
-
 #turn is the side playing the move: black's moves are mirrored to match encode_board
 def encode_move_to_id(move: chess.Move, turn: chess.Color) -> int:
     flip = 0 if turn == chess.WHITE else 56
@@ -119,8 +101,3 @@ def decode_id_to_move(move_id: int, turn: chess.Color) -> chess.Move:
     if turn == chess.BLACK:
         return chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square), promotion=move.promotion)
     return move
-
-def integer_to_piece(piece: int) -> chess.Piece | None:
-    if piece == 0: return None
-    if piece <= NUM_PIECE_TYPES: return chess.Piece(piece, chess.WHITE)
-    return chess.Piece(piece - NUM_PIECE_TYPES, chess.BLACK)

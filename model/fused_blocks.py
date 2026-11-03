@@ -11,7 +11,7 @@ from triton.language.extra.cuda import gdc_wait
 
 from model.attention_cuda import cuda_template_attention, prepare
 from model.encoding import TOKENS_PER_BOARD
-from model.model import EDGE, KING, KNIGHT, NO_PIECE, NUM_SQUARES, PAWN, QUEEN, THEIRS, ChessTransformer, TransformerBlock, value_bin_edges
+from model.model import EDGE, KING, KNIGHT, NO_PIECE, NUM_SQUARES, PAWN, QUEEN, THEIRS, VALUE_TOKEN_DIM, ChessTransformer, TransformerBlock, value_bin_centres
 
 SQUARE_WARPS, META_WARPS = 2, 2
 MAX_WARPS = 32
@@ -535,7 +535,7 @@ class InputEmbedding(nn.Module):
 #the narrow matmul's columns: board_down_project's, then a square's terms (s and t, a move's terms of its from and to square, and the 4 promotion
 #logits), padded
 NARROW_COLUMNS = 32
-DOWN_COLUMNS = 16
+DOWN_COLUMNS = VALUE_TOKEN_DIM
 #where the promotions' logits are among a square's terms, and where r is
 PROMOTION_TERM, R_TERM = 2, 6
 #per square, its terms and r, padded
@@ -710,8 +710,7 @@ def head_answer_kernel(partials_ptr, squares_ptr, moves_ptr, board_down_ptr, hid
                         HIDDEN, BINS, BLOCK_BINS, BOARDS, UNITS, DEPTH, LO_SCALE)
 
 
-#a board's expected score from the eval head's output (value_partials summed, then its bias): the bins' softmax times their centres, or one bin's
-#sigmoid (model.expected_score)
+#a board's expected score from the eval head's output (value_partials summed, then its bias): the bins' softmax times their centres (model.expected_score)
 @triton.jit
 def head_value_kernel(value_partials_ptr, out_bias_ptr, centres_ptr, rows_ptr, B, UNIT_TILES: tl.constexpr, BLOCK_TILES: tl.constexpr,
                       MOVES: tl.constexpr, BINS: tl.constexpr, BLOCK_BINS: tl.constexpr, PDL: tl.constexpr):
@@ -721,13 +720,10 @@ def head_value_kernel(value_partials_ptr, out_bias_ptr, centres_ptr, rows_ptr, B
     bin_ok = bins < BINS
     partials = tl.load(value_partials_ptr + (tiles[:, None] * B + b) * BLOCK_BINS + bins[None, :], mask=(tiles < UNIT_TILES)[:, None], other=0.0)
     value = tl.sum(partials, 0) + tl.load(out_bias_ptr + bins, mask=bin_ok, other=0.0)
-    if BINS == 1:
-        score = tl.sigmoid(tl.sum(tl.where(bins == 0, value, 0.0), 0))
-    else:
-        value = tl.where(bin_ok, value, float("-inf"))
-        exponent = libdevice.exp(value - tl.max(value, 0))
-        probability = exponent / tl.sum(exponent, 0)
-        score = tl.sum(probability * tl.load(centres_ptr + bins, mask=bin_ok, other=0.0), 0)
+    value = tl.where(bin_ok, value, float("-inf"))
+    exponent = libdevice.exp(value - tl.max(value, 0))
+    probability = exponent / tl.sum(exponent, 0)
+    score = tl.sum(probability * tl.load(centres_ptr + bins, mask=bin_ok, other=0.0), 0)
     tl.store(rows_ptr + b * (MOVES + 1) + MOVES, score)
 
 
@@ -834,7 +830,7 @@ class FusedTransformer(nn.Module):
         super().__init__()
         self.d_model = model.d_model
         self.input_embedding = InputEmbedding(model)
-        self.templates, self.ln, self.loops = model.templates, model.ln, model.loops
+        self.templates, self.ln = model.templates, model.ln
         self.encoder = nn.ModuleList(FusedBlock(block) for block in model.encoder)
         link_input_mixes(list(self.encoder))
         prepare(model.templates)
@@ -843,10 +839,9 @@ class FusedTransformer(nn.Module):
             self.eps = model.ln.eps
             a_weight, narrow, narrow_bias = fused_head_weights(model)
             hidden, out = model.eval_head[0], model.eval_head[2]
-            edges = value_bin_edges(out.out_features, out.weight.device)
             buffers = {"a_weight": a_weight, "narrow": narrow, "narrow_bias": narrow_bias, "moves": move_table(model), "hidden": split_weight(hidden.weight),
                        "hidden_bias": hidden.bias.detach(), "out": split_weight(out.weight), "out_bias": out.bias.detach(),
-                       "centres": (edges[:-1] + edges[1:]) / 2}
+                       "centres": value_bin_centres(out.out_features, out.weight.device)}
             for name, tensor in buffers.items():
                 self.register_buffer(name, tensor)
             return
@@ -860,9 +855,8 @@ class FusedTransformer(nn.Module):
     def forward(self, board_state: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         embed_state = self.input_embedding(board_state)
         original_board_embed = embed_state
-        for _ in range(self.loops):
-            for block in self.encoder:
-                embed_state = block(embed_state, self.templates, original_board_embed)
+        for block in self.encoder:
+            embed_state = block(embed_state, self.templates, original_board_embed)
         if self.fused_heads:
             return self.answers(embed_state)
         model_output = self.ln(embed_state)

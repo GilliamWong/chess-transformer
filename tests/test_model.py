@@ -213,22 +213,6 @@ def test_every_parameter_gets_a_gradient(batch):
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0, name
 
 
-def test_a_looped_block_is_the_same_block_twice(batch):
-    boards, _ = batch
-    torch.manual_seed(0)
-    looped = ChessTransformer(d_model=32, num_layers=1, n_heads=2, loops=2).eval()
-    with torch.no_grad():
-        looped.templates.normal_(std=0.1)  #zero templates would leave the attention bias out of the comparison
-    unrolled = ChessTransformer(d_model=32, num_layers=2, n_heads=2).eval()
-    weights = looped.state_dict()
-    weights.update({name.replace("encoder.0.", "encoder.1."): tensor for name, tensor in weights.items() if name.startswith("encoder.0.")})
-    unrolled.load_state_dict(weights)
-
-    for looped_output, unrolled_output in zip(looped(boards), unrolled(boards)):
-        assert torch.equal(looped_output, unrolled_output)
-    assert sum(parameter.numel() for parameter in looped.parameters()) < sum(parameter.numel() for parameter in unrolled.parameters())
-
-
 def test_can_overfit_one_batch(batch):
     model = small_model()
     boards, moves = batch
@@ -259,10 +243,9 @@ def test_a_smaller_qk_ratio_narrows_only_the_queries_and_keys(batch, qk_ratio, q
 
 
 @pytest.mark.parametrize("settings", [
-    {"loops": 0},
     {"qk_ratio": [0.25, 0.5, 1.0]},
     {"n_heads": 4, "kv_heads": 3},
-], ids=["no loops", "a ratio per block that does not match", "key/value heads that do not divide the heads"])
+], ids=["a ratio per block that does not match", "key/value heads that do not divide the heads"])
 def test_sizes_that_do_not_fit_are_rejected(settings):
     with pytest.raises(ValueError):
         ChessTransformer(**{"d_model": 32, "num_layers": 2, "n_heads": 2, **settings})
