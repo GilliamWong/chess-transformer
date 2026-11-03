@@ -19,11 +19,12 @@ if ! command -v uv >/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
     export PATH="$HOME/.local/bin:$PATH"
 fi
+#rustup into CARGO_HOME (default ~/.cargo), the shell's profile left as it is
 if ! command -v cargo >/dev/null; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
 fi
-if [ -f "$HOME/.cargo/env" ]; then
-    . "$HOME/.cargo/env"
+if [ -f "${CARGO_HOME:-$HOME/.cargo}/env" ]; then
+    . "${CARGO_HOME:-$HOME/.cargo}/env"
 fi
 rust=$(rustc --version | cut -d' ' -f2)
 if [ "$(printf '%s\n' "$RUST_AT_LEAST" "$rust" | sort -V | head -1)" != "$RUST_AT_LEAST" ]; then
