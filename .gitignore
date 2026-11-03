@@ -16,10 +16,8 @@ match.pgn
 processed_data/
 runs/
 
-# local only: experiments' data and results, and the tools that make and measure them
+# what training, self-play and the table downloads write
 artifacts/
-tools/
-notes.txt
 
 engine/selfplay_rs/target/
 

@@ -254,7 +254,7 @@ def load_training_set(name: str, target_temperature: float, result_weight: float
 
         stockfish_moves_path = path(split, "stockfish_moves")
         if not stockfish_moves_path.exists():
-            raise FileNotFoundError(f"{stockfish_moves_path.name} is missing, label_with_stockfish writes it")
+            raise FileNotFoundError(f"{stockfish_moves_path.name} is missing: a training set needs its stockfish_moves file")
         #the file size says how many top moves per position
         stockfish_moves = read(split, "stockfish_moves", np.int16)
         stockfish_evals = read(split, "stockfish_evals", np.int16)
@@ -266,7 +266,7 @@ def load_training_set(name: str, target_temperature: float, result_weight: float
         if weight:
             missing = [kind for kind in TEACHER_FILES if not path(split, kind).exists()]
             if missing:
-                raise FileNotFoundError(f"{name}_{split}: no {', '.join(missing)}, teacher_targets writes them")
+                raise FileNotFoundError(f"{name}_{split}: no {', '.join(missing)}, a teacher weight needs them")
             teacher = {kind: read(split, kind, dtype) for kind, dtype in TEACHER_FILES.items()}
             for kind in ("teacher_moves", "teacher_probabilities"):
                 teacher[kind] = teacher[kind].reshape(len(boards), -1)

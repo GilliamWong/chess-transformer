@@ -7,13 +7,11 @@ requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 dependencies = [
     "chess>=1.11",
-    "matplotlib>=3.8", # tools/plot_templates.py
     "numpy>=1.26", # torch warns on every start without it
     "tensorboard>=2.15",
     "tqdm>=4.66",
     # torch.compile needs triton; on Windows only this community build exists
     "triton-windows>=3.5; sys_platform == 'win32'",
-    "zstandard>=0.25.0", # tools/puzzles.py
 ]
 
 [dependency-groups]
@@ -50,4 +48,4 @@ explicit = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests", "tools/tests"] #tools/ is local only, so a clone has just tests/
+testpaths = ["tests"]
