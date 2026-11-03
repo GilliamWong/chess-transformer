@@ -1,4 +1,4 @@
-//the games of tests/reference_selfplay.py's SelfPlayBatch: without the random numbers, the python's move for move
+//tests/reference_selfplay.py's games move for move, apart from the random numbers
 use crate::rules::{MoveIds, Tables, encode_board, final_result};
 use crate::search::{SearchSettings, Tree};
 use rand::{RngExt, SeedableRng};
@@ -6,7 +6,6 @@ use rand_chacha::ChaCha8Rng;
 use shakmaty::{Chess, Color, Position};
 use shakmaty_syzygy::SyzygyError;
 
-//the search's constants from mcts.py and the game's from selfplay.py
 pub struct GameSettings {
     pub search: SearchSettings,
     pub simulations: u32,
@@ -19,7 +18,7 @@ pub struct GameSettings {
     pub root_noise_share: f64,
 }
 
-//selfplay.Game: every position before a move with what the search found there
+//every position before a move, with what the search found there
 #[derive(Default)]
 pub struct Record {
     pub boards: Vec<u8>,
@@ -35,7 +34,6 @@ pub struct FinishedGame {
     pub white_score: f64,
 }
 
-//reference_selfplay.GameInProgress
 pub struct Game {
     number: u64,
     random: ChaCha8Rng,
@@ -68,68 +66,57 @@ impl Game {
         FinishedGame { number: self.number, record: self.record, white_score }
     }
 
-    //the root's noise is still to come: it comes once the root is expanded, before the next simulation
     pub fn awaits_noise(&self) -> bool {
         !self.noised
     }
 
-    //GameInProgress.add_noise_once_expanded
     pub fn add_noise_once_expanded(&mut self, settings: &GameSettings) {
-        if !self.noised && !self.tree.root().edges().is_empty() {
+        if !self.noised && self.tree.root().has_edges() {
             self.tree.add_root_noise(&mut self.random, settings.root_noise_alpha, settings.root_noise_share);
             self.noised = true;
         }
     }
 
-    //GameInProgress.play_move
     pub fn play_move(&mut self, settings: &GameSettings, move_ids: &MoveIds) {
-        let root = *self.tree.root();
         let turn = self.tree.board.turn();
-        //the most visited first, ties in the children's order (np.argsort's stable sort)
-        let root_index = self.tree.root_index();
-        let most_visited: Vec<usize> = self
-            .tree
-            .edges_by_visits()
-            .into_iter()
-            .take(settings.top_moves)
-            .filter(|&edge| self.tree.visits(root_index, edge) > 0)
-            .collect();
-        let visits: u32 = most_visited.iter().map(|&edge| self.tree.visits(root_index, edge)).sum();
+        let root = self.tree.root_index();
+        let visits = |edge| self.tree.visits(root, edge);
+        let most_visited: Vec<usize> =
+            self.tree.edges_by_visits().into_iter().take(settings.top_moves).filter(|&edge| visits(edge) > 0).collect();
+        let total: u32 = most_visited.iter().map(|&edge| visits(edge)).sum();
         for slot in 0..settings.top_moves {
-            match most_visited.get(slot) {
+            let (id, share) = match most_visited.get(slot) {
                 Some(&edge) => {
-                    self.record.visit_moves.push(move_ids.id(self.tree.chess_move(edge).to_move(&self.tree.board), turn) as i16);
-                    self.record.visit_shares.push((f64::from(self.tree.visits(root_index, edge)) / f64::from(visits)) as f32);
+                    let id = move_ids.id(self.tree.chess_move(edge).to_move(&self.tree.board), turn) as i16;
+                    (id, (f64::from(visits(edge)) / f64::from(total)) as f32)
                 }
-                None => {
-                    self.record.visit_moves.push(settings.no_move);
-                    self.record.visit_shares.push(0.0);
-                }
-            }
+                None => (settings.no_move, 0.0),
+            };
+            self.record.visit_moves.push(id);
+            self.record.visit_shares.push(share);
         }
         encode_board(&self.tree.board, &mut self.record.boards);
-        //the root keeps its score for the side that moved into it, the opponent of the side to move here
-        self.record.root_scores.push((1.0 - root.mean_score()) as f32);
+        //the root's score is for the side that moved into it, the opponent of the side to move
+        self.record.root_scores.push((1.0 - self.tree.root().mean_score()) as f32);
         self.record.white_to_move.push(u8::from(turn == Color::White));
 
-        let chosen =
-            if self.plies < settings.sampled_plies { self.sample_by_visits() } else { self.tree.most_visited_edge(self.tree.root_index()) };
+        let chosen = if self.plies < settings.sampled_plies { self.sample_by_visits() } else { self.tree.most_visited_edge(root) };
         self.tree.play(chosen, settings.tree_reuse);
         self.plies += 1;
         self.noised = false;
         self.add_noise_once_expanded(settings);
     }
 
-    //a root's edge drawn with the chance of its share of the visits (random.choice(p=visits / visits.sum()))
     fn sample_by_visits(&mut self) -> usize {
         let (root, edges) = (self.tree.root_index(), self.tree.root().edges());
         let total: u32 = edges.clone().map(|edge| self.tree.visits(root, edge)).sum();
         let mut draw = self.random.random_range(0..total);
         for edge in edges {
-            if draw < self.tree.visits(root, edge) {
+            let visits = self.tree.visits(root, edge);
+            if draw < visits {
                 return edge;
             }
-            draw -= self.tree.visits(root, edge);
+            draw -= visits;
         }
         unreachable!("the draw is below the total")
     }

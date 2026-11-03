@@ -1,5 +1,4 @@
-//mcts.py's search for many trees at once while python runs the network: self play games (SelfPlayGames) and match
-//searches (Searches). A round is descend (the leaves that need the network come back as boards), then finish
+//mcts.py's search for many trees at once while python runs the network: self play games (SelfPlayGames) and match searches (Searches)
 mod affinity;
 mod concurrent;
 mod fake_cuda;
@@ -65,7 +64,7 @@ fn answer_numbers<'a>(py: Python<'a>, answers: &'a PyBuffer<f32>) -> PyResult<&'
     answers.as_slice(py).ok_or_else(|| PyValueError::new_err("the answers must be one contiguous array"))
 }
 
-//an answer's number: a cell of the array a caller gave, or an f32 of the pinned answers Searches' own round loop reads
+//an answer's number: a cell of the caller's array, or an f32 of the pinned answers the round loop reads
 trait Number {
     fn number(&self) -> f32;
 }
@@ -82,7 +81,6 @@ impl Number for f32 {
     }
 }
 
-//the network's answers, answer_width float32s for each board descend gave it
 fn answers_for<N: Number>(answers: &[N], boards: usize, answer_width: usize) -> PyResult<&[N]> {
     if answers.len() != boards * answer_width {
         return Err(PyValueError::new_err(format!("{} numbers of answers for {boards} boards of {answer_width} each", answers.len())));
@@ -101,22 +99,19 @@ struct SelfPlayGames {
     answer_width: usize,
     tables: Option<Tables>,
     seed: u64,
-    //every game starts here, with the keys of the positions played to reach it
     start: Chess,
     start_keys: Vec<u64>,
     start_plies: usize,
     games: Vec<Game>,
     waiting: Vec<usize>, //games whose leaf the network is evaluating, in board order
     finished: Vec<FinishedGame>,
-    cache: Option<Cache>, //shared by the games: the network answers a position the same in every game
+    cache: Option<Cache>,
     simulations_per_round: u32,
 }
 
 #[pymethods]
 impl SelfPlayGames {
-    //cache_positions is the size of the cache of network answers by position (search.rs Cache), 0 for none.
-    //simulations_per_round: a game's round may do this many simulations, all but the last answered at once (by the
-    //cache or the game's end); the games are the same, in fewer rounds
+    //simulations_per_round: a game's round may do this many simulations, all but the last answered at once (by the cache or the game's end)
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, start_fen, start_moves, seed, simulations, sampled_plies, max_plies, tree_reuse,
                         top_moves, no_move, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
@@ -203,9 +198,8 @@ impl SelfPlayGames {
         }
     }
 
-    //the boards of the leaves that need the network, at most one a game (TOKENS_PER_BOARD bytes each). As in
-    //reference_selfplay a move gets at least one simulation, and the move is played once the root has its simulations
-    //(so a round stops there); until the root's noise is in, a round is one simulation
+    //the boards of the leaves that need the network, at most one a game (TOKENS_PER_BOARD bytes each); until a root's noise is in,
+    //its round is one simulation
     fn descend<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         if !self.waiting.is_empty() {
             return Err(PyRuntimeError::new_err("the last leaves are still waiting for finish"));
@@ -293,7 +287,6 @@ impl SelfPlayGames {
             .collect()
     }
 
-    //games being played or finished and not yet taken
     fn playing(&self) -> bool {
         !self.games.is_empty() || !self.finished.is_empty()
     }
@@ -316,8 +309,7 @@ impl SelfPlayGames {
     }
 }
 
-//one search of a match: mcts.search, without noise. It ends at its simulations, when stopped, or when its tree has no
-//room for more (search.rs make_room)
+//one search of a match: mcts.search without noise
 struct Search {
     id: u64,
     fen: String,
@@ -341,49 +333,47 @@ impl Search {
             Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
             _ => 1.0 - tree.root().mean_score(),
         };
-        let moves = |edges: &[usize]| -> Vec<String> { edges.iter().map(|&edge| uci(tree.chess_move(edge))).collect() };
+        let expected_line = line.iter().map(|&edge| uci(tree.chess_move(edge))).collect();
         let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(tree.root_index(), edge)));
-        (self.id, moves(&line), score, root_moves.collect(), tree.root().visit_count)
+        (self.id, expected_line, score, root_moves.collect(), tree.root().visit_count)
     }
 }
 
 //(id, expected line in uci, the chosen move's mean score, root moves by visits, the root's visits)
 type SearchReport = (u64, Vec<String>, f64, Vec<(String, u32)>, u32);
 
-//a round whose leaves the network is evaluating: its number in the trees (search.rs Round's id), the name descend was
-//given for it, and the searches with leaves in it with how many, in board order
+//a round whose leaves the network is evaluating: its number in the trees (search.rs Round's id), the name descend gave it,
+//and the searches with leaves in it with how many, in board order
 struct RoundOut {
     number: u64,
     name: Option<u64>,
     leaves: Vec<(u64, u32)>,
-    //descended for lean answers: LEAN_COLUMNS numbers a board, its legal moves' logits and its expected score
     lean: bool,
 }
 
-//a lean round's columns of a board's answer row (descend_into's legal_columns): its legal moves' in python-chess's order,
-//padded to LEGAL_SLOTS (chess's most legal moves) with the expected score's, which also ends them
+//a lean round's answer row: its legal moves' logits in python-chess's order, padded to LEGAL_SLOTS (chess's most legal moves)
+//with the expected score, which also ends them
 const LEGAL_SLOTS: usize = 218;
 const LEAN_COLUMNS: usize = LEGAL_SLOTS + 1;
-//a lean lane's bytes a board: its tokens, then its columns as u16s
+//a lean board's bytes: its tokens, then its columns as u16s
 const LEAN_ROW: usize = TOKENS_PER_BOARD + 2 * LEAN_COLUMNS;
 
-//the tree of a game's search that ended last, for the game's next search, at the position after `moves`
+//the tree of a game's last search, for its next search at the position after `moves`
 struct KeptTree<T = Tree> {
     fen: String,
     moves: Vec<String>,
     tree: Kept<T>,
 }
 
-//a kept tree as its last search left it, or carried on by advance: on its thread, or back from it with the leaves the
-//next root may make stale (None if the thread was stopped before it found them all)
+//a kept tree as its last search left it, on advance's thread, or back from it with the leaves the next root may make stale
+//(None if the thread was stopped before it found them all)
 enum Kept<T = Tree> {
     Searched(T),
     Advancing(JoinHandle<(T, Option<Vec<Vec<u16>>>)>, Arc<Stops>),
     Advanced(T, Option<Vec<Vec<u16>>>),
 }
 
-//what of an advance's thread is to stop where it is: the copy, for a search that starts, and the walk too once the tree
-//is no longer wanted
+//what of an advance's thread is to stop at its next look: the copy, and the walk too once the tree is unwanted
 #[derive(Default)]
 struct Stops {
     copy: AtomicBool,
@@ -391,8 +381,7 @@ struct Stops {
 }
 
 impl<T> Kept<T> {
-    //the tree to search on: an advance not done yet stops its copy where it is, which the tree does without, and the
-    //search waits for its walk (on the walk's threads, the shortest way to the stale leaves)
+    //the tree to search on: an advance not done stops its copy and is waited for (its walk is the shortest way to the stale leaves)
     fn ready(self) -> Option<Kept<T>> {
         match self {
             Kept::Advancing(thread, stops) => {
@@ -403,7 +392,6 @@ impl<T> Kept<T> {
         }
     }
 
-    //no longer wanted: an advance's thread stops at its next look and frees the tree
     fn abandon(self) {
         if let Kept::Advancing(_, stops) = self {
             stops.copy.store(true, Ordering::Relaxed);
@@ -417,7 +405,6 @@ struct State {
     searches: Vec<Search>,
     rounds: VecDeque<RoundOut>, //oldest first
     rounds_descended: u64,
-    //by id: a new game under an id drops the last game's tree at its first search
     kept: HashMap<u64, KeptTree>,
     cache: Option<Cache>,
     //concurrent_descents' searches and kept trees, in place of searches and kept
@@ -425,8 +412,7 @@ struct State {
     shared_kept: HashMap<u64, KeptTree<Arc<SharedTree>>>,
 }
 
-//every call releases the gil while it works, so that other python threads run meanwhile, and python threads may share
-//one Searches (lc0's search threads on one tree): a call waits for the one before it to end
+//every call releases the gil while it works, and python threads may share one Searches: a call waits for the one before it to end
 #[pyclass(frozen)]
 struct Searches {
     settings: SearchSettings,
@@ -434,18 +420,22 @@ struct Searches {
     answer_width: usize,
     tables: Option<Tables>,
     tree_reuse: bool,
-    memory_limit: usize, //bytes a search's tree may take (search.rs Round), usize::MAX for no limit
+    memory_limit: usize, //bytes a search's tree may take, usize::MAX for no limit
     advance_threads: usize,
-    //search/shared.rs: the searches are SharedTrees that the networks' threads work in at once, with this cache
+    //the searches are SharedTrees (search/shared.rs) that the networks' threads work in at once
     concurrent_descents: bool,
     shared_cache: Option<SharedCache>,
     state: Mutex<State>,
 }
 
-//root_visits': (the root's visits, the visits of its two most visited moves)
+//(the root's visits, the visits of its two most visited moves)
 type RootNumbers = (u32, u32, u32);
 
-//root_score's: the chosen move's score, or the root's for its side to move before the move has a visit
+fn find_search(state: &State, id: u64) -> PyResult<&Search> {
+    state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))
+}
+
+//the chosen move's score, or the root's for its side to move before the move has a visit
 fn root_score_of(search: &Search) -> f64 {
     let tree = &search.tree;
     match tree.principal_variation().first().and_then(|&edge| tree.child(tree.root_index(), edge)) {
@@ -454,7 +444,7 @@ fn root_score_of(search: &Search) -> f64 {
     }
 }
 
-//root_visits' numbers of search id, None when it is not running
+//None when search id is not running
 fn root_numbers(state: &State, id: u64) -> Option<RootNumbers> {
     let search = state.searches.iter().find(|search| search.id == id)?;
     let (most, second) = search.tree.two_most_visits();
@@ -491,8 +481,7 @@ impl BoardsBuffer {
         }
     }
 
-    //the tokens, a board's TOKENS_PER_BOARD after another; with columns, lean rows (LEAN_ROW bytes: the board's tokens,
-    //then its LEAN_COLUMNS columns as little-endian u16s)
+    //the tokens, a board's TOKENS_PER_BOARD after another; with columns, lean rows (LEAN_ROW bytes, columns as little-endian u16s)
     fn write(&self, py: Python<'_>, tokens: &[u8], columns: Option<&[u16]>) -> PyResult<()> {
         let unwritable = || PyValueError::new_err("the boards must go into one writable contiguous array");
         match (self, columns) {
@@ -599,6 +588,39 @@ impl Searches {
         Ok(())
     }
 
+    //descend_round in either mode, for the callers that write the boards into an array of their own (room boards long)
+    #[allow(clippy::too_many_arguments)]
+    fn descend_boards(
+        &self,
+        room: usize,
+        leaves: u32,
+        collisions: u32,
+        simulations: Option<u32>,
+        round: Option<u64>,
+        root_of: Option<u64>,
+        lean: bool,
+    ) -> PyResult<(Vec<u8>, Vec<u16>, Option<RootNumbers>)> {
+        let mut state = self.lock()?;
+        let searching = if self.concurrent_descents {
+            state.shared_searches.iter().filter(|search| !search.stopped).count()
+        } else {
+            state.searches.iter().filter(|search| !search.stopped).count()
+        };
+        if leaves as usize * searching > room {
+            return Err(PyValueError::new_err(format!("room for {room} boards, not {leaves} for each of {searching} searches")));
+        }
+        let (mut tokens, mut columns) = (Vec::new(), Vec::new());
+        let root = if self.concurrent_descents {
+            drop(state);
+            self.shared_descend(leaves, collisions, simulations, round, &mut tokens, lean.then_some(&mut columns))?;
+            root_of.map(|id| self.shared_root_numbers(id)).transpose()?.flatten()
+        } else {
+            self.descend_round(&mut state, leaves, collisions, simulations, round, &mut tokens, lean.then_some(&mut columns))?;
+            root_of.and_then(|id| root_numbers(&state, id))
+        };
+        Ok((tokens, columns, root))
+    }
+
     //finish's round
     fn finish_round<N: Number>(&self, state: &mut State, answers: &[N], round: Option<u64>) -> PyResult<Vec<SearchReport>> {
         let index = match round {
@@ -612,26 +634,25 @@ impl Searches {
         let boards = state.rounds[index].leaves.iter().map(|&(_, leaves)| leaves as usize).sum();
         let width = if state.rounds[index].lean { LEAN_COLUMNS } else { self.answer_width };
         let answers = answers_for(answers, boards, width)?;
-        let out = state.rounds.remove(index).expect("the round");
+        let RoundOut { number, leaves: round_leaves, lean, .. } = state.rounds.remove(index).expect("the round");
         let index_of: HashMap<u64, usize> = state.searches.iter().enumerate().map(|(index, search)| (search.id, index)).collect();
         let mut rows = answers.chunks_exact(width);
         //a lean answer put back in its columns of a whole row, where finish_leaf reads it
-        let mut row = if out.lean { vec![0.0; self.answer_width] } else { Vec::new() };
-        for (id, leaves) in out.leaves {
+        let mut row = if lean { vec![0.0; self.answer_width] } else { Vec::new() };
+        for (id, leaves) in round_leaves {
             let tree = &mut state.searches[index_of[&id]].tree;
             for answer in rows.by_ref().take(leaves as usize) {
-                if out.lean {
-                    let (moves, turn) = tree.round_moves(out.number).next().expect("the round's next leaf");
+                if lean {
+                    let (moves, turn) = tree.round_moves(number).next().expect("the round's next leaf");
                     let columns = moves.iter().map(|&chess_move| self.move_ids.id(chess_move, turn));
-                    for (column, number) in
+                    for (column, value) in
                         columns.chain(std::iter::once(self.answer_width - 1)).zip(answer.iter().take(moves.len()).chain(answer.last()))
                     {
-                        row[column] = number.number();
+                        row[column] = value.number();
                     }
                 }
-                let lean = out.lean;
                 tree.finish_leaf(
-                    out.number,
+                    number,
                     |column| if lean { row[column] } else { answer[column].number() },
                     self.answer_width,
                     &self.move_ids,
@@ -643,8 +664,8 @@ impl Searches {
         Ok(self.take_reports(state))
     }
 
-    //descend_into's lean round for Searches' own round loop (rounds.rs): the rows written at rows_host, a lane's pinned
-    //buffer with room for `room` boards
+    //descend_into's lean round for Searches' own round loop (rounds.rs): the rows written at rows_host, a lane's pinned buffer
+    //with room for `room` boards
     #[allow(clippy::too_many_arguments)]
     fn descend_rows(
         &self,
@@ -656,31 +677,12 @@ impl Searches {
         round: u64,
         root_of: u64,
     ) -> PyResult<(usize, Option<RootNumbers>)> {
-        let (tokens, columns, root) = if self.concurrent_descents {
-            let searching = self.lock()?.shared_searches.iter().filter(|search| !search.stopped).count();
-            if leaves as usize * searching > room {
-                return Err(PyValueError::new_err(format!("room for {room} boards, not {leaves} for each of {searching} searches")));
-            }
-            let (mut tokens, mut columns) = (Vec::new(), Vec::new());
-            self.shared_descend(leaves, collisions, Some(simulations), Some(round), &mut tokens, Some(&mut columns))?;
-            (tokens, columns, self.shared_root_numbers(root_of)?)
-        } else {
-            let mut guard = self.lock()?;
-            let state = &mut *guard;
-            let searching = state.searches.iter().filter(|search| !search.stopped).count();
-            if leaves as usize * searching > room {
-                return Err(PyValueError::new_err(format!("room for {room} boards, not {leaves} for each of {searching} searches")));
-            }
-            let (mut tokens, mut columns) = (Vec::new(), Vec::new());
-            self.descend_round(state, leaves, collisions, Some(simulations), Some(round), &mut tokens, Some(&mut columns))?;
-            (tokens, columns, root_numbers(state, root_of))
-        };
+        let (tokens, columns, root) = self.descend_boards(room, leaves, collisions, Some(simulations), Some(round), Some(root_of), true)?;
         //SAFETY: the lane's rows, room boards long, are the loop's until it launches them
         unsafe { rounds::write_lean_rows(rows_host as *mut u8, &tokens, &columns) };
         Ok((tokens.len() / TOKENS_PER_BOARD, root))
     }
 
-    //stop's
     fn stop_search(&self, state: &mut State, id: u64) -> PyResult<Option<SearchReport>> {
         let search =
             state.searches.iter_mut().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
@@ -703,10 +705,8 @@ impl Searches {
         reports
     }
 
-    //the id's kept tree carried on to the position after `moves`, when it is the same game and holds the moves played
-    //since, without the leaves the new root makes stale (search.rs drop_stale_leaves). A tree that advance carried on
-    //moves its root down in place, and takes out the stale leaves among the candidates advance found (or walks for
-    //them, if it was stopped first). A root the last search never expanded (a repeat it scored as a draw) starts over
+    //the id's kept tree moved to the position after `moves`, without the leaves the new root makes stale (search.rs drop_stale_leaves);
+    //None if it is another game, lacks the moves, or its root was never expanded
     fn reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String]) -> Option<Tree> {
         let kept = state.kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
@@ -738,8 +738,8 @@ impl Searches {
     }
 }
 
-//the moves since (uci) as the edges from the tree's root down to the position after them, and as their places among
-//their nodes' moves, when every move has its node and the last node has moves (a search reports from its root's)
+//the edges from the tree's root down the moves (uci), and their places among their nodes' moves; None unless every move has its node
+//and the last node has moves
 fn line_to(tree: &Tree, moves: &[String]) -> Option<(Vec<usize>, Vec<u16>)> {
     let (mut line, mut places, mut root) = (Vec::new(), Vec::new(), tree.root_index());
     for played in moves {
@@ -754,13 +754,8 @@ fn line_to(tree: &Tree, moves: &[String]) -> Option<(Vec<usize>, Vec<u16>)> {
 
 #[pymethods]
 impl Searches {
-    //tree_reuse keeps the tree of a game's (an id's) last search for its next search; cache_positions is the size of
-    //the cache of network answers by position (search.rs Cache), 0 for none; value_sharpness see search.rs sharpen,
-    //certainty search.rs SearchSettings'. memory_limit_mb (lc0's RamLimitMb, 0 for none) ends a search once its tree's
-    //vectors would grow past that many megabytes; the cache comes on top, and so does advance's copy of the part of the
-    //tree it keeps. advance_threads: the threads advance walks and copies a kept tree on, off the clock. concurrent_descents:
-    //the trees are SharedTrees (search/shared.rs), which threads descend at once. transpositions: search.rs
-    //SearchSettings'
+    //memory_limit_mb (lc0's RamLimitMb, 0 for none) ends a search once its tree's vectors would grow past it; the cache and
+    //advance's copy come on top
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
@@ -823,9 +818,8 @@ impl Searches {
         })
     }
 
-    //the game's moves let the search see repetitions. It refuses a mate or stalemate, but searches a position drawn only
-    //by a claim (threefold, fifty moves), which a gui may still ask a move for, and one the tables cover (search.rs
-    //gather). With tree reuse, the tree of this id's last search is kept when it holds the moves played since
+    //the game's moves let the search see repetitions. A mate or stalemate is refused, a position drawn only by a claim or
+    //covered by the tables is searched
     fn start(&self, py: Python<'_>, id: u64, fen: &str, moves: Vec<String>, simulations: u32) -> PyResult<()> {
         py.detach(|| {
             if self.concurrent_descents {
@@ -850,9 +844,8 @@ impl Searches {
         })
     }
 
-    //the boards of up to `leaves` new leaves of every search for the network, in a round of at most `simulations`
-    //(default `leaves`) with those finished at once (see search.rs gather). Rounds may be gathered before the last ones
-    //are finished, so that the network is never idle; a round given a name (`round`) may be finished by it, in any order
+    //the boards of up to `leaves` new leaves of every search, in a round of at most `simulations` (default `leaves`); a round given a
+    //name (`round`) may be finished by it, in any order
     #[pyo3(signature = (leaves=1, collisions=0, simulations=None, *, round=None))]
     fn descend<'py>(
         &self,
@@ -874,12 +867,10 @@ impl Searches {
         Ok(PyBytes::new(py, &boards))
     }
 
-    //descend with the boards written into `boards` (a writable array of bytes or int64s, such as a lane's pinned buffer,
-    //with room for `leaves` boards of every search running) rather than returned, and root_visits' numbers of search
-    //`root_of` after the round, so that a caller needs no call of its own for them: (the boards written, those numbers,
-    //None for no root_of or a search not running). legal_columns: a lean round, into an array of bytes in lean rows
-    //(LEAN_ROW a board: the tokens, then the board's LEAN_COLUMNS answer columns as little-endian u16s), whose finish
-    //takes LEAN_COLUMNS numbers a board, those columns of its answer row
+    //descend with the boards written into `boards` (a writable array of bytes or int64s with room for `leaves` boards of every search
+    //running), and root_visits' numbers of search `root_of` after the round: (the boards written, those numbers, None for no
+    //root_of or a search not running).
+    //legal_columns: a lean round, into an array of bytes in lean rows, whose finish takes LEAN_COLUMNS numbers a board
     #[pyo3(signature = (boards, leaves=1, collisions=0, simulations=None, *, round=None, root_of=None, legal_columns=false))]
     #[allow(clippy::too_many_arguments)]
     fn descend_into(
@@ -895,33 +886,14 @@ impl Searches {
     ) -> PyResult<(usize, Option<RootNumbers>)> {
         let target = BoardsBuffer::get(boards)?;
         let room = target.boards(if legal_columns { LEAN_ROW } else { TOKENS_PER_BOARD });
-        let (tokens, columns, root) = py.detach(|| {
-            if self.concurrent_descents {
-                let searching = self.lock()?.shared_searches.iter().filter(|search| !search.stopped).count();
-                if leaves as usize * searching > room {
-                    return Err(PyValueError::new_err(format!("room for {room} boards, not {leaves} for each of {searching} searches")));
-                }
-                let (mut tokens, mut columns) = (Vec::new(), Vec::new());
-                self.shared_descend(leaves, collisions, simulations, round, &mut tokens, legal_columns.then_some(&mut columns))?;
-                let root = root_of.map(|id| self.shared_root_numbers(id)).transpose()?.flatten();
-                return Ok((tokens, columns, root));
-            }
-            let mut guard = self.lock()?;
-            let state = &mut *guard;
-            let searching = state.searches.iter().filter(|search| !search.stopped).count();
-            if leaves as usize * searching > room {
-                return Err(PyValueError::new_err(format!("room for {room} boards, not {leaves} for each of {searching} searches")));
-            }
-            let (mut tokens, mut columns) = (Vec::new(), Vec::new());
-            self.descend_round(state, leaves, collisions, simulations, round, &mut tokens, legal_columns.then_some(&mut columns))?;
-            Ok((tokens, columns, root_of.and_then(|id| root_numbers(state, id))))
-        })?;
+        let (tokens, columns, root) =
+            py.detach(|| self.descend_boards(room, leaves, collisions, simulations, round, root_of, legal_columns))?;
         target.write(py, &tokens, legal_columns.then_some(&columns[..]))?;
         Ok((tokens.len() / TOKENS_PER_BOARD, root))
     }
 
-    //finishes a round with the network's answers, the one descend named `round` or else the oldest, and returns the
-    //reports of the searches that are done
+    //finishes the round descend named `round` or else the oldest with the network's answers, and returns the reports of the
+    //searches that are done
     #[pyo3(signature = (answers, round=None))]
     fn finish(&self, py: Python<'_>, answers: PyBuffer<f32>, round: Option<u64>) -> PyResult<Vec<SearchReport>> {
         let answers = Answers(answer_numbers(py, &answers)?);
@@ -954,10 +926,9 @@ impl Searches {
         })
     }
 
-    //EngineSearch's rust_rounds: the running search's rounds on threads of their own, a network each, engine_search.py's
-    //rounds_on in Rust (rounds.rs). networks: (a GraphedBatches of lean lanes, its rust_network()); addresses: the cuda
-    //runtime calls' (cuda_runtime.py); settings: EngineSearch's (rust_round_settings()); then the run's simulations,
-    //seconds to its deadline, fall extension, only move, root numbers and round times. RoundLoop.wait has its report
+    //EngineSearch's rust_rounds: engine_search.py's rounds_on in Rust (rounds.rs), on threads of their own, a network each.
+    //networks: (a GraphedBatches of lean lanes, its rust_network()); addresses: the cuda runtime calls'; settings: EngineSearch's
+    //rust_round_settings(). RoundLoop.wait has the report
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (networks, addresses, settings, simulations, seconds, extension, only_move, root, round_times))]
     fn round_loop(
@@ -976,8 +947,8 @@ impl Searches {
         rounds::start_loop(searches, networks, addresses, settings, simulations, seconds, extension, only_move, root, round_times)
     }
 
-    //ends a search at its next report: at once when none of its leaves is waiting for the network, else from the finish
-    //that brings the last of them back
+    //ends a search at its next report: at once when none of its leaves is waiting for the network, else from the finish that
+    //brings the last back
     fn stop(&self, py: Python<'_>, id: u64) -> PyResult<Option<SearchReport>> {
         py.detach(|| {
             if self.concurrent_descents {
@@ -987,8 +958,6 @@ impl Searches {
         })
     }
 
-    //(the root's visits, the visits of its two most visited moves) of a running search, for smart pruning: the most
-    //visited move is decided once the simulations left cannot close the gap
     fn root_visits(&self, py: Python<'_>, id: u64) -> PyResult<RootNumbers> {
         py.detach(|| {
             let numbers = if self.concurrent_descents { self.shared_root_numbers(id)? } else { root_numbers(&*self.lock()?, id) };
@@ -996,39 +965,31 @@ impl Searches {
         })
     }
 
-    //the score a running search would report now (report's), for a clock that compares it with the last search's
+    //the score a running search would report now (report's)
     fn root_score(&self, py: Python<'_>, id: u64) -> PyResult<f64> {
         py.detach(|| {
             if self.concurrent_descents {
                 return self.shared_root_score(id);
             }
-            let state = self.lock()?;
-            let search =
-                state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-            Ok(root_score_of(search))
+            Ok(root_score_of(find_search(&*self.lock()?, id)?))
         })
     }
 
-    //a running search's report as it would be now, for a gui's info lines while it runs; None while its root has no
-    //moves yet (its first simulation still waiting for the network)
+    //a running search's report as it would be now; None while its root has no moves yet (its first simulation is still out)
     fn report_now(&self, py: Python<'_>, id: u64) -> PyResult<Option<SearchReport>> {
         py.detach(|| {
             if self.concurrent_descents {
                 return self.shared_report_now(id);
             }
             let state = self.lock()?;
-            let search =
-                state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+            let search = find_search(&state, id)?;
             Ok(search.tree.root().has_edges().then(|| search.report()))
         })
     }
 
-    //carries the id's kept tree on to the position after `moves` (the game's, the engine's own move last), for uci.py to
-    //call once that move is sent. The root moves down in place, and on a thread of its own, while the opponent thinks,
-    //the tree finds the leaves the next root may make stale (search.rs stale_candidates) and copies the root's part out
-    //of the rest (compact), both on advance_threads threads. The next search's start then only moves the root down the
-    //reply; one that comes before the thread is done waits for the walk, stops the copy and goes on from the tree as
-    //it is. False when no tree is kept for these moves
+    //carries the id's kept tree on to the position after `moves` (the engine's own move last): the root moves down in place, and a
+    //thread finds the leaves the next root may make stale and copies its part out, while the opponent thinks. The next start waits for
+    //the walk, stops the copy and goes on from the tree as it is. False when no tree is kept for these moves
     fn advance(&self, py: Python<'_>, id: u64, fen: &str, moves: Vec<String>) -> PyResult<bool> {
         py.detach(|| {
             if self.concurrent_descents {
@@ -1062,13 +1023,11 @@ impl Searches {
         })
     }
 
-    //a new game under the id (uci's ucinewgame): its first search starts a fresh tree, and the network's answers are
-    //forgotten, as lc0 forgets them
+    //uci's ucinewgame: the id's first search starts a fresh tree, and the network's answers are forgotten, as lc0 forgets them
     fn new_game(&self, py: Python<'_>, id: u64) -> PyResult<()> {
         py.detach(|| {
             if self.concurrent_descents {
-                self.shared_new_game(id)?;
-                return Ok(());
+                return self.shared_new_game(id);
             }
             let mut state = self.lock()?;
             if let Some(kept) = state.kept.remove(&id) {
@@ -1087,27 +1046,20 @@ impl Searches {
             if self.concurrent_descents {
                 return Ok(self.shared_running(id)?.root_decided());
             }
-            let state = self.lock()?;
-            let search =
-                state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-            Ok(search.tree.root_decided())
+            Ok(find_search(&*self.lock()?, id)?.tree.root_decided())
         })
     }
 
-    //a running search's root moves not proven lost (search.rs moves_not_lost), for smart pruning to stop at one, as lc0 does
+    //a running search's root moves not proven lost (search.rs moves_not_lost)
     fn moves_not_lost(&self, py: Python<'_>, id: u64) -> PyResult<usize> {
         py.detach(|| {
             if self.concurrent_descents {
                 return Ok(self.shared_running(id)?.moves_not_lost());
             }
-            let state = self.lock()?;
-            let search =
-                state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-            Ok(search.tree.moves_not_lost())
+            Ok(find_search(&*self.lock()?, id)?.tree.moves_not_lost())
         })
     }
 
-    //the searches still running
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
         py.detach(|| {
             let state = self.lock()?;
@@ -1118,20 +1070,19 @@ impl Searches {
 
 //finish_leaf's arithmetic, for the tests' python search to use
 #[pyfunction]
-fn softmax(logits: Vec<f32>) -> Vec<f32> {
-    let mut priors = logits;
-    search::softmax(&mut priors);
-    priors
+fn softmax(mut logits: Vec<f32>) -> Vec<f32> {
+    search::softmax(&mut logits);
+    logits
 }
 
-//the cpus this process may run on as the hardware groups them (affinity.rs), for pinning threads to: each L3's bytes
-//and cpus, and each physical core's cpus (its smt siblings); None where the os does not say
+//the cpus this process may run on as the hardware groups them (affinity.rs): each L3's bytes and cpus, and each physical core's
+//cpus (its smt siblings)
 #[pyfunction]
 fn cpu_topology() -> Option<(Vec<(u64, Vec<usize>)>, Vec<Vec<usize>>)> {
     affinity::topology().map(|topology| (topology.l3s, topology.cores))
 }
 
-//pins the calling thread (a python thread's own) to the cpu, one of cpu_topology's; false if it may not run there
+//pins the calling thread to the cpu, one of cpu_topology's; false if it may not run there
 #[pyfunction]
 fn pin_thread(cpu: usize) -> bool {
     affinity::pin_current(cpu)

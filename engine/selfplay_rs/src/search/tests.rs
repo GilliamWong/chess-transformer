@@ -1,19 +1,18 @@
-//tree reuse (Searches): play_line's one copy and drop_stale_leaves' walk against the moves played one at a time (play)
-//and a walk that plays out every node's position, as trees were reused before, and against advance's way (the root
-//moved in place, the stale leaves from candidates). They must give the same tree, number for number, on trees the
-//engine's rounds grow with a stand-in for the network
+//tree reuse (Searches) against the moves played one at a time and a walk over every node's position, number for number
 use super::*;
 use crate::rules::{MOVE_ID_TABLE_LENGTH, TOKENS_PER_BOARD};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, EnPassantMode};
 use std::fmt::Debug;
-use std::sync::atomic::AtomicBool;
 
-//encoding.NUM_MOVE_IDS, and an answer's numbers: the moves' logits, then the expected score
+mod bench;
+mod shared;
+
+//encoding.NUM_MOVE_IDS; an answer is the moves' logits, then the expected score
 const MOVE_IDS: usize = 1858;
 const ANSWER_WIDTH: usize = MOVE_IDS + 1;
-//by shakmaty's role numbers, which the encoding's piece tokens are
+//indexed by shakmaty's role numbers, which the piece tokens are
 const PIECE_VALUES: [f32; 7] = [0.0, 1.0, 3.0, 3.0, 5.0, 9.0, 0.0];
 
 //splitmix64's finaliser
@@ -24,13 +23,11 @@ fn mix(value: u64) -> u64 {
     mixed ^ (mixed >> 31)
 }
 
-//a number in [0, 1) from the value's hash
 fn uniform(value: u64) -> f32 {
     (mix(value) >> 40) as f32 / (1u64 << 24) as f32
 }
 
-//the stand-in network's answer for a board (seed its hash): a few moves much likelier than the rest, and an expected
-//score that follows the material of the side to move
+//the stand-in network: a few moves much likelier than the rest, and the side to move's material as the expected score
 fn answer(board: &[u8], seed: u64, column: usize) -> f32 {
     if column == ANSWER_WIDTH - 1 {
         let material: f32 = board[..64]
@@ -46,7 +43,7 @@ fn answer(board: &[u8], seed: u64, column: usize) -> f32 {
     8.0 * uniform(seed ^ column as u64).powi(2)
 }
 
-//the stand-in network's move ids (any id a column of its answer) and the search's cache of its answers
+//the stand-in network's move ids (any id is a column of its answer) and the search's cache of its answers
 struct Network {
     move_ids: MoveIds,
     cache: Cache,
@@ -61,8 +58,21 @@ impl Network {
     }
 }
 
-//engine_search.py's rounds until the root has its simulations or the tree is full: a leaf per 16 simulations up to 64, as
-//many collisions, three simulations a leaf
+//engine_search.py's round: a leaf per 16 visits up to 64, as many collisions, three simulations a leaf
+fn new_round(tree: &Tree, id: u64, visit_limit: u32, memory_limit: usize) -> Round {
+    let leaves = (tree.root().visit_count / 16).clamp(1, 64);
+    Round { id, leaves, simulations: 3 * leaves, collisions: leaves, visit_limit, memory_limit }
+}
+
+//the leaves waiting under round `id` finished with the stand-in network's answers for their boards
+fn finish_leaves(tree: &mut Tree, id: u64, boards: &[u8], settings: &SearchSettings, network: &mut Network) {
+    for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
+        let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
+        tree.finish_leaf(id, |column| answer(board, seed, column), ANSWER_WIDTH, &network.move_ids, Some(&mut network.cache), settings);
+    }
+}
+
+//engine_search.py's rounds until the root has its simulations or the tree is full
 fn search(
     tree: &mut Tree,
     simulations: u32,
@@ -73,14 +83,10 @@ fn search(
 ) {
     let mut boards = Vec::new();
     while tree.root().visit_count < simulations && !(tree.full && tree.pending() == 0) {
-        let leaves = (tree.root().visit_count / 16).clamp(1, 64);
-        let round = Round { id: 0, leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: simulations, memory_limit };
+        let round = new_round(tree, 0, simulations, memory_limit);
         boards.clear();
         tree.gather(&round, settings, tables, Some(&network.cache), &mut boards).expect("the tables");
-        for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
-            let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
-            tree.finish_leaf(0, |column| answer(board, seed, column), ANSWER_WIDTH, &network.move_ids, Some(&mut network.cache), settings);
-        }
+        finish_leaves(tree, round.id, &boards, settings, network);
     }
 }
 
@@ -94,7 +100,6 @@ fn tree_after(fen: &str, moves: &[&str]) -> Tree {
     Tree::new(board, keys)
 }
 
-//a copy of a tree whose search is done (nothing waits for the network)
 fn copied(tree: &Tree) -> Tree {
     assert_eq!(tree.pending(), 0);
     Tree {
@@ -116,8 +121,7 @@ fn copied(tree: &Tree) -> Tree {
     }
 }
 
-//drop_stale_leaves' walk as it was, every node's position played out on the way down: the paths to the stale leaves
-//under the path's last node, whose position is board
+//drop_stale_leaves' walk as it was, playing out every node's position: the paths to the stale leaves below the path's last node
 fn stale_leaves_by_positions(
     tree: &mut Tree,
     board: &Chess,
@@ -154,8 +158,7 @@ fn stale_leaves_by_positions(
     }
 }
 
-//Searches' tree reuse as it was: the moves played one at a time, each copying the subtree, then the stale leaves
-//taken out. Returns how many were
+//Searches' tree reuse as it was: the moves played one at a time, then the stale leaves taken out; returns how many
 fn reused_move_by_move(tree: &mut Tree, moves: &[PackedMove], settings: &SearchSettings, tables: Option<&Tables>) -> usize {
     for &played in moves {
         let edge = tree.root().edges().find(|&edge| tree.chess_move(edge) == played).expect("the line's move");
@@ -178,14 +181,13 @@ fn assert_same<T: PartialEq + Debug>(what: &str, old: &[T], new: &[T]) {
     }
 }
 
-//each node's moves with a node, in their order, as (place, node, visits): what the links and slots hold, whichever holds it
+//each node's moves with a node, in order, as (place, node, visits): what the links and slots hold, whichever holds it
 fn moves_with_nodes(tree: &Tree) -> Vec<Vec<(usize, u32, u32)>> {
     (0..tree.nodes.len())
         .map(|node| tree.linked(node).map(|(place, link)| (place, tree.link_child(link), tree.move_visits(link))).collect())
         .collect()
 }
 
-//the node a line of moves from the root ends on
 fn line_end(tree: &Tree, line: &[usize]) -> usize {
     line.iter().fold(tree.root_index(), |node, &edge| tree.child_index(node, edge).expect("a line through the tree's nodes"))
 }
@@ -211,7 +213,7 @@ fn assert_same_trees(old: &Tree, new: &Tree) {
     let bits = |priors: &[f32]| -> Vec<u32> { priors.iter().map(|prior| prior.to_bits()).collect() };
     assert_same("priors", &bits(&old.priors), &bits(&new.priors));
     assert_same("children", &moves_with_nodes(old), &moves_with_nodes(new));
-    //with transpositions the same graph: the fifty-move counts and the table (the moves' visits are the children's)
+    //with transpositions, the fifty-move counts and the table too (the moves' visits are the children's)
     assert_eq!(old.graph.is_some(), new.graph.is_some(), "one tree with transpositions, the other without");
     if let (Some(old), Some(new)) = (&old.graph, &new.graph) {
         assert_same("fifty-move counts", &old.halfmoves, &new.halfmoves);
@@ -224,9 +226,7 @@ fn assert_same_trees(old: &Tree, new: &Tree) {
     }
 }
 
-//lines a game may have played since a search, for which Searches reuses the tree (every move has its node, and the
-//last node is expanded): the expected move, the expected two and three, and the expected move answered by the reply
-//searched second most
+//lines of play for which Searches reuses the tree: the expected 1 to 3 moves, and the expected move with the second most searched reply
 fn reusable_lines(tree: &Tree) -> Vec<Vec<usize>> {
     let expected = tree.principal_variation();
     let mut lines: Vec<Vec<usize>> = (1..=expected.len().min(3)).map(|plies| expected[..plies].to_vec()).collect();
@@ -245,9 +245,7 @@ fn reusable_lines(tree: &Tree) -> Vec<Vec<usize>> {
     lines
 }
 
-//Searches' advance and the next start: the line's first move in place, the stale candidates and the copy on `threads`
-//threads unless stopped before them, then the rest of the line in place and the candidates under it (a walk without
-//them), compacted to be compared node for node. Returns the tree and whether the candidates were found
+//Searches' advance and the next start, stopped in the "walk" or the "copy" as asked; returns the tree and whether the candidates were found
 fn advanced(
     tree: &Tree,
     line: &[usize],
@@ -317,7 +315,7 @@ const LOCKED_PAWNS: &str = "4k3/8/8/1p1p1p1p/1P1P1P1P/8/8/4K3 w - - 0 1";
 const MATE_IN_TWO: &str = "k7/8/2K5/8/8/8/8/7R w - - 0 1";
 const PAWNS_AND_ROOKS: &str = "8/8/4k3/3p4/3P4/4K3/R7/7r w - - 0 1";
 
-//the positions of the reuse test: a middlegame, endings with repeats, a mate certainty proves, and the tables' ending
+//a middlegame, endings with repeats, a mate certainty proves, and the tables' ending
 fn cases(tables: &Option<Tables>) -> Vec<(&'static str, &'static [&'static str], u32, bool, Option<&Tables>)> {
     let mut cases = vec![
         (START, OPENING, 6_000, true, None),
@@ -348,15 +346,7 @@ fn search_in_flight(
     loop {
         let room = tree.root().visit_count as usize + tree.pending() < simulations as usize && !tree.full;
         if room && rounds.len() < in_flight {
-            let leaves = (tree.root().visit_count / 16).clamp(1, 64);
-            let round = Round {
-                id: gathered.len() as u64,
-                leaves,
-                simulations: 3 * leaves,
-                collisions: leaves,
-                visit_limit: simulations,
-                memory_limit: usize::MAX,
-            };
+            let round = new_round(tree, gathered.len() as u64, simulations, usize::MAX);
             let mut boards = Vec::new();
             let count = gather(tree, &round, &network.cache, &mut boards);
             assert_eq!(boards.len(), count as usize * TOKENS_PER_BOARD);
@@ -365,30 +355,21 @@ fn search_in_flight(
             continue;
         }
         let Some((id, boards)) = rounds.pop_front() else { break };
-        for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
-            let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
-            tree.finish_leaf(id, |column| answer(board, seed, column), ANSWER_WIDTH, &network.move_ids, Some(&mut network.cache), settings);
-        }
+        finish_leaves(tree, id, &boards, settings, network);
     }
     gathered
 }
 
-//a middlegame after its opening, a rook ending and kings behind locked pawns whose shuffles repeat positions (the draws
-//that go stale), a mate in two that certainty proves, and a rook and pawn ending whose captures the tables score
+//rooks and locked pawns repeat positions (draws that go stale), the mate in two is proven, the tables score the captures
 #[test]
 fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() {
-    const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-    const OPENING: &[&str] = &["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6", "c1g5", "f8e7", "e2e3", "e8g8", "g1f3", "b8d7"];
-    const ROOKS: &str = "8/8/4k3/8/8/4K3/R7/7r w - - 0 1";
-    const LOCKED_PAWNS: &str = "4k3/8/8/1p1p1p1p/1P1P1P1P/8/8/4K3 w - - 0 1";
-    const PAWNS_AND_ROOKS: &str = "8/8/4k3/3p4/3P4/4K3/R7/7r w - - 0 1";
     let tables = tables();
     let mut cases = vec![
         (START, OPENING, 20_000, true, None),
         (ROOKS, &[][..], 10_000, true, None),
         (ROOKS, &[], 10_000, false, None),
         (LOCKED_PAWNS, &[], 10_000, true, None),
-        ("k7/8/2K5/8/8/8/8/7R w - - 0 1", &[], 10_000, true, None),
+        (MATE_IN_TWO, &[], 10_000, true, None),
         ("8/8/8/4k3/8/8/8/4K2Q w - - 0 1", &[], 20_000, true, None),
         ("8/8/8/4k3/8/8/8/4K2R w - - 0 1", &[], 20_000, true, None),
     ];
@@ -417,8 +398,7 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
                 assert_same_trees(&new, &advanced);
                 walked += usize::from(!found);
             }
-            //the parallel walk finds the one-thread walk's candidates in its order, and the parallel copy leaves the
-            //tree the one-thread copy leaves, number for number
+            //the parallel walk and copy against the one-thread ones
             let (mut moved, never) = (copied(&tree), AtomicBool::new(false));
             moved.move_root(&line[..1]);
             assert_eq!(moved.stale_candidates(4, &never), moved.stale_candidates(1, &never));
@@ -436,15 +416,14 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
     );
 }
 
-//a proven node hides the leaves below it from the stale walk unless it is the new root, whose proof is dropped:
-//advance's candidates must leave and take out the same ones. Searches rarely leave a stale leaf below a proven node, so
-//the proofs are set by hand on a tree whose shuffles leave stale draws
+//a proven node hides the leaves below it from the stale walk unless it is the new root; searches rarely leave a stale leaf
+//below one, so the proofs are set by hand
 #[test]
 fn proven_nodes_hide_stale_leaves_from_advance_as_from_the_walk() {
     let settings = settings(true);
-    let mut tree = tree_after("4k3/8/8/1p1p1p1p/1P1P1P1P/8/8/4K3 w - - 0 1", &[]);
+    let mut tree = tree_after(LOCKED_PAWNS, &[]);
     search(&mut tree, 10_000, usize::MAX, &settings, None, &mut Network::new());
-    //a two-ply line under which a stale leaf lies at least two nodes down, as the walk finds it in place
+    //a two-ply line with a stale leaf at least two nodes below its end
     let (line, path) = reusable_lines(&tree)
         .into_iter()
         .filter(|line| line.len() == 2)
@@ -468,9 +447,8 @@ fn proven_nodes_hide_stale_leaves_from_advance_as_from_the_walk() {
     }
 }
 
-//the answer cache keeps its two latest generations and a position's latest answer, and no insert takes time out of the
-//search: a turnover is quick (dropping a generation's boxed answers there stalled it), and a generation's vectors are
-//made at its first answer, never regrown while it fills (a regrowth copies all they hold)
+//the cache keeps its two latest generations and a position's latest answer; a turnover is quick (dropping boxed answers
+//stalled it) and a generation's vectors are made at its first answer, never regrown while it fills
 #[test]
 fn the_cache_keeps_two_generations_and_turns_one_over_at_once() {
     let generation = 1_000_000u64;
@@ -498,8 +476,7 @@ fn the_cache_keeps_two_generations_and_turns_one_over_at_once() {
     assert!(slowest_turnover.as_millis() < 20, "a turnover took {slowest_turnover:?}");
 }
 
-//the nodes' u32 indices: gathering stops before a node would be numbered NO_NODE; a vector under a memory limit grows by
-//doubling as far as the limit lets it
+//gathering stops before a node would be numbered NO_NODE; a vector under a memory limit doubles as far as the limit lets it
 #[test]
 fn the_nodes_stop_short_of_their_u32_indices() {
     assert!(node_fits(NO_NODE as usize - 1));
@@ -510,33 +487,33 @@ fn the_nodes_stop_short_of_their_u32_indices() {
     assert_eq!(grown_capacity(8, 9, 13, 13 * 8), None);
 }
 
-//a search under a memory limit ends once its tree has no room left, its vectors within the limit (a growth's copy
-//included, which leaves the vectors half to two thirds of it), and until then it is the search without a limit, node
-//for node
+//a search under a memory limit ends once its tree has no room left, its vectors within the limit (a growth's copy included,
+//so they end half to two thirds of it), and until then it is the search without a limit, node for node
 #[test]
 fn a_search_ends_at_its_memory_limit_as_the_same_search() {
     let memory_limit = 4_000_000;
     let settings = settings(true);
-    let mut limited = tree_after("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", &[]);
+    let mut limited = tree_after(START, &[]);
     search(&mut limited, 1_000_000, memory_limit, &settings, None, &mut Network::new());
     let reached = limited.root().visit_count;
     assert!(limited.full && reached < 1_000_000 && limited.allocated_bytes() <= memory_limit, "{reached} {}", limited.allocated_bytes());
 
-    let mut unlimited = tree_after("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", &[]);
+    let mut unlimited = tree_after(START, &[]);
     search(&mut unlimited, reached, usize::MAX, &settings, None, &mut Network::new());
     assert_same_trees(&unlimited, &limited);
     assert!(!unlimited.full && limited.allocated_bytes() > memory_limit / 3);
 }
 
-mod bench;
-
-mod shared;
-
-//a node whose every move is a proven loss chooses none, and the descent takes its first move (select_edge names no move
-//then): to that move's own node, as a list or as solid slots, never a second link or another move's slot
+//with every move a proven loss select_edge names none and the descent takes the first move, to its own node (in a list or
+//solid slots), never a second link or another slot
 #[test]
 fn a_node_whose_every_move_is_lost_descends_to_its_first_moves_node() {
     let lost = Proof { outcome: Outcome::Loss, value: 0.0, plies: 1 };
+    let after = |tree: &Tree, edge: usize| {
+        let mut board = tree.board.clone();
+        board.play_unchecked(tree.moves[edge].to_move(&tree.board));
+        board
+    };
     for solid in [false, true] {
         let mut tree = tree_after(START, &[]);
         let moves = tree.board.legal_moves();
@@ -544,11 +521,6 @@ fn a_node_whose_every_move_is_lost_descends_to_its_first_moves_node() {
         tree.expand(0, &moves, &priors);
         tree.nodes[0].visit_count = SOLID_TREE_THRESHOLD;
         tree.nodes[0].value_sum = 0.5 * f64::from(SOLID_TREE_THRESHOLD);
-        let after = |tree: &Tree, edge: usize| {
-            let mut board = tree.board.clone();
-            board.play_unchecked(tree.moves[edge].to_move(&tree.board));
-            board
-        };
         let mut nodes_of = Vec::new();
         for edge in tree.nodes[0].edges() {
             let board = after(&tree, edge);

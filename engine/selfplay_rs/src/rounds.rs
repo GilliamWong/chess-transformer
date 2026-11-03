@@ -1,11 +1,8 @@
-//Searches' own round loop (EngineSearch's rust_rounds): engine_search.py's rounds_on, a thread a network, every round
-//gathered, launched, collected and finished without python. A network is a GraphedBatches of lean lanes
-//(inference.Lane): the loop writes a round's rows into a lane's pinned buffer and makes the cuda runtime calls lean
-//launch_filled and collect make, through their addresses (cuda_runtime.py). python keeps the networks, and so every
-//buffer, graph, stream and event their handles point at, alive while the loop runs (RoundLoop holds them)
+//Searches' own round loop (EngineSearch's rust_rounds): engine_search.py's rounds_on, a thread a network, without python
+//python keeps the networks (their buffers, graphs, streams and events) alive while the loop runs, RoundLoop holds them
 use crate::affinity;
 use crate::rules::TOKENS_PER_BOARD;
-use crate::{LEAN_COLUMNS, LEAN_ROW, RootNumbers, SearchReport, Searches, root_numbers, root_score_of};
+use crate::{LEAN_COLUMNS, LEAN_ROW, RootNumbers, Search, SearchReport, Searches, State, root_numbers, root_score_of};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -19,7 +16,7 @@ use std::time::{Duration, Instant};
 const HOST_TO_DEVICE: i32 = 1;
 const DEVICE_TO_HOST: i32 = 2;
 
-//the cuda runtime's calls (cuda_runtime.py's), a pointer an integer as the runtime's are on 64-bit targets
+//the cuda runtime's calls by address (cuda_runtime.py's), a pointer a usize as on 64-bit targets
 type SetDevice = unsafe extern "C" fn(i32) -> i32;
 type Memcpy = unsafe extern "C" fn(usize, usize, usize, i32, usize) -> i32;
 type OnStream = unsafe extern "C" fn(usize, usize) -> i32;
@@ -57,7 +54,6 @@ impl CudaCalls {
         }
     }
 
-    //a call's error as python's exception
     fn check(&self, error: i32, what: &str) -> PyResult<()> {
         if error == 0 {
             return Ok(());
@@ -66,6 +62,10 @@ impl CudaCalls {
         let text = unsafe { CStr::from_ptr((self.error_string)(error)) }.to_string_lossy().into_owned();
         Err(PyRuntimeError::new_err(format!("{what}: cuda error {error}, {text}")))
     }
+}
+
+fn panicked<E>(_: E) -> PyErr {
+    PyRuntimeError::new_err("a round loop thread panicked")
 }
 
 //a lean lane's handles (inference.Lane.handles), and whether its batch is out
@@ -84,7 +84,7 @@ struct Network {
     device: i32,
     blocking_wait: bool,
     lanes: Vec<Lane>,
-    cpu: Option<usize>, //its thread's, pinned (EngineSearch's pin_threads)
+    cpu: Option<usize>,
 }
 
 fn item<'py>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -123,10 +123,12 @@ impl Network {
         Ok(Network { device, blocking_wait: item(network, "blocking_wait")?.extract()?, lanes, cpu })
     }
 
-    //lean launch_filled's calls on the lane free first: the rows' copy, the smallest graph that holds them, the event
-    fn launch(&mut self, calls: &CudaCalls, count: usize) -> PyResult<(usize, usize)> {
-        let index =
-            self.lanes.iter().position(|lane| !lane.pending).ok_or_else(|| PyRuntimeError::new_err("more batches in flight than lanes"))?;
+    fn free_lane(&self) -> PyResult<usize> {
+        self.lanes.iter().position(|lane| !lane.pending).ok_or_else(|| PyRuntimeError::new_err("more batches in flight than lanes"))
+    }
+
+    //lean launch_filled's calls on a free lane: the rows' copy, the smallest graph that holds them, the event; the graph's index
+    fn launch(&mut self, calls: &CudaCalls, index: usize, count: usize) -> PyResult<usize> {
         let lane = &mut self.lanes[index];
         let graph = lane
             .graphs
@@ -141,7 +143,7 @@ impl Network {
             calls.check((calls.graph_launch)(lane.graphs[graph].1, lane.stream), "the graph's launch")?;
             calls.check((calls.event_record)(lane.done, lane.stream), "the batch's event")?;
         }
-        Ok((index, graph))
+        Ok(graph)
     }
 
     //lean collect's calls: the batch's wait, the answers' copy; the answers, LEAN_COLUMNS a board, in the pinned buffer
@@ -163,7 +165,6 @@ impl Network {
         }
     }
 
-    //every batch still out waited for (a failed search's), the lanes free
     fn settle(&mut self, calls: &CudaCalls) {
         for lane in self.lanes.iter_mut().filter(|lane| lane.pending) {
             //SAFETY: as launch's
@@ -180,7 +181,7 @@ impl Network {
     }
 }
 
-//EngineSearch's settings the rounds take (engine_search.py's names)
+//EngineSearch's settings (engine_search.py's names)
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
 pub(crate) struct LoopSettings {
@@ -224,9 +225,7 @@ struct Run {
     root: RootNumbers,
     round_times: VecDeque<f64>,
     round_seconds: f64,
-    //the first failure of a thread, which the search ends with
     error: Option<PyErr>,
-    //the networks' threads still running, and their batches and boards
     running: usize,
     batches: u64,
     boards: u64,
@@ -245,13 +244,23 @@ impl Run {
         self.stopping = true;
         self.report = report;
     }
+
+    fn simulations_left(&self) -> f64 {
+        let (&(then, visits_then), &(now, visits_now)) =
+            (self.progress.front().expect("progress"), self.progress.back().expect("a round's progress"));
+        let mut left = self.simulations.map_or(f64::INFINITY, |simulations| f64::from(simulations) - f64::from(visits_now));
+        if let Some(deadline) = self.deadline {
+            let speed = if now > then { (f64::from(visits_now) - f64::from(visits_then)) / (now - then) } else { f64::INFINITY };
+            left = left.min((deadline - now) * speed);
+        }
+        left
+    }
 }
 
 struct Shared {
     run: Mutex<Run>,
     changed: Condvar,
-    //uci's stop
-    told: AtomicBool,
+    told: AtomicBool, //uci's stop
     started: Instant,
 }
 
@@ -261,16 +270,14 @@ impl Shared {
     }
 
     fn lock(&self) -> PyResult<MutexGuard<'_, Run>> {
-        self.run.lock().map_err(|_| PyRuntimeError::new_err("a round loop thread panicked"))
+        self.run.lock().map_err(panicked)
     }
 }
 
-//sharpen's (engine_search.py)
 fn sharpen(score: f64, sharpness: f64) -> f64 {
     if sharpness == 1.0 || score == 0.0 || score == 1.0 { score } else { 1.0 / (1.0 + ((1.0 - score) / score).powf(sharpness)) }
 }
 
-//statistics.median's
 fn median(times: &VecDeque<f64>) -> f64 {
     let mut sorted: Vec<f64> = times.iter().copied().collect();
     sorted.sort_by(f64::total_cmp);
@@ -278,7 +285,11 @@ fn median(times: &VecDeque<f64>) -> f64 {
     if sorted.len() % 2 == 1 { sorted[middle] } else { (sorted[middle - 1] + sorted[middle]) / 2.0 }
 }
 
-//a launched round: its name, its lane and graph or None for a round without leaves, its boards, when it was launched
+fn running_search(state: &State, game: u64) -> PyResult<&Search> {
+    state.searches.iter().find(|search| search.id == game).ok_or_else(|| PyValueError::new_err("no search"))
+}
+
+//a launched round: its name, its lane and graph (None for a round without leaves), its boards, when it was launched
 type Launched = (u64, Option<(usize, usize)>, usize, f64);
 
 //one network's rounds: engine_search.py's rounds_on, line for line
@@ -291,13 +302,9 @@ struct Rounds<'a> {
 }
 
 impl Rounds<'_> {
-    //round_leaves'
     fn round_leaves(&self, simulations: Option<u32>, visits: u32) -> (u32, usize) {
         let settings = self.settings;
         let (mut count, mut rounds) = (settings.leaves, settings.rounds_in_flight * self.networks);
-        if settings.grow_leaves == 0 && settings.visits_per_leaf_out == 0 {
-            return (count, rounds);
-        }
         if settings.grow_leaves > 0 {
             let visits = i64::from(visits);
             let done_or_left = simulations.map_or(visits, |simulations| visits.min(i64::from(simulations) - visits));
@@ -310,7 +317,6 @@ impl Rounds<'_> {
         (count, rounds)
     }
 
-    //extra_for_fall's
     fn extra_for_fall(&self, (last, seconds): (i64, f64)) -> PyResult<f64> {
         let settings = self.settings;
         let score = if self.searches.concurrent_descents {
@@ -319,31 +325,13 @@ impl Rounds<'_> {
             score
         } else {
             let state = self.searches.lock()?;
-            let search =
-                state.searches.iter().find(|search| search.id == settings.game).ok_or_else(|| PyValueError::new_err("no search"))?;
-            root_score_of(search)
+            root_score_of(running_search(&state, settings.game)?)
         };
         let score = sharpen(score, 1.0 / settings.value_sharpness).clamp(1.0 - settings.max_reported_score, settings.max_reported_score);
         let centipawns = ((score / (1.0 - score)).ln() / settings.expected_score_per_centipawn).round_ties_even();
         let fall = last as f64 - centipawns;
         let share = ((fall - settings.fall_start_cp) / (settings.fall_full_cp - settings.fall_start_cp)).clamp(0.0, 1.0);
         Ok(share * seconds)
-    }
-
-    //simulations_left's
-    fn simulations_left(run: &Run) -> f64 {
-        let &(_, visits) = run.progress.back().expect("a round's progress");
-        let mut left = f64::INFINITY;
-        if let Some(simulations) = run.simulations {
-            left = f64::from(simulations) - f64::from(visits);
-        }
-        if let Some(deadline) = run.deadline {
-            let (&(then, visits_then), &(now, visits_now)) =
-                (run.progress.front().expect("progress"), run.progress.back().expect("progress"));
-            let speed = if now > then { (f64::from(visits_now) - f64::from(visits_then)) / (now - then) } else { f64::INFINITY };
-            left = left.min((deadline - now) * speed);
-        }
-        left
     }
 
     fn rounds_on(&self, network: &mut Network) -> PyResult<()> {
@@ -353,13 +341,10 @@ impl Rounds<'_> {
         let mut seen: Option<RootNumbers> = None;
         let room = network.room();
         loop {
-            let mut name = None;
-            let (mut count, mut answered) = (0, 0);
+            let mut gathering = None;
             {
                 let mut run = shared.lock()?;
-                if seen.is_some() {
-                    run.seen(seen.take());
-                }
+                run.seen(seen.take());
                 while run.report.is_none() && !run.stopping {
                     let round_times = if settings.rounds_at_once { rounds.len().max(1) } else { rounds.len() + 1 } as f64;
                     let told_to_stop = shared.told.load(Ordering::Relaxed);
@@ -378,37 +363,31 @@ impl Rounds<'_> {
                         shared.changed.notify_all();
                         break;
                     }
-                    let (round_count, in_flight) = self.round_leaves(run.simulations, run.root.0);
-                    count = round_count;
+                    let (count, in_flight) = self.round_leaves(run.simulations, run.root.0);
                     let blocked = run.starved == Some(run.rounds_answered) && run.rounds_out > rounds.len();
                     if run.rounds_out < in_flight && rounds.len() < settings.rounds_in_flight && !blocked {
-                        name = Some(run.next_round);
+                        gathering = Some((run.next_round, count, run.rounds_answered));
                         run.next_round += 1;
-                        answered = run.rounds_answered;
                         run.rounds_out += 1;
                         run.gathered = true;
                     } else if rounds.is_empty() {
                         //the rounds out are other networks': one must come back first
-                        run = shared.changed.wait(run).map_err(|_| PyRuntimeError::new_err("a round loop thread panicked"))?;
+                        run = shared.changed.wait(run).map_err(panicked)?;
                         continue;
                     }
                     break;
                 }
-                if name.is_none() && rounds.is_empty() {
+                if gathering.is_none() && rounds.is_empty() {
                     return Ok(());
                 }
             }
-            if let Some(name) = name {
+            if let Some((name, count, answered)) = gathering {
                 if count as usize > room {
                     return Err(PyValueError::new_err(format!("rounds of {count} leaves, past the lanes' {room}")));
                 }
-                let lane = network
-                    .lanes
-                    .iter()
-                    .find(|lane| !lane.pending)
-                    .ok_or_else(|| PyRuntimeError::new_err("more batches in flight than lanes"))?;
+                let lane = network.free_lane()?;
                 let (written, root) = self.searches.descend_rows(
-                    lane.rows_host,
+                    network.lanes[lane].rows_host,
                     room,
                     count,
                     settings.collisions.min(count),
@@ -421,7 +400,7 @@ impl Rounds<'_> {
                     shared.lock()?.starved = Some(answered);
                 }
                 let launched_at = shared.now();
-                let launched = if written > 0 { Some(network.launch(calls, written)?) } else { None };
+                let launched = if written > 0 { Some((lane, network.launch(calls, lane, written)?)) } else { None };
                 rounds.push_back((name, launched, written, launched_at));
                 continue;
             }
@@ -475,7 +454,7 @@ impl Rounds<'_> {
                     run.progress.pop_front();
                 }
                 let first_answers = *run.first_answers.get_or_insert(now);
-                let decided = f64::from(most - second) > Self::simulations_left(&run) / settings.smart_pruning_factor
+                let decided = f64::from(most - second) > run.simulations_left() / settings.smart_pruning_factor
                     && now - first_answers >= settings.smart_pruning_wait;
                 let proven = settings.certainty
                     && if self.searches.concurrent_descents {
@@ -484,14 +463,10 @@ impl Rounds<'_> {
                         })
                     } else {
                         let state = self.searches.lock()?;
-                        let search = state
-                            .searches
-                            .iter()
-                            .find(|search| search.id == settings.game)
-                            .ok_or_else(|| PyValueError::new_err("no search"))?;
-                        search.tree.root_decided() || settings.stop_at_one_move_left && search.tree.moves_not_lost() <= 1
+                        let tree = &running_search(&state, settings.game)?.tree;
+                        tree.root_decided() || settings.stop_at_one_move_left && tree.moves_not_lost() <= 1
                     };
-                //once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
+                //once: a stop smart pruning would make is extended instead when the score has fallen
                 let mut extra = 0.0;
                 if decided
                     && !(run.only_move || proven)
@@ -512,7 +487,7 @@ impl Rounds<'_> {
     }
 }
 
-//write_lean_rows' rows for Searches.descend_rows: a board's tokens, then its columns as little-endian u16s
+//a board's tokens, then its columns as little-endian u16s, LEAN_ROW bytes a board (Searches.descend_rows')
 //SAFETY: rows points at room for every board's LEAN_ROW bytes, which nothing else touches meanwhile
 pub(crate) unsafe fn write_lean_rows(rows: *mut u8, tokens: &[u8], columns: &[u16]) {
     for (index, (board, board_columns)) in
@@ -533,8 +508,7 @@ pub(crate) unsafe fn write_lean_rows(rows: *mut u8, tokens: &[u8], columns: &[u1
 pub(crate) struct RoundLoop {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
-    //the searches, and the networks python built, held while the threads use them; the last of the searches' is the
-    //loop's, dropped with the gil
+    //held while the threads use them; the last Arc of the searches is dropped with the gil
     _searches: Arc<Py<Searches>>,
     _networks: Vec<Py<PyAny>>,
 }
@@ -550,7 +524,7 @@ impl RoundLoop {
                 .shared
                 .changed
                 .wait_timeout_while(run, Duration::from_secs_f64(seconds.max(0.0)), |run| run.running > 0)
-                .map_err(|_| PyRuntimeError::new_err("a round loop thread panicked"))?;
+                .map_err(panicked)?;
             Ok(run.running == 0)
         })?;
         if !done {
@@ -558,7 +532,7 @@ impl RoundLoop {
         }
         py.detach(|| {
             for thread in self.threads.drain(..) {
-                thread.join().map_err(|_| PyRuntimeError::new_err("a round loop thread panicked"))?;
+                thread.join().map_err(panicked)?;
             }
             Ok::<_, PyErr>(())
         })?;
@@ -569,19 +543,18 @@ impl RoundLoop {
         run.report.take().map(Some).ok_or_else(|| PyRuntimeError::new_err("the round loop ended without a report"))
     }
 
-    //uci's stop: the search stops gathering at its next look, as told does in engine_search.py
     fn tell_stop(&self) {
         self.shared.told.store(true, Ordering::Relaxed);
     }
 
-    //the round times (EngineSearch.round_times), the batches launched and their boards, as they stand
+    //the round times (EngineSearch.round_times), the batches launched and their boards
     fn counts(&self) -> PyResult<(Vec<f64>, u64, u64)> {
         let run = self.shared.lock()?;
         Ok((run.round_times.iter().copied().collect(), run.batches, run.boards))
     }
 }
 
-//a loop python lets go of before its report (an exception in the waiting thread): its threads stopped and joined
+//a loop python lets go of before its report (an exception in the waiting thread): its threads are stopped and joined
 //before the networks they use can go
 impl Drop for RoundLoop {
     fn drop(&mut self) {
@@ -592,7 +565,6 @@ impl Drop for RoundLoop {
     }
 }
 
-//Searches.round_loop's work: the threads started on the networks (GraphedBatches.rust_network's dicts, their objects)
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_loop(
     searches: Arc<Py<Searches>>,
@@ -607,12 +579,8 @@ pub(crate) fn start_loop(
     round_times: Vec<f64>,
 ) -> PyResult<RoundLoop> {
     let calls = CudaCalls::new(&addresses)?;
-    let mut built = Vec::new();
-    let mut objects = Vec::new();
-    for (object, network) in networks {
-        built.push(Network::get(&network)?);
-        objects.push(object);
-    }
+    let built = networks.iter().map(|(_, network)| Network::get(network)).collect::<PyResult<Vec<_>>>()?;
+    let objects = networks.into_iter().map(|(object, _)| object).collect();
     let round_times: VecDeque<f64> = round_times.into();
     let round_seconds = median(&round_times);
     let started = Instant::now();
@@ -666,7 +634,6 @@ pub(crate) fn start_loop(
                     run.running -= 1;
                 }
                 shared.changed.notify_all();
-                drop(searches);
             })
         })
         .collect();

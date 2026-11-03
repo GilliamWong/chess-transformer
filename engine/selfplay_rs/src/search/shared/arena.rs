@@ -1,9 +1,6 @@
-//the storage of a tree that many threads grow at once: chunks made on first use and never moved or freed before the tree
-//is, so a reference into one stays valid while other threads allocate. A node is one cache line of atomics and an edge
-//a prior and a move (PackedMove). As lc0 has them, a move gets a Link once a simulation goes through it: its node, its
-//own visits (with transpositions) and its place among the node's moves, in a list in the moves' order; a node with
-//SOLID_TREE_THRESHOLD visits has its list turned into an array of slots, one a move (lc0's solid tree), each only a node
-//and visits, so that a busy node's scan reads no more than the moves' node and visit columns did
+//the storage of a tree that many threads grow at once: chunks are made on first use and live as long as the tree, so references
+//into them stay valid while others allocate. As in lc0, a move gets a Link once a simulation goes through it; a node with
+//SOLID_TREE_THRESHOLD visits has its list of links turned into one Slot a move (lc0's solid tree)
 use crate::rules::PackedMove;
 use crate::search::{NO_LINK, NO_NODE, Outcome, Proof, SOLID, listed};
 use shakmaty::Move;
@@ -15,14 +12,13 @@ const NODE_CHUNK_BITS: u32 = if cfg!(test) { 6 } else { 16 };
 const NODE_CHUNKS: usize = 1 << 14;
 const EDGE_CHUNK_BITS: u32 = if cfg!(test) { 10 } else { 20 };
 const EDGE_CHUNKS: usize = 1 << 15;
-//a slot chunk holds a solid node's slots (at most 218 moves); links and slots below 1 << 31, which SOLID takes
+//a chunk holds a solid node's slots (218 moves at most); links and slots stay below 1 << 31, which SOLID takes
 const LINK_CHUNK_BITS: u32 = if cfg!(test) { 8 } else { 18 };
 const LINK_CHUNKS: usize = 1 << 13;
 
-//one in-flight simulation in a node's count, which holds the visits below it
 pub const IN_FLIGHT: u64 = 1 << 32;
 
-//a node's numbers; every access is atomic, and the orderings are the tree's protocol (see shared.rs)
+//every access is atomic; the orderings are the tree's protocol (shared.rs)
 #[repr(align(64))]
 #[derive(Default)]
 pub struct Node {
@@ -33,12 +29,9 @@ pub struct Node {
     proof_value: AtomicU64,
     proof_meta: AtomicU64, //0 without a proof, else the plies above the low 2 bits and the outcome in them (1 loss, 2 draw, 3 win)
     key: AtomicU64,
-    //the refreshes of the visited policy begun, wrapping: a refresh compares two counts a few loads apart
-    refreshes: AtomicU16,
-    //with transpositions the node's fifty-move count (search.rs Graph's halfmoves)
-    halfmoves: AtomicU16,
-    //the links of its moves with a node (Children)
-    children: AtomicU32,
+    refreshes: AtomicU16, //the visited policy's refreshes begun, wrapping
+    halfmoves: AtomicU16, //with transpositions the node's fifty-move count
+    children: AtomicU32,  //a list's first link, or once solid its first slot (SOLID set): see Children
 }
 
 //a node's moves with a node: a list of links in the moves' order, or once solid a slot a move from the first
@@ -58,7 +51,7 @@ impl Node {
         self.count.load(Ordering::Acquire) as u32
     }
 
-    //counts one more simulation in flight through the node; returns the (visits, in flight) before
+    //one more simulation in flight; returns the (visits, in flight) before
     pub fn bump(&self) -> (u32, u32) {
         let before = self.count.fetch_add(IN_FLIGHT, Ordering::AcqRel);
         (before as u32, (before >> 32) as u32)
@@ -76,7 +69,7 @@ impl Node {
         before as u32
     }
 
-    //a node of a tree being copied, before anything else sees it
+    //for a node of a tree being copied, before anything else sees it
     #[cfg(test)]
     pub fn set_counts(&self, visits: u32, in_flight: u32, value_sum: f64) {
         self.count.store(u64::from(in_flight) << 32 | u64::from(visits), Ordering::Relaxed);
@@ -87,7 +80,7 @@ impl Node {
         self.count.fetch_sub(u64::from(visits), Ordering::Relaxed);
     }
 
-    //the node as if never visited, its position's key kept
+    //the node as if never visited, its key kept
     pub fn reset(&self) {
         for field in [&self.count, &self.value_sum, &self.visited_policy_sqrt, &self.edges_at, &self.proof_value, &self.proof_meta] {
             field.store(0, Ordering::Relaxed);
@@ -95,7 +88,7 @@ impl Node {
         self.children.store(NO_LINK, Ordering::Relaxed);
     }
 
-    //the numbers, key and proof of a node (not its edges or links) copied to a node of a tree being made
+    //the numbers, key and proof (not the edges or links) copied to a node of a tree being made
     pub fn copy_to(&self, target: &Node) {
         target.count.store(self.count.load(Ordering::Relaxed), Ordering::Relaxed);
         target.value_sum.store(self.value_sum.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -111,12 +104,7 @@ impl Node {
     }
 
     pub fn add_value(&self, delta: f64) {
-        let mut seen = self.value_sum.load(Ordering::Relaxed);
-        while let Err(now) =
-            self.value_sum.compare_exchange_weak(seen, (f64::from_bits(seen) + delta).to_bits(), Ordering::Relaxed, Ordering::Relaxed)
-        {
-            seen = now;
-        }
+        let _ = self.value_sum.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| Some((f64::from_bits(seen) + delta).to_bits()));
     }
 
     pub fn mean_score(&self, visits: u32) -> f64 {
@@ -127,12 +115,12 @@ impl Node {
         f64::from_bits(self.visited_policy_sqrt.load(Ordering::Relaxed))
     }
 
-    //with the refresh counter below this is sequentially consistent: a store buffered past the counter's check is a lost one
+    //sequentially consistent with the refresh counter: a store buffered past the counter's check would be lost
     pub fn set_visited_policy_sqrt(&self, value: f64) {
         self.visited_policy_sqrt.store(value.to_bits(), Ordering::SeqCst);
     }
 
-    //a refresh of the visited policy begins; returns the number of refreshes begun, itself included
+    //returns the refreshes begun, this one included
     pub fn begin_refresh(&self) -> u16 {
         self.refreshes.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
     }
@@ -149,7 +137,7 @@ impl Node {
         self.halfmoves.load(Ordering::Relaxed)
     }
 
-    //set by the thread that makes the node, before its index is given out
+    //by the thread that makes the node, before its index is given out
     pub fn set_halfmoves(&self, halfmoves: u16) {
         self.halfmoves.store(halfmoves, Ordering::Relaxed);
     }
@@ -159,13 +147,12 @@ impl Node {
         if listed(children) { Children::List(children) } else { Children::Solid(children) }
     }
 
-    //the head of a list node's links, which a new first link is swapped into (Links::insert)
+    //the list's head, which a new first link is swapped into (Links::insert)
     pub fn list_head(&self) -> &AtomicU32 {
         &self.children
     }
 
-    //the node's moves from now on the solid slots from `first` (Links::solid's); with the tree to itself (or one not yet
-    //published)
+    //the moves from now on the solid slots from `first` (Links::solid's); only with the tree to itself or before it is published
     pub fn make_solid(&self, first: u32) {
         self.children.store(first, Ordering::Release);
     }
@@ -180,7 +167,7 @@ impl Node {
         self.edges_at.load(Ordering::Acquire) & 255 > 0
     }
 
-    //makes the node's edges, written before, visible to those that read them
+    //the edges, written before, become visible to those that read them
     pub fn publish_edges(&self, first: usize, count: usize) {
         self.edges_at.store((first as u64) << 8 | count as u64, Ordering::Release);
     }
@@ -215,22 +202,19 @@ impl Node {
     }
 }
 
-//chunks of `columns` times `1 << bits` elements made on first use, a pointer to each. A chunk is allocated once, by whichever
-//thread needs it first, and freed only with the table, so a reference into one is valid for the table's life. Elements are
-//found by an index that counts `1 << bits` to a chunk, a column of a chunk by its number
+//chunks of `1 << bits` elements, each made on first use by whichever thread needs it first and freed only with the table; an
+//index counts `1 << bits` to a chunk
 struct Table<T> {
     chunks: Box<[AtomicPtr<T>]>,
     bits: u32,
-    columns: usize,
 }
 
 impl<T> Table<T> {
-    fn new(chunks: usize, bits: u32, columns: usize) -> Table<T> {
-        Table { chunks: (0..chunks).map(|_| AtomicPtr::new(null_mut())).collect(), bits, columns }
+    fn new(chunks: usize, bits: u32) -> Table<T> {
+        Table { chunks: (0..chunks).map(|_| AtomicPtr::new(null_mut())).collect(), bits }
     }
 
-    //the chunk's first element; every index given out is in a chunk that is made (the allocators make it before they give
-    //the index out)
+    //every index given out is in a made chunk (the allocators make it first)
     fn chunk_of(&self, index: usize) -> *mut T {
         let chunk = self.chunks[index >> self.bits].load(Ordering::Acquire);
         assert!(!chunk.is_null(), "an index in a chunk that was never made");
@@ -238,26 +222,24 @@ impl<T> Table<T> {
     }
 
     fn get(&self, index: usize) -> &T {
-        &self.slice(index, 0, 1)[0]
+        &self.slice(index, 1)[0]
     }
 
-    //`len` elements of a column from `index`, all in its chunk
-    fn slice(&self, index: usize, column: usize, len: usize) -> &[T] {
+    fn slice(&self, index: usize, len: usize) -> &[T] {
         let offset = index & ((1 << self.bits) - 1);
-        assert!(column < self.columns && offset + len <= 1 << self.bits, "elements across a chunk's end");
-        // SAFETY: the chunk holds columns << bits elements and never moves or goes before the table does, and the assert keeps
-        // the elements inside the column
-        unsafe { std::slice::from_raw_parts(self.chunk_of(index).add((column << self.bits) + offset), len) }
+        assert!(offset + len <= 1 << self.bits, "elements across a chunk's end");
+        // SAFETY: the chunk never moves or goes before the table does, and the assert keeps the elements inside it
+        unsafe { std::slice::from_raw_parts(self.chunk_of(index).add(offset), len) }
     }
 
-    //makes the chunk of the index (columns << bits elements, from `make`) if no thread has
+    //makes the index's chunk from `make` unless a thread has
     fn made(&self, index: usize, make: impl FnOnce() -> Box<[T]>) {
         let slot = &self.chunks[index >> self.bits];
         if !slot.load(Ordering::Acquire).is_null() {
             return;
         }
         let fresh = Box::into_raw(make());
-        assert_eq!(fresh.len(), self.columns << self.bits);
+        assert_eq!(fresh.len(), 1 << self.bits);
         if slot.compare_exchange(null_mut(), fresh.cast(), Ordering::AcqRel, Ordering::Acquire).is_err() {
             // SAFETY: fresh came from Box::into_raw just now, and the other thread's chunk won the slot
             drop(unsafe { Box::from_raw(fresh) });
@@ -267,7 +249,7 @@ impl<T> Table<T> {
 
 impl<T> Drop for Table<T> {
     fn drop(&mut self) {
-        let len = self.columns << self.bits;
+        let len = 1 << self.bits;
         for slot in self.chunks.iter_mut() {
             let chunk = *slot.get_mut();
             if !chunk.is_null() {
@@ -285,11 +267,11 @@ pub struct Nodes {
 }
 
 impl Nodes {
-    //the nodes a tree may have: below NO_NODE, and the table's
+    //below NO_NODE, and the table's
     pub const CAPACITY: usize = (NODE_CHUNKS << NODE_CHUNK_BITS) - 1;
 
     pub fn new() -> Nodes {
-        Nodes { table: Table::new(NODE_CHUNKS, NODE_CHUNK_BITS, 1), next: AtomicUsize::new(0) }
+        Nodes { table: Table::new(NODE_CHUNKS, NODE_CHUNK_BITS), next: AtomicUsize::new(0) }
     }
 
     pub fn len(&self) -> usize {
@@ -310,7 +292,7 @@ impl Nodes {
     }
 }
 
-//`count` elements (at most a chunk of `1 << bits`) in one chunk from the allocator's next, below `capacity`: the first
+//the first of `count` elements (at most a chunk of `1 << bits`) in one chunk, from `next` and below `capacity`
 fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> usize {
     debug_assert!(count > 0 && count <= 1 << bits);
     let mut at = next.load(Ordering::Relaxed);
@@ -326,19 +308,17 @@ fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> us
     first
 }
 
-//a list's move with a node: the node, the move's own visits (with transpositions), the next link of its node's list, and its
-//place among the node's moves. A link is written before it is swapped in (release) and read after its predecessor's
-//`next` (acquire)
+//a list's move with a node; written before it is swapped into its list (release) and read after its predecessor's `next` (acquire)
 pub struct Link {
     child: AtomicU32,
-    visits: AtomicU32,
-    next: AtomicU32,
-    place: AtomicU32,
+    visits: AtomicU32, //the move's own visits (with transpositions)
+    next: AtomicU32,   //the next link of its node's list
+    place: AtomicU32,  //its place among the node's moves
 }
 
 impl Link {
-    fn new(place: u32) -> Link {
-        Link { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0), next: AtomicU32::new(NO_LINK), place: AtomicU32::new(place) }
+    fn new() -> Link {
+        Link { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0), next: AtomicU32::new(NO_LINK), place: AtomicU32::new(0) }
     }
 
     pub fn child(&self) -> u32 {
@@ -373,7 +353,7 @@ impl Slot {
         &self.visits
     }
 
-    //the move's node, which may have one already: the node it has
+    //sets the move's node if it has none: Ok(child), else Err(the node it has)
     pub fn claim(&self, child: u32) -> Result<u32, u32> {
         self.child.compare_exchange(NO_NODE, child, Ordering::AcqRel, Ordering::Acquire).map(|_| child)
     }
@@ -393,42 +373,41 @@ impl Links {
     //link 0 is NO_LINK's, never given out
     pub fn new() -> Links {
         let links = Links {
-            table: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS, 1),
+            table: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
             next: AtomicUsize::new(1),
-            slots: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS, 1),
+            slots: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
             next_slot: AtomicUsize::new(0),
         };
         links.make(0);
         links
     }
 
-    //the links and the slots given out so far, the gaps at chunk ends included
+    //the links given out so far, the gaps at chunk ends included
     pub fn len(&self) -> usize {
         self.next.load(Ordering::Relaxed)
     }
 
+    //the slots, likewise
     pub fn slots(&self) -> usize {
         self.next_slot.load(Ordering::Relaxed)
     }
 
     fn make(&self, first: usize) {
-        self.table.made(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Link::new(0)).collect());
+        self.table.made(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Link::new()).collect());
     }
 
-    //a list's link
     pub fn get(&self, link: u32) -> &Link {
         debug_assert!(listed(link), "a solid slot read as a link");
         self.table.get(link as usize)
     }
 
-    //a solid node's slot
     pub fn slot(&self, link: u32) -> &Slot {
         self.slots.get((link & !SOLID) as usize)
     }
 
     //a solid node's slots, one a move from its first
     pub fn solid_slots(&self, first: u32, moves: usize) -> &[Slot] {
-        if moves == 0 { &[] } else { self.slots.slice((first & !SOLID) as usize, 0, moves) }
+        if moves == 0 { &[] } else { self.slots.slice((first & !SOLID) as usize, moves) }
     }
 
     //the move's node: NO_NODE for a solid slot without one
@@ -436,7 +415,6 @@ impl Links {
         if listed(link) { self.get(link).child() } else { self.slot(link).child() }
     }
 
-    //the move's own visits (with transpositions)
     pub fn visits(&self, link: u32) -> &AtomicU32 {
         if listed(link) { &self.get(link).visits } else { &self.slot(link).visits }
     }
@@ -447,22 +425,16 @@ impl Links {
         self.make(link);
         let made = self.table.get(link);
         made.child.store(child, Ordering::Relaxed);
-        made.visits.store(0, Ordering::Relaxed);
         made.place.store(place as u32, Ordering::Relaxed);
         link as u32
     }
 
-    //a solid node's slots, one a move from the first returned (SOLID with its index): none has a node yet
+    //`count` solid slots, none with a node (a chunk starts empty): returns the first, SOLID with its index
     pub fn solid(&self, count: usize) -> u32 {
         let first = alloc_run(&self.next_slot, count, LINK_CHUNK_BITS, Self::CAPACITY);
         self.slots.made(first, || {
             (0..1 << LINK_CHUNK_BITS).map(|_| Slot { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0) }).collect()
         });
-        for place in 0..count {
-            let slot = self.slots.get(first + place);
-            slot.child.store(NO_NODE, Ordering::Relaxed);
-            slot.visits.store(0, Ordering::Relaxed);
-        }
         first as u32 | SOLID
     }
 
@@ -472,18 +444,23 @@ impl Links {
         let mut pointer = head;
         loop {
             let link = pointer.load(Ordering::Acquire);
-            if link == NO_LINK || self.get(link).place() > place {
+            if link == NO_LINK {
                 return Err((pointer, link));
             }
-            if self.get(link).place() == place {
+            let record = self.get(link);
+            let at = record.place();
+            if at > place {
+                return Err((pointer, link));
+            }
+            if at == place {
                 return Ok(link);
             }
-            pointer = &self.get(link).next;
+            pointer = &record.next;
         }
     }
 
-    //puts the link (Links::push's, of its place) into its list between the pointer found and the link it held: false if
-    //the pointer holds another link now
+    //puts `link` (Links::push's) into its list where `find` said, between `pointer` and the link `at` it held: false if the
+    //pointer holds another link now
     pub fn insert(&self, pointer: &AtomicU32, at: u32, link: u32) -> bool {
         self.get(link).next.store(at, Ordering::Relaxed);
         pointer.compare_exchange(at, link, Ordering::AcqRel, Ordering::Acquire).is_ok()
@@ -501,7 +478,6 @@ impl Links {
         slot.visits.store(visits, Ordering::Relaxed);
     }
 
-    //the node's moves with a node, in their order
     pub fn linked<'a>(&'a self, node: &Node) -> Linked<'a> {
         let children = node.children();
         let (at, solid) = match children {
@@ -559,8 +535,8 @@ impl Edges {
 
     pub fn new() -> Edges {
         Edges {
-            priors: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 1),
-            moves: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS, 1),
+            priors: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS),
+            moves: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS),
             next: AtomicUsize::new(0),
         }
     }
@@ -582,8 +558,7 @@ impl Edges {
         if edges.is_empty() {
             return &[];
         }
-        debug_assert_eq!(edges.start >> EDGE_CHUNK_BITS, (edges.end - 1) >> EDGE_CHUNK_BITS, "a node's edges lie in one chunk");
-        self.priors.slice(edges.start, 0, edges.len())
+        self.priors.slice(edges.start, edges.len())
     }
 
     pub fn prior(&self, edge: usize) -> f32 {
@@ -595,20 +570,18 @@ impl Edges {
         PackedMove::from_bits(self.moves.get(edge).load(Ordering::Relaxed))
     }
 
-    //a node's moves and priors from edge `first`, written by the thread that owns the node before its edges are published
+    //a node's moves and priors from edge `first`, by the thread that owns the node, before its edges are published
     pub fn write(&self, first: usize, moves: &[Move], priors: &[f32]) {
         if moves.is_empty() {
             return;
         }
-        let edges = first..first + moves.len();
-        let slots = self.moves.slice(first, 0, moves.len()).iter().zip(self.priors(edges));
+        let slots = self.moves.slice(first, moves.len()).iter().zip(self.priors.slice(first, moves.len()));
         for ((move_slot, prior_slot), (&chess_move, &prior)) in slots.zip(moves.iter().zip(priors)) {
             move_slot.store(PackedMove::new(chess_move).bits(), Ordering::Relaxed);
             prior_slot.store(prior.to_bits(), Ordering::Relaxed);
         }
     }
 
-    //an edge's move and prior
     pub fn set(&self, edge: usize, chess_move: PackedMove, prior: f32) {
         self.moves.get(edge).store(chess_move.bits(), Ordering::Relaxed);
         self.priors.get(edge).store(prior.to_bits(), Ordering::Relaxed);
@@ -619,35 +592,33 @@ impl Edges {
 mod tests {
     use super::*;
 
-    //edges are given out in runs that never cross a chunk, to threads that never get the same edge twice
     #[test]
     fn edges_are_given_out_whole_and_once() {
         let edges = Edges::new();
         let chunk = 1usize << EDGE_CHUNK_BITS;
-        let runs: Vec<Vec<(usize, usize)>> = std::thread::scope(|scope| {
+        let run_len = |worker: usize, turn: usize| 1 + (turn * 7 + worker * 13) % 218;
+        let runs: Vec<Vec<usize>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..4)
                 .map(|worker| {
                     let edges = &edges;
-                    scope.spawn(move || (0..2_000).map(|turn| (edges.alloc(1 + (turn * 7 + worker * 13) % 218), 0)).collect::<Vec<_>>())
+                    scope.spawn(move || (0..2_000).map(|turn| edges.alloc(run_len(worker, turn))).collect::<Vec<_>>())
                 })
                 .collect();
             workers.into_iter().map(|worker| worker.join().expect("a thread")).collect()
         });
         let mut taken = vec![false; edges.len()];
-        for (worker, worker_runs) in runs.iter().enumerate() {
-            for (turn, &(first, _)) in worker_runs.iter().enumerate() {
-                let count = 1 + (turn * 7 + worker * 13) % 218;
+        for (worker, firsts) in runs.iter().enumerate() {
+            for (turn, &first) in firsts.iter().enumerate() {
+                let count = run_len(worker, turn);
                 assert_eq!(first / chunk, (first + count - 1) / chunk, "a run across a chunk");
                 for edge in first..first + count {
                     assert!(!std::mem::replace(&mut taken[edge], true), "edge {edge} given out twice");
                 }
-                //its priors are there
                 assert_eq!(edges.priors(first..first + count).len(), count);
             }
         }
     }
 
-    //a list's links stay in their moves' order and each move gets one link, however many threads put them in at once
     #[test]
     fn a_list_keeps_one_link_a_move_in_order() {
         let (links, head) = (Links::new(), AtomicU32::new(NO_LINK));
@@ -681,7 +652,6 @@ mod tests {
             link = links.get(link).next();
         }
         assert!(list.windows(2).all(|pair| pair[0].0 < pair[1].0), "a list out of order or with a move twice");
-        //every thread found the node its move's link has
         for (place, child) in made.into_iter().flatten() {
             assert_eq!(list.iter().find(|&&(at, _)| at == place).map(|&(_, child)| child), Some(child));
         }

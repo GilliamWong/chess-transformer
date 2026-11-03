@@ -1,28 +1,10 @@
-//tree reuse for a SharedTree, Tree's (search.rs) line for line: the root moved down in place, the leaves that a rule scored
-//only from the old root taken out, the part kept copied out of the rest. A tree here belongs to one thread (`&mut self`)
-//or is only read by the threads of stale_candidates; no search runs in it
+//tree reuse for a SharedTree, Tree's (search.rs) line for line: no search runs in the tree, which is `&mut self` or only read
+//by the threads of stale_candidates
 use super::*;
 
-//nodes a walk or copy that may be stopped goes through between looks at its flag
-const ABORT_CHECKS: usize = 4096;
-
-//parts of the tree a thread of stale_candidates gets on the mean, so that a big part at the end leaves none idle long
-const PARTS_A_THREAD: usize = 16;
-
-//a part of the tree for one of stale_candidates' threads: a subtree (its node, and the places of the moves down to it) or a
-//candidate leaf
-enum Part {
-    Subtree(usize, Vec<u16>),
-    Leaf(Vec<u16>),
-}
-
-//a tree's storage, as compact returns the old one to free
-pub type Storage = (Nodes, Edges, Links);
-
 impl SharedTree {
-    //plays a line of moves from the root (edges, each of the node the last one leads to) and makes the node it ends on the
-    //root where it is, without a copy: the rest of the tree stays in the arenas until compact. The new root's proof is
-    //dropped, as a root is never proven
+    //plays a line of edges from the root and makes the node it ends on the root in place; the rest stays in the arenas until
+    //compact. The new root's proof is dropped, as a root is never proven
     pub fn move_root(&mut self, line: &[usize]) {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         for &edge in line {
@@ -37,22 +19,21 @@ impl SharedTree {
         }
     }
 
-    //move_root and compact, the old tree freed on a thread of its own
+    //move_root, then compact with the old tree freed on another thread
     pub fn play_line(&mut self, line: &[usize]) {
         self.move_root(line);
         let old = self.compact(None);
         let _ = std::thread::Builder::new().spawn(move || drop(old));
     }
 
-    //the root's part of the tree copied out of the rest as a tree of its own, in breadth-first order from the root, as
-    //Tree::compact has it, each node's links made again (solid with the threshold's visits). With transpositions a node
-    //that several moves lead to is copied once (Tree::compact_graph's), with the moves' visits, and the table made again of
-    //the copied nodes. Returns the old storage to free, or None once abort is set (the tree then as it was)
-    pub fn compact(&mut self, abort: Option<&AtomicBool>) -> Option<Storage> {
+    //copies the root's part of the tree out as a tree of its own, breadth first as Tree::compact has it (with transpositions a
+    //node several moves lead to is copied once, with the moves' visits, as Tree::compact_graph does). Returns the old storage
+    //to free, or None once abort is set (the tree then as it was)
+    pub fn compact(&mut self, abort: Option<&AtomicBool>) -> Option<(Nodes, Edges, Links)> {
         let (nodes, edges, links) = (Nodes::new(), Edges::new(), Links::new());
         let mut children = Vec::new();
         let mut order = vec![self.root];
-        //with transpositions each copied node's new number
+        //each old node's new number; empty without transpositions
         let mut copied_as = if self.graph.is_some() { vec![NO_NODE; self.nodes.len()] } else { Vec::new() };
         if let Some(first) = copied_as.get_mut(self.root) {
             *first = 0;
@@ -103,7 +84,7 @@ impl SharedTree {
             *graph = fresh;
         }
         self.root = 0;
-        //what was queued for solid slots: compact made them
+        //the copy made the solid slots that were queued
         self.to_solidify.get_mut().expect("the solid queue").clear();
         *self.queued.get_mut() = 0;
         Some((
@@ -113,8 +94,8 @@ impl SharedTree {
         ))
     }
 
-    //Tree::drop_stale_leaves: a kept tree under a new root, the leaves a rule scored that held only from the old root
-    //taken out, their visits off their ancestors. With transpositions nothing is taken out (Tree's)
+    //Tree::drop_stale_leaves: takes out the leaves scored by a rule that held only from the old root, their visits off their
+    //ancestors; with transpositions nothing is taken out
     pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) -> Result<(), SyzygyError> {
         if self.graph.is_some() {
             return Ok(());
@@ -129,8 +110,7 @@ impl SharedTree {
         Ok(())
     }
 
-    //the paths to the stale leaves under the path's last node, which the line's moves (its edges) reach from the root;
-    //keys end with the path's keys
+    //pushes the paths of the stale leaves under the path's last node; line is the path's edges from the root, keys end with its keys
     #[allow(clippy::too_many_arguments)]
     fn find_stale_leaves(
         &self,
@@ -158,17 +138,15 @@ impl SharedTree {
             path.push(child);
             line.push(edges.start + place);
             keys.push(self.nodes.get(child).key());
-            let found = self.find_stale_leaves(path, line, keys, settings, tables, root_covered, stale);
+            self.find_stale_leaves(path, line, keys, settings, tables, root_covered, stale)?;
             keys.pop();
             line.pop();
             path.pop();
-            found?;
         }
         Ok(())
     }
 
-    //whether the leaf at the end of path, which the line's moves (edges) reach from the root, is no longer what gather scored
-    //it as; keys end with the path's keys
+    //whether the path's leaf (reached by line's edges from the root; keys end with the path's) is no longer what gather scored
     fn is_stale(
         &self,
         path: &[usize],
@@ -178,7 +156,6 @@ impl SharedTree {
         tables: Option<&Tables>,
         root_covered: bool,
     ) -> Result<bool, SyzygyError> {
-        //as gather scores a leaf
         let mut board = self.board.clone();
         for &edge in line {
             board.play_unchecked(self.edges.chess_move(edge).to_move(&board));
@@ -190,11 +167,10 @@ impl SharedTree {
         Ok(over.is_none() && !path_keys.contains(&leaf_key))
     }
 
-    //the leaves drop_stale_leaves may find stale once the root has moved further down, found before the moves are known
-    //(Searches' advance, while the opponent thinks): every leaf below the root with visits, no moves and no proof of its
-    //own, in the walk's order, each as the places of its line's moves among their nodes' moves, which hold across
-    //compact. The walk runs on `threads` threads, each taking the next of the tree's parts, their candidates joined in
-    //the parts' order. None once abort is set. With transpositions none: nothing is taken out (drop_stale_leaves)
+    //the leaves drop_stale_leaves may find stale once the root has moved further down, found before the moves are known: every
+    //leaf below the root with visits, no moves and no proof, in the walk's order, each as the places of its line's moves among
+    //their nodes' moves (stable across compact). Parts of the tree go to `threads` threads, the candidates joined in the parts'
+    //order. None once abort is set; with transpositions none, as nothing is taken out
     pub fn stale_candidates(&self, threads: usize, abort: &AtomicBool) -> Option<Vec<Vec<u16>>> {
         if self.graph.is_some() {
             return (!abort.load(Ordering::Relaxed)).then(Vec::new);
@@ -231,9 +207,8 @@ impl SharedTree {
         Some(walked.into_iter().flat_map(|(_, candidates)| candidates).collect())
     }
 
-    //the parts of the tree below node (its line's moves at `places`) for stale_candidates' threads, in the walk's order: a
-    //subtree of at most `share` visits is one part, a bigger one is split into its moves'; a leaf met on the way that is a
-    //candidate is a part of its own
+    //the parts below node (reached by `places`) in the walk's order: a subtree of at most `share` visits is one part, a bigger
+    //one is split into its moves'; a candidate leaf is a part of its own
     fn split_for_walk(&self, node: usize, places: &mut Vec<u16>, share: u32, parts: &mut Vec<Part>) {
         if node != self.root && self.nodes.get(node).visits() <= share {
             parts.push(Part::Subtree(node, places.clone()));
@@ -252,6 +227,7 @@ impl SharedTree {
         }
     }
 
+    //false once abort is set
     fn find_candidates(
         &self,
         node: usize,
@@ -280,8 +256,8 @@ impl SharedTree {
         true
     }
 
-    //drop_stale_leaves from the candidates found at the root the moves at `line`'s places moved it down from: of those
-    //below the root, the leaves its walk would find stale, taken out in its order
+    //drop_stale_leaves from candidates found at the old root, `line` being the places of the moves down from it: takes out
+    //those below the new root that its walk would find stale, in its order
     pub fn drop_stale_candidates(
         &mut self,
         line: &[u16],
@@ -289,7 +265,6 @@ impl SharedTree {
         settings: &SearchSettings,
         tables: Option<&Tables>,
     ) -> Result<(), SyzygyError> {
-        //with transpositions nothing is taken out (drop_stale_leaves)
         if self.graph.is_some() {
             return Ok(());
         }
@@ -303,7 +278,7 @@ impl SharedTree {
                 let parent = self.nodes.get(*path.last().expect("the root at least"));
                 let edge = parent.edges().start + usize::from(place);
                 let child = self.child_index(parent, edge).expect("a candidate's moves have nodes");
-                //the walk passes over a proven node and what is below it
+                //the walk skips a proven node and what is below it
                 if self.nodes.get(child).proof().is_some() {
                     continue 'candidates;
                 }
@@ -326,8 +301,7 @@ impl SharedTree {
         Ok(())
     }
 
-    //takes a leaf's visits out of the tree: a visit's score s went to the leaf, 1 - s to its parent and so on up, and the
-    //leaf is as if never visited
+    //takes a leaf's visits out of the tree: a visit's score s went to the leaf, 1 - s to its parent and so on up
     fn take_out(&mut self, path: &[usize]) {
         let (&leaf, ancestors) = path.split_last().expect("a leaf below the root");
         let leaf_node = self.nodes.get(leaf);

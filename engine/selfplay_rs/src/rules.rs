@@ -1,5 +1,4 @@
-//the rules exactly as the python has them: python-chess, encoding.py, mcts.game_result and final_result in
-//tests/reference_selfplay.py (tests/test_selfplay_rs.py holds the two together)
+//the rules as the python has them, held together by tests/test_selfplay_rs.py
 use shakmaty::uci::UciMove;
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{Bitboard, Board, CastlingSide, Chess, Color, EnPassantMode, File, Move, MoveList, Position, Role, Square};
@@ -70,10 +69,7 @@ impl MoveIds {
 //a move's squares and promotion the way python-chess writes the move: castling as the king's two steps
 fn python_chess_squares(chess_move: Move) -> (usize, usize, usize) {
     match chess_move {
-        Move::Castle { king, rook } => {
-            let file = if rook > king { 6 } else { 2 };
-            (king.to_usize(), king.to_usize() / 8 * 8 + file, 0)
-        }
+        Move::Castle { king, rook } => (king.to_usize(), castle_target(king, rook).to_usize(), 0),
         _ => (
             chess_move.from().expect("no drops in chess").to_usize(),
             chess_move.to().to_usize(),
@@ -82,9 +78,13 @@ fn python_chess_squares(chess_move: Move) -> (usize, usize, usize) {
     }
 }
 
-//a tree edge's move in 2 bytes rather than shakmaty's 5, read in the position it is played from, which has the moved
-//piece and the capture: from 0..6, to 6..12 (a castle's rook), the kind 12..16 (0 a plain move, 1 to 4 a promotion to a
-//knight, bishop, rook or queen, EN_PASSANT, CASTLE)
+//the king's square after castling with `rook`: the g or c file
+fn castle_target(king: Square, rook: Square) -> Square {
+    Square::from_coords(if rook > king { File::G } else { File::C }, king.rank())
+}
+
+//a tree edge's move in 2 bytes, read in the position it is played from: from bits 0..6, to 6..12 (a castle's rook), kind 12..16
+//(0 plain, 1 to 4 a promotion to knight, bishop, rook or queen, EN_PASSANT, CASTLE)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PackedMove(u16);
 
@@ -103,7 +103,6 @@ impl PackedMove {
         PackedMove(code as u16)
     }
 
-    //the 16 bits, for storage that holds them as they are (SharedTree's atomics)
     pub fn from_bits(bits: u16) -> PackedMove {
         PackedMove(bits)
     }
@@ -144,15 +143,11 @@ impl PackedMove {
         }
     }
 
-    //Move::to_uci(CastlingMode::Standard)'s uci, no position needed: a castle as the king's two steps
+    //Move::to_uci(CastlingMode::Standard)'s uci, no position needed
     pub fn to_uci(self) -> UciMove {
         let (from, to) = (self.from(), self.to());
-        match self.kind() {
-            CASTLE => {
-                UciMove::Normal { from, to: Square::from_coords(if to > from { File::G } else { File::C }, from.rank()), promotion: None }
-            }
-            _ => UciMove::Normal { from, to, promotion: self.promotion() },
-        }
+        let to = if self.kind() == CASTLE { castle_target(from, to) } else { to };
+        UciMove::Normal { from, to, promotion: self.promotion() }
     }
 }
 
@@ -208,7 +203,6 @@ fn promotion_order(promotion: Option<Role>) -> u32 {
     }
 }
 
-//Board.is_insufficient_material
 pub fn is_insufficient_material(board: &Board) -> bool {
     has_insufficient_material(board, Color::White) && has_insufficient_material(board, Color::Black)
 }
@@ -229,16 +223,19 @@ fn has_insufficient_material(board: &Board, color: Color) -> bool {
     true
 }
 
-//occurrences of the last key (positions oldest first), counting back to the last capture or pawn move
-pub fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
-    let (current, earlier) = keys.split_last().expect("the position itself");
-    let since_zeroing = &earlier[earlier.len() - earlier.len().min(halfmoves as usize)..];
-    1 + since_zeroing.iter().filter(|&key| key == current).count()
+//the keys back to the last capture or pawn move, the last key (the position itself) included
+fn since_zeroing(keys: &[u64], halfmoves: u32) -> &[u64] {
+    let earlier = keys.len() - 1;
+    &keys[earlier - earlier.min(halfmoves as usize)..]
 }
 
-//the syzygy tables (engine.tablebase), memory mapped: a probe's few small reads would each be a system call. Mapped
-//for random reads (MADV_RANDOM, as TCEC asks of engines on its 7 piece tables): a probe reads a page or two, which
-//readahead would pad with pages no probe wants
+//occurrences of the last key (positions oldest first), counting back to the last capture or pawn move
+pub fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
+    let current = keys.last().expect("the position itself");
+    since_zeroing(keys, halfmoves).iter().filter(|&key| key == current).count()
+}
+
+//the syzygy tables (engine.tablebase), memory mapped for random reads: a probe reads a page or two, which readahead would pad
 pub struct Tables {
     tablebase: Tablebase<Chess>,
     pieces: usize,
@@ -255,7 +252,6 @@ impl Tables {
         Ok(Tables { tablebase, pieces })
     }
 
-    //engine.tablebase.covers
     pub fn covers(&self, board: &Chess) -> bool {
         board.board().occupied().count() <= self.pieces && board.castles().castling_rights().is_empty()
     }
@@ -332,10 +328,10 @@ pub fn final_result(
 
 //a legal move reaches a position for the third time (the second half of can_claim_threefold_repetition)
 fn threefold_after_a_move(board: &Chess, keys: &[u64], legal_moves: &MoveList) -> bool {
-    let since_zeroing = &keys[keys.len() - 1 - (keys.len() - 1).min(board.halfmoves() as usize)..];
+    let recent = since_zeroing(keys, board.halfmoves());
     legal_moves.iter().any(|&chess_move| {
         let key = position_key(&after(board, chess_move));
-        since_zeroing.iter().filter(|&&earlier| earlier == key).count() >= THREEFOLD - 1
+        recent.iter().filter(|&&earlier| earlier == key).count() >= THREEFOLD - 1
     })
 }
 
@@ -355,8 +351,7 @@ mod tests {
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     ];
 
-    //every legal move of positions with all kinds of moves comes back from its packing in its position, its uci without
-    //it, and no two of a position's moves share a packing
+    //every legal move comes back from its packing in its position, its uci without it, and no two of a position's moves share a packing
     #[test]
     fn a_move_comes_back_from_its_packing() {
         let mut kinds = [0; 7];

@@ -1,24 +1,24 @@
 //cargo test --release bench_replay -- --ignored --nocapture --test-threads 1: bench_drivers' drivers on the real network's
-//recorded answers (rust-selection's answers_all.pkl, exported by concurrent-descents/export_store.py to BENCH_STORE, and
-//BENCH_POSITIONS, one line a position: game, move, fen, moves), a Tree behind a lock (bench_replay_locked) or a
-//SharedTree (bench_replay_shared). BENCH_GAME and BENCH_MOVE choose the position,
-//BENCH_VISITS what one thread searches of it first; the rest is bench_drivers'. A board the recording lacks gets the
-//stand-in's answer, and "recorded" tells their share of the timed rounds
+//recorded answers, a Tree behind a lock (bench_replay_locked) or a SharedTree (bench_replay_shared). Environment: BENCH_STORE
+//(rust-selection's answers_all.pkl, exported by concurrent-descents/export_store.py), BENCH_MOVE_IDS (the move id table it is
+//by, concurrent-descents/move_ids.bin), BENCH_POSITIONS (a line a position: game, move, fen, moves), BENCH_GAME and BENCH_MOVE
+//(the position), BENCH_VISITS (what one thread searches of it first); the rest is bench_drivers'. A board the recording lacks
+//gets the stand-in's answer, and "recorded" tells the recorded share of the timed rounds' boards
 use super::*;
 
-//the engine's answer: its 1,968 move ids' logits, then the expected score
+//an answer: the 1,968 move ids' logits, then the expected score
 const WIDTH: usize = 1969;
+const CACHE_POSITIONS: usize = 5_000_000;
 
-//the engine's move id table (concurrent-descents/move_ids.bin, from engine_search_settings), the ids the recording is by
 fn engine_move_ids() -> MoveIds {
     let bytes = std::fs::read(std::env::var("BENCH_MOVE_IDS").expect("BENCH_MOVE_IDS")).expect("the move ids");
-    MoveIds::new(bytes.chunks_exact(2).map(|pair| i16::from_le_bytes([pair[0], pair[1]])).collect())
+    MoveIds::new(bytes.as_chunks::<2>().0.iter().copied().map(i16::from_le_bytes).collect())
 }
 
-//a board's legal moves' logits and its value, by the board's hash
 struct Replay {
     index: HashMap<u64, usize>,
     data: Vec<u8>,
+    stand_in: StandIn,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -28,29 +28,30 @@ fn read<const N: usize>(data: &[u8], at: usize) -> [u8; N] {
 }
 
 impl Replay {
+    //"ANS1", u64 count, then a record a board: tokens, u16 moves, f32 value, i16 move ids, f32 logits
     fn load(path: &str) -> Replay {
         let data = std::fs::read(path).expect("BENCH_STORE, the exported answers");
         assert_eq!(&data[..4], b"ANS1");
         let count = u64::from_le_bytes(read(&data, 4)) as usize;
         let (mut index, mut at) = (HashMap::with_capacity(count), 12);
         for _ in 0..count {
-            index.insert(StandIn::seed(&data[at..at + TOKENS_PER_BOARD]), at);
-            at += TOKENS_PER_BOARD + 6 + 6 * usize::from(u16::from_le_bytes(read(&data, at + TOKENS_PER_BOARD)));
+            let head = at + TOKENS_PER_BOARD;
+            index.insert(StandIn::seed(&data[at..head]), at);
+            at = head + 6 + 6 * usize::from(u16::from_le_bytes(read(&data, head)));
         }
-        Replay { index, data, hits: AtomicU64::new(0), misses: AtomicU64::new(0) }
+        Replay { index, data, stand_in: StandIn::from_environment(), hits: AtomicU64::new(0), misses: AtomicU64::new(0) }
     }
 
-    //the board's whole answer row: the recorded one, or the stand-in's
-    fn row(&self, board: &[u8], stand_in: &StandIn) -> Vec<f32> {
+    fn row(&self, board: &[u8]) -> Vec<f32> {
         let Some(&at) = self.index.get(&StandIn::seed(board)) else {
             self.misses.fetch_add(1, Ordering::Relaxed);
-            return stand_in.row_of(board, WIDTH);
+            return self.stand_in.row_of(board, WIDTH);
         };
         self.hits.fetch_add(1, Ordering::Relaxed);
         let data = &self.data;
-        let (moves, value) =
-            (usize::from(u16::from_le_bytes(read(data, at + TOKENS_PER_BOARD))), f32::from_le_bytes(read(data, at + TOKENS_PER_BOARD + 2)));
-        let (ids, logits) = (at + TOKENS_PER_BOARD + 6, at + TOKENS_PER_BOARD + 6 + 2 * moves);
+        let head = at + TOKENS_PER_BOARD;
+        let (moves, value) = (usize::from(u16::from_le_bytes(read(data, head))), f32::from_le_bytes(read(data, head + 2)));
+        let (ids, logits) = (head + 6, head + 6 + 2 * moves);
         let mut row = vec![-30.0; WIDTH];
         for place in 0..moves {
             row[i16::from_le_bytes(read(data, ids + 2 * place)) as usize] = f32::from_le_bytes(read(data, logits + 4 * place));
@@ -59,15 +60,17 @@ impl Replay {
         row
     }
 
+    fn rows(&self, boards: &[u8]) -> Vec<Vec<f32>> {
+        boards.as_chunks::<TOKENS_PER_BOARD>().0.iter().map(|board| self.row(board)).collect()
+    }
+
     fn recorded(&self) -> (u64, u64) {
         (self.hits.load(Ordering::Relaxed), self.misses.load(Ordering::Relaxed))
     }
 }
 
-//a search the drivers share
 trait Searcher: Sync {
     fn visits(&self) -> u32;
-    //a round's boards
     fn gather(&self, round: &Round) -> Vec<u8>;
     fn finish(&self, round: u64, rows: &[Vec<f32>]);
 }
@@ -129,32 +132,25 @@ impl Searcher for Concurrent {
     }
 }
 
-//one thread's rounds on the recorded answers until the root has `visits`, two rounds out as the recorded searches had
-fn base_search(
-    position: &(String, Vec<String>),
-    visits: u32,
-    replay: &Replay,
-    stand_in: StandIn,
-    settings: &SearchSettings,
-) -> (Tree, Cache) {
-    let moves: Vec<&str> = position.1.iter().map(String::as_str).collect();
-    let (mut tree, mut cache) = (tree_after(&position.0, &moves), Cache::new(5_000_000));
-    let move_ids = engine_move_ids();
+//rounds on the recorded answers until the root has `visits`, two out at a time as the recorded searches had
+fn base_search(fen: &str, moves: &[String], visits: u32, replay: &Replay, move_ids: &MoveIds, settings: &SearchSettings) -> (Tree, Cache) {
+    let moves: Vec<&str> = moves.iter().map(String::as_str).collect();
+    let (mut tree, mut cache) = (tree_after(fen, &moves), Cache::new(CACHE_POSITIONS));
     let mut waiting: VecDeque<(u64, Vec<Vec<f32>>)> = VecDeque::new();
     let mut id = 0;
     loop {
-        if (tree.root().visit_count as usize + tree.pending() < visits as usize) && waiting.len() < 2 {
+        if tree.root().visit_count as usize + tree.pending() < visits as usize && waiting.len() < 2 {
             let leaves = (tree.root().visit_count / 16).clamp(1, 64);
             let round = Round { id, leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: visits, memory_limit: usize::MAX };
             let mut boards = Vec::new();
             tree.gather(&round, settings, None, Some(&cache), &mut boards).expect("no tables");
-            waiting.push_back((id, boards.as_chunks::<TOKENS_PER_BOARD>().0.iter().map(|board| replay.row(board, &stand_in)).collect()));
+            waiting.push_back((id, replay.rows(&boards)));
             id += 1;
             continue;
         }
         let Some((round, rows)) = waiting.pop_front() else { break };
         for row in &rows {
-            tree.finish_leaf(round, |column| row[column], WIDTH, &move_ids, Some(&mut cache), settings);
+            tree.finish_leaf(round, |column| row[column], WIDTH, move_ids, Some(&mut cache), settings);
         }
     }
     (tree, cache)
@@ -162,12 +158,12 @@ fn base_search(
 
 fn position(game: usize, place: usize) -> (String, Vec<String>) {
     let text = std::fs::read_to_string(std::env::var("BENCH_POSITIONS").expect("BENCH_POSITIONS")).expect("the positions");
-    let line = text
+    let fields = text
         .lines()
         .map(|line| line.split('\t').collect::<Vec<_>>())
         .find(|fields| fields[0] == game.to_string() && fields[1] == place.to_string())
         .expect("the position");
-    (line[2].to_string(), line[3].split_whitespace().map(String::from).collect())
+    (fields[2].to_string(), fields[3].split_whitespace().map(String::from).collect())
 }
 
 fn replay_drivers(shared: bool) {
@@ -175,27 +171,26 @@ fn replay_drivers(shared: bool) {
     let (drivers, in_flight) = (setting("BENCH_DRIVERS", 8usize), setting("BENCH_IN_FLIGHT", 2usize));
     let collisions = setting("BENCH_COLLISIONS", 0u32);
     let driver_cpus = if std::env::var("BENCH_DRIVER_CPUS").is_ok() { settings_list("BENCH_DRIVER_CPUS", "") } else { Vec::new() };
-    let (stand_in, search_settings) = (StandIn::from_environment(), settings(true));
+    let search_settings = settings(true);
     let replay = Replay::load(&std::env::var("BENCH_STORE").expect("BENCH_STORE"));
-    let place = position(setting("BENCH_GAME", 0usize), setting("BENCH_MOVE", 0usize));
+    let (fen, moves) = position(setting("BENCH_GAME", 0usize), setting("BENCH_MOVE", 0usize));
+    let move_ids = engine_move_ids();
     let built = Instant::now();
-    let (base, base_cache) = base_search(&place, visits, &replay, stand_in, &search_settings);
+    let (base, base_cache) = base_search(&fen, &moves, visits, &replay, &move_ids, &search_settings);
     let (hits, misses) = replay.recorded();
     println!(
-        "{} + {} moves: {} nodes, {:.1}% of the boards recorded ({hits} of {}), built in {:.1} s; {drivers} {} drivers, {in_flight} rounds out each, {timed} rounds",
-        place.0,
-        place.1.len(),
+        "{fen} + {} moves: {} nodes, {:.1}% of the boards recorded ({hits} of {}), built in {:.1} s; {drivers} {} drivers, {in_flight} rounds out each, {timed} rounds",
+        moves.len(),
         base.nodes.len(),
         100.0 * hits as f64 / (hits + misses) as f64,
         hits + misses,
         built.elapsed().as_secs_f64(),
         if shared { "shared" } else { "locked" }
     );
-    let move_ids = engine_move_ids();
-    let searcher: Box<dyn Searcher + '_> = if shared {
+    let searcher: Box<dyn Searcher> = if shared {
         Box::new(Concurrent {
             tree: SharedTree::from_tree(&base),
-            cache: SharedCache::from_cache(&base_cache, 5_000_000),
+            cache: SharedCache::from_cache(&base_cache, CACHE_POSITIONS),
             settings: search_settings,
             move_ids,
         })
@@ -206,9 +201,7 @@ fn replay_drivers(shared: bool) {
             move_ids,
         })
     };
-    let searcher = &*searcher;
     drop((base, base_cache));
-    let before = replay.recorded();
     let (run, leaves) = ((Mutex::new(DriversRun::default()), Condvar::new()), AtomicU64::new(0));
     //the nanoseconds the drivers spent in gather and in finish
     let spent = (AtomicU64::new(0), AtomicU64::new(0));
@@ -216,13 +209,13 @@ fn replay_drivers(shared: bool) {
     let started = Instant::now();
     std::thread::scope(|scope| {
         for driver in 0..drivers {
-            let (leaves, run, replay, spent) = (&leaves, &run, &replay, &spent);
+            let (searcher, leaves, run, replay, spent) = (&searcher, &leaves, &run, &replay, &spent);
             let cpu = (!driver_cpus.is_empty()).then(|| driver_cpus[driver % driver_cpus.len()]);
             scope.spawn(move || {
                 if let Some(cpu) = cpu {
                     assert!(crate::affinity::pin_current(cpu), "driver pinned to cpu {cpu}");
                 }
-                let mut waiting: VecDeque<(u64, bool, Vec<Vec<f32>>)> = VecDeque::new();
+                let mut waiting: VecDeque<(u64, Vec<Vec<f32>>)> = VecDeque::new();
                 loop {
                     let next_round = {
                         let mut state = run.0.lock().expect("the run");
@@ -242,35 +235,33 @@ fn replay_drivers(shared: bool) {
                     };
                     if let Some((id, answered)) = next_round {
                         let count = (searcher.visits() / 16).clamp(1, 64);
-                        let collisions = if collisions == 0 { count } else { collisions };
                         let round = Round {
                             id,
                             leaves: count,
                             simulations: 3 * count,
-                            collisions,
+                            collisions: if collisions == 0 { count } else { collisions },
                             visit_limit: u32::MAX,
                             memory_limit: usize::MAX,
                         };
                         let gathering = Instant::now();
                         let boards = searcher.gather(&round);
                         spent.0.fetch_add(gathering.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        //the network's answer for each board, out of any lock
-                        let rows: Vec<Vec<f32>> =
-                            boards.as_chunks::<TOKENS_PER_BOARD>().0.iter().map(|board| replay.row(board, &stand_in)).collect();
+                        //answered out of any lock
+                        let rows = replay.rows(&boards);
                         leaves.fetch_add(rows.len() as u64, Ordering::Relaxed);
                         if rows.is_empty() {
                             run.0.lock().expect("the run").starved = Some(answered);
                         }
-                        waiting.push_back((id, !rows.is_empty(), rows));
+                        waiting.push_back((id, rows));
                         continue;
                     }
-                    let Some((id, with_leaves, rows)) = waiting.pop_front() else { break };
+                    let Some((id, rows)) = waiting.pop_front() else { break };
                     let finishing = Instant::now();
                     searcher.finish(id, &rows);
                     spent.1.fetch_add(finishing.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let mut state = run.0.lock().expect("the run");
                     state.out -= 1;
-                    state.answered += u64::from(with_leaves);
+                    state.answered += u64::from(!rows.is_empty());
                     run.1.notify_all();
                 }
             });
@@ -278,7 +269,8 @@ fn replay_drivers(shared: bool) {
     });
     let seconds = started.elapsed().as_secs_f64();
     let (simulations, leaves) = (searcher.visits() - start, leaves.load(Ordering::Relaxed));
-    let (hits, misses) = (replay.recorded().0 - before.0, replay.recorded().1 - before.1);
+    let (recorded_hits, recorded_misses) = replay.recorded();
+    let (hits, misses) = (recorded_hits - hits, recorded_misses - misses);
     println!(
         "{}\trepeat 0\tevals_per_s {:.0}\tsims_per_s {:.0}\tus_per_eval {:.3}\tleaves_per_round {:.1}\trecorded {:.3}\tgather_us {:.3}\tfinish_us {:.3}",
         if shared { "SHARED" } else { "DRIVERS" },

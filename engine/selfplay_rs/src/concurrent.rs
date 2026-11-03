@@ -1,17 +1,15 @@
-//Searches with concurrent_descents: the searches are SharedTrees (search/shared.rs), so a call holds the state lock only to
-//find them and to queue or take a round, and the threads that drive the networks descend, finish and back up in one
-//tree at once. The plain mode's search and its locks (lib.rs) are untouched
+//Searches with concurrent_descents: the searches are SharedTrees (search/shared.rs) that the networks' threads descend, finish
+//and back up in at once, so a call holds the state lock only to find them and to queue or take a round
 use super::*;
 use search::SharedTree;
 
-//a running search of concurrent mode; the tree is shared with the calls in it
 pub(crate) struct SharedSearch {
-    pub(crate) id: u64,
-    pub(crate) fen: String,
-    pub(crate) moves: Vec<String>,
-    pub(crate) simulations: u32,
+    id: u64,
+    fen: String,
+    moves: Vec<String>,
+    simulations: u32,
     pub(crate) stopped: bool,
-    pub(crate) tree: Arc<SharedTree>,
+    tree: Arc<SharedTree>,
 }
 
 impl SharedSearch {
@@ -19,8 +17,7 @@ impl SharedSearch {
         (self.stopped || self.tree.root().visits() >= self.simulations || self.tree.is_full()) && self.tree.pending() == 0
     }
 
-    //the search's report if it is done, looked at with no call in its tree: a thread that was gathering when it looked done
-    //may have a leaf out by now. A search that is done closes its tree to the calls that still have it
+    //done is checked again with no call in the tree: a thread that was gathering when it looked done may have a leaf out by now
     fn end(&self) -> Option<SearchReport> {
         if !self.done() {
             return None;
@@ -33,34 +30,42 @@ impl SharedSearch {
         })
     }
 
-    //as player.search_move reports it
+    //the chosen move's score; the root's for its side to move while the move has no visit (one simulation)
+    fn score(&self, best: Option<usize>) -> f64 {
+        let tree = &self.tree;
+        match best.and_then(|edge| tree.child(tree.root(), edge)) {
+            Some(chosen) if chosen.visits() > 0 => chosen.mean_score(chosen.visits()),
+            _ => 1.0 - tree.root().mean_score(tree.root().visits()),
+        }
+    }
+
+    fn root_score(&self) -> f64 {
+        self.score(self.tree.principal_variation().first().copied())
+    }
+
     fn report(&self) -> SearchReport {
         let tree = &self.tree;
         let line = tree.principal_variation();
-        //one simulation visits no child: then the root's score for its side to move
-        let score = match tree.child(tree.root(), line[0]) {
-            Some(chosen) if chosen.visits() > 0 => chosen.mean_score(chosen.visits()),
-            _ => 1.0 - tree.root().mean_score(tree.root().visits()),
-        };
-        let moves = |edges: &[usize]| -> Vec<String> { edges.iter().map(|&edge| uci(tree.chess_move(edge))).collect() };
+        let score = self.score(Some(line[0]));
+        let moves = line.iter().map(|&edge| uci(tree.chess_move(edge)));
         let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(tree.root(), edge)));
-        (self.id, moves(&line), score, root_moves.collect(), tree.root().visits())
+        (self.id, moves.collect(), score, root_moves.collect(), tree.root().visits())
     }
 }
 
-//the root's score of a running search (root_score_of's)
-fn shared_root_score(search: &SharedSearch) -> f64 {
-    let tree = &search.tree;
-    match tree.principal_variation().first().and_then(|&edge| tree.child(tree.root(), edge)) {
-        Some(chosen) if chosen.visits() > 0 => chosen.mean_score(chosen.visits()),
-        _ => 1.0 - tree.root().mean_score(tree.root().visits()),
+impl State {
+    fn shared_search(&self, id: u64) -> Option<&SharedSearch> {
+        self.shared_searches.iter().find(|search| search.id == id)
     }
+}
+
+fn no_search(id: u64) -> PyErr {
+    PyValueError::new_err(format!("no search {id}"))
 }
 
 impl Searches {
-    //the running search `id`'s tree
     pub(crate) fn shared_tree(&self, id: u64) -> PyResult<Option<Arc<SharedTree>>> {
-        Ok(self.lock()?.shared_searches.iter().find(|search| search.id == id).map(|search| search.tree.clone()))
+        Ok(self.lock()?.shared_search(id).map(|search| search.tree.clone()))
     }
 
     pub(crate) fn shared_start(&self, id: u64, fen: &str, moves: Vec<String>, simulations: u32) -> PyResult<()> {
@@ -68,7 +73,7 @@ impl Searches {
             return Err(PyValueError::new_err("a search needs at least one simulation"));
         }
         let mut state = self.lock()?;
-        if state.shared_searches.iter().any(|search| search.id == id) {
+        if state.shared_search(id).is_some() {
             return Err(PyValueError::new_err(format!("search {id} is already running")));
         }
         let (board, keys) = play_out(fen, &moves)?;
@@ -78,12 +83,11 @@ impl Searches {
         let tree = self
             .shared_reused_tree(&mut state, id, fen, &moves)
             .unwrap_or_else(|| SharedTree::new(board, keys).with_transpositions(self.settings.transpositions));
-        let tree = Arc::new(tree);
-        state.shared_searches.push(SharedSearch { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
+        state.shared_searches.push(SharedSearch { id, fen: fen.to_string(), moves, simulations, stopped: false, tree: Arc::new(tree) });
         Ok(())
     }
 
-    //descend_round without the state lock around the gathers: the boards of up to `leaves` new leaves of every search
+    //descend_round without the state lock around the gathers
     pub(crate) fn shared_descend(
         &self,
         leaves: u32,
@@ -144,9 +148,9 @@ impl Searches {
         Ok(())
     }
 
-    //finish_round without the state lock around the finishes. Returns the reports of the searches that are done
+    //finish_round without the state lock around the finishes; the reports of the searches that are done
     pub(crate) fn shared_finish<N: Number>(&self, answers: &[N], round: Option<u64>) -> PyResult<Vec<SearchReport>> {
-        let (out, trees) = {
+        let (out, trees, width) = {
             let mut state = self.lock()?;
             let index = match round {
                 None => {
@@ -165,12 +169,11 @@ impl Searches {
             let trees: Vec<Arc<SharedTree>> = out
                 .leaves
                 .iter()
-                .map(|&(id, _)| state.shared_searches.iter().find(|search| search.id == id).map(|search| search.tree.clone()))
+                .map(|&(id, _)| state.shared_search(id).map(|search| search.tree.clone()))
                 .collect::<Option<_>>()
                 .ok_or_else(|| PyRuntimeError::new_err("a search of the round is gone"))?;
-            (out, trees)
+            (out, trees, width)
         };
-        let width = if out.lean { LEAN_COLUMNS } else { self.answer_width };
         let mut rows = answers.chunks_exact(width);
         //a lean answer put back in its columns of a whole row, where finish_leaf reads it
         let mut row = if out.lean { vec![0.0; self.answer_width] } else { Vec::new() };
@@ -189,10 +192,9 @@ impl Searches {
                         row[column] = number.number();
                     }
                 }
-                let lean = out.lean;
                 tree.finish_leaf(
                     leaf,
-                    |column| if lean { row[column] } else { answer[column].number() },
+                    |column| if out.lean { row[column] } else { answer[column].number() },
                     self.answer_width,
                     &self.move_ids,
                     self.shared_cache.as_ref(),
@@ -206,18 +208,17 @@ impl Searches {
         Ok(self.shared_reports(&mut state))
     }
 
-    //removes the searches that are done, the reports of those that were searched; each is reported once no call is in
-    //its tree
-    pub(crate) fn shared_reports(&self, state: &mut State) -> Vec<SearchReport> {
+    //removes the searches that are done and reports them, each once no call is in its tree
+    fn shared_reports(&self, state: &mut State) -> Vec<SearchReport> {
         let mut reports = Vec::new();
-        let mut at = 0;
-        while at < state.shared_searches.len() {
-            let Some(report) = state.shared_searches[at].end() else {
-                at += 1;
-                continue;
-            };
-            reports.push(report);
-            let search = state.shared_searches.remove(at);
+        let ended = state.shared_searches.extract_if(.., |search| match search.end() {
+            Some(report) => {
+                reports.push(report);
+                true
+            }
+            None => false,
+        });
+        for search in ended {
             if self.tree_reuse {
                 state.shared_kept.insert(search.id, KeptTree { fen: search.fen, moves: search.moves, tree: Kept::Searched(search.tree) });
             }
@@ -225,12 +226,11 @@ impl Searches {
         reports
     }
 
-    //stop's: the search's report if no leaf of it waits. With `if_running` a search that is gone is not an error: another
-    //thread's finish has ended it, and its report is on its way
+    //with `if_running` a search that is gone is no error: another thread's finish has ended it and reports it
     fn shared_stop_with(&self, id: u64, if_running: bool) -> PyResult<Option<SearchReport>> {
         let mut state = self.lock()?;
         let Some(search) = state.shared_searches.iter_mut().find(|search| search.id == id) else {
-            return if if_running { Ok(None) } else { Err(PyValueError::new_err(format!("no search {id}"))) };
+            return if if_running { Ok(None) } else { Err(no_search(id)) };
         };
         if search.tree.root().visits() == 0 && search.tree.pending() == 0 {
             return Err(PyRuntimeError::new_err(format!("search {id} was stopped before its first simulation")));
@@ -248,13 +248,10 @@ impl Searches {
         if self.concurrent_descents { self.shared_stop_with(id, true) } else { self.stop_search(&mut *self.lock()?, id) }
     }
 
-    //the root's score of a running search, None once it is gone
     pub(crate) fn shared_root_score_if_running(&self, id: u64) -> PyResult<Option<f64>> {
-        let state = self.lock()?;
-        Ok(state.shared_searches.iter().find(|search| search.id == id).map(shared_root_score))
+        Ok(self.lock()?.shared_search(id).map(SharedSearch::root_score))
     }
 
-    //root_numbers of a running search, None when it is not running
     pub(crate) fn shared_root_numbers(&self, id: u64) -> PyResult<Option<RootNumbers>> {
         Ok(self.shared_tree(id)?.map(|tree| {
             let (most, second) = tree.two_most_visits();
@@ -264,24 +261,20 @@ impl Searches {
 
     pub(crate) fn shared_root_score(&self, id: u64) -> PyResult<f64> {
         let state = self.lock()?;
-        let search =
-            state.shared_searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
-        Ok(shared_root_score(search))
+        Ok(state.shared_search(id).ok_or_else(|| no_search(id))?.root_score())
     }
 
     pub(crate) fn shared_report_now(&self, id: u64) -> PyResult<Option<SearchReport>> {
         let state = self.lock()?;
-        let search =
-            state.shared_searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))?;
+        let search = state.shared_search(id).ok_or_else(|| no_search(id))?;
         Ok(search.tree.root().has_edges().then(|| search.report()))
     }
 
-    //the tree of a running search, or the error of every call that asks for one
     pub(crate) fn shared_running(&self, id: u64) -> PyResult<Arc<SharedTree>> {
-        self.shared_tree(id)?.ok_or_else(|| PyValueError::new_err(format!("no search {id}")))
+        self.shared_tree(id)?.ok_or_else(|| no_search(id))
     }
 
-    //a new game under the id (uci's ucinewgame): its first search starts a fresh tree, and the network's answers are forgotten
+    //ucinewgame: the id's next search starts a fresh tree, and the network's answers are forgotten
     pub(crate) fn shared_new_game(&self, id: u64) -> PyResult<()> {
         if let Some(kept) = self.lock()?.shared_kept.remove(&id) {
             kept.tree.abandon();
@@ -292,9 +285,7 @@ impl Searches {
         Ok(())
     }
 
-    //the id's kept tree under the position after `moves`, when it is the same game and holds the moves played since, as
-    //reused_tree does for a Tree. A tree is reused only once the calls of its last search have left it (it is then the
-    //kept slot's alone)
+    //reused_tree for a SharedTree: None while a call of its last search still holds the tree
     fn shared_reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String]) -> Option<SharedTree> {
         let kept = state.shared_kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
@@ -329,11 +320,11 @@ impl Searches {
         }
     }
 
-    //advance for a SharedTree: the root moves down in place, and on a thread of its own the tree finds the leaves the next
-    //root may make stale and copies the kept part out of the rest
+    //advance for a SharedTree: the root moves down in place, and a thread finds the leaves the next root may make stale and
+    //copies the kept part out of the rest
     pub(crate) fn shared_advance(&self, id: u64, fen: &str, moves: Vec<String>) -> PyResult<bool> {
         let mut state = self.lock()?;
-        if state.shared_searches.iter().any(|search| search.id == id) {
+        if state.shared_search(id).is_some() {
             return Err(PyValueError::new_err(format!("search {id} is running")));
         }
         let Some(kept) = state.shared_kept.remove(&id) else { return Ok(false) };
@@ -345,8 +336,8 @@ impl Searches {
         let Some(mut tree) = Arc::into_inner(tree) else { return Ok(false) };
         let Some((line, _)) = shared_line_to(&tree, &moves[kept.moves.len()..]) else { return Ok(false) };
         tree.move_root(&line);
-        let (stops, threads) = (Arc::new(Stops::default()), self.advance_threads);
-        let thread_stops = stops.clone();
+        let stops = Arc::new(Stops::default());
+        let (thread_stops, threads) = (stops.clone(), self.advance_threads);
         let carry = move || {
             let candidates = tree.stale_candidates(threads, &thread_stops.walk);
             if candidates.is_some() {
@@ -361,8 +352,8 @@ impl Searches {
     }
 }
 
-//the moves since (uci) as the edges from the tree's root down to the position after them, and as their places among their
-//nodes' moves, when every move has its node and the last node has moves (line_to's)
+//the moves since (uci) as the edges from the tree's root down to the position after them and their places among their
+//nodes' moves; None unless every move has its node and the last node has moves
 fn shared_line_to(tree: &SharedTree, moves: &[String]) -> Option<(Vec<usize>, Vec<u16>)> {
     let (mut line, mut places, mut root) = (Vec::new(), Vec::new(), tree.root());
     for played in moves {

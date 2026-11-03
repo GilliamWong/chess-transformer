@@ -1,13 +1,9 @@
-//cargo test --release bench_shared -- --ignored --nocapture --test-threads 1: bench_drivers' drivers on a SharedTree, no lock
-//around the tree (the same environment: BENCH_VISITS ROUNDS IN_FLIGHT DRIVERS REPEATS FIRST DRIVER_CPUS COLLISIONS and the
-//stand-in's), the line it prints is bench_drivers'. BENCH_TRANSPOSITIONS=1 searches with transpositions: the drivers grow
-//the graph from the position to BENCH_VISITS themselves (a Tree's copy has no graph), then the timed rounds; BENCH_GROW=1
-//grows a tree so too.
-//BENCH_SOLID_THRESHOLD and BENCH_SOLID_BATCH set the tree's solid slots (with_solid_links)
+//cargo test --release bench_shared -- --ignored --nocapture --test-threads 1: bench_drivers' drivers and environment on a
+//SharedTree, no lock. BENCH_TRANSPOSITIONS=1 or BENCH_GROW=1: the drivers grow the tree from the position to BENCH_VISITS.
+//BENCH_SOLID_THRESHOLD and BENCH_SOLID_BATCH set the tree's solid slots
 use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
 
-//BENCH_DRIVERS threads on one SharedTree, each with BENCH_IN_FLIGHT rounds out and the stand-in's answers at once
 #[test]
 #[ignore]
 fn bench_shared_drivers() {
@@ -16,7 +12,6 @@ fn bench_shared_drivers() {
     let (drivers, in_flight) = (setting("BENCH_DRIVERS", 8usize), setting("BENCH_IN_FLIGHT", 2usize));
     let collisions = setting("BENCH_COLLISIONS", 0u32);
     let transpositions = setting("BENCH_TRANSPOSITIONS", 0u32) == 1;
-    //the drivers grow the tree from the position too (BENCH_GROW=1), as they always grow a graph
     let grow = transpositions || setting("BENCH_GROW", 0u32) == 1;
     let driver_cpus = if std::env::var("BENCH_DRIVER_CPUS").is_ok() { settings_list("BENCH_DRIVER_CPUS", "") } else { Vec::new() };
     let (stand_in, mut settings, move_ids) = (StandIn::from_environment(), settings(true), Network::new().move_ids);
@@ -73,8 +68,7 @@ fn bench_shared_drivers() {
                                 visit_limit: u32::MAX,
                                 memory_limit: usize::MAX,
                             };
-                            let queued = tree.gather(&round, settings, None, Some(cache), &mut boards).expect("no tables");
-                            tree.queue(id, queued);
+                            tree.queue(id, tree.gather(&round, settings, None, Some(cache), &mut boards).expect("no tables"));
                             leaves.fetch_add((boards.len() / TOKENS_PER_BOARD) as u64, Ordering::Relaxed);
                             if boards.is_empty() {
                                 run.0.lock().expect("the run").starved = Some(answered);
@@ -85,8 +79,7 @@ fn bench_shared_drivers() {
                         let Some((id, boards)) = waiting.pop_front() else { break };
                         {
                             let _hold = tree.hold();
-                            let queued = tree.take_round(id);
-                            for (leaf, board) in queued.into_iter().zip(boards.as_chunks::<TOKENS_PER_BOARD>().0) {
+                            for (leaf, board) in tree.take_round(id).into_iter().zip(boards.as_chunks::<TOKENS_PER_BOARD>().0) {
                                 let seed = StandIn::seed(board);
                                 tree.finish_leaf(
                                     leaf,
