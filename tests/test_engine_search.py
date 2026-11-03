@@ -1678,13 +1678,46 @@ def test_the_options_reach_the_search(monkeypatch):
     uci.main(Path("unused.pt"), selection="mcts", search_options={"smart_pruning": False})
 
     assert [line.split()[2] for line in sent if line.startswith("option name")] == ["SyzygyPath", "SyzygyProbeLimit", "MoveOverhead", "CachePositions",
-                                                                                     "RamLimitMb", "AdvanceThreads"]
+                                                                                     "RamLimitMb", "AdvanceThreads", "FirstMoveBonus", "BookPlyBonus",
+                                                                                     "SearchSettings"]
     assert len(built) == 1 and built[0][4] is False
     assert built[0][5] == {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64,
                            "advance_threads": 12}
     assert given == [pytest.approx(0.5), pytest.approx(0.9), pytest.approx(0.9)]
     told = [line for line in sent if line.startswith("info string")]
     assert len(told) == 5 and "AdvanceThreads" in told[0] and "-1" in told[1] and "7" in told[2] and "Hash" in told[3] and "CachePositions" in told[4]
+
+#the competition options reach the search on the gpu as the command line's would: GPUs, Leaves, SmartPruningFactor (0
+#for none) and SearchSettings over --search-settings' at isready, the clock's bonuses at each game's first search. Values the
+#engine could not take (a device that is not there, one leaf on several gpus, an unknown setting) leave them as they were
+def test_the_competition_options_reach_the_search(monkeypatch):
+    built, given = [], []
+    class Player:
+        def search(self, board, nodes, seconds, extension, stop, info=None):
+            given.append(seconds)
+            return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
+    script = ["uci", "setoption name GPUs value 0,1,2", "setoption name GPUs value 0,7", "setoption name Leaves value 32",
+              "setoption name SmartPruningFactor value 0", "setoption name SearchSettings value fpu_reduction=0.3",
+              "setoption name SearchSettings value nope=1", "setoption name FirstMoveBonus value 1.8", "setoption name BookPlyBonus value x",
+              "isready", "setoption name Leaves value 16", "position startpos", "go " + " ".join(CLOCK_60), "ucinewgame", "position startpos",
+              "go " + " ".join(CLOCK_60), "quit"]
+    sent = []
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(uci, "load_player", lambda *arguments: built.append(arguments) or Player())
+    monkeypatch.setattr(uci, "send", sent.append)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(script)))
+    uci.main(Path("unused.pt"), selection="mcts", gpu=True, gpus=[0], search_options={"settings": {"c_puct": 0.7}})
+
+    names = [line.split()[2] for line in sent if line.startswith("option name")]
+    assert names[6:] == ["Leaves", "GPUs", "SmartPruningFactor", "FirstMoveBonus", "BookPlyBonus", "SearchSettings"]
+    assert "option name GPUs type string default 0" in sent
+    (_, _, _, leaves, _, options, _, _, gpus), = built
+    assert (leaves, gpus) == (32, [0, 1, 2])
+    assert options["smart_pruning"] is False and options["settings"] == {"c_puct": 0.7, "fpu_reduction": 0.3}
+    first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
+    assert given == [first, first]
+    told = [line for line in sent if line.startswith("info string")]
+    assert len(told) == 4 and "device 7" in told[0] and "nope" in told[1] and "BookPlyBonus" in told[2] and "Leaves" in told[3]
 
 #EngineSearch makes its Searches with the cache size, memory limit and advance threads it is given, and a search ends at
 #the limit

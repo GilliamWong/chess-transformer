@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 import queue
 import random
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -28,13 +30,36 @@ from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, C
 from engine.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
 
 ENGINE_NAME = "ChessTransformer"
+REPOSITORY = Path(__file__).resolve().parent.parent
 
 #one board takes a few ms on the cpu, less than starting cuda; one thread so parallel games don't fight over cores
 DEVICE = torch.device("cpu")
 #the time between the search's end and the gui reading bestmove, kept off go's time (uci option MoveOverhead)
 MOVE_OVERHEAD_SECONDS = 0.02
+#uci's id name version: pyproject.toml's, with the commit when the engine runs from a git checkout. git gets no stdin:
+#given the gui's pipe it waits on it
+def engine_version() -> str:
+    version = re.search(r'^version = "([^"]+)"', (REPOSITORY / "pyproject.toml").read_text(), re.MULTILINE).group(1)
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPOSITORY, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        commit = ""
+    return f"{version}-{commit}" if commit else version
+
+#--gpus and the GPUs option: "all" for every cuda device, else devices by number ("0,1,2")
+def parse_gpus(text: str) -> list[int]:
+    if text == "all":
+        if not torch.cuda.device_count():
+            raise ValueError("there is no cuda device")
+        return list(range(torch.cuda.device_count()))
+    devices = [int(device) for device in text.split(",")]
+    if min(devices) < 0 or len(set(devices)) < len(devices):
+        raise ValueError(f"{text} is not a list of different cuda devices")
+    return devices
+
 #go's arguments that take a number
-GO_NUMBERS = ("wtime", "btime", "winc", "binc", "movestogo", "movetime", "nodes", "depth", "mate")
+GO_NUMBERS =("wtime", "btime", "winc", "binc", "movestogo", "movetime", "nodes", "depth", "mate")
 #with wtime/btime and no movestogo, the time left is planned over the moves the game still has, this many a man above
 #the two kings: the plan follows the material rather than a move number
 MOVES_PER_MAN = 1.5
@@ -311,12 +336,20 @@ class Commands:
         with self.lock:
             self.unfinished.remove(go)
 
-#setoption's whole number options, (lowest, highest): the tables' most pieces, MoveOverhead in ms, RamLimitMb in MB
+#setoption's whole number options, (lowest, highest): the tables' most pieces, MoveOverhead in ms, RamLimitMb in MB,
+#Leaves a round on each gpu (--leaves)
 SPIN_OPTIONS = {"SyzygyProbeLimit": (min(table_set.pieces for table_set in TABLE_SETS), max(table_set.pieces for table_set in TABLE_SETS)),
-                "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000), "AdvanceThreads": (1, 256)}
+                "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000), "AdvanceThreads": (1, 256),
+                "Leaves": (1, 1024)}
+#setoption's decimal options, strings as lc0's (uci has no decimal type), (lowest, highest): SmartPruningFactor 0 for
+#none (--no-smart-pruning), the bonuses --first-move-bonus's and --book-ply-bonus's
+DECIMAL_OPTIONS = {"SmartPruningFactor": (0.0, 100.0), "FirstMoveBonus": (0.0, 100.0), "BookPlyBonus": (0.0, 100.0)}
+#the options only the search on the gpu has
+GPU_OPTIONS = ("GPUs", "Leaves", "SmartPruningFactor")
 #the options the search is built with (at isready or the first go): set later, they take effect when the engine
 #restarts, not at a new game (Searches takes them when it is made)
-BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb", "AdvanceThreads")
+BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb", "AdvanceThreads", "GPUs", "Leaves", "SearchSettings",
+                 "SmartPruningFactor")
 
 #setoption's "name <name> value <value>", each of any number of words (a path may hold spaces)
 def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
@@ -327,9 +360,14 @@ def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
 #between them, or <empty> for the command line's (--tablebase, else none); SyzygyProbeLimit: their most pieces;
 #CachePositions: the network's answers the search keeps (engine_search.CACHE_POSITIONS); RamLimitMb: the MB (10^6
 #bytes) the search's tree may take, 0 for no limit (Searches' memory_limit_mb, without the cache or a kept tree's copy);
-#AdvanceThreads: the threads the kept tree is carried on to the next move on (engine_search.ADVANCE_THREADS)
+#AdvanceThreads: the threads the kept tree is carried on to the next move on (engine_search.ADVANCE_THREADS). On the gpu
+#GPUs: "all" or cuda devices by number (--gpus), <empty> for the command line's; Leaves (--leaves); SmartPruningFactor
+#(--smart-pruning-factor). SearchSettings: changes to the search's settings over --search-settings', the same "name=value,...".
+#FirstMoveBonus and BookPlyBonus: the clock's (--first-move-bonus, --book-ply-bonus), for each game's first search
 class Options:
-    def __init__(self, tablebase: bool, tablebase_pieces: int):
+    def __init__(self, tablebase: bool, tablebase_pieces: int, gpu: bool = False, gpus: list[int] | None = None, leaves: int = LEAVES,
+                 search_options: dict | None = None, clock_options: dict | None = None):
+        search_options, clock_options = search_options or {}, clock_options or {}
         self.tablebase, self.default_pieces = tablebase, tablebase_pieces
         self.syzygy_path: str | None = None #None for the command line's tables
         self.tablebase_pieces = tablebase_pieces
@@ -337,19 +375,41 @@ class Options:
         self.cache_positions = CACHE_POSITIONS
         self.ram_limit_mb = 0
         self.advance_threads = ADVANCE_THREADS
+        self.gpu, self.command_line_gpus, self.gpus, self.leaves = gpu, gpus, gpus, leaves
+        self.command_line_settings = search_options.get("settings", {})
+        self.settings: dict | None = None #SearchSettings' changes, None for the command line's alone
+        self.command_line_factor = search_options.get("smart_pruning_factor", SMART_PRUNING_FACTOR) if search_options.get("smart_pruning", True) else 0.0
+        self.smart_pruning_factor: float | None = None #None for the command line's
+        self.first_move_bonus = clock_options.get("first_move_bonus", FIRST_MOVE_BONUS)
+        self.book_ply_bonus = clock_options.get("book_ply_bonus", BOOK_PLY_BONUS)
+
+    #this engine's options: the gpu's only with --gpu
+    def names(self) -> list[str]:
+        names = ["SyzygyPath", *SPIN_OPTIONS, "GPUs", *DECIMAL_OPTIONS, "SearchSettings"]
+        return [name for name in names if self.gpu or name not in GPU_OPTIONS]
 
     #the uci reply's lines
     def lines(self) -> list[str]:
         defaults = {"SyzygyProbeLimit": self.default_pieces, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": CACHE_POSITIONS,
-                    "RamLimitMb": 0, "AdvanceThreads": ADVANCE_THREADS}
-        return (["option name SyzygyPath type string default <empty>"]
-                + [f"option name {name} type spin default {defaults[name]} min {lowest} max {highest}" for name, (lowest, highest) in SPIN_OPTIONS.items()])
+                    "RamLimitMb": 0, "AdvanceThreads": ADVANCE_THREADS, "Leaves": self.leaves, "SmartPruningFactor": self.command_line_factor,
+                    "FirstMoveBonus": self.first_move_bonus, "BookPlyBonus": self.book_ply_bonus,
+                    "GPUs": ",".join(map(str, self.command_line_gpus)) if self.command_line_gpus else "<empty>"}
+        lines = []
+        for name in self.names():
+            if name in SPIN_OPTIONS:
+                lowest, highest = SPIN_OPTIONS[name]
+                lines.append(f"option name {name} type spin default {defaults[name]} min {lowest} max {highest}")
+            elif name in DECIMAL_OPTIONS:
+                lines.append(f"option name {name} type string default {defaults[name]:g}")
+            else:
+                lines.append(f"option name {name} type string default {defaults.get(name, '<empty>')}")
+        return lines
 
     #a setoption once the search is built or not: what to tell the gui (an info string), None if nothing. A value the
     #search could not take (tables that are not all there, a number out of range) leaves the option as it was
     def set(self, name: str, value: str, built: bool) -> str | None:
-        name = next((known for known in ("SyzygyPath", *SPIN_OPTIONS) if known.lower() == name.lower()), name)
-        if name not in ("SyzygyPath", *SPIN_OPTIONS):
+        name = next((known for known in self.names() if known.lower() == name.lower()), name)
+        if name not in self.names():
             return f"no option {name}"
         if built and name in BUILD_OPTIONS:
             return f"{name} takes effect when the engine restarts: the search is built"
@@ -359,6 +419,16 @@ class Options:
             if problem is None:
                 self.syzygy_path = path or None
             return problem
+        if name == "GPUs":
+            return self.set_gpus(value)
+        if name == "SearchSettings":
+            try:
+                self.settings = parse_changes("" if value == "<empty>" else value, engine_search_settings(self.tablebase or self.syzygy_path is not None))
+            except ValueError as error:
+                return f"{error}: the search's settings stay as they were"
+            return None
+        if name in DECIMAL_OPTIONS:
+            return self.set_decimal(name, value)
         lowest, highest = SPIN_OPTIONS[name]
         try:
             number = int(value)
@@ -377,8 +447,45 @@ class Options:
             self.cache_positions = number
         elif name == "RamLimitMb":
             self.ram_limit_mb = number
+        elif name == "Leaves":
+            if number == 1 and self.gpus is not None and len(self.gpus) > 1:
+                return "1 leaf a round is mcts.py's search, on one gpu: Leaves stays as it was"
+            self.leaves = number
         else:
             self.advance_threads = number
+        return None
+
+    #GPUs: the devices must be there, and several need more than a leaf a round
+    def set_gpus(self, value: str) -> str | None:
+        if value == "<empty>":
+            gpus = self.command_line_gpus
+        else:
+            try:
+                gpus = parse_gpus(value)
+            except ValueError as error:
+                return f"{error}: GPUs stays as it was"
+            if max(gpus) >= torch.cuda.device_count():
+                return f"there is no cuda device {max(gpus)} ({torch.cuda.device_count()} found): GPUs stays as it was"
+        if gpus is not None and len(gpus) > 1 and self.leaves == 1:
+            return "several gpus need Leaves above 1: GPUs stays as it was"
+        self.gpus = gpus
+        return None
+
+    #a decimal option, in its range
+    def set_decimal(self, name: str, value: str) -> str | None:
+        lowest, highest = DECIMAL_OPTIONS[name]
+        try:
+            number = float(value)
+        except ValueError:
+            number = None
+        if number is None or not lowest <= number <= highest:
+            return f"{name} is a number from {lowest:g} to {highest:g}, not {value!r}"
+        if name == "SmartPruningFactor":
+            self.smart_pruning_factor = number
+        elif name == "FirstMoveBonus":
+            self.first_move_bonus = number
+        else:
+            self.book_ply_bonus = number
         return None
 
     #why the search could not open the tables of `path` (None for the command line's) up to `pieces`, None if it can
@@ -394,9 +501,19 @@ class Options:
 
     #load_player's tablebase and the search options these set
     def search(self) -> tuple[bool, dict]:
-        return (self.tablebase or self.syzygy_path is not None,
-                {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": self.cache_positions,
-                 "memory_limit_mb": self.ram_limit_mb, "advance_threads": self.advance_threads})
+        options = {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": self.cache_positions,
+                   "memory_limit_mb": self.ram_limit_mb, "advance_threads": self.advance_threads}
+        if self.settings is not None:
+            options["settings"] = {**self.command_line_settings, **self.settings}
+        if self.smart_pruning_factor == 0:
+            options["smart_pruning"] = False
+        elif self.smart_pruning_factor is not None:
+            options.update(smart_pruning=True, smart_pruning_factor=self.smart_pruning_factor)
+        return self.tablebase or self.syzygy_path is not None, options
+
+    #Clock's keyword arguments these set
+    def clock(self) -> dict:
+        return {"first_move_bonus": self.first_move_bonus, "book_ply_bonus": self.book_ply_bonus, "move_overhead_seconds": self.move_overhead_seconds}
 
 
 def main(checkpoint_path: Path | None = None, random_mover: bool = False, selection: str = "argmax",
@@ -409,15 +526,16 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
     clock_options = clock_options or {}
     #the options are the search's
     searching = selection == "mcts" and not random_mover
-    options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES))
+    options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES), gpu, gpus, leaves, search_options, clock_options)
     player = None
     board = chess.Board()
-    clock = Clock(**clock_options)
+    clock = Clock(**{**clock_options, **options.clock()})
     commands = Commands(sys.stdin, infinite_until_stop)
 
     def load() -> nn.Module | EngineSearch:
         use_tablebase, set_options = options.search()
-        return load_player(checkpoint_path, selection, gpu, leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks, gpus)
+        return load_player(checkpoint_path, selection, gpu, options.leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
+                           options.gpus)
 
     #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by
     #itself (a proven or only move), as UCI asks; a go ponder searches the opponent's time until ponderhit, then on as
@@ -462,7 +580,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         command, arguments, go = received
 
         if command == "uci":
-            send(f"id name {'RandomMover' if random_mover else ENGINE_NAME}")
+            send(f"id name {'RandomMover' if random_mover else f'{ENGINE_NAME} {engine_version()}'}")
             send("id author William Gong")
             if searching:
                 for line in options.lines():
@@ -477,13 +595,14 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
 
         elif command == "setoption" and searching:
             told = options.set(*option_name_and_value(arguments), built=player is not None)
-            clock.move_overhead_seconds = options.move_overhead_seconds
+            for name, value in options.clock().items():
+                setattr(clock, name, value)
             if told is not None:
                 send(f"info string {told}")
 
         elif command == "ucinewgame":
             board = chess.Board()
-            clock = Clock(**clock_options, move_overhead_seconds=options.move_overhead_seconds)
+            clock = Clock(**{**clock_options, **options.clock()})
             if isinstance(player, EngineSearch):
                 player.new_game()
 
@@ -520,8 +639,8 @@ if __name__ == "__main__":
                         help="for --select mcts --gpu: leaves gathered for each network call, default %(default)s; 1 is mcts.py's search")
     parser.add_argument("--precision", choices=PRECISIONS,
                         help=f"for --select mcts --gpu: the network's precision (engine_search.PRECISIONS), default {ENGINE_PRECISION}")
-    parser.add_argument("--gpus", type=lambda text: [int(device) for device in text.split(",")],
-                        help="for --select mcts --gpu: the cuda devices to search on at once, e.g. 0,1,2,3, a thread driving each; "
+    parser.add_argument("--gpus", type=parse_gpus,
+                        help="for --select mcts --gpu: the cuda devices to search on at once, e.g. 0,1,2,3 or all, a thread driving each; "
                              "default the current one. On more than one, for --leaves above 1, the search is another (more leaves out): the "
                              "threads descend in the one tree at once, each pinned to a cpu by the topology and asleep while its gpu works")
     parser.add_argument("--fp16-blocks", type=int,
