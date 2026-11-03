@@ -8,7 +8,7 @@ from torch.optim._muon import _adjust_lr
 from torch.optim.optimizer import _to_scalar
 
 
-#torch's _zeropower_via_newtonschulz on a stack of matrices no taller than wide, each normalised by its own norm
+#a stack of matrices no taller than wide, each normalised by its own norm
 def newton_schulz(stack: Tensor, group: dict) -> Tensor:
     a, b, c = group["ns_coefficients"]
     ortho = stack.bfloat16()
@@ -19,13 +19,13 @@ def newton_schulz(stack: Tensor, group: dict) -> Tensor:
         ortho = torch.baddbmm(ortho, gram_update, ortho, beta=a)
     return ortho
 
-#the rank's equal part of a stack, zero-padded to a multiple of the world size
+#zero-padded so that every rank's share has the same size
 def share_of(stack: Tensor, rank: int, world_size: int) -> Tensor:
     share = math.ceil(stack.shape[0] / world_size)
     padded = F.pad(stack, (0, 0, 0, 0, 0, share * world_size - stack.shape[0]))
     return padded[rank * share:(rank + 1) * share]
 
-#every rank's shares, (world size, shares size); untraced, as the collective splits the compiled step into two cuda graphs
+#untraced: the collective would split the compiled step into two cuda graphs
 @torch.compiler.disable
 def gather_shares(shares: Tensor) -> Tensor:
     world_size = dist.get_world_size()
@@ -34,8 +34,7 @@ def gather_shares(shares: Tensor) -> Tensor:
     return gathered.view(world_size, -1)
 
 
-#torch.optim.Muon with each shape's matrices orthogonalised in batched matmuls, same arithmetic and state_dict. Under
-#torch.distributed each rank orthogonalises a share and one gather brings the rest: gradients must match on every rank
+#torch.optim.Muon with each shape's matrices orthogonalised in one batch; under torch.distributed each rank orthogonalises a share, so gradients must match on every rank
 class BatchedMuon(torch.optim.Muon):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

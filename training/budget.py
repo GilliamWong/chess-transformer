@@ -1,4 +1,3 @@
-#how long a training run lasts: a number of positions, or minutes of pure training (equal gpu time)
 import time
 
 class Budget:
@@ -12,7 +11,7 @@ class Budget:
         self.max_seconds = None if minutes is None else minutes * 60
 
         self.steps = 0
-        self.seconds = 0.0 #training only: compiling (the first step) and evaluating are not counted
+        self.seconds = 0.0 #training only: the first step (torch.compile) and evaluation are not counted
         self._running_since = None
 
     @property
@@ -33,13 +32,11 @@ class Budget:
             self.seconds += now - self._running_since
             self._running_since = now
 
-    #call after every training step. Returns how far the progress bar moves
     def step_done(self) -> float:
         before = self.seconds
         self._catch_up()
         self.steps += 1
         if self._running_since is None:
-            #the clock starts after the first step, where torch.compile compiles
             self._running_since = time.perf_counter()
         return self.seconds - before if self.timed else 1
 

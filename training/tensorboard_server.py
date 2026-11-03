@@ -29,5 +29,4 @@ def start_tensorboard() -> None:
                 return
             time.sleep(0.5)
 
-    #tensorboard takes seconds to come up; training should not wait
     threading.Thread(target=open_when_ready, daemon=True).start()

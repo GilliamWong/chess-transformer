@@ -1,4 +1,3 @@
-#every finished run side by side, grouped by budget: python -m training.compare_runs prints a table and writes artifacts/progress.html
 import html
 import json
 from itertools import groupby
@@ -17,12 +16,11 @@ def load_runs() -> list[dict]:
             continue
 
         model_settings = settings["model_settings"]
-        #the oldest runs recorded only positions_budget
-        positions = settings.get("positions_seen", settings.get("positions_budget", 0))
+        positions = settings["positions_seen"]
         runs.append({
-            "budget": settings.get("budget", f"{round(positions / 1e6):g}M"),
+            "budget": settings["budget"],
             "name": settings_path.parent.name,
-            "note": settings.get("note", ""),
+            "note": settings["note"],
             "d_model": model_settings["d_model"],
             "layers": model_settings["num_layers"],
             "heads": model_settings["n_heads"],
@@ -32,7 +30,7 @@ def load_runs() -> list[dict]:
             "minutes": f"{settings['train_seconds'] / 60:.1f}",
             "val_loss": f"{settings['final_val_loss']:.4f}",
             "val_acc": f"{settings['final_val_accuracy']:.2%}",
-            "commit": settings.get("commit", ""),
+            "commit": settings["commit"],
             "accuracy": settings["final_val_accuracy"],
             "order": settings_path.stat().st_mtime_ns,
         })
