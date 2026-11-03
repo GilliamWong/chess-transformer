@@ -23,7 +23,7 @@ from model.model import ChessTransformer
 from training import train_ddp
 from training.muon import BatchedMuon
 from training.budget import Budget
-from engine.checkpoint import load_checkpoint
+from model.checkpoint import load_checkpoint
 
 
 #random boards as the data holds them: a piece code on every square (the square features index by it), any token after

@@ -64,6 +64,8 @@ NUM_MOVE_IDS = len(ALL_POSSIBLE_MOVES) #1968
 #a label slot without a move or eval (the eval as the fishtest set's)
 NO_EVAL = -32768
 NO_MOVE = -1 #also marks a position not labelled yet
+#centipawns to expected score (0 lost, 1 won): sigmoid(EXPECTED_SCORE_PER_CENTIPAWN * centipawns), lichess's fit
+EXPECTED_SCORE_PER_CENTIPAWN = 0.00368208
 
 def _build_move_dict() -> dict[chess.Move, int]:
     output = {}

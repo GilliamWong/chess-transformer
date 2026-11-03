@@ -3,9 +3,10 @@ import json
 import math
 from pathlib import Path
 import torch
-from training.data import ARTIFACTS_DIR
 from model.model import ChessTransformer
 
+#no code lives here: pgns, training sets, checkpoints, runs, engines
+ARTIFACTS_DIR = Path(__file__).resolve().parent.parent / "artifacts"
 #one folder per run: tensorboard logs, settings.json, model.pt (the best checkpoint) and final.pt
 RUNS_DIR = ARTIFACTS_DIR / "runs"
 

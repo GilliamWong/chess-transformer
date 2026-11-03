@@ -5,9 +5,8 @@ from pathlib import Path
 import chess
 import torch
 from torch import nn
-from training.data import EXPECTED_SCORE_PER_CENTIPAWN
-from engine.checkpoint import load_checkpoint
-from model.encoding import NUM_MOVE_IDS, encode_board, encode_move_to_id, decode_id_to_move
+from model.encoding import EXPECTED_SCORE_PER_CENTIPAWN, NUM_MOVE_IDS, encode_board, encode_move_to_id, decode_id_to_move
+from model.checkpoint import load_checkpoint
 from model.model import ChessTransformer, expected_score
 from engine.tablebase import covers, ranked_moves, wdl_score
 

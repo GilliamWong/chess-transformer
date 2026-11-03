@@ -19,7 +19,7 @@ from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from fake_models import BoardModel
 from selfplay_rs import LEAN_COLUMNS, LEAN_ROW
 from model.model import VALUE_BINS, ChessTransformer, expected_score
-from engine.checkpoint import save_checkpoint
+from model.checkpoint import save_checkpoint
 from engine.player import CudaGraphModel
 from tests.test_model import mix_in_the_input
 

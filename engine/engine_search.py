@@ -16,12 +16,11 @@ import chess
 import numpy as np
 import selfplay_rs
 import torch
-from model.encoding import TOKENS_PER_BOARD
+from model.encoding import EXPECTED_SCORE_PER_CENTIPAWN, TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
 from engine.inference import ExactSizeCompiled, GraphedBatches, chunk_positions, fp16_model, int8_model, small_graph_sizes
 from engine.player import MAX_REPORTED_SCORE, ROOT_MOVES_REPORTED, SearchReport, score_to_centipawns
 from engine.cuda_runtime import cuda_runtime
-from training.data import EXPECTED_SCORE_PER_CENTIPAWN
 from engine.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
 
 #leaves a round (lc0's minibatch), and its descents that may end on a leaf already waiting before it stops gathering.

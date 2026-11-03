@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 import webbrowser
-from engine.checkpoint import RUNS_DIR
+from model.checkpoint import RUNS_DIR
 
 TENSORBOARD_PORT = 6006
 

@@ -21,7 +21,7 @@ import chess
 import torch
 from torch import nn
 from engine.inference import cpu_batches
-from engine.checkpoint import latest_checkpoint
+from model.checkpoint import latest_checkpoint
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS,
                                   SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks,
                                   engine_search_settings, parse_changes)

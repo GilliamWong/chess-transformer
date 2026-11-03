@@ -1,7 +1,7 @@
 import chess.pgn
 import pytest
 
-from training.data import CARLSEN_PGN
+from engine.quantization import CARLSEN_PGN
 from engine.tablebase import open_tablebase
 
 NUM_PGN_GAMES_TO_REPLAY = 5

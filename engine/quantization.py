@@ -18,8 +18,9 @@ from model.encoding import NUM_MOVE_IDS, encode_board, encode_move_to_id
 from model.fused_blocks import link_input_mixes
 from model.int8_blocks import DOWN_INPUT_MULTIPLE, HADAMARD_BLOCK, Int8Block, down_inputs, hadamard
 from model.model import ChessTransformer
-from training.data import CARLSEN_PGN
 
+#carlsen's games: the matches' openings, the tests' positions and the int8 network's calibration
+CARLSEN_PGN = Path(__file__).resolve().parent / "Carlsen.pgn"
 #in the home folder, not the checkpoint's: that may be read-only, and hyak's nodes share their home folders
 CACHE = Path.home() / ".cache" / "chess_transformer" / "int8"
 #the rounding code's version, changed with it: it and the settings below name the cached file with the checkpoint

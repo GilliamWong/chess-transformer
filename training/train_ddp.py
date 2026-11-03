@@ -24,7 +24,7 @@ from training.data import concatenate_batches
 from training.mirror import draw_mirrors
 from model.model import ChessTransformer, mlp_hidden_width
 from training.budget import Budget
-from engine.checkpoint import RUNS_DIR, save_checkpoint, warm_start
+from model.checkpoint import RUNS_DIR, save_checkpoint, warm_start
 from training.compare_runs import write_progress_page
 from training.tensorboard_server import start_tensorboard
 

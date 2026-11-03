@@ -3,8 +3,7 @@
 import html
 import json
 from pathlib import Path
-from training.data import ARTIFACTS_DIR
-from engine.checkpoint import RUNS_DIR
+from model.checkpoint import ARTIFACTS_DIR, RUNS_DIR
 
 PROGRESS_PAGE = ARTIFACTS_DIR / "progress.html"
 

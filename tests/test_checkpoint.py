@@ -4,8 +4,8 @@ import chess
 import pytest
 import torch
 
-from engine import checkpoint
-from engine.checkpoint import load_checkpoint, save_checkpoint, warm_start
+from model import checkpoint
+from model.checkpoint import load_checkpoint, save_checkpoint, warm_start
 from model.model import ChessTransformer
 from engine.player import choose_move, load_model
 

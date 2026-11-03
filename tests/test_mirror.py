@@ -9,6 +9,7 @@ from model.encoding import (
     CASTLING_TOKEN_OFFSET,
     EN_PASSANT_INDEX,
     EN_PASSANT_TOKEN_OFFSET,
+    EXPECTED_SCORE_PER_CENTIPAWN,
     NO_EVAL,
     NO_MOVE,
     NUM_MOVE_IDS,
@@ -18,7 +19,7 @@ from model.encoding import (
     encode_board,
     encode_move_to_id,
 )
-from training.data import BLUNDER_THRESHOLD, EXPECTED_SCORE_PER_CENTIPAWN, ChessGamesDataset, SelfPlayDataset, datasets_to_dataloaders
+from training.data import BLUNDER_THRESHOLD, ChessGamesDataset, SelfPlayDataset, datasets_to_dataloaders
 from training.mirror import MIRRORED_MOVE_IDS, MirrorRows, can_mirror, draw_mirrors, mirror_boards, mirror_moves
 from training.train_ddp import TrainingSampler, parse_args
 

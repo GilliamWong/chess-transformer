@@ -9,7 +9,8 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from training.data import ARTIFACTS_DIR, BLUNDER_THRESHOLD, RESULT_WEIGHT, VISIT_TEMPERATURE, MixedLoader, datasets_to_dataloaders, load_training_set
+from training.data import BLUNDER_THRESHOLD, RESULT_WEIGHT, VISIT_TEMPERATURE, MixedLoader, datasets_to_dataloaders, load_training_set
+from model.checkpoint import ARTIFACTS_DIR, RUNS_DIR, load_checkpoint, save_checkpoint
 from training.muon import BatchedMuon
 import torch
 import torch.nn.functional as F
@@ -19,7 +20,6 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from training.budget import Budget
-from engine.checkpoint import RUNS_DIR, load_checkpoint, save_checkpoint
 from training.compare_runs import write_progress_page
 from model.encoding import NO_MOVE
 from training.tensorboard_server import start_tensorboard

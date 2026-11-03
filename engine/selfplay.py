@@ -30,7 +30,7 @@ from engine import mcts
 import selfplay_rs
 from model.encoding import MOVE_IDS_BY_SQUARES, NO_MOVE, NUM_MOVE_IDS, TOKENS_PER_BOARD
 from engine.tablebase import TABLEBASE_PIECES, open_tablebase, tablebase_path
-#every worker imports this file, so nothing at the top may import torch (data.py, engine.checkpoint and inference.py do)
+#every worker imports this file, so nothing at the top may import torch (data.py, model.checkpoint and inference.py do)
 
 SIMULATIONS = 64 #+390 elo over the policy alone (artifacts/reports/mcts_ladder_2026-09-23.md)
 TOP_MOVES = 8
@@ -379,7 +379,7 @@ def set_priority(priority_class: int) -> None:
 def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use_tablebase: bool, processes: int, games_per_process: int, seed: int,
          tree_reuse: bool, compile_model: bool, precision: str) -> None:
     from training.data import PROCESSED_DATA_DIR
-    from engine.checkpoint import RUNS_DIR
+    from model.checkpoint import RUNS_DIR
     if simulations < 2:
         raise ValueError("a search of fewer than 2 simulations visits no move, so there would be no visit shares to learn")
     settings = {"checkpoint": str(checkpoint_path), "simulations": simulations, "top_moves": TOP_MOVES, "sampled_plies": SAMPLED_PLIES,
@@ -498,7 +498,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
 
 
 if __name__ == "__main__":
-    from engine.checkpoint import latest_checkpoint
+    from model.checkpoint import latest_checkpoint
     parser = argparse.ArgumentParser(description="the model plays itself with mcts.py's search, and every position is saved as a training set")
     parser.add_argument("checkpoint", nargs="?", type=Path, help="a model.pt, default the run that finished last")
     parser.add_argument("--name", required=True, help="the training set that is made in processed_data/")

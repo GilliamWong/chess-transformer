@@ -238,7 +238,7 @@ def main(checkpoint_path: Path, fen: str, simulations: int, device: torch.device
 
 if __name__ == "__main__":
     import torch
-    from engine.checkpoint import latest_checkpoint
+    from model.checkpoint import latest_checkpoint
     parser = argparse.ArgumentParser(description="one search from a position, to watch what it does")
     parser.add_argument("checkpoint", nargs="?", type=Path, help="a model.pt, default the run that finished last")
     parser.add_argument("--fen", default=chess.STARTING_FEN, help="the position to search, default the start")
