@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 import subprocess
@@ -7,15 +8,14 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch
-from torch import nn
 
 from training import data
 from engine import selfplay
 from training.data import SelfPlayDataset, load_training_set
-from model.encoding import NO_MOVE, NUM_MOVE_IDS
+from model.encoding import NO_MOVE, TOKENS_PER_BOARD
 from engine.inference import cpu_batches, serve
 from engine.selfplay import TOP_MOVES, Game, RemoteNetwork, SelfPlaySet, Slot, play_games_in_rust, slot_arrays
+from fake_models import BoardModel
 
 SETTINGS = {"simulations": 16}
 
@@ -25,51 +25,51 @@ def two_games() -> list[Game]:
     visit_moves[:, :2] = [[5, 9], [7, 3]]
     visit_shares = np.zeros((2, TOP_MOVES), dtype=np.float32)
     visit_shares[:, :2] = [[0.75, 0.25], [1.0, 0.0]]
-    boards = np.full((2, 70), 3, dtype=np.uint8)
+    boards = np.full((2, TOKENS_PER_BOARD), 3, dtype=np.uint8)
     return [Game(0, boards, visit_moves, visit_shares, np.array([0.6, 0.3], dtype=np.float32), np.array([True, False]), 1.0),
             Game(1, boards, visit_moves, visit_shares, np.array([0.8, 0.1], dtype=np.float32), np.array([True, False]), 0.5)]
 
-#game 0 goes to val, game 1 to train, read back with the value target blended half and half
-def test_a_self_play_set_is_read_back_for_training(tmp_path, monkeypatch):
-    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
-    games = SelfPlaySet(tmp_path, "played", SETTINGS)
-    for game in two_games():
-        games.add(game, 1.0)
 
+@pytest.fixture
+def fresh_set(tmp_path, monkeypatch):
+    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    return SelfPlaySet(tmp_path, "played", SETTINGS)
+
+
+#game 0 goes to val, game 1 to train
+@pytest.fixture
+def played_set(fresh_set):
+    for game in two_games():
+        fresh_set.add(game, 1.0)
+    return fresh_set
+
+
+def test_a_self_play_set_is_read_back_for_training(played_set):
     train, val = load_training_set("played", 0.02, result_weight=0.5)
 
     assert isinstance(train, SelfPlayDataset) and len(train) == len(val) == 2
     _, moves, shares, values, _ = val[[0, 1]]
     assert moves[:, :2].tolist() == [[5, 9], [7, 3]] and moves[:, 2:].eq(0).all()
     assert shares.tolist()[0][:2] == [0.75, 0.25]
-    #white won game 0: white to move gets (1 + 0.6) / 2, black to move (0 + 0.3) / 2
+    #white won game 0: white to move gets (1 + 0.6) / 2, black to move (0 + 0.3) / 2; game 1 was a draw
     assert values.tolist() == pytest.approx([0.8, 0.15])
-    assert train.value_target_of([0, 1]).tolist() == pytest.approx([0.65, 0.3]) #game 1 was a draw
+    assert train.value_target_of([0, 1]).tolist() == pytest.approx([0.65, 0.3])
 
 
-#0.75/0.25 becomes 0.9/0.1 at 0.5 and 1/0 at 0; a single visited move stays whole
-def test_the_visit_temperature_sharpens_the_policy_target(tmp_path, monkeypatch):
-    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
-    games = SelfPlaySet(tmp_path, "played", SETTINGS)
-    for game in two_games():
-        games.add(game, 1.0)
+@pytest.mark.parametrize("temperature, expected", [(1.0, [0.75, 0.25]), (0.5, [0.9, 0.1]), (0.0, [1.0, 0.0])])
+def test_the_visit_temperature_sharpens_the_policy_target(played_set, temperature, expected):
+    _, val = load_training_set("played", 0.02, visit_temperature=temperature)
 
-    for temperature, expected in ((1.0, [0.75, 0.25]), (0.5, [0.9, 0.1]), (0.0, [1.0, 0.0])):
-        _, val = load_training_set("played", 0.02, visit_temperature=temperature)
-        _, moves, shares, _, _ = val[[0, 1]]
-        assert shares[0, :2].tolist() == pytest.approx(expected) and shares[1, :2].tolist() == pytest.approx([1.0, 0.0])
-        assert shares.sum(dim=1).tolist() == pytest.approx([1.0, 1.0])
-        assert moves[:, :2].tolist() == [[5, 9], [7, 3]]
+    _, moves, shares, _, _ = val[[0, 1]]
+    assert shares[0, :2].tolist() == pytest.approx(expected) and shares[1, :2].tolist() == pytest.approx([1.0, 0.0])
+    assert shares.sum(dim=1).tolist() == pytest.approx([1.0, 1.0])
+    assert moves[:, :2].tolist() == [[5, 9], [7, 3]]
 
 
-#part of a game written after the last record is cut off on reopening
-def test_a_self_play_set_continues_after_an_interruption(tmp_path, monkeypatch):
-    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
-    games = SelfPlaySet(tmp_path, "played", SETTINGS)
-    for game in two_games():
-        games.add(game, 1.0)
+#the part of a game written after the last record is cut off on reopening
+def test_a_self_play_set_continues_after_an_interruption(played_set, tmp_path):
     with open(tmp_path / "played_train_boards.bin", "ab") as boards:
-        boards.write(bytes(70 * 3))
+        boards.write(bytes(TOKENS_PER_BOARD * 3))
 
     reopened = SelfPlaySet(tmp_path, "played", SETTINGS)
 
@@ -81,8 +81,7 @@ def test_a_self_play_set_continues_after_an_interruption(tmp_path, monkeypatch):
 
 
 #windows refuses the move for a moment while another program holds the record open
-def test_a_record_write_that_fails_for_a_moment_is_tried_again(tmp_path, monkeypatch):
-    games = SelfPlaySet(tmp_path, "played", SETTINGS)
+def test_a_record_write_that_fails_for_a_moment_is_tried_again(fresh_set, tmp_path, monkeypatch):
     replace = Path.replace
     refusals = iter([True, True, False])
     def refuse_twice(path, target):
@@ -91,24 +90,20 @@ def test_a_record_write_that_fails_for_a_moment_is_tried_again(tmp_path, monkeyp
         return replace(path, target)
     monkeypatch.setattr(Path, "replace", refuse_twice)
 
-    assert games.add(two_games()[0], 1.0)
+    assert fresh_set.add(two_games()[0], 1.0)
     assert SelfPlaySet.read_record(tmp_path / "played_selfplay.json")["games"] == 1
 
 
-#what stopped a run on 2026-09-23: the .part record keeps the game instead of it being cut off
-def test_a_game_whose_record_could_not_be_moved_into_place_is_kept(tmp_path, monkeypatch):
-    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+#the .part record holds the game, so reopening keeps it
+def test_a_game_whose_record_could_not_be_moved_into_place_is_kept(fresh_set, tmp_path, monkeypatch):
     first, second = two_games()
-    games = SelfPlaySet(tmp_path, "played", SETTINGS)
-    games.add(first, 1.0)
+    fresh_set.add(first, 1.0)
     def refuse(path, target):
         raise PermissionError("in use")
-    monkeypatch.setattr(Path, "replace", refuse)
-    monkeypatch.setattr(selfplay, "RECORD_ATTEMPTS", 2)
-
-    assert not games.add(second, 1.0)
-    monkeypatch.undo()
-    monkeypatch.setattr(data, "PROCESSED_DATA_DIR", tmp_path)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", refuse)
+        patch.setattr(selfplay, "RECORD_ATTEMPTS", 2)
+        assert not fresh_set.add(second, 1.0)
 
     reopened = SelfPlaySet(tmp_path, "played", SETTINGS)
     assert reopened.record["games"] == 2 and reopened.positions() == 4
@@ -124,32 +119,22 @@ def test_a_set_from_before_tree_reuse_carries_on_without_it(tmp_path):
     assert SelfPlaySet(tmp_path, "played", {**SETTINGS, "tree_reuse": False}).positions() == 2
 
 
-#answers that depend on the board, so answers handed to the wrong worker show
-class BoardModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weights = torch.randn(70, NUM_MOVE_IDS, generator=torch.Generator().manual_seed(0))
-
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        tokens = boards.float()
-        return tokens @ self.weights / 100, tokens.sum(dim=1, keepdim=True) / 1000
-
-
-#the inference process's loop in a thread
+#the inference process's loop in a thread, with a RemoteNetwork for each slot
 @contextmanager
-def serving(slots: list[Slot], evaluate_boards, games_per_process: int):
+def serving(slots: list[Slot], network, games_per_process: int):
     stop = threading.Event()
     arrays = [slot_arrays(slot.boards.name, slot.answers.name, games_per_process) for slot in slots]
     counts = SimpleNamespace(value=0), SimpleNamespace(value=0)
-    thread = threading.Thread(target=serve, args=(evaluate_boards, [boards for _, boards, _ in arrays], [answers for _, _, answers in arrays],
+    thread = threading.Thread(target=serve, args=(network, [boards for _, boards, _ in arrays], [answers for _, _, answers in arrays],
                                                   [slot.server_end for slot in slots], stop, *counts), daemon=True)
     thread.start()
+    remotes = [RemoteNetwork(slot.boards.name, slot.answers.name, slot.worker_end, games_per_process) for slot in slots]
     try:
-        yield counts
+        yield remotes, counts
     finally:
         stop.set()
         thread.join()
-        for memories, _, _ in arrays:
+        for memories in [remote.memories for remote in remotes] + [memories for memories, _, _ in arrays]:
             for memory in memories:
                 memory.close()
         for slot in slots:
@@ -158,38 +143,29 @@ def serving(slots: list[Slot], evaluate_boards, games_per_process: int):
 
 #two workers asking at once are served in one batch, each getting the answers to its own boards
 def test_every_worker_gets_the_answers_to_its_own_boards():
-    slots = [Slot(8), Slot(8)]
     network = BoardModel()
-    with serving(slots, cpu_batches(network), 8) as (calls, positions):
-        remotes = [RemoteNetwork(slot.boards.name, slot.answers.name, slot.worker_end, 8) for slot in slots]
-        asked = [np.random.default_rng(index).integers(0, 13, (count, 70), dtype=np.uint8) for index, count in enumerate((5, 8))]
-        answers = [None, None]
-        def ask(index: int) -> None:
+    asked = [np.random.default_rng(index).integers(0, 13, (count, TOKENS_PER_BOARD), dtype=np.uint8) for index, count in enumerate((5, 8))]
+    with serving([Slot(8), Slot(8)], cpu_batches(network), 8) as (remotes, (calls, positions)):
+        def ask(index: int) -> np.ndarray:
             for _ in range(20):
-                answers[index] = remotes[index](asked[index]).copy()
-        threads = [threading.Thread(target=ask, args=(index,)) for index in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+                answer = remotes[index](asked[index]).copy()
+            return answer
+        with ThreadPoolExecutor(2) as pool:
+            answers = list(pool.map(ask, range(2)))
 
-        for answer, boards in zip(answers, asked):
-            assert np.allclose(answer, cpu_batches(network).evaluate_boards(boards), atol=1e-5)
-        assert positions.value == 20 * (5 + 8) and calls.value <= 40
-        for remote in remotes:
-            for memory in remote.memories:
-                memory.close()
+    for answer, boards in zip(answers, asked):
+        assert np.allclose(answer, cpu_batches(network).evaluate_boards(boards), atol=1e-5)
+    assert positions.value == 20 * (5 + 8) and calls.value <= 40
 
 
 def test_games_through_the_inference_process_are_the_games_played_directly():
     network = cpu_batches(BoardModel())
-    alone = sorted(play_games_in_rust(network.evaluate_boards, 8, range(4), size=2, max_plies=10), key=lambda game: game.number)
-    slot = Slot(2)
-    with serving([slot], network, 2):
-        remote = RemoteNetwork(slot.boards.name, slot.answers.name, slot.worker_end, 2)
-        served = sorted(play_games_in_rust(remote, 8, range(4), size=2, max_plies=10), key=lambda game: game.number)
-        for memory in remote.memories:
-            memory.close()
+    def play(evaluate) -> list[Game]:
+        return sorted(play_games_in_rust(evaluate, 8, range(4), size=2, max_plies=10), key=lambda game: game.number)
+
+    alone = play(network.evaluate_boards)
+    with serving([Slot(2)], network, 2) as ([remote], _):
+        served = play(remote)
 
     for direct, through in zip(alone, served):
         assert np.array_equal(direct.boards, through.boards)
@@ -199,6 +175,6 @@ def test_games_through_the_inference_process_are_the_games_played_directly():
 
 #torch would cost every worker about half a gigabyte
 def test_a_worker_does_not_import_torch():
-    imported = subprocess.run([sys.executable, "-c", "import sys, engine.selfplay; print('torch' in sys.modules)"], capture_output=True, text=True,
-                              check=True, cwd=Path(selfplay.__file__).parent.parent)
-    assert imported.stdout.strip() == "False"
+    imported = subprocess.check_output([sys.executable, "-c", "import sys, engine.selfplay; print('torch' in sys.modules)"], text=True,
+                                       cwd=Path(selfplay.__file__).parent.parent)
+    assert imported.strip() == "False"

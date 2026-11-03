@@ -1,6 +1,5 @@
-#self play in python, with mcts.py's search: the reference the rust games (selfplay_rs) are held to in test_selfplay_rs.py.
-#a change to the search or the rules goes here and into engine/selfplay_rs/src alike
-from collections.abc import Iterable, Iterator
+#self play in python, with mcts.py's search: the reference the rust games (selfplay_rs) are held to in test_selfplay_rs.py
+from collections.abc import Iterator
 import chess
 import numpy as np
 import torch
@@ -41,13 +40,12 @@ class GameInProgress:
         self.noised = False
         self.add_noise_once_expanded()
 
-    #as soon as the root has children, before any is chosen: at once for a reused root, after the first simulation otherwise
+    #once the root has children, before any is chosen: at once for a reused root, after the first simulation otherwise
     def add_noise_once_expanded(self) -> None:
         if not self.noised and self.root.children:
             mcts.add_root_noise(self.root, self.random)
             self.noised = True
 
-    #records the position with what the search found, and plays a move
     def play_move(self, sampled_plies: int) -> None:
         moves = list(self.root.children)
         visits = np.array([self.root.children[move].visit_count for move in moves], dtype=np.float64)
@@ -79,8 +77,7 @@ class GameInProgress:
                     np.array(self.root_scores, dtype=np.float32), np.array(self.white_to_move, dtype=bool), white_score)
 
 
-#up to `size` games at once, one simulation of each per round, their leaves through the network in one call.
-#a move is played once its root has `simulations` visits, and a game that ends makes room for the next number
+#up to `size` games at once, one simulation of each per round, their leaves through the network in one call
 class SelfPlayBatch:
     def __init__(self, model: nn.Module, device: torch.device, simulations: int, numbers: Iterator[int], size: int, seed: int,
                  board: chess.Board, sampled_plies: int, max_plies: int, tree_reuse: bool):
@@ -101,10 +98,7 @@ class SelfPlayBatch:
                 return
             self.finished.append(game.to_game(white_score)) #over before it began: a game without positions
 
-    def playing(self) -> bool:
-        return bool(self.games or self.finished)
-
-    #one round, returning the games it finished
+    #a move is played once its root has `simulations` visits, and a game that ends makes room for the next number
     def step(self) -> list[Game]:
         waiting = []
         for game in self.games:
@@ -139,15 +133,11 @@ class SelfPlayBatch:
         finished, self.finished = self.finished, []
         return finished
 
-#the games with these numbers, `size` at a time, each yielded as it ends
-def play_games(model: nn.Module, device: torch.device, simulations: int, numbers: Iterable[int], size: int, seed: int = SEED,
-               board: chess.Board | None = None, sampled_plies: int = SAMPLED_PLIES, max_plies: int = MAX_PLIES,
-               tree_reuse: bool = TREE_REUSE) -> Iterator[Game]:
-    batch = SelfPlayBatch(model, device, simulations, iter(numbers), size, seed, board if board is not None else chess.Board(), sampled_plies,
-                          max_plies, tree_reuse)
-    while batch.playing():
-        yield from batch.step()
-
 def play_game(model: nn.Module, device: torch.device, simulations: int, number: int, seed: int = SEED, board: chess.Board | None = None,
               sampled_plies: int = SAMPLED_PLIES, max_plies: int = MAX_PLIES, tree_reuse: bool = TREE_REUSE) -> Game:
-    return next(play_games(model, device, simulations, [number], 1, seed, board, sampled_plies, max_plies, tree_reuse))
+    batch = SelfPlayBatch(model, device, simulations, iter([number]), 1, seed, board if board is not None else chess.Board(), sampled_plies,
+                          max_plies, tree_reuse)
+    while True:
+        finished = batch.step()
+        if finished:
+            return finished[0]

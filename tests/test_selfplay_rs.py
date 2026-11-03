@@ -7,10 +7,9 @@ import pytest
 import torch
 from torch import nn
 
-from engine import mcts
-from engine import selfplay
+from engine import mcts, selfplay
 import selfplay_rs
-from model.encoding import encode_board, encode_move_to_id
+from model.encoding import TOKENS_PER_BOARD, encode_board, encode_move_to_id
 from fake_models import BoardModel, UniformModel
 from engine.inference import cpu_batches
 from reference_selfplay import final_result, play_game
@@ -18,8 +17,7 @@ from engine.selfplay import ANSWER_WIDTH, MAX_PLIES, RustSelfPlayBatch, play_gam
 
 CPU = torch.device("cpu")
 
-#castling both ways, en passant (and one a pin makes illegal), promotions, check, the fifty move rule, same-coloured
-#bishops, and a start that already has moves played
+#castling, en passant (one a pin makes illegal), promotions, check, fifty moves, same-coloured bishops, moves already played
 STARTS = [
     chess.STARTING_FEN,
     "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 4 9",
@@ -39,8 +37,8 @@ def start_board(fen: str) -> chess.Board:
             board.push_san(san)
     return board
 
-def rust_rules(board: chess.Board, use_tablebase: bool = False) -> selfplay_rs.SelfPlayGames:
-    return RustSelfPlayBatch(lambda boards: boards, 1, iter(()), 0, 0, board, 0, MAX_PLIES, True, use_tablebase).games
+def rust_rules(board: chess.Board) -> selfplay_rs.SelfPlayGames:
+    return RustSelfPlayBatch(lambda boards: boards, 1, iter(()), 0, 0, board, 0, MAX_PLIES, True, False).games
 
 #a random game that often takes its last move back, so that positions come round again
 def playout(board: chess.Board, plies: int, random_numbers: random.Random) -> list[chess.Board]:
@@ -55,8 +53,7 @@ def playout(board: chess.Board, plies: int, random_numbers: random.Random) -> li
         boards.append(board.copy())
     return boards
 
-#every playout position and every position one move on: the encoding, the legal moves in python-chess's order (a
-#node's children's order), the search's game_result and the game's final_result
+#every playout position and each one move on: encoding, legal moves in python-chess's order, game_result, final_result
 def test_the_rust_rules_are_the_pythons():
     random_numbers = random.Random(0)
     checked = {"positions": 0, "over in the search": 0, "over in the game": 0}
@@ -66,9 +63,12 @@ def test_the_rust_rules_are_the_pythons():
         for _ in range(10):
             for board in playout(start.copy(), 80, random_numbers):
                 played = [move.uci() for move in board.move_stack[len(start.move_stack):]]
-                for position, moves in [(board, played)] + [(board.copy(), played + [move.uci()]) for move in board.legal_moves][:10]:
-                    if len(moves) > len(played):
-                        position.push_uci(moves[-1])
+                positions = [(board, played)]
+                for move in list(board.legal_moves)[:10]:
+                    after = board.copy()
+                    after.push(move)
+                    positions.append((after, played + [move.uci()]))
+                for position, moves in positions:
                     encoding, move_ids, in_search, over = rules.inspect(moves)
                     assert list(encoding) == encode_board(position), position.fen()
                     assert move_ids == [encode_move_to_id(move, position.turn) for move in position.legal_moves], position.fen()
@@ -78,7 +78,6 @@ def test_the_rust_rules_are_the_pythons():
                     checked["over in the search"] += in_search is not None
                     checked["over in the game"] += over is not None
 
-    #the corners were reached, not only positions where the game goes on
     assert checked["positions"] > 10000 and checked["over in the search"] > 200 and checked["over in the game"] > 400, checked
 
 
@@ -93,7 +92,8 @@ def evaluate_many_in_rust_numbers(model: nn.Module, boards: list[chess.Board], d
     return evaluations
 
 def assert_same_games(python_games, rust_games) -> None:
-    for python, rust in zip(python_games, rust_games, strict=True):
+    by_number = lambda games: sorted(games, key=lambda game: game.number)
+    for python, rust in zip(by_number(python_games), by_number(rust_games), strict=True):
         assert python.number == rust.number and python.white_score == rust.white_score
         assert np.array_equal(python.boards, rust.boards)
         assert np.array_equal(python.visit_moves, rust.visit_moves)
@@ -101,9 +101,19 @@ def assert_same_games(python_games, rust_games) -> None:
         assert np.array_equal(python.root_scores, rust.root_scores)
         assert np.array_equal(python.white_to_move, rust.white_to_move)
 
-#without root noise and sampled plies nothing is random: every number must match to the last bit. The uniform model's
-#searches are all ties, which go to the first child in python-chess's order. With the cache (and the rounds of several
-#simulations it allows) the games are the same, from fewer network calls
+#game 0 of board in python and in rust, with nothing random, which must match to the last bit; returns the rust game
+def play_and_compare(model: nn.Module, board: chess.Board, use_tablebase: bool = False, **options) -> selfplay.Game:
+    python = play_game(model, CPU, 24, 0, board=board, sampled_plies=0, **options)
+    rust, = play_games_in_rust(cpu_batches(model).evaluate_boards, 24, [0], 1, board=board, sampled_plies=0, use_tablebase=use_tablebase, **options)
+    assert_same_games([python], [rust])
+    return rust
+
+#the cache and the rounds of several simulations it allows, both off
+def disable_cache(monkeypatch) -> None:
+    monkeypatch.setattr(selfplay, "CACHE_POSITIONS", 0)
+    monkeypatch.setattr(selfplay, "SIMULATIONS_PER_LEAF", 1)
+
+#without root noise and sampled plies nothing is random; the uniform model's ties go to the first child in python-chess's order
 @pytest.mark.parametrize("cache", [True, False])
 @pytest.mark.parametrize("tree_reuse", [True, False])
 @pytest.mark.parametrize("model", ["board", "uniform"])
@@ -111,20 +121,13 @@ def test_rust_games_are_the_python_games(monkeypatch, tree_reuse, model, cache):
     monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
     monkeypatch.setattr(mcts, "ROOT_NOISE_SHARE", 0.0)
     if not cache:
-        monkeypatch.setattr(selfplay, "CACHE_POSITIONS", 0)
-        monkeypatch.setattr(selfplay, "SIMULATIONS_PER_LEAF", 1)
+        disable_cache(monkeypatch)
     model = BoardModel() if model == "board" else UniformModel()
 
-    results = []
-    for fen in STARTS:
-        board = start_board(fen)
-        python = play_game(model, CPU, 24, 0, board=board, sampled_plies=0, max_plies=160, tree_reuse=tree_reuse)
-        rust = list(play_games_in_rust(cpu_batches(model).evaluate_boards, 24, [0], 1, board=board, sampled_plies=0, max_plies=160,
-                                       tree_reuse=tree_reuse))
-        assert_same_games([python], rust)
-        results.append(rust[0].white_score)
+    results = [play_and_compare(model, start_board(fen), max_plies=160, tree_reuse=tree_reuse).white_score for fen in STARTS]
+
     if isinstance(model, BoardModel):
-        assert any(result != 0.5 for result in results) #some were won, not all drawn
+        assert any(result != 0.5 for result in results)
 
 
 def test_rust_games_end_where_the_tablebase_knows_the_result(tablebase, monkeypatch):
@@ -134,17 +137,14 @@ def test_rust_games_end_where_the_tablebase_knows_the_result(tablebase, monkeypa
     model = BoardModel()
 
     #6 and 7 pieces, then 4: a game the tables know before it begins has no positions
-    for fen in ("4k3/2p5/8/3P4/8/8/2R2K2/6r1 w - - 0 1", "8/5pk1/6p1/8/8/5PK1/6P1/2R5 b - - 0 1", "8/8/8/2k5/8/2K5/2P5/5n2 w - - 0 1"):
-        board = chess.Board(fen)
-        python = play_game(model, CPU, 24, 0, board=board, sampled_plies=0)
-        rust = list(play_games_in_rust(cpu_batches(model).evaluate_boards, 24, [0], 1, board=board, sampled_plies=0, use_tablebase=True))
-        assert_same_games([python], rust)
-        assert len(rust[0].boards) < MAX_PLIES
-    assert len(rust[0].boards) == 0
+    fens = ("4k3/2p5/8/3P4/8/8/2R2K2/6r1 w - - 0 1", "8/5pk1/6p1/8/8/5PK1/6P1/2R5 b - - 0 1", "8/8/8/2k5/8/2K5/2P5/5n2 w - - 0 1")
+    games = [play_and_compare(model, chess.Board(fen), use_tablebase=True) for fen in fens]
+
+    assert all(len(game.boards) < MAX_PLIES for game in games)
+    assert len(games[-1].boards) == 0
 
 
-#a match's searches (selfplay_rs.Searches) are mcts.search, with the game's moves for the repetitions. One position per
-#network call, as mcts.search asks, so that no bit depends on the batch
+#selfplay_rs.Searches are mcts.search, one position per network call so that no bit depends on the batch
 @pytest.mark.parametrize("model", ["board", "uniform"])
 def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
     monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
@@ -163,8 +163,8 @@ def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
     evaluate = cpu_batches(model).evaluate_boards
     found = {}
     while len(searches):
-        leaves = np.frombuffer(searches.descend(), dtype=np.uint8).reshape(-1, 70)
-        answers = np.concatenate([evaluate(leaves[row:row + 1]) for row in range(len(leaves))]) if len(leaves) else np.zeros((0, ANSWER_WIDTH), np.float32)
+        leaves = np.frombuffer(searches.descend(), dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
+        answers = np.array([evaluate(leaf[None])[0] for leaf in leaves], dtype=np.float32).reshape(-1, ANSWER_WIDTH)
         for number, line, score, root_moves, visits in searches.finish(answers):
             found[number] = (line, score, root_moves, visits)
 
@@ -191,6 +191,15 @@ def test_the_rust_numbers_are_numpys():
 def uniform(boards: np.ndarray) -> np.ndarray:
     return cpu_batches(UniformModel()).evaluate_boards(boards)
 
+#`count` games played together, and how many boards the network was asked for
+def play_counting(count: int, **options) -> tuple[list[selfplay.Game], int]:
+    evaluated = 0
+    def counting(boards: np.ndarray) -> np.ndarray:
+        nonlocal evaluated
+        evaluated += len(boards)
+        return uniform(boards)
+    return list(play_games_in_rust(counting, 64, range(count), count, **options)), evaluated
+
 #black mates at once: black's win, and black's move stored mirrored
 def test_a_rust_game_is_recorded_for_the_side_to_move():
     board = chess.Board("7r/8/8/8/8/1k6/8/K7 b - - 0 1")
@@ -208,7 +217,7 @@ def test_a_rust_game_is_recorded_for_the_side_to_move():
 def test_rust_games_played_together_are_the_games_played_alone():
     alone = [game for number in range(5) for game in play_games_in_rust(uniform, 8, [number], 1, max_plies=40)]
 
-    together = sorted(play_games_in_rust(uniform, 8, range(5), 3, max_plies=40), key=lambda game: game.number)
+    together = list(play_games_in_rust(uniform, 8, range(5), 3, max_plies=40))
 
     assert_same_games(alone, together)
     assert not np.array_equal(alone[0].boards, alone[1].boards)
@@ -216,43 +225,31 @@ def test_rust_games_played_together_are_the_games_played_alone():
     assert not np.array_equal(alone[0].boards, other_seed.boards)
 
 
-#with root noise and sampled plies too, the cache changes no game: the noise still comes right after the root's
-#expansion, before a second simulation. Without tree reuse every move's root is new, and the cache often knows it
+#with noise too the cache changes no game (the noise comes right after the root's expansion); without tree reuse it knows many roots
 def test_the_cache_changes_no_game_with_noise(monkeypatch):
     board_model = cpu_batches(BoardModel()).evaluate_boards
     cached = list(play_games_in_rust(board_model, 32, range(3), 3, max_plies=30, tree_reuse=False))
-    monkeypatch.setattr(selfplay, "CACHE_POSITIONS", 0)
-    monkeypatch.setattr(selfplay, "SIMULATIONS_PER_LEAF", 1)
+    disable_cache(monkeypatch)
     uncached = list(play_games_in_rust(board_model, 32, range(3), 3, max_plies=30, tree_reuse=False))
 
-    key = lambda game: game.number
-    assert_same_games(sorted(uncached, key=key), sorted(cached, key=key))
+    assert_same_games(uncached, cached)
 
 
-#the cache answers the positions games reach again, the openings above all: 8 games' first plies take fewer network calls
+#the cache answers the openings games share: 8 games' first plies take fewer network calls
 def test_the_cache_saves_network_calls(monkeypatch):
-    evaluated = {}
-    for cache in (True, False):
-        if not cache:
-            monkeypatch.setattr(selfplay, "CACHE_POSITIONS", 0)
-            monkeypatch.setattr(selfplay, "SIMULATIONS_PER_LEAF", 1)
-        evaluated[cache] = 0
-        def counting(boards: np.ndarray) -> np.ndarray:
-            evaluated[cache] += len(boards)
-            return uniform(boards)
-        games = list(play_games_in_rust(counting, 64, range(8), 8, max_plies=4))
-        assert len(games) == 8
+    cached_games, cached = play_counting(8, max_plies=4)
+    disable_cache(monkeypatch)
+    uncached_games, uncached = play_counting(8, max_plies=4)
 
-    assert evaluated[True] < 0.85 * evaluated[False]
+    assert len(cached_games) == len(uncached_games) == 8
+    assert cached < 0.85 * uncached
 
 
 def test_rust_tree_reuse_needs_fewer_evaluations_for_the_same_visits():
-    evaluated = {True: 0, False: 0}
-    for tree_reuse in evaluated:
-        def counting(boards: np.ndarray) -> np.ndarray:
-            evaluated[tree_reuse] += len(boards)
-            return uniform(boards)
-        game, = play_games_in_rust(counting, 64, [0], 1, max_plies=10, tree_reuse=tree_reuse)
+    evaluated = {}
+    for tree_reuse in (True, False):
+        games, evaluated[tree_reuse] = play_counting(1, max_plies=10, tree_reuse=tree_reuse)
+        game, = games
         assert len(game.boards) == 10 and np.allclose(game.visit_shares.sum(axis=1), 1.0)
 
     assert evaluated[True] < evaluated[False]

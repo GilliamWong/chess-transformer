@@ -12,17 +12,17 @@ from model.model import ChessTransformer
 CPU = torch.device("cpu")
 
 
-#every move equally likely, and a position scored by its material for the side to move: a pawn up is a logit of 1
+#every move equally likely; the value logit is the side to move's material, a pawn is 1
 class MaterialModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         material = PIECE_VALUES[boards[:, :NUM_SQUARES]].sum(dim=1, keepdim=True)
         return torch.zeros(len(boards), NUM_MOVE_IDS), material
 
-#nearly all of the policy on the given move ids, shared among those that are legal
+#nearly all of the policy on these moves, split among those that are legal
 class FavouriteMoveModel(nn.Module):
-    def __init__(self, *move_ids: int):
+    def __init__(self, *ucis: str):
         super().__init__()
-        self.move_ids = list(move_ids)
+        self.move_ids = [MOVE_TO_ID[chess.Move.from_uci(uci)] for uci in ucis]
 
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = torch.zeros(len(boards), NUM_MOVE_IDS)
@@ -35,7 +35,7 @@ def test_black_moves_get_the_priors_of_their_mirrored_ids():
     board = chess.Board()
     board.push_san("e4")
 
-    priors, _ = evaluate(FavouriteMoveModel(MOVE_TO_ID[chess.Move.from_uci("e2e4")]), board, CPU)
+    priors, _ = evaluate(FavouriteMoveModel("e2e4"), board, CPU)
 
     assert priors[chess.Move.from_uci("e7e5")] == pytest.approx(1.0)
 
@@ -70,23 +70,21 @@ def node_after(root: Node, *moves: str) -> Node:
         node = node.children[chess.Move.from_uci(move)]
     return node
 
-#the knights go out and back: the root position seen a second time inside the search is a draw, never expanded
+#black's g8f6 and f6g8 mirror to the ids of g1f3 and f3g1, so both sides shuffle the knights
 def test_a_position_repeated_inside_the_search_is_a_draw():
-    model = FavouriteMoveModel(MOVE_TO_ID[chess.Move.from_uci("g1f3")], MOVE_TO_ID[chess.Move.from_uci("f3g1")])
-
-    root = search(model, chess.Board(), CPU, 20)
+    root = search(FavouriteMoveModel("g1f3", "f3g1"), chess.Board(), CPU, 20)
 
     repeated = node_after(root, "g1f3", "g8f6", "f3g1", "f6g8")
     assert repeated.visit_count > 0
     assert repeated.children == {}
 
-#its first occurrence was in the game before the root, not in a loop the search chose, so it is evaluated as usual
+#c6b8 is c3b1 mirrored; the position first occurred before the root
 def test_a_single_repeat_of_the_game_before_the_root_is_not_a_draw():
     board = chess.Board()
     for san in ("Nf3", "Nf6", "Nc3", "Nc6"):
         board.push_san(san)
 
-    root = search(FavouriteMoveModel(MOVE_TO_ID[chess.Move.from_uci("c3b1")]), board, CPU, 20)
+    root = search(FavouriteMoveModel("c3b1"), board, CPU, 20)
 
     repeated = node_after(root, "c3b1", "c6b8")
     assert repeated.visit_count > 0
@@ -103,13 +101,10 @@ def test_a_finished_game_is_neither_evaluated_nor_searched():
         search(UniformModel(), checkmate, CPU)
 
 
-#one simulation visits no move: the tie goes to the policy's favourite, not the first legal move
 def test_a_search_too_short_to_visit_anything_plays_the_policys_move():
-    favourite = chess.Move.from_uci("g1f3")
+    root = search(FavouriteMoveModel("g1f3"), chess.Board(), CPU, 1)
 
-    root = search(FavouriteMoveModel(MOVE_TO_ID[favourite]), chess.Board(), CPU, 1)
-
-    assert most_visited_move(root) == favourite
+    assert most_visited_move(root).uci() == "g1f3"
 
 
 def test_every_simulation_passes_through_the_root():
@@ -124,7 +119,6 @@ def mates_on_the_spot(board: chess.Board, move: chess.Move) -> bool:
     board.pop()
     return mated
 
-#nothing tells the search which move mates: it has to find it, and score the mate as a win for the side playing it
 @pytest.mark.parametrize(
     "fen, mate",
     [
@@ -138,13 +132,12 @@ def test_finds_mate_in_one(fen, mate):
 
     root = search(UniformModel(), board, CPU, 800)
 
-    mating_move = chess.Move.from_uci(mate)
-    assert most_visited_move(root) == mating_move
-    child = root.children[mating_move]
-    assert child.value_sum / child.visit_count == pytest.approx(1.0)
+    assert most_visited_move(root).uci() == mate
+    child = root.children[chess.Move.from_uci(mate)]
+    assert child.value_sum / child.visit_count == pytest.approx(1.0) #the mate scores 1 for the side playing it
 
 
-#catches a sign error between levels; with one, the visits spread about evenly and the capture wins only by luck
+#a sign error between levels spreads the visits about evenly
 def test_takes_a_hanging_queen():
     board = chess.Board("4k3/8/8/3q4/8/8/8/3RK3 w - - 0 1")
     simulations = 200
@@ -166,15 +159,14 @@ def test_root_noise_moves_the_priors_the_same_way_for_the_same_seed():
 def test_positions_evaluated_together_get_what_they_get_alone(carlsen_games):
     torch.manual_seed(0)
     model = ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval()
-    board = carlsen_games[0].board()
+    game = carlsen_games[0]
+    board = game.board()
     boards = []
-    for move in list(carlsen_games[0].mainline_moves())[:6]:
+    for move in list(game.mainline_moves())[:6]:
         board.push(move)
         boards.append(board.copy())
 
-    together = evaluate_many(model, boards, CPU)
-
-    for position, (priors, value) in zip(boards, together):
+    for position, (priors, value) in zip(boards, evaluate_many(model, boards, CPU)):
         alone_priors, alone_value = evaluate_many(model, [position], CPU)[0]
         assert value == pytest.approx(alone_value, abs=1e-5)
         assert list(priors) == list(alone_priors)
