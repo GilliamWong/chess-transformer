@@ -1,6 +1,3 @@
-//the storage of a tree that many threads grow at once: chunks are made on first use and live as long as the tree, so references
-//into them stay valid while others allocate. As in lc0, a move gets a Link once a simulation goes through it; a node with
-//SOLID_TREE_THRESHOLD visits has its list of links turned into one Slot a move (lc0's solid tree)
 use crate::rules::PackedMove;
 use crate::search::{NO_LINK, NO_NODE, Outcome, Proof, SOLID, listed};
 use shakmaty::Move;
@@ -16,25 +13,25 @@ const EDGE_CHUNKS: usize = 1 << 15;
 const LINK_CHUNK_BITS: u32 = if cfg!(test) { 8 } else { 18 };
 const LINK_CHUNKS: usize = 1 << 13;
 
-pub const IN_FLIGHT: u64 = 1 << 32;
+const IN_FLIGHT: u64 = 1 << 32;
 
-//every access is atomic; the orderings are the tree's protocol (shared.rs)
+//the orderings are the tree's protocol (shared.rs)
 #[repr(align(64))]
 #[derive(Default)]
 pub struct Node {
     count: AtomicU64, //visits in the low 32 bits, simulations in flight in the high 32
     value_sum: AtomicU64,
     visited_policy_sqrt: AtomicU64,
-    edges_at: AtomicU64, //Tree's encoding: the first edge above the low 8 bits, the number of edges in them; 0 until expanded
+    edges_at: AtomicU64, //the first edge above the low 8 bits, the number of edges in them; 0 until expanded
     proof_value: AtomicU64,
     proof_meta: AtomicU64, //0 without a proof, else the plies above the low 2 bits and the outcome in them (1 loss, 2 draw, 3 win)
     key: AtomicU64,
-    refreshes: AtomicU16, //the visited policy's refreshes begun, wrapping
+    refreshes: AtomicU16, //begun, wrapping
     halfmoves: AtomicU16, //with transpositions the node's fifty-move count
     children: AtomicU32,  //a list's first link, or once solid its first slot (SOLID set): see Children
 }
 
-//a node's moves with a node: a list of links in the moves' order, or once solid a slot a move from the first
+//a node's moves with a node: a list of links in the moves' order, or once solid one slot a move
 #[derive(Clone, Copy)]
 pub enum Children {
     List(u32),
@@ -147,7 +144,7 @@ impl Node {
         if listed(children) { Children::List(children) } else { Children::Solid(children) }
     }
 
-    //the list's head, which a new first link is swapped into (Links::insert)
+    //the list's head, which a new first link is swapped into
     pub fn list_head(&self) -> &AtomicU32 {
         &self.children
     }
@@ -202,8 +199,7 @@ impl Node {
     }
 }
 
-//chunks of `1 << bits` elements, each made on first use by whichever thread needs it first and freed only with the table; an
-//index counts `1 << bits` to a chunk
+//chunks of `1 << bits` elements, each made on first use by whichever thread needs it first and freed only with the table
 struct Table<T> {
     chunks: Box<[AtomicPtr<T>]>,
     bits: u32,
@@ -232,8 +228,7 @@ impl<T> Table<T> {
         unsafe { std::slice::from_raw_parts(self.chunk_of(index).add(offset), len) }
     }
 
-    //makes the index's chunk from `make` unless a thread has
-    fn made(&self, index: usize, make: impl FnOnce() -> Box<[T]>) {
+    fn ensure_chunk(&self, index: usize, make: impl FnOnce() -> Box<[T]>) {
         let slot = &self.chunks[index >> self.bits];
         if !slot.load(Ordering::Acquire).is_null() {
             return;
@@ -286,7 +281,7 @@ impl Nodes {
     pub fn push(&self, key: u64) -> usize {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         assert!(index < Self::CAPACITY, "the tree is past its nodes");
-        self.table.made(index, || (0..1 << NODE_CHUNK_BITS).map(|_| Node::default()).collect());
+        self.table.ensure_chunk(index, || (0..1 << NODE_CHUNK_BITS).map(|_| Node::default()).collect());
         self.table.get(index).key.store(key, Ordering::Relaxed);
         index
     }
@@ -312,8 +307,8 @@ fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> us
 pub struct Link {
     child: AtomicU32,
     visits: AtomicU32, //the move's own visits (with transpositions)
-    next: AtomicU32,   //the next link of its node's list
-    place: AtomicU32,  //its place among the node's moves
+    next: AtomicU32,
+    place: AtomicU32, //its place among the node's moves
 }
 
 impl Link {
@@ -345,6 +340,10 @@ pub struct Slot {
 }
 
 impl Slot {
+    fn new() -> Slot {
+        Slot { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0) }
+    }
+
     pub fn child(&self) -> u32 {
         self.child.load(Ordering::Acquire)
     }
@@ -359,7 +358,6 @@ impl Slot {
     }
 }
 
-//the list links and the solid slots of a tree's moves with a node
 pub struct Links {
     table: Table<Link>,
     next: AtomicUsize,
@@ -368,7 +366,7 @@ pub struct Links {
 }
 
 impl Links {
-    pub const CAPACITY: usize = LINK_CHUNKS << LINK_CHUNK_BITS;
+    const CAPACITY: usize = LINK_CHUNKS << LINK_CHUNK_BITS;
 
     //link 0 is NO_LINK's, never given out
     pub fn new() -> Links {
@@ -387,13 +385,13 @@ impl Links {
         self.next.load(Ordering::Relaxed)
     }
 
-    //the slots, likewise
+    //the slots given out so far, the gaps included
     pub fn slots(&self) -> usize {
         self.next_slot.load(Ordering::Relaxed)
     }
 
     fn make(&self, first: usize) {
-        self.table.made(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Link::new()).collect());
+        self.table.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Link::new()).collect());
     }
 
     pub fn get(&self, link: u32) -> &Link {
@@ -405,7 +403,6 @@ impl Links {
         self.slots.get((link & !SOLID) as usize)
     }
 
-    //a solid node's slots, one a move from its first
     pub fn solid_slots(&self, first: u32, moves: usize) -> &[Slot] {
         if moves == 0 { &[] } else { self.slots.slice((first & !SOLID) as usize, moves) }
     }
@@ -429,12 +426,10 @@ impl Links {
         link as u32
     }
 
-    //`count` solid slots, none with a node (a chunk starts empty): returns the first, SOLID with its index
+    //`count` solid slots, none with a node: returns the first, SOLID with its index
     pub fn solid(&self, count: usize) -> u32 {
         let first = alloc_run(&self.next_slot, count, LINK_CHUNK_BITS, Self::CAPACITY);
-        self.slots.made(first, || {
-            (0..1 << LINK_CHUNK_BITS).map(|_| Slot { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0) }).collect()
-        });
+        self.slots.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Slot::new()).collect());
         first as u32 | SOLID
     }
 
@@ -466,7 +461,7 @@ impl Links {
         pointer.compare_exchange(at, link, Ordering::AcqRel, Ordering::Acquire).is_ok()
     }
 
-    //a link's next when a list is made whole, as compact and from_tree make them, before the node is published
+    //for a list made whole (compact, from_tree), before its node is published
     pub fn set_next(&self, link: u32, next: u32) {
         self.get(link).next.store(next, Ordering::Relaxed);
     }
@@ -531,7 +526,7 @@ pub struct Edges {
 }
 
 impl Edges {
-    pub const CAPACITY: usize = EDGE_CHUNKS << EDGE_CHUNK_BITS;
+    const CAPACITY: usize = EDGE_CHUNKS << EDGE_CHUNK_BITS;
 
     pub fn new() -> Edges {
         Edges {
@@ -549,8 +544,8 @@ impl Edges {
     //room for a node's `count` edges (at most a chunk), in one chunk; returns the first
     pub fn alloc(&self, count: usize) -> usize {
         let first = alloc_run(&self.next, count, EDGE_CHUNK_BITS, Self::CAPACITY);
-        self.priors.made(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU32::new(0)).collect());
-        self.moves.made(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
+        self.priors.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU32::new(0)).collect());
+        self.moves.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
         first
     }
 
@@ -565,7 +560,6 @@ impl Edges {
         f32::from_bits(self.priors.get(edge).load(Ordering::Relaxed))
     }
 
-    //the edge's move, as the position it is played from reads it (PackedMove::to_move)
     pub fn chess_move(&self, edge: usize) -> PackedMove {
         PackedMove::from_bits(self.moves.get(edge).load(Ordering::Relaxed))
     }

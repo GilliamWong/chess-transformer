@@ -1,4 +1,3 @@
-//the rules as the python has them, held together by tests/test_selfplay_rs.py
 use shakmaty::uci::UciMove;
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{Bitboard, Board, CastlingSide, Chess, Color, EnPassantMode, File, Move, MoveList, Position, Role, Square};
@@ -12,7 +11,6 @@ const TURN_TOKEN_OFFSET: u8 = 13;
 const CASTLING_TOKEN_OFFSET: u8 = 15;
 const EN_PASSANT_TOKEN_OFFSET: u8 = 17;
 const PIECE_TYPES: u8 = 6;
-//the rules' threefold repetition (mcts.py's search has its own)
 const THREEFOLD: usize = 3;
 
 //python-chess's _transposition_key as a zobrist hash: en passant only counts when the capture is legal
@@ -20,7 +18,7 @@ pub fn position_key(board: &Chess) -> u64 {
     board.zobrist_hash::<Zobrist64>(EnPassantMode::Legal).0
 }
 
-pub fn after(board: &Chess, chess_move: Move) -> Chess {
+fn after(board: &Chess, chess_move: Move) -> Chess {
     let mut next = board.clone();
     next.play_unchecked(chess_move);
     next
@@ -78,7 +76,6 @@ fn python_chess_squares(chess_move: Move) -> (usize, usize, usize) {
     }
 }
 
-//the king's square after castling with `rook`: the g or c file
 fn castle_target(king: Square, rook: Square) -> Square {
     Square::from_coords(if rook > king { File::G } else { File::C }, king.rank())
 }
@@ -193,7 +190,6 @@ fn python_order(chess_move: Move, in_check: bool) -> u32 {
     group << 16 | first << 10 | second << 4 | promotion
 }
 
-//queen, rook, bishop, knight
 fn promotion_order(promotion: Option<Role>) -> u32 {
     match promotion {
         None | Some(Role::Queen) => 0,
@@ -203,7 +199,7 @@ fn promotion_order(promotion: Option<Role>) -> u32 {
     }
 }
 
-pub fn is_insufficient_material(board: &Board) -> bool {
+fn is_insufficient_material(board: &Board) -> bool {
     has_insufficient_material(board, Color::White) && has_insufficient_material(board, Color::Black)
 }
 
@@ -229,13 +225,12 @@ fn since_zeroing(keys: &[u64], halfmoves: u32) -> &[u64] {
     &keys[earlier - earlier.min(halfmoves as usize)..]
 }
 
-//occurrences of the last key (positions oldest first), counting back to the last capture or pawn move
-pub fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
+//occurrences of the last key, positions oldest first
+fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
     let current = keys.last().expect("the position itself");
     since_zeroing(keys, halfmoves).iter().filter(|&key| key == current).count()
 }
 
-//the syzygy tables (engine.tablebase), memory mapped for random reads: a probe reads a page or two, which readahead would pad
 pub struct Tables {
     tablebase: Tablebase<Chess>,
     pieces: usize,
@@ -351,7 +346,6 @@ mod tests {
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
     ];
 
-    //every legal move comes back from its packing in its position, its uci without it, and no two of a position's moves share a packing
     #[test]
     fn a_move_comes_back_from_its_packing() {
         let mut kinds = [0; 7];

@@ -1,7 +1,4 @@
-//fake gpus for timing Searches' round loop (rounds.rs) on more gpus than the machine has: the cuda runtime calls the loop
-//makes (cuda_runtime.addresses') and graphs that answer a lean round from a hash of each board. A launch keeps its stream
-//busy for fixed + per_board * size after its device's (the thread's set_device) other batches: a gpu runs one at a time.
-//Streams, events and devices are numbers taken modulo STREAMS; the waits spin, as a blocking wait holds the thread.
+//stand-ins for the round loop's cuda calls: a graph answers from a hash of each board and keeps its device busy for a set time
 use crate::rules::TOKENS_PER_BOARD;
 use crate::{LEAN_COLUMNS, LEAN_ROW};
 use pyo3::exceptions::PyValueError;
@@ -15,7 +12,7 @@ use std::time::{Duration, Instant};
 
 const STREAMS: usize = 256;
 
-//rows and answers are the caller's buffers' addresses; busy is a batch's nanoseconds
+//rows and answers are buffer addresses; busy is nanoseconds
 struct Graph {
     size: usize,
     rows: usize,
@@ -24,7 +21,7 @@ struct Graph {
 }
 
 static GRAPHS: RwLock<Vec<Graph>> = RwLock::new(Vec::new());
-//nanoseconds since START when each stream's and each device's batches are done, and each event's stream
+//READY and DEVICE_READY are nanoseconds since START
 static READY: [AtomicU64; STREAMS] = [const { AtomicU64::new(0) }; STREAMS];
 static DEVICE_READY: [AtomicU64; STREAMS] = [const { AtomicU64::new(0) }; STREAMS];
 static EVENT_STREAMS: [AtomicU64; STREAMS] = [const { AtomicU64::new(0) }; STREAMS];
@@ -50,7 +47,7 @@ extern "C" fn set_device(device: i32) -> i32 {
 }
 
 extern "C" fn memcpy(target: usize, source: usize, bytes: usize, _kind: i32, _stream: usize) -> i32 {
-    //SAFETY: the loop copies between buffers fake_cuda_graph's caller keeps alive, of the sizes it gave
+    //SAFETY: the loop copies between its caller's live buffers, within the sizes fake_cuda_graph was given
     unsafe { std::ptr::copy_nonoverlapping(source as *const u8, target as *mut u8, bytes) };
     0
 }
@@ -59,7 +56,6 @@ fn seed(tokens: &[u8]) -> u64 {
     tokens.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &token| (hash ^ u64::from(token)).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
-//a hash's top 24 bits as a fraction of 1
 fn unit(hash: u64) -> f32 {
     (hash >> 40) as f32 / (1u64 << 24) as f32
 }
@@ -67,14 +63,14 @@ fn unit(hash: u64) -> f32 {
 extern "C" fn graph_launch(exec: usize, stream: usize) -> i32 {
     let graphs = GRAPHS.read().expect("the fake graphs");
     let Some(graph) = exec.checked_sub(1).and_then(|index| graphs.get(index)) else { return 1 };
-    //SAFETY: the graph's rows and answers are its caller's buffers of its size (fake_cuda_graph)
+    //SAFETY: fake_cuda_graph's caller keeps rows and answers alive, sized for the graph
     let (rows, answers) = unsafe {
         (
             std::slice::from_raw_parts(graph.rows as *const u8, graph.size * LEAN_ROW),
             std::slice::from_raw_parts_mut(graph.answers as *mut f32, graph.size * LEAN_COLUMNS),
         )
     };
-    //the last column is the expected score's, which also pads the legal moves' columns: only those before it get logits
+    //a row's columns are its moves' ids then padding equal to the last column: only the moves get logits
     for (row, answer) in rows.chunks_exact(LEAN_ROW).zip(answers.chunks_exact_mut(LEAN_COLUMNS)) {
         let board = seed(&row[..TOKENS_PER_BOARD]);
         let column = |slot: usize| u16::from_le_bytes([row[TOKENS_PER_BOARD + 2 * slot], row[TOKENS_PER_BOARD + 2 * slot + 1]]);
@@ -128,8 +124,7 @@ pub fn fake_cuda_addresses() -> HashMap<String, usize> {
     .collect()
 }
 
-//a fake graph of `size` boards reading lean rows at `rows` and writing their answers at `answers`, both kept alive by the
-//caller while the loop runs: its exec's handle
+//rows and answers must stay alive while the loop runs; returns the graph's exec handle
 #[pyfunction]
 pub fn fake_cuda_graph(size: usize, rows: usize, answers: usize, fixed_seconds: f64, per_board_seconds: f64) -> PyResult<usize> {
     if size == 0 || rows == 0 || answers == 0 {

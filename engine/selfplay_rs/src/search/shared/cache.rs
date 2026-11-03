@@ -1,4 +1,3 @@
-//Tree's cache cut into shards by the key's top bits, each behind its own lock; an answer is copied out, not borrowed
 use crate::search::Cache;
 use std::sync::{Mutex, MutexGuard};
 
@@ -9,7 +8,6 @@ pub struct SharedCache {
 }
 
 impl SharedCache {
-    //room for `positions` answers in all
     pub fn new(positions: usize) -> SharedCache {
         let shards = 1usize << SHARD_BITS;
         SharedCache { shards: (0..shards).map(|_| Mutex::new(Cache::new(positions.div_ceil(shards)))).collect() }
@@ -30,7 +28,6 @@ impl SharedCache {
         self.shards[(key >> (64 - SHARD_BITS)) as usize].lock().expect("a cache shard")
     }
 
-    //copies the priors into `priors`, returns the value
     pub fn get(&self, key: u64, priors: &mut Vec<f32>) -> Option<f32> {
         let shard = self.shard(key);
         let answer = shard.get(key)?;

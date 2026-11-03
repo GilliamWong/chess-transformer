@@ -1,13 +1,8 @@
-//cargo test --release bench_replay -- --ignored --nocapture --test-threads 1: bench_drivers' drivers on the real network's
-//recorded answers, a Tree behind a lock (bench_replay_locked) or a SharedTree (bench_replay_shared). Environment: BENCH_STORE
-//(rust-selection's answers_all.pkl, exported by concurrent-descents/export_store.py), BENCH_MOVE_IDS (the move id table it is
-//by, concurrent-descents/move_ids.bin), BENCH_POSITIONS (a line a position: game, move, fen, moves), BENCH_GAME and BENCH_MOVE
-//(the position), BENCH_VISITS (what one thread searches of it first); the rest is bench_drivers'. A board the recording lacks
-//gets the stand-in's answer, and "recorded" tells the recorded share of the timed rounds' boards
+//cargo test --release bench_replay -- --ignored --nocapture --test-threads 1
 use super::*;
 
-//an answer: the 1,968 move ids' logits, then the expected score
-const WIDTH: usize = 1969;
+const NETWORK_MOVE_IDS: usize = 1968;
+const WIDTH: usize = NETWORK_MOVE_IDS + 1;
 const CACHE_POSITIONS: usize = 5_000_000;
 
 fn engine_move_ids() -> MoveIds {
@@ -72,7 +67,7 @@ impl Replay {
 trait Searcher: Sync {
     fn visits(&self) -> u32;
     fn gather(&self, round: &Round) -> Vec<u8>;
-    fn finish(&self, round: u64, rows: &[Vec<f32>]);
+    fn finish(&self, id: u64, rows: &[Vec<f32>]);
 }
 
 struct Locked {
@@ -94,11 +89,11 @@ impl Searcher for Locked {
         boards
     }
 
-    fn finish(&self, round: u64, rows: &[Vec<f32>]) {
+    fn finish(&self, id: u64, rows: &[Vec<f32>]) {
         let mut guard = self.tree.lock().expect("the tree");
         let (tree, cache) = &mut *guard;
         for row in rows {
-            tree.finish_leaf(round, |column| row[column], WIDTH, &self.move_ids, Some(cache), &self.settings);
+            tree.finish_leaf(id, |column| row[column], WIDTH, &self.move_ids, Some(cache), &self.settings);
         }
     }
 }
@@ -122,17 +117,16 @@ impl Searcher for Concurrent {
         boards
     }
 
-    fn finish(&self, round: u64, rows: &[Vec<f32>]) {
+    fn finish(&self, id: u64, rows: &[Vec<f32>]) {
         let _hold = self.tree.hold();
         let mut logits = Vec::new();
-        for (leaf, row) in self.tree.take_round(round).into_iter().zip(rows) {
+        for (leaf, row) in self.tree.take_round(id).into_iter().zip(rows) {
             let (cache, settings) = (Some(&self.cache), &self.settings);
             self.tree.finish_leaf(leaf, |column| row[column], WIDTH, &self.move_ids, cache, settings, usize::MAX, &mut logits);
         }
     }
 }
 
-//rounds on the recorded answers until the root has `visits`, two out at a time as the recorded searches had
 fn base_search(fen: &str, moves: &[String], visits: u32, replay: &Replay, move_ids: &MoveIds, settings: &SearchSettings) -> (Tree, Cache) {
     let moves: Vec<&str> = moves.iter().map(String::as_str).collect();
     let (mut tree, mut cache) = (tree_after(fen, &moves), Cache::new(CACHE_POSITIONS));
@@ -140,8 +134,7 @@ fn base_search(fen: &str, moves: &[String], visits: u32, replay: &Replay, move_i
     let mut id = 0;
     loop {
         if tree.root().visit_count as usize + tree.pending() < visits as usize && waiting.len() < 2 {
-            let leaves = (tree.root().visit_count / 16).clamp(1, 64);
-            let round = Round { id, leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: visits, memory_limit: usize::MAX };
+            let round = round_of(id, tree.root().visit_count, 0, visits);
             let mut boards = Vec::new();
             tree.gather(&round, settings, None, Some(&cache), &mut boards).expect("no tables");
             waiting.push_back((id, replay.rows(&boards)));
@@ -156,6 +149,7 @@ fn base_search(fen: &str, moves: &[String], visits: u32, replay: &Replay, move_i
     (tree, cache)
 }
 
+//a line a position, tab-separated: game, move, fen, the moves played from the fen
 fn position(game: usize, place: usize) -> (String, Vec<String>) {
     let text = std::fs::read_to_string(std::env::var("BENCH_POSITIONS").expect("BENCH_POSITIONS")).expect("the positions");
     let fields = text
@@ -203,13 +197,13 @@ fn replay_drivers(shared: bool) {
     };
     drop((base, base_cache));
     let (run, leaves) = ((Mutex::new(DriversRun::default()), Condvar::new()), AtomicU64::new(0));
-    //the nanoseconds the drivers spent in gather and in finish
-    let spent = (AtomicU64::new(0), AtomicU64::new(0));
+    let (gather_nanos, finish_nanos) = (AtomicU64::new(0), AtomicU64::new(0));
     let start = searcher.visits();
     let started = Instant::now();
     std::thread::scope(|scope| {
         for driver in 0..drivers {
-            let (searcher, leaves, run, replay, spent) = (&searcher, &leaves, &run, &replay, &spent);
+            let (searcher, leaves, run, replay, gather_nanos, finish_nanos) =
+                (&searcher, &leaves, &run, &replay, &gather_nanos, &finish_nanos);
             let cpu = (!driver_cpus.is_empty()).then(|| driver_cpus[driver % driver_cpus.len()]);
             scope.spawn(move || {
                 if let Some(cpu) = cpu {
@@ -234,19 +228,10 @@ fn replay_drivers(shared: bool) {
                         }
                     };
                     if let Some((id, answered)) = next_round {
-                        let count = (searcher.visits() / 16).clamp(1, 64);
-                        let round = Round {
-                            id,
-                            leaves: count,
-                            simulations: 3 * count,
-                            collisions: if collisions == 0 { count } else { collisions },
-                            visit_limit: u32::MAX,
-                            memory_limit: usize::MAX,
-                        };
+                        let round = round_of(id, searcher.visits(), collisions, u32::MAX);
                         let gathering = Instant::now();
                         let boards = searcher.gather(&round);
-                        spent.0.fetch_add(gathering.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                        //answered out of any lock
+                        gather_nanos.fetch_add(gathering.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let rows = replay.rows(&boards);
                         leaves.fetch_add(rows.len() as u64, Ordering::Relaxed);
                         if rows.is_empty() {
@@ -258,7 +243,7 @@ fn replay_drivers(shared: bool) {
                     let Some((id, rows)) = waiting.pop_front() else { break };
                     let finishing = Instant::now();
                     searcher.finish(id, &rows);
-                    spent.1.fetch_add(finishing.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    finish_nanos.fetch_add(finishing.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let mut state = run.0.lock().expect("the run");
                     state.out -= 1;
                     state.answered += u64::from(!rows.is_empty());
@@ -279,8 +264,8 @@ fn replay_drivers(shared: bool) {
         seconds * 1e6 / leaves as f64,
         leaves as f64 / timed as f64,
         hits as f64 / (hits + misses).max(1) as f64,
-        spent.0.load(Ordering::Relaxed) as f64 / 1e3 / leaves as f64,
-        spent.1.load(Ordering::Relaxed) as f64 / 1e3 / leaves as f64
+        gather_nanos.load(Ordering::Relaxed) as f64 / 1e3 / leaves as f64,
+        finish_nanos.load(Ordering::Relaxed) as f64 / 1e3 / leaves as f64
     );
 }
 

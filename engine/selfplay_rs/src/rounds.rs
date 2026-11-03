@@ -1,5 +1,3 @@
-//Searches' own round loop (EngineSearch's rust_rounds): engine_search.py's rounds_on, a thread a network, without python
-//python keeps the networks (their buffers, graphs, streams and events) alive while the loop runs, RoundLoop holds them
 use crate::affinity;
 use crate::rules::TOKENS_PER_BOARD;
 use crate::{LEAN_COLUMNS, LEAN_ROW, RootNumbers, Search, SearchReport, Searches, State, root_numbers, root_score_of};
@@ -16,7 +14,7 @@ use std::time::{Duration, Instant};
 const HOST_TO_DEVICE: i32 = 1;
 const DEVICE_TO_HOST: i32 = 2;
 
-//the cuda runtime's calls by address (cuda_runtime.py's), a pointer a usize as on 64-bit targets
+//the cuda runtime's functions by address; pointers travel as usize, as on 64-bit targets
 type SetDevice = unsafe extern "C" fn(i32) -> i32;
 type Memcpy = unsafe extern "C" fn(usize, usize, usize, i32, usize) -> i32;
 type OnStream = unsafe extern "C" fn(usize, usize) -> i32;
@@ -68,7 +66,6 @@ fn panicked<E>(_: E) -> PyErr {
     PyRuntimeError::new_err("a round loop thread panicked")
 }
 
-//a lean lane's handles (inference.Lane.handles), and whether its batch is out
 struct Lane {
     stream: usize,
     done: usize,
@@ -127,7 +124,6 @@ impl Network {
         self.lanes.iter().position(|lane| !lane.pending).ok_or_else(|| PyRuntimeError::new_err("more batches in flight than lanes"))
     }
 
-    //lean launch_filled's calls on a free lane: the rows' copy, the smallest graph that holds them, the event; the graph's index
     fn launch(&mut self, calls: &CudaCalls, index: usize, count: usize) -> PyResult<usize> {
         let lane = &mut self.lanes[index];
         let graph = lane
@@ -146,7 +142,6 @@ impl Network {
         Ok(graph)
     }
 
-    //lean collect's calls: the batch's wait, the answers' copy; the answers, LEAN_COLUMNS a board, in the pinned buffer
     fn collect(&mut self, calls: &CudaCalls, (index, graph): (usize, usize), count: usize) -> PyResult<&[f32]> {
         let lane = &mut self.lanes[index];
         //SAFETY: as launch's; the pinned answers stay put until this lane's next collect
@@ -181,7 +176,6 @@ impl Network {
     }
 }
 
-//EngineSearch's settings (engine_search.py's names)
 #[derive(FromPyObject)]
 #[pyo3(from_item_all)]
 pub(crate) struct LoopSettings {
@@ -207,7 +201,7 @@ pub(crate) struct LoopSettings {
     value_sharpness: f64,
 }
 
-//engine_search.py's SearchRun, behind Shared's lock; times are seconds since the loop's start
+//times are seconds since the loop's start
 struct Run {
     simulations: Option<u32>,
     deadline: Option<f64>,
@@ -292,7 +286,7 @@ fn running_search(state: &State, game: u64) -> PyResult<&Search> {
 //a launched round: its name, its lane and graph (None for a round without leaves), its boards, when it was launched
 type Launched = (u64, Option<(usize, usize)>, usize, f64);
 
-//one network's rounds: engine_search.py's rounds_on, line for line
+//one network's rounds, as engine_search.py's rounds_on
 struct Rounds<'a> {
     searches: &'a Searches,
     settings: &'a LoopSettings,
@@ -411,8 +405,8 @@ impl Rounds<'_> {
                 None => &[],
             };
             let answered = shared.now();
-            //concurrent descents finish outside the run's lock, so that the threads finish at once; a thread may then find
-            //the search gone before its report is in, which every call it makes then takes as the search being done
+            //concurrent descents finish outside the run's lock; a thread may then find the search gone before its report is
+            //in, which every call it makes then takes as the search being done
             let finished = if self.searches.concurrent_descents {
                 let reports = self.searches.shared_finish(answers, Some(name))?;
                 Some((reports, self.searches.shared_root_numbers(settings.game)?))
@@ -487,7 +481,6 @@ impl Rounds<'_> {
     }
 }
 
-//a board's tokens, then its columns as little-endian u16s, LEAN_ROW bytes a board (Searches.descend_rows')
 //SAFETY: rows points at room for every board's LEAN_ROW bytes, which nothing else touches meanwhile
 pub(crate) unsafe fn write_lean_rows(rows: *mut u8, tokens: &[u8], columns: &[u16]) {
     for (index, (board, board_columns)) in
@@ -503,7 +496,6 @@ pub(crate) unsafe fn write_lean_rows(rows: *mut u8, tokens: &[u8], columns: &[u1
     }
 }
 
-//a search's rounds on Searches' own threads, a network each, from Searches.round_loop until wait has its report
 #[pyclass]
 pub(crate) struct RoundLoop {
     shared: Arc<Shared>,
@@ -515,8 +507,7 @@ pub(crate) struct RoundLoop {
 
 #[pymethods]
 impl RoundLoop {
-    //the search's report once every network's rounds are back, None if that takes longer than `seconds`; a thread's
-    //failure (a cuda error among them) is raised here
+    //None if the rounds take longer than `seconds`; a thread's failure (a cuda error among them) is raised here
     fn wait(&mut self, py: Python<'_>, seconds: f64) -> PyResult<Option<SearchReport>> {
         let done = py.detach(|| -> PyResult<bool> {
             let run = self.shared.lock()?;
@@ -547,15 +538,13 @@ impl RoundLoop {
         self.shared.told.store(true, Ordering::Relaxed);
     }
 
-    //the round times (EngineSearch.round_times), the batches launched and their boards
     fn counts(&self) -> PyResult<(Vec<f64>, u64, u64)> {
         let run = self.shared.lock()?;
         Ok((run.round_times.iter().copied().collect(), run.batches, run.boards))
     }
 }
 
-//a loop python lets go of before its report (an exception in the waiting thread): its threads are stopped and joined
-//before the networks they use can go
+//a loop dropped before its report (an exception in the waiting thread) stops and joins its threads before the networks can go
 impl Drop for RoundLoop {
     fn drop(&mut self) {
         self.shared.told.store(true, Ordering::Relaxed);

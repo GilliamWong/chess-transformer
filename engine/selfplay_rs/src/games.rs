@@ -1,4 +1,4 @@
-//tests/reference_selfplay.py's games move for move, apart from the random numbers
+//plays tests/reference_selfplay.py's games move for move, apart from the random numbers
 use crate::rules::{MoveIds, Tables, encode_board, final_result};
 use crate::search::{SearchSettings, Tree};
 use rand::{RngExt, SeedableRng};
@@ -18,7 +18,6 @@ pub struct GameSettings {
     pub root_noise_share: f64,
 }
 
-//every position before a move, with what the search found there
 #[derive(Default)]
 pub struct Record {
     pub boards: Vec<u8>,
@@ -38,7 +37,7 @@ pub struct Game {
     number: u64,
     random: ChaCha8Rng,
     pub tree: Tree,
-    plies: usize, //len(board.move_stack)
+    plies: usize, //moves played since the start fen, the start moves included
     noised: bool,
     record: Record,
 }

@@ -1,6 +1,4 @@
-//cargo test --release bench_ -- --ignored --nocapture --test-threads 1: the round loop's threads on one tree (stand-in
-//network). Environment, BENCH_-prefixed: VISITS ROUNDS IN_FLIGHT REPEATS FIRST COLLISIONS (0: the round's leaves), the
-//stand-in's VALUE_NOISE (logit sd) and PRIOR_SCALE, and bench_drivers' DRIVERS, DRIVER_CPUS and TRANSPOSITIONS (1: on)
+//cargo test --release bench_ -- --ignored --nocapture --test-threads 1; the settings are BENCH_-prefixed environment variables
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -53,7 +51,7 @@ fn cache_with_room(cache: &Cache, rounds: usize) -> Cache {
     Cache { newer: with_room(&cache.newer), older: with_room(&cache.older), generation: cache.generation }
 }
 
-//the round the benchmarks gather: a leaf per 16 root visits up to 64, three simulations a leaf
+//collisions 0 for as many as leaves
 fn round_of(id: u64, root_visits: u32, collisions: u32, visit_limit: u32) -> Round {
     let leaves = (root_visits / 16).clamp(1, 64);
     let collisions = if collisions == 0 { leaves } else { collisions };
@@ -140,8 +138,7 @@ struct DriversRun {
     starved: Option<u64>,
 }
 
-//BENCH_DRIVERS threads on one tree behind a lock, as rounds.rs runs a thread a gpu, each with BENCH_IN_FLIGHT rounds out,
-//BENCH_ROUNDS in all (DRIVER_CPUS pins the threads in turn)
+//BENCH_DRIVERS threads on one tree behind a lock, as rounds.rs runs a thread a gpu, each with BENCH_IN_FLIGHT rounds out
 #[test]
 #[ignore]
 fn bench_drivers() {

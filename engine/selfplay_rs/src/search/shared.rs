@@ -1,16 +1,9 @@
-//a tree many threads search at once (Searches' concurrent_descents): Tree's search with atomic counters and chunked storage
-//that never moves. A simulation counts itself in flight on every node it passes, as Leela Zero's virtual loss does, so the
-//threads steer around each other as one thread's rounds do. One thread makes exactly Tree::gather's search.
-//
-//A node's bump returns its state before it: no visits and nothing in flight is a leaf the descent now owns; no visits and
-//something in flight is a collision (the node waits for the network or is being expanded). Edges are published (release)
-//after they are written, a visit is counted (release) after the node's value is added, and readers load both with acquire.
-//A move's link is written before it is put into its node's list (release, arena.rs Links); of two threads that put one in
-//for a move, one link is kept. A node reaching SOLID_TREE_THRESHOLD visits is queued, and the queue's nodes have their lists
-//made solid (lc0's solid tree) with the gate held exclusively; a link a waiting leaf holds is then found again by its place
-//(current_link). A reader may see a half backed up path, never a torn field. A proof rewrites a node's sum and its
-//ancestors', which cannot happen beside backups, so a proof of a node with visits holds the gate exclusively (a leaf nobody
-//has visited rewrites nothing)
+//the protocol between threads: edges are published (release) after they are written, a visit is counted (release) after the
+//node's value is added, and readers load both with acquire. A move's link is written before it is put into its node's list
+//(release); of two threads that put one in for a move, one link is kept. A reader may see a half backed up path, never a torn
+//field. A proof rewrites a node's sum and its ancestors', which cannot happen beside backups, so proving a node with visits
+//holds the gate exclusively
+
 mod arena;
 mod cache;
 mod reuse;
@@ -22,7 +15,6 @@ use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use super::*;
 
-//a call's share of the gate; calls give way between descents, so a thread wanting the tree waits for a descent, not a call
 pub struct Hold<'a> {
     tree: &'a SharedTree,
     guard: Option<RwLockReadGuard<'a, ()>>,
@@ -47,16 +39,13 @@ const EDGE_BYTES: usize = size_of::<f32>() + size_of::<PackedMove>();
 const LINK_BYTES: usize = size_of::<Link>();
 const SLOT_BYTES: usize = size_of::<Slot>();
 const TABLE_ENTRY_BYTES: usize = 32;
-//what a descent may need: its node and the link of the move to it, and the moves of its leaf
 const DESCENT_NODE_BYTES: usize = NODE_BYTES + LINK_BYTES;
 const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + MOST_MOVES * EDGE_BYTES;
 
-//the nodes queued for their solid slots before a call takes the tree to itself to make them so
 const SOLID_BATCH: usize = 32;
 
 const TABLE_SHARDS: usize = 256;
 
-//the node of each position by graph_key (search.rs Graph), in shards each behind its own lock
 struct SharedGraph {
     shards: Box<[Mutex<KeyMap<u32>>]>,
     entries: AtomicUsize,
@@ -72,7 +61,6 @@ impl SharedGraph {
     }
 }
 
-//where a descent ended
 enum Arrival {
     Inner,
     Proven(Proof),
@@ -81,7 +69,7 @@ enum Arrival {
     //a node to evaluate: a new leaf the descent owns, or a game's end or repeat reached again
     Leaf,
     //with transpositions, above the node the path's last move leads to (not counted in flight there): a repeat of a
-    //position on the path, or a move with fewer visits than its node (search.rs Stop)
+    //position on the path, or a move with fewer visits than its node
     Repeat,
     CatchUp,
 }
@@ -106,12 +94,10 @@ pub struct SharedTree {
     nodes: Nodes,
     edges: Edges,
     links: Links,
-    //nodes queued to be made solid, and how many (read without the lock)
     to_solidify: Mutex<Vec<u32>>,
     queued: AtomicUsize,
     solid_threshold: u32,
     solid_batch: usize,
-    //the network leaves of each round, queued by the call that gathered them
     pending: Mutex<HashMap<u64, Vec<PendingLeaf>>>,
     //network leaves gathered and not yet backed up
     waiting: AtomicUsize,
@@ -119,13 +105,11 @@ pub struct SharedTree {
     reserved: AtomicUsize,
     //no room for another simulation: the search ends as at its simulations, until a move is played
     full: AtomicBool,
-    //the search is over and reported: a call that still has the tree gathers nothing more
     closed: AtomicBool,
     //calls hold the gate shared, whatever needs the tree to itself holds it exclusive; writers counts the threads waiting
     gate: RwLock<()>,
     writers: AtomicUsize,
     pub counts: Counts,
-    //None without transpositions
     graph: Option<SharedGraph>,
 }
 
@@ -223,7 +207,6 @@ impl SharedTree {
         Hold { tree: self, guard: Some(self.gate.read().expect("the gate")) }
     }
 
-    //the gate exclusively; the calls give way while it waits
     fn writer(&self) -> RwLockWriteGuard<'_, ()> {
         self.writers.fetch_add(1, Ordering::AcqRel);
         let writer = self.gate.write().expect("the gate");
@@ -233,14 +216,13 @@ impl SharedTree {
 
     //runs `work` with the tree to itself, once every call has left it. The caller's share is given up first and taken again
     //after: a thread waiting for the gate while holding a share would never get it
-    fn exclusive<'a, R>(&'a self, hold: &mut Hold<'a>, work: impl FnOnce() -> R) -> R {
+    fn exclusive<'a>(&'a self, hold: &mut Hold<'a>, work: impl FnOnce()) {
         hold.guard = None;
         let writer = self.writer();
         self.counts.exclusive.fetch_add(1, Ordering::Relaxed);
-        let result = work();
+        work();
         drop(writer);
         hold.guard = Some(self.gate.read().expect("the gate"));
-        result
     }
 
     //the tree to itself for a caller that holds no share
@@ -271,7 +253,6 @@ impl SharedTree {
         self.child_index(parent, edge).map(|child| self.nodes.get(child))
     }
 
-    //a move's visits: its node's, or with transpositions the move's own
     fn link_visits(&self, link: u32) -> u32 {
         match (link, &self.graph) {
             (NO_LINK, _) => 0,
@@ -289,7 +270,6 @@ impl SharedTree {
         self.child(parent, edge).is_some_and(|child| child.proves_a_loss())
     }
 
-    //the visits of the root's two most visited moves, a proven loss left out
     pub fn two_most_visits(&self) -> (u32, u32) {
         let (mut most, mut second) = (0, 0);
         let root = self.root();
@@ -308,7 +288,7 @@ impl SharedTree {
         root.edges().filter(|&edge| !self.proven_lost(root, edge)).count()
     }
 
-    pub fn most_visited_edge(&self, node: usize) -> usize {
+    fn most_visited_edge(&self, node: usize) -> usize {
         let parent = self.nodes.get(node);
         let preference = |edge: usize| {
             let visits = self.visits(parent, edge);
@@ -360,7 +340,6 @@ impl SharedTree {
         if moves == 0 {
             return None;
         }
-        //a move without a node has no proof
         let (mut best, mut proven): (Option<Proof>, usize) = (None, 0);
         for (_, link) in self.links.linked(node) {
             if let Some(proof) = self.nodes.get(self.links.child(link) as usize).proof() {
@@ -441,8 +420,7 @@ impl SharedTree {
         (edges.start + best, best_link)
     }
 
-    //select_edge's value of a move; None for a proven loss, never chosen. A method rather than the scan's closure, which may
-    //be left a call a move
+    //select_edge's value of a move; None for a proven loss, never chosen
     #[inline(always)]
     fn move_value(&self, scan: &Scan, repeats: Option<&Repeats>, prior: &AtomicU32, child: u32, own_visits: &AtomicU32) -> Option<f64> {
         let prior = f64::from(f32::from_bits(prior.load(Ordering::Relaxed)));
@@ -534,7 +512,6 @@ impl SharedTree {
         }
     }
 
-    //queues the node on the visit that reaches the threshold (`visits_before` the last)
     fn queue_solid(&self, id: usize, visits_before: u32) {
         if visits_before + 1 == self.solid_threshold && matches!(self.nodes.get(id).children(), Children::List(_)) {
             let mut queue = self.to_solidify.lock().expect("the solid queue");
@@ -543,7 +520,6 @@ impl SharedTree {
         }
     }
 
-    //makes the queued nodes' lists solid once a batch is queued, with the tree to itself
     fn solidify_queued<'a>(&'a self, hold: &mut Hold<'a>) {
         if self.queued.load(Ordering::Acquire) < self.solid_batch {
             return;
@@ -563,7 +539,7 @@ impl SharedTree {
         });
     }
 
-    //lc0's MakeSolid: the node's list copied into one slot a move. Needs the tree to itself
+    //the node's list copied into one slot a move; needs the tree to itself
     fn make_solid(&self, id: usize) {
         let node = self.nodes.get(id);
         let moves = node.edges().len();
@@ -750,7 +726,6 @@ impl SharedTree {
         }
     }
 
-    //whether propagate_proofs would prove the leaf's parent
     fn proves_parent(&self, path: &[usize]) -> bool {
         path.len() >= 3 && self.proof_from_moves(path[path.len() - 2]).is_some()
     }
@@ -1039,7 +1014,6 @@ impl SharedTree {
         self.pending.lock().expect("the pending leaves").len()
     }
 
-    //a copy of a Tree whose search is done (nothing waits for the network), nodes numbered as they are in the Tree
     pub fn from_tree(tree: &Tree) -> SharedTree {
         assert_eq!(tree.pending(), 0, "a tree to copy has nothing waiting");
         let (nodes, edges, links) = (Nodes::new(), Edges::new(), Links::new());
@@ -1075,7 +1049,6 @@ impl SharedTree {
         self.nodes.get(id)
     }
 
-    //the tree with nodes made solid at `threshold` visits, `batch` of them at a time: the tests' small trees make many
     pub fn with_solid_links(mut self, threshold: u32, batch: usize) -> SharedTree {
         (self.solid_threshold, self.solid_batch) = (threshold, batch);
         self
@@ -1097,8 +1070,7 @@ impl SharedTree {
         self.root
     }
 
-    //a Tree of the same numbers with its edges numbered as Tree's vectors have them (those of a one thread search, in the
-    //order the nodes were expanded in), to compare a search with Tree's number for number
+    //edges numbered as a one thread search's Tree has them, in the order the nodes were expanded in
     pub fn to_tree(&self) -> Tree {
         let count = self.nodes.len();
         let mut expanded: Vec<(usize, usize)> = (0..count)

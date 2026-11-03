@@ -1,4 +1,4 @@
-//mcts.py's search operation for operation; a round of one leaf is exactly mcts.py's, more gather as lc0's minibatch
+//mcts.py's search operation for operation: a round of one leaf is exactly mcts.py's
 use crate::rules::{MoveIds, PackedMove, Tables, encode_board, game_result, position_key, sort_moves_in_python_order};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Gamma};
@@ -17,10 +17,10 @@ pub struct SearchSettings {
     pub fpu_reduction: f64,
     pub draw: f64,
     pub repetitions_for_a_draw: usize,
-    pub value_sharpness: f64, //through sharpen; 1 is mcts.py's search
-    //lc0's sticky endgames: proven results end descents and count; mcts.py has none
+    pub value_sharpness: f64, //1 is mcts.py's search
+    //proven results end descents; mcts.py has none
     pub certainty: bool,
-    //lc0's DAG search: a position reached by another move order shares one node; mcts.py has none
+    //one node a position; mcts.py has none
     pub transpositions: bool,
 }
 
@@ -32,7 +32,7 @@ pub enum Outcome {
     Win,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Proof {
     pub outcome: Outcome,
     pub value: f64, //the node's score under the proof
@@ -42,7 +42,6 @@ pub struct Proof {
 //plies a tablebase win or loss counts, so that a mate comes first
 const TABLEBASE_PLIES: u32 = 1000;
 
-//a move's proven result ranked for the side choosing it: quicker wins, then draws, then slower losses
 fn proof_rank(proof: &Proof) -> (Outcome, i64) {
     let plies = i64::from(proof.plies);
     (proof.outcome, match proof.outcome {
@@ -52,7 +51,6 @@ fn proof_rank(proof: &Proof) -> (Outcome, i64) {
     })
 }
 
-//mcts.Node's numbers; a move gets a node only once a simulation goes through it, as in lc0
 #[derive(Clone, Copy)]
 #[repr(align(64))]
 pub struct Node {
@@ -61,7 +59,7 @@ pub struct Node {
     in_flight: u32,
     pub value_sum: f64,
     visited_policy_sqrt: f64, //sqrt of the sum of visited children's priors
-    //first edge above the low 8 bits, number of edges in them (at most 218), 0 until expanded; u64 as u32 would end at ~115M nodes
+    //first edge above the low 8 bits, number of edges in them (at most 218); 0 until expanded
     edges_at: u64,
     pub proof: Option<Proof>, //only with SearchSettings' certainty, and never at the root
     children: u32,            //its moves with a node (NO_LINK)
@@ -69,18 +67,17 @@ pub struct Node {
 
 const NO_NODE: u32 = u32::MAX;
 
-//lc0's layout: a move with a node has a link in its node's list, or a slot once the node has SOLID_TREE_THRESHOLD visits. A move is named
-//by its link, or by SOLID with its slot; a node's children is NO_LINK, its first link or its first slot. Link 0 is never given out
+//a move with a node has a link in its node's list, or a slot once the node has SOLID_TREE_THRESHOLD visits. A move is named by its
+//link, or by SOLID with its slot; a node's children is NO_LINK, its first link or SOLID with its first slot. Link 0 is never given out
 pub const NO_LINK: u32 = 0;
 pub const SOLID: u32 = 1 << 31;
 pub const SOLID_TREE_THRESHOLD: u32 = 100;
 
-//whether a move's name is a list link's, not a solid slot's
 pub fn listed(link: u32) -> bool {
     link & SOLID == 0
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct Link {
     child: u32,
     visits: u32,
@@ -88,7 +85,7 @@ pub struct Link {
     place: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy)]
 pub struct Slot {
     child: u32,
     visits: u32,
@@ -147,7 +144,7 @@ pub fn softmax(logits: &mut [f32]) {
     }
 }
 
-//the value's logit times sharpness, E' = 1 / (1 + ((1 - E) / E)^sharpness); 1 leaves it exactly as it was
+//the value's logit times sharpness
 pub fn sharpen(value: f32, sharpness: f64) -> f32 {
     if sharpness == 1.0 {
         return value;
@@ -170,7 +167,6 @@ struct Answer<'a> {
     value: f32,
 }
 
-//zobrist keys are uniform already: one multiply spreads them over the table, where SipHash would hash them again
 #[derive(Default)]
 struct KeyHasher(u64);
 
@@ -202,7 +198,7 @@ pub fn halfmove_count(halfmoves: u32) -> u16 {
 
 //the positions of a descent's path that a move from its last node could repeat (a two-fold repetition inside the search): same side
 //to move, four plies or more back, no capture or pawn move between. `keys` is the game's positions then the path's from `path_start`,
-//the last node's last; `halfmoves` its count. A move whose position has a count of 0 repeats nothing
+//the last node's last; `halfmoves` its count
 pub struct Repeats<'a> {
     candidates: &'a [u64],
     filter: u128,
@@ -212,7 +208,6 @@ impl<'a> Repeats<'a> {
     pub fn new(keys: &'a [u64], path_start: usize, halfmoves: u32) -> Repeats<'a> {
         let position = keys.len();
         let lowest = position.saturating_sub(halfmoves as usize + 1).max(path_start);
-        //every other position from four plies back down (as `repeats` steps)
         let candidates = if position >= lowest + 4 { &keys[lowest..position - 3] } else { &[] };
         let filter = candidates.iter().rev().step_by(2).fold(0, |filter, &key| filter | Self::bit(key));
         Repeats { candidates, filter }
@@ -256,7 +251,6 @@ enum Stop {
     CatchUp,
 }
 
-//priors of room per cached position, above a middlegame's ~37 legal moves
 const PRIORS_A_POSITION: usize = 40;
 
 #[derive(Default)]
@@ -277,8 +271,8 @@ impl Generation {
     }
 }
 
-//the network's answers by position (lc0's nn cache); the network sees no history, so an answer is the same however the position was
-//reached. In two generations: when the newer is full the older is cleared and becomes the newer. Priors share one vector per generation
+//the network's answers by position: it sees no history, so an answer is the same however the position was reached. In two
+//generations: when the newer is full the older is cleared and becomes the newer
 pub struct Cache {
     newer: Generation,
     older: Generation,
@@ -299,7 +293,6 @@ impl Cache {
             std::mem::swap(&mut self.older, &mut self.newer);
             self.newer.clear();
         }
-        //a generation makes its room at its first answer, so that filling it never regrows its vectors
         if self.newer.places.capacity() == 0 {
             self.newer.places.reserve(self.generation);
             self.newer.priors.reserve(self.generation * PRIORS_A_POSITION);
@@ -314,8 +307,8 @@ impl Cache {
     }
 }
 
-//lc0's minibatch: leaves to gather for the network, simulations in all (those finished at once too), and descents that may end on a
-//leaf already waiting (collisions). Waiting simulations count as visits in the exploration term
+//a round (lc0's minibatch): leaves to gather for the network, simulations in all (those finished at once too), and descents that may
+//end on a leaf already waiting (collisions). Waiting simulations count as visits in the exploration term
 pub struct Round {
     pub id: u64, //its leaves wait under it until finish_leaf takes them; rounds may come back in any order
     pub leaves: u32,
@@ -348,12 +341,10 @@ fn reserve_to<T>(vector: &mut Vec<T>, capacity: usize) {
     }
 }
 
-//the vectors compact returns to free
 pub type Vectors = (Vec<Node>, Vec<u64>, Vec<PackedMove>, Vec<f32>, Vec<Link>, Vec<Slot>);
 
 const ABORT_CHECKS: usize = 4096;
 
-//whether the abort flag is set, looked at on every ABORT_CHECKS-th item
 fn aborted(item: usize, abort: Option<&AtomicBool>) -> bool {
     item.is_multiple_of(ABORT_CHECKS) && abort.is_some_and(|abort| abort.load(Ordering::Relaxed))
 }
@@ -361,7 +352,6 @@ fn aborted(item: usize, abort: Option<&AtomicBool>) -> bool {
 //fewer items than this are copied on one thread; the tests' small trees take several
 const PARALLEL_ITEMS: usize = if cfg!(test) { 64 } else { 16384 };
 
-//parts of the tree per thread of stale_candidates, so that a big part at the end leaves none idle long
 const PARTS_A_THREAD: usize = 16;
 
 //a subtree (its node, the places of the moves down to it) or a candidate leaf, for one of stale_candidates' threads
@@ -374,19 +364,17 @@ pub struct Tree {
     pub board: Chess,   //the root's position
     pub keys: Vec<u64>, //the position_key of every position of the game, the root's last
     pub nodes: Vec<Node>,
-    root: usize,         //the root's node: 0 but after move_root, until compact
-    node_keys: Vec<u64>, //each node's position_key
+    root: usize, //the root's node: 0 but after move_root, until compact
+    node_keys: Vec<u64>,
     //the edges: every expanded node's moves in python-chess's order with their priors
     moves: Vec<PackedMove>,
     priors: Vec<f32>,        //as the network gives them, read as f64s
     noised_priors: Vec<f64>, //the root's once add_root_noise has mixed its noise in; empty without
-    //moves with a node (NO_LINK): the lists' links, link 0 never given out, and the solid nodes' slots
     links: Vec<Link>,
     slots: Vec<Slot>,
     //the last round's memory limit, which make_solid stays within
     memory_limit: usize,
-    //the simulations waiting for the network by round (Round's id), in the order of the round's boards; a round whose leaves are all
-    //back keeps its room for a later one
+    //the simulations waiting for the network by round (Round's id), in the order of the round's boards
     pending: Vec<(u64, VecDeque<PendingLeaf>)>,
     logits: Vec<f32>,
     //no room for another simulation (make_room): the search ends as at its simulations, until a move is played
@@ -499,7 +487,6 @@ impl Tree {
         self.root
     }
 
-    //an edge's prior, a root edge's with its noise
     fn prior(&self, edge: usize) -> f64 {
         let root = self.root().edges();
         if !self.noised_priors.is_empty() && root.contains(&edge) {
@@ -522,7 +509,6 @@ impl Tree {
         if listed(link) { &mut self.links[link as usize].visits } else { &mut self.slots[(link & !SOLID) as usize].visits }
     }
 
-    //the name of the node's move `edge` if it has a node, NO_LINK if not
     fn link_of(&self, node: usize, edge: usize) -> u32 {
         let place = edge - self.nodes[node].edges().start;
         let children = self.nodes[node].children;
@@ -558,7 +544,6 @@ impl Tree {
         }
     }
 
-    //the node of the node's move `edge`, None until a simulation has gone through it
     pub fn child_index(&self, node: usize, edge: usize) -> Option<usize> {
         let link = self.link_of(node, edge);
         (link != NO_LINK).then(|| self.link_child(link) as usize)
@@ -578,7 +563,7 @@ impl Tree {
         if !listed(children) && listed(link) { children + self.links[link as usize].place } else { link }
     }
 
-    //lc0's MakeSolid: the node's slots one a move, its list copied in; under a memory limit only into the room make_room made
+    //the node's list copied into slots, one a move; under a memory limit only into the room make_room made
     fn make_solid(&mut self, node: usize) {
         let moves = self.nodes[node].edges().len();
         let head = self.nodes[node].children;
@@ -608,7 +593,6 @@ impl Tree {
         self.pending.iter().map(|(_, leaves)| leaves.len()).sum()
     }
 
-    //the legal moves of the round's waiting leaves in their order, with the side to move at each
     pub fn round_moves(&self, round: u64) -> impl Iterator<Item = (&[Move], Color)> {
         self.pending
             .iter()
@@ -653,9 +637,9 @@ impl Tree {
     }
 
     //mcts.select_child, with the simulations waiting under a child counted in its visits (lc0's n started); an edge without a node is a
-    //child without visits. A proven loss is passed over while any other move is left: its visits would only drag the node's mean down. With
-    //transpositions a move that repeats a position of the path (`repeats`) is worth a draw. Returns the edge and its move's name (NO_LINK
-    //for a list's move without a node, a solid slot's whether it has a node or not)
+    //child without visits. A proven loss is passed over while any other move is left. With transpositions a move that repeats a position
+    //of the path (`repeats`) is worth a draw. Returns the edge and its move's name (NO_LINK for a list's move without a node, a solid
+    //slot's whether it has a node or not)
     fn select_edge(&self, node: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> (usize, u32) {
         let parent = &self.nodes[node];
         let c_puct =
@@ -681,7 +665,6 @@ impl Tree {
                 && u > best_u
             {
                 (best, best_u, best_link) = (index, u, link);
-                //prefetch the best child's moves while the scan goes on, as the descent goes through them
                 if child_edges & 255 > 0 {
                     self.prefetch_edges((child_edges >> 8) as usize, child_moves);
                 }
@@ -690,7 +673,6 @@ impl Tree {
         let priors = &self.priors[edges.clone()];
         let children = parent.children;
         if listed(children) {
-            //a list's links come in their moves' order, the next one's place known ahead
             let place_of = |link: u32| if link == NO_LINK { usize::MAX } else { self.links[link as usize].place as usize };
             let (mut next_link, mut next_place) = (children, place_of(children));
             for (index, &prior) in priors.iter().enumerate() {
@@ -747,7 +729,7 @@ impl Tree {
         Some((q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + started))), child.edges_at, child.children))
     }
 
-    //asks for the cache lines of the priors from edge `first` on and of the first link or slots (`moves`), never faulting
+    //prefetches the priors from edge `first` on and the first link or slots of `moves` (a node's children)
     #[inline(always)]
     fn prefetch_edges(&self, first: usize, moves: u32) {
         #[cfg(target_arch = "x86_64")]
@@ -824,8 +806,7 @@ impl Tree {
         let mut path = Vec::new();
         let mut edges = Vec::new();
         //the tables finish the nodes they cover below the root; below a root they cover (a size with no dtz tables) only those right
-        //after a capture or pawn move, as lc0 probes: the network steers the moves between, and the tables' result starts the fifty move
-        //count there
+        //after a capture or pawn move, as lc0 probes: the tables' result starts the fifty move count there
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         while gathered < round.leaves
             && simulations < round.simulations
@@ -848,7 +829,6 @@ impl Tree {
                 let repeats = self.graph.is_some().then(|| Repeats::new(&self.keys, root_keys - 1, halfmoves));
                 let (edge, selected) = self.select_edge(node, settings, repeats.as_ref());
                 board.play_unchecked(self.moves[edge].to_move(&board));
-                //a descent never ends without a visit or a waiting simulation, so the node is needed
                 let link;
                 (node, link) = self.child_node(node, edge, selected, &board);
                 path.push(node);
@@ -876,7 +856,7 @@ impl Tree {
                 simulations += 1;
                 let value = match stop {
                     Stop::Repeat => 1.0 - settings.draw,
-                    //as SharedTree keeps it (a mean read there beside other backups may be off): a score
+                    //clamped as SharedTree does: a mean read there beside other backups may be off
                     Stop::CatchUp => self.nodes[node].mean_score().clamp(0.0, 1.0),
                 };
                 path.pop();
@@ -1058,7 +1038,6 @@ impl Tree {
         }
     }
 
-    //after the path's last node was proven, its parent may be too, and so on up to the root's children
     fn propagate_proofs(&mut self, path: &[usize]) {
         for depth in (1..path.len().saturating_sub(1)).rev() {
             match self.proof_from_moves(path[depth]) {
@@ -1095,7 +1074,6 @@ impl Tree {
         Some(Proof { outcome, value: 1.0 - best.value, plies: best.plies + 1 })
     }
 
-    //the root's result is proven, so searching on changes nothing
     pub fn root_decided(&self) -> bool {
         self.proof_from_moves(self.root).is_some()
     }
@@ -1103,7 +1081,7 @@ impl Tree {
     //a kept tree under a new root (Searches' tree reuse; self-play keeps mcts.py's tree as it is): a leaf scored by a rule that held only
     //from the old root comes out of the tree, its visits taken off its ancestors, as lc0 drops a two-fold draw whose first position is no
     //longer in the search, or a tables' result the new root would not probe. Leaves below a proven node stay: no descent reaches them.
-    //With transpositions nothing is taken out (as lc0's DAG search): that would miscount a node other paths share
+    //With transpositions nothing is taken out: that would miscount a node other paths share
     pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) -> Result<(), SyzygyError> {
         if self.graph.is_some() {
             return Ok(());
@@ -1356,7 +1334,6 @@ impl Tree {
         best
     }
 
-    //mcts.principal_variation, as edges
     pub fn principal_variation(&self) -> Vec<usize> {
         let (mut line, mut node) = (Vec::new(), self.root);
         while self.nodes[node].has_edges() {
@@ -1378,7 +1355,6 @@ impl Tree {
         edges
     }
 
-    //plays the root's move and makes its node the root, with its subtree (tree reuse) or without
     pub fn play(&mut self, edge: usize, keep_subtree: bool) {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         if keep_subtree && self.child_index(self.root, edge).is_some() {
@@ -1399,7 +1375,6 @@ impl Tree {
         }
     }
 
-    //move_root and compact at once: the subtree is copied once, where play would copy it at every move
     pub fn play_line(&mut self, line: &[usize]) {
         self.move_root(line);
         let old = self.compact(1, None);
@@ -1426,8 +1401,8 @@ impl Tree {
 
     //the root's part of the tree copied out of the rest (left there by move_root) as a tree of its own, in breadth-first order. Its proofs
     //still hold: they come from the game's end by its rules or the tables, which a new root leaves as it was. On more than one thread the
-    //order is found a level at a time in chunks, then each stretch of it is copied into its own part of the new vectors by the thread that
-    //first touches those pages: the same tree. Returns the old vectors to free, or None once abort is set (the tree then left as it was)
+    //order is found a level at a time, then each stretch of it is copied into its own part of the new vectors: the same tree. Returns the
+    //old vectors to free, or None once abort is set (the tree then left as it was)
     pub fn compact(&mut self, threads: usize, abort: Option<&AtomicBool>) -> Option<Vectors> {
         if self.graph.is_some() {
             return self.compact_graph(abort);
@@ -1562,8 +1537,6 @@ impl Tree {
         )
     }
 
-    //the nodes the moves of a chunk of a level lead to, in order, and of each node in the chunk its moves with a node and its moves;
-    //None once abort is set
     fn next_level(&self, chunk: &[u32], abort: Option<&AtomicBool>) -> Option<Level> {
         let (mut next, mut counts) = (Vec::new(), Vec::with_capacity(chunk.len()));
         for (index, &node) in chunk.iter().enumerate() {
@@ -1577,8 +1550,6 @@ impl Tree {
         Some((next, counts))
     }
 
-    //compact on one thread, in one pass: the nodes in breadth-first order, each one's moves as it comes, and the moves with a node getting
-    //theirs copied at the end (their links or slots made again)
     fn compact_on_one_thread(&mut self, abort: Option<&AtomicBool>) -> Option<Vectors> {
         let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
         let (mut nodes, mut node_keys, mut old_of) =
@@ -1616,8 +1587,7 @@ impl Tree {
         Some(self.replace_vectors(nodes, node_keys, moves, priors, links, slots))
     }
 
-    //compact with transpositions, on one thread: a node that several moves lead to is copied once (at the first) and every one of those
-    //moves given its new number, each move's visits with it; then the table again
+    //a node that several moves lead to is copied once, at the first, and each move is given its new number and its own visits
     fn compact_graph(&mut self, abort: Option<&AtomicBool>) -> Option<Vectors> {
         let graph = self.graph.as_ref().expect("the graph");
         let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
@@ -1671,8 +1641,7 @@ impl Tree {
         Some(self.replace_vectors(nodes, node_keys, moves, priors, links, slots))
     }
 
-    //compact's copy of a stretch of the breadth-first order: each node with its moves at their new edges, and the moves' nodes numbered
-    //as the order has them in its links or slots. False once abort is set
+    //copies a stretch, numbering the moves' nodes as the order has them; false once abort is set
     fn copy_stretch(&self, stretch: Stretch, order: &[u32], abort: Option<&AtomicBool>) -> bool {
         let (mut edge, mut child) = (stretch.first_edge, stretch.first_child);
         let (mut link, mut slot) = (stretch.first_link, stretch.first_slot);
@@ -1793,12 +1762,10 @@ struct Scan {
     draw: f64,
 }
 
-//a part of a level of compact's order: the nodes its chunk's moves lead to, and of each node of the chunk its moves with a node and
-//its moves
+//a chunk's next level: the nodes its moves lead to, and of each node in the chunk (its moves with a node, its moves)
 type Level = (Vec<u32>, Vec<(u8, u8)>);
 
-//a stretch of the order for one of compact's threads: its positions, where its edges, links, slots and the numbers of its moves'
-//nodes start, and its parts of the new vectors
+//one thread's stretch of compact's order: where its edges, links, slots and children's numbers start, and its parts of the new vectors
 struct Stretch<'a> {
     positions: Range<usize>,
     first_edge: usize,
@@ -1813,12 +1780,11 @@ struct Stretch<'a> {
     slots: &'a mut [MaybeUninit<Slot>],
 }
 
-//the items in a chunk for compact's threads: a `threads`th of them each, or all in one below PARALLEL_ITEMS
 fn chunk_size(items: usize, threads: usize) -> usize {
     if items < PARALLEL_ITEMS { items.max(1) } else { items.div_ceil(threads.max(1)) }
 }
 
-//f of each item, in order, each on a scoped thread of its own (the first here); items is not empty
+//f of each item, in order, on a scoped thread each but the first; items is not empty
 fn each_in_parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     std::thread::scope(|scope| {
         let workers: Vec<_> = items[1..].iter().map(|item| scope.spawn(|| f(item))).collect();
