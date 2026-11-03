@@ -740,16 +740,17 @@ impl SharedTree {
         *self.closed.get_mut() = false;
     }
 
-    //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent
-    fn reserve(&self, memory_limit: usize) -> bool {
-        if self.nodes.len() + 64 >= Nodes::CAPACITY {
+    //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent. Without
+    //`limited` the descent is let through whatever the room, but reserves like the rest: finish_leaf gives back every leaf's
+    fn reserve(&self, memory_limit: usize, limited: bool) -> bool {
+        if limited && self.nodes.len() + 64 >= Nodes::CAPACITY {
             return false;
         }
         if memory_limit == usize::MAX {
             return true;
         }
         let reserved = self.reserved.fetch_add(DESCENT_BYTES, Ordering::AcqRel) + DESCENT_BYTES;
-        if self.allocated_bytes() + reserved <= memory_limit {
+        if !limited || self.allocated_bytes() + reserved <= memory_limit {
             return true;
         }
         self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
@@ -821,8 +822,7 @@ impl SharedTree {
                 break;
             }
             //the root's own evaluation always fits, so that a full search still has moves to report
-            let reserved = self.root().has_edges();
-            if reserved && !self.reserve(round.memory_limit) {
+            if !self.reserve(round.memory_limit, self.root().has_edges()) {
                 self.full.store(true, Ordering::Relaxed);
                 break;
             }
@@ -831,11 +831,7 @@ impl SharedTree {
             path.clear();
             edges.clear();
             let arrival = self.descend(settings, &mut board, &mut keys, &mut path, &mut edges);
-            let give_back = |waiting: bool| {
-                if reserved {
-                    self.release(round.memory_limit, waiting);
-                }
-            };
+            let give_back = |waiting: bool| self.release(round.memory_limit, waiting);
             let node = *path.last().expect("the root at least");
             match arrival {
                 Arrival::Inner => unreachable!("a descent ends on a leaf"),
@@ -1042,6 +1038,10 @@ impl SharedTree {
 
     pub fn node(&self, id: usize) -> &Node {
         self.nodes.get(id)
+    }
+
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved.load(Ordering::Acquire)
     }
 
     pub fn with_solid_links(mut self, threshold: u32, batch: usize) -> SharedTree {

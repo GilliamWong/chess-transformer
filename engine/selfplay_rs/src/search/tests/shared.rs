@@ -295,6 +295,20 @@ fn a_search_ends_at_its_memory_limit_as_the_same_search() {
 }
 
 #[test]
+fn a_search_under_a_memory_limit_gives_back_every_reservation() {
+    let settings = settings(true);
+    let tree = shared_tree_after(START, &[]);
+    shared_in_flight(&tree, 3_000, 2, &settings, None, &SharedNetwork::new(), 4_000_000);
+    assert!(!tree.is_full());
+    assert_eq!(tree.reserved_bytes(), 0, "one thread");
+    for threads in [2, 8] {
+        let crowded = shared_tree_after(START, &[]);
+        search_on_threads(&crowded, threads, 3_000, 2, 16, &settings, &SharedNetwork::new(), 4_000_000);
+        assert_eq!(crowded.reserved_bytes(), 0, "{threads} threads");
+    }
+}
+
+#[test]
 fn the_shared_cache_gives_back_what_threads_put_in() {
     let cache = SharedCache::new(1 << 16);
     let priors = |key: u64| -> Vec<f32> { (0..37).map(|index| (key % 1000 + index) as f32).collect() };
