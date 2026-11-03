@@ -36,7 +36,7 @@ if [ "$(printf '%s\n' "$RUST_AT_LEAST" "$rust" | sort -V | head -1)" != "$RUST_A
     exit 1
 fi
 
-uv sync --frozen --no-group dev --no-group cu130 --group "$TORCH_CUDA" --python 3.12
+uv sync --frozen --no-default-groups --group selfplay --group "$TORCH_CUDA" --python 3.12
 
 if ! echo "$WEIGHTS_SHA256  $WEIGHTS" | sha256sum --check --status 2>/dev/null; then
     mkdir -p weights
