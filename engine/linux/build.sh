@@ -4,7 +4,7 @@
 #done. Needs git, curl, a C compiler (build-essential) and an NVIDIA driver for CUDA 13.0 (580 or newer).
 #SKIP_INT8=1 leaves the rounding to the engine's first isready
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 WEIGHTS=weights/fry-final-117.pt
 WEIGHTS_URL=https://github.com/GilliamWong/chess-transformer/releases/download/fry-final-117/fry-final-117.pt
@@ -50,4 +50,4 @@ if [ "${SKIP_INT8:-0}" != 1 ] && nvidia-smi >/dev/null 2>&1; then
 else
     echo "the int8 weights are left to the engine's first isready (no gpu, or SKIP_INT8=1)"
 fi
-echo "built: linux/engine.sh runs the engine"
+echo "built: engine/linux/engine.sh runs the engine"

@@ -9,4 +9,4 @@ if [ -d "$FOLDER/.git" ]; then
 else
     git clone --depth 1 "$REPOSITORY" "$FOLDER"
 fi
-"$FOLDER/linux/build.sh"
+"$FOLDER/engine/linux/build.sh"

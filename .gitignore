@@ -29,5 +29,5 @@ engine/selfplay_rs/target/
 .mypy_cache/
 *.egg-info/
 
-# the engine's downloaded weights (linux/build.sh)
+# the engine's downloaded weights (engine/linux/build.sh)
 weights/
