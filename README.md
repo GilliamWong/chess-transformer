@@ -35,7 +35,7 @@ the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clon
 | `MoveOverhead` | 20 | Milliseconds kept back from each move's time for the GUI's lag |
 | `CachePositions` | 5000000 | Network answers kept by position, ~190-260 bytes each |
 | `RamLimitMb` | 0 | MB the search tree may take (0 for no limit); the cache and the kept tree's copy come on top, so set it to about (memory - cache) / 1.7 |
-| `AdvanceThreads` | 4 | Threads that carry the tree on to the next move while the opponent thinks |
+| `AdvanceThreads` | 4 | Threads that carry the tree on to the next move while the opponent thinks; 0 moves it at the next search's start instead, on the engine's own time, as lc0 does |
 | `Leaves` | 64 | Positions sent to the network at once on each GPU |
 | `GPUs` | every GPU | `all`, or CUDA devices by number (`0,1,2,3`) |
 | `SmartPruningFactor` | 1 | Stops a search once its best move cannot be caught with the simulations left / this; 0 uses all of its time |
@@ -48,5 +48,5 @@ the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clon
 (the memory is `RamLimitMb`, the threads follow from the GPUs), and the engine does not ponder.
 
 `engine/linux/tcec.json` is a tournament entry for TCEC's GPU server (2x EPYC 9175F, 8x RTX 5090, driver 570, at most
-320 GiB of RAM for an engine, both engines on the one machine): `RamLimitMb` 180000, `CachePositions` 50000000 and
-`MoveOverhead` 200, with `SyzygyPath` set to the box's 7 piece tables.
+320 GiB of RAM for an engine, both engines on the one machine): `RamLimitMb` 180000, `CachePositions` 50000000,
+`AdvanceThreads` 0 (no work on the opponent's time) and `MoveOverhead` 200, with `SyzygyPath` set to the box's 7 piece tables.

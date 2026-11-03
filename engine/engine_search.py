@@ -69,7 +69,9 @@ RUST_WAIT_SECONDS = 0.005
 #rather than self-play's 500k gave 18% more nodes a search on the mean (3.5% on the median) from as many network
 #calls. The engine's own: every self-play worker has a selfplay.CACHE_POSITIONS cache
 CACHE_POSITIONS = 5_000_000
-#the threads advance walks and copies the kept tree on after a move, while the opponent thinks (Searches' advance_threads)
+#the threads advance walks and copies the kept tree on after a move, while the opponent thinks (Searches' advance_threads).
+#0 for none: the next search's start carries the tree on, on the engine's own clock, as lc0 does (TCEC's two engines
+#share one box); a reply's subtree of 2.2M nodes took 0.66 s to copy so on a 9950X3D (2026-11-03)
 ADVANCE_THREADS = 4
 #the engine's own changes to mcts.py's search, which self-play keeps (tools/play/variant_match.py tunes them). One leaf
 #a round (uci.py --leaves 1, evaluate_elo) stays mcts.py's search. c_puct 0.4 won +78 elo at 4k nodes a move and +46 at
@@ -275,6 +277,7 @@ class EngineSearch:
         self.smart_pruning = batched and smart_pruning
         self.smart_pruning_factor, self.smart_pruning_wait = smart_pruning_factor, smart_pruning_wait
         self.stop_at_one_move_left = stop_at_one_move_left
+        self.advance_threads = advance_threads
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
         pinned = several if pin_threads is None else pin_threads
         self.network_cpus = thread_cpus(len(self.networks) if pinned and batched else 0)
@@ -304,9 +307,10 @@ class EngineSearch:
 
     #once the engine's move is sent, while the opponent thinks: the kept tree carried on to the game after it (board) on
     #a thread of Searches', so that the next search's start only moves its root down the reply (Searches.advance).
-    #False when there is no tree to carry on
+    #False when there is no tree to carry on, or no advance threads (the next search's start then carries it on)
     def advance(self, board: chess.Board) -> bool:
-        return self.leaves > 1 and self.searches.advance(GAME, board.root().fen(), [move.uci() for move in board.move_stack])
+        return (self.leaves > 1 and self.advance_threads > 0
+                and self.searches.advance(GAME, board.root().fen(), [move.uci() for move in board.move_stack]))
 
     #searches until `simulations` (counting those of a reused tree, as lc0's go nodes does), until `seconds` have
     #passed or until `stop` is set (uci's reader thread sets it), whichever comes first; at least one of the three.

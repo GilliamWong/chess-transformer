@@ -346,7 +346,7 @@ class Commands:
 #setoption's whole number options, (lowest, highest): the tables' most pieces, MoveOverhead in ms, RamLimitMb in MB,
 #Leaves a round on each gpu (--leaves)
 SPIN_OPTIONS = {"SyzygyProbeLimit": (min(table_set.pieces for table_set in TABLE_SETS), max(table_set.pieces for table_set in TABLE_SETS)),
-                "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000), "AdvanceThreads": (1, 256),
+                "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000), "AdvanceThreads": (0, 256),
                 "Leaves": (1, 1024)}
 #setoption's decimal options, strings as lc0's (uci has no decimal type), (lowest, highest): SmartPruningFactor 0 for
 #none (--no-smart-pruning), the bonuses --first-move-bonus's and --book-ply-bonus's
@@ -368,7 +368,7 @@ def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
 #stockfish's: a SyzygyPath gives the most it holds up to it (MOST_PIECES by default), --tablebase's take --tablebase-pieces;
 #CachePositions: the network's answers the search keeps (engine_search.CACHE_POSITIONS); RamLimitMb: the MB (10^6
 #bytes) the search's tree may take, 0 for no limit (Searches' memory_limit_mb, without the cache or a kept tree's copy);
-#AdvanceThreads: the threads the kept tree is carried on to the next move on (engine_search.ADVANCE_THREADS). On the gpu
+#AdvanceThreads: the threads the kept tree is carried on to the next move on, 0 for none (engine_search.ADVANCE_THREADS). On the gpu
 #GPUs: "all" or cuda devices by number (--gpus), <empty> for the command line's; Leaves (--leaves); SmartPruningFactor
 #(--smart-pruning-factor). SearchSettings: changes to the search's settings over --search-settings', the same "name=value,...".
 #FirstMoveBonus and BookPlyBonus: the clock's (--first-move-bonus, --book-ply-bonus), for each game's first search

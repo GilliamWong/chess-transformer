@@ -1667,7 +1667,7 @@ def test_the_options_reach_the_search(monkeypatch):
             given.append(seconds)
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     script = ["uci", "setoption name cachepositions value 1000", "setoption name RamLimitMb value 64", "setoption name SyzygyProbeLimit value 6",
-              "setoption name AdvanceThreads value 12", "setoption name AdvanceThreads value 0",
+              "setoption name AdvanceThreads value 12", "setoption name AdvanceThreads value 257",
               "setoption name MoveOverhead value 500", "setoption name MoveOverhead value -1", "setoption name SyzygyProbeLimit value 8",
               "setoption name Hash value 16", "isready", "setoption name CachePositions value 5", "go movetime 1000",
               "setoption name MoveOverhead value 100", "go movetime 1000", "ucinewgame", "go movetime 1000", "quit"]
@@ -1730,6 +1730,20 @@ def test_the_search_takes_its_cache_size_memory_limit_and_advance_threads(monkey
     assert ([(settings["cache_positions"], settings["memory_limit_mb"], settings["advance_threads"]) for settings in made]
             == [(engine_search.CACHE_POSITIONS, 0, engine_search.ADVANCE_THREADS), (1000, 1, 12)])
     assert 100 < limited.search(chess.Board(), simulations=100_000).simulations < 3000
+
+#with no advance threads nothing runs while the opponent thinks (TCEC's two engines share one box): advance does
+#nothing, and the next search's start carries the kept tree down both moves itself, under its lock and in concurrent
+#descents
+@pytest.mark.parametrize("concurrent_descents", [False, True])
+def test_no_advance_threads_carry_the_tree_on_at_the_next_search(concurrent_descents):
+    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, advance_threads=0, concurrent_descents=concurrent_descents)
+    board = chess.Board()
+    report = search.search(board, simulations=3000)
+    board.push(report.line[0])
+
+    assert search.advance(board) is False
+    board.push(report.line[1])
+    assert search.search(board, simulations=1).simulations > 1
 
 #a SyzygyPath the gui sets reaches the search: the root takes the tables' move (no simulations) from its folders. A
 #folder without the tables is refused, and the engine plays on as it was
