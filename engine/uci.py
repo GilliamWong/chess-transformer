@@ -27,7 +27,7 @@ from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_
                                   engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
-from engine.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
+from engine.tablebase import MOST_PIECES, TABLE_SETS, TABLEBASE_PIECES, complete_pieces, open_tablebase, open_tablebase_path
 
 ENGINE_NAME = "Fry"
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -364,7 +364,8 @@ def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
     return " ".join(arguments[1:value_at]), " ".join(arguments[value_at + 1:])
 
 #the search's uci options, the command line's choices their defaults. SyzygyPath: folders of syzygy tables, os.pathsep
-#between them, or <empty> for the command line's (--tablebase, else none); SyzygyProbeLimit: their most pieces;
+#between them, or <empty> for the command line's (--tablebase, else none); SyzygyProbeLimit: their most pieces, as
+#stockfish's: a SyzygyPath gives the most it holds up to it (MOST_PIECES by default), --tablebase's take --tablebase-pieces;
 #CachePositions: the network's answers the search keeps (engine_search.CACHE_POSITIONS); RamLimitMb: the MB (10^6
 #bytes) the search's tree may take, 0 for no limit (Searches' memory_limit_mb, without the cache or a kept tree's copy);
 #AdvanceThreads: the threads the kept tree is carried on to the next move on (engine_search.ADVANCE_THREADS). On the gpu
@@ -378,6 +379,7 @@ class Options:
         self.tablebase, self.default_pieces = tablebase, tablebase_pieces
         self.syzygy_path: str | None = None #None for the command line's tables
         self.tablebase_pieces = tablebase_pieces
+        self.probe_limit: int | None = None #SyzygyProbeLimit's, None for its default
         self.move_overhead_seconds = MOVE_OVERHEAD_SECONDS
         self.cache_positions = CACHE_POSITIONS
         self.ram_limit_mb = 0
@@ -397,7 +399,7 @@ class Options:
 
     #the uci reply's lines
     def lines(self) -> list[str]:
-        defaults = {"SyzygyProbeLimit": self.default_pieces, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": CACHE_POSITIONS,
+        defaults = {"SyzygyProbeLimit": MOST_PIECES, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": CACHE_POSITIONS,
                     "RamLimitMb": 0, "AdvanceThreads": ADVANCE_THREADS, "Leaves": self.leaves, "SmartPruningFactor": self.command_line_factor,
                     "FirstMoveBonus": self.first_move_bonus, "BookPlyBonus": self.book_ply_bonus,
                     "GPUs": ",".join(map(str, self.command_line_gpus)) if self.command_line_gpus else "<empty>"}
@@ -422,10 +424,7 @@ class Options:
             return f"{name} takes effect when the engine restarts: the search is built"
         if name == "SyzygyPath":
             path = os.pathsep.join(filter(None, value.split(os.pathsep))) if value != "<empty>" else ""
-            problem = self.tables_problem(path or None, self.tablebase_pieces)
-            if problem is None:
-                self.syzygy_path = path or None
-            return problem
+            return self.set_tables(path or None, self.probe_limit)
         if name == "GPUs":
             return self.set_gpus(value)
         if name == "SearchSettings":
@@ -444,10 +443,7 @@ class Options:
         if number is None or not lowest <= number <= highest:
             return f"{name} is a whole number from {lowest} to {highest}, not {value!r}"
         if name == "SyzygyProbeLimit":
-            problem = self.tables_problem(self.syzygy_path, number)
-            if problem is None:
-                self.tablebase_pieces = number
-            return problem
+            return self.set_tables(self.syzygy_path, number)
         if name == "MoveOverhead":
             self.move_overhead_seconds = number / 1000
         elif name == "CachePositions":
@@ -494,6 +490,24 @@ class Options:
         else:
             self.book_ply_bonus = number
         return None
+
+    #the tables of `path` (None for the command line's) up to `limit` (None for SyzygyProbeLimit's default), if the search
+    #can open them: a SyzygyPath gives the most pieces it holds up to the limit, at least TABLEBASE_PIECES'; the command
+    #line's take the limit or --tablebase-pieces. What to tell the gui, None if nothing
+    def set_tables(self, path: str | None, limit: int | None) -> str | None:
+        if path is None:
+            pieces = self.default_pieces if limit is None else limit
+        else:
+            try:
+                pieces = complete_pieces(path, MOST_PIECES if limit is None else limit)
+            except OSError as error:
+                return f"{error}: the tables stay as they were"
+            if pieces < TABLEBASE_PIECES:
+                return f"{path} does not hold every table of up to {TABLEBASE_PIECES} pieces: the tables stay as they were"
+        problem = self.tables_problem(path, pieces)
+        if problem is None:
+            self.syzygy_path, self.tablebase_pieces, self.probe_limit = path, pieces, limit
+        return problem
 
     #why the search could not open the tables of `path` (None for the command line's) up to `pieces`, None if it can
     def tables_problem(self, path: str | None, pieces: int) -> str | None:

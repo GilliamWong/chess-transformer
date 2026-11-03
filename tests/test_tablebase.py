@@ -17,7 +17,8 @@ from reference_selfplay import final_result
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from engine.engine_search import EngineSearch
 from engine.player import choose_move
-from engine.tablebase import TABLE_SETS, TableSet, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces
+from engine.tablebase import TABLE_SETS, TABLEBASE_PIECES, TableSet, complete_pieces, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces
+from engine.uci import Options
 
 CPU = torch.device("cpu")
 #white takes the rook (Qxd5+), which wins: from 7 pieces, 6 (a 6 piece table's) and 6 pieces, 5
@@ -98,20 +99,47 @@ def test_which_tables_open(tmp_path, monkeypatch, five, six, ranked):
         open_tablebase(6).close()
         assert ranked_pieces(6) == ranked
 
-#empty files named for every table of up to 6 pieces but those left out, the 3-5 piece ones in one folder and the 6
-#piece ones in another, as a SyzygyPath
-def fake_syzygy_path(folder: Path, left_out: tuple[str, ...] = ()) -> str:
-    names = list(chess.syzygy.tablenames(piece_count=6))
+#empty files named for every table of up to `pieces` pieces but those left out, the 3-5 piece ones in one folder and
+#each bigger size's in another, as a SyzygyPath
+def fake_syzygy_path(folder: Path, left_out: tuple[str, ...] = (), pieces: int = 6) -> str:
+    names = list(chess.syzygy.tablenames(piece_count=pieces))
+    sizes = [(3, 4, 5), *((size,) for size in range(6, pieces + 1))]
     #as many as the downloaded sets have
-    assert [sum(len(name) - 1 in sizes for name in names) for sizes in ((3, 4, 5), (6,))] == [table_set.tables_per_half for table_set in TABLE_SETS]
-    folders = [folder / "345", folder / "6"]
+    assert [sum(len(name) - 1 in group for name in names) for group in sizes] == [table_set.tables_per_half for table_set in TABLE_SETS[:len(sizes)]]
+    folders = [folder / "".join(map(str, group)) for group in sizes]
     for size_folder in folders:
         size_folder.mkdir()
     for name in names:
         for extension in ("rtbw", "rtbz"):
             if f"{name}.{extension}" not in left_out:
-                (folders[len(name) - 1 == 6] / f"{name}.{extension}").touch()
+                (folders[max(0, len(name) - 1 - 5)] / f"{name}.{extension}").touch()
     return os.pathsep.join(str(size_folder) for size_folder in folders)
+
+SEVEN_PIECE_TABLES = [name for name in chess.syzygy.tablenames(piece_count=7) if len(name) == 8]
+
+#a SyzygyPath gives the most pieces it holds up to the limit, as stockfish takes the tables it finds: a 7 piece table
+#left out gives 6, the 7 piece dtz tables left out as a whole still 7 (searched, not ranked), a 5 piece dtz table 4
+@pytest.mark.parametrize("left_out, limit, pieces", [((), 7, 7), ((), 6, 6), ((f"{SEVEN_PIECE_TABLES[0]}.rtbw",), 7, 6),
+                                                     (tuple(f"{name}.rtbz" for name in SEVEN_PIECE_TABLES), 7, 7), (("KQRvKR.rtbz",), 7, 4)])
+def test_a_syzygy_path_gives_the_most_pieces_it_holds(tmp_path, left_out, limit, pieces):
+    assert complete_pieces(fake_syzygy_path(tmp_path, left_out, pieces=7), limit) == pieces
+
+#uci's SyzygyPath takes the most pieces its folders hold, up to SyzygyProbeLimit: 7 by default, so TCEC's tables need no
+#limit set. A folder without every table up to 5 pieces is refused
+def test_the_engine_takes_the_7_piece_tables_it_is_given(tmp_path):
+    for name in ("seven", "six", "none"):
+        (tmp_path / name).mkdir()
+    seven = fake_syzygy_path(tmp_path / "seven", pieces=7)
+    six = fake_syzygy_path(tmp_path / "six", (f"{SEVEN_PIECE_TABLES[0]}.rtbw",), pieces=7)
+    options = Options(False, TABLEBASE_PIECES)
+
+    assert "option name SyzygyProbeLimit type spin default 7 min 5 max 7" in options.lines()
+    assert options.set("SyzygyPath", seven, built=False) is None and options.search()[1]["tablebase_pieces"] == 7
+    assert options.set("SyzygyPath", six, built=False) is None and options.search()[1]["tablebase_pieces"] == 6
+    assert options.set("SyzygyProbeLimit", "5", built=False) is None and options.search()[1]["tablebase_pieces"] == 5
+    assert options.set("SyzygyPath", seven, built=False) is None and options.search()[1]["tablebase_pieces"] == 5
+    assert options.set("SyzygyPath", str(tmp_path / "none"), built=False).endswith("the tables stay as they were")
+    assert options.search()[1]["syzygy_path"] == seven
 
 #a SyzygyPath's folders (uci's option) are checked as the downloaded sets are, by the tables' names across them: every
 #wdl table, every dtz table up to 5 pieces, the 6 piece dtz tables all or none (then 6 pieces are searched, not ranked)

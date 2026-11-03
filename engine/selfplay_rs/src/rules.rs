@@ -3,7 +3,9 @@
 use shakmaty::uci::UciMove;
 use shakmaty::zobrist::Zobrist64;
 use shakmaty::{Bitboard, Board, CastlingSide, Chess, Color, EnPassantMode, File, Move, MoveList, Position, Role, Square};
+use shakmaty_syzygy::filesystem::MmapFilesystem;
 use shakmaty_syzygy::{SyzygyError, Tablebase, Wdl};
+use std::sync::Arc;
 
 pub const TOKENS_PER_BOARD: usize = 70;
 //encoding.py's token offsets
@@ -234,7 +236,9 @@ pub fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
     1 + since_zeroing.iter().filter(|&key| key == current).count()
 }
 
-//the syzygy tables (engine.tablebase), memory mapped: a probe's few small reads would each be a system call
+//the syzygy tables (engine.tablebase), memory mapped: a probe's few small reads would each be a system call. Mapped
+//for random reads (MADV_RANDOM, as TCEC asks of engines on its 7 piece tables): a probe reads a page or two, which
+//readahead would pad with pages no probe wants
 pub struct Tables {
     tablebase: Tablebase<Chess>,
     pieces: usize,
@@ -244,7 +248,7 @@ impl Tables {
     //folders as a SyzygyPath (engine.tablebase.tablebase_path): ';' between them on windows, ':' elsewhere
     pub fn open(folders: &str, pieces: usize) -> std::io::Result<Tables> {
         //SAFETY: the files stay unchanged while mapped; a failed page read ends the process rather than erroring
-        let mut tablebase = unsafe { Tablebase::with_mmap_filesystem() };
+        let mut tablebase = Tablebase::with_filesystem(Arc::new(unsafe { MmapFilesystem::new() }.with_advise_random(true)));
         for folder in std::env::split_paths(folders) {
             tablebase.add_directory(folder)?;
         }

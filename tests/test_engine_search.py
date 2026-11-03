@@ -1668,7 +1668,7 @@ def test_the_options_reach_the_search(monkeypatch):
             return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     script = ["uci", "setoption name cachepositions value 1000", "setoption name RamLimitMb value 64", "setoption name SyzygyProbeLimit value 6",
               "setoption name AdvanceThreads value 12", "setoption name AdvanceThreads value 0",
-              "setoption name MoveOverhead value 500", "setoption name MoveOverhead value -1", "setoption name SyzygyProbeLimit value 7",
+              "setoption name MoveOverhead value 500", "setoption name MoveOverhead value -1", "setoption name SyzygyProbeLimit value 8",
               "setoption name Hash value 16", "isready", "setoption name CachePositions value 5", "go movetime 1000",
               "setoption name MoveOverhead value 100", "go movetime 1000", "ucinewgame", "go movetime 1000", "quit"]
     sent = []
@@ -1685,7 +1685,7 @@ def test_the_options_reach_the_search(monkeypatch):
                            "advance_threads": 12}
     assert given == [pytest.approx(0.5), pytest.approx(0.9), pytest.approx(0.9)]
     told = [line for line in sent if line.startswith("info string")]
-    assert len(told) == 5 and "AdvanceThreads" in told[0] and "-1" in told[1] and "7" in told[2] and "Hash" in told[3] and "CachePositions" in told[4]
+    assert len(told) == 5 and "AdvanceThreads" in told[0] and "-1" in told[1] and "8" in told[2] and "Hash" in told[3] and "CachePositions" in told[4]
 
 #the competition options reach the search on the gpu as the command line's would: GPUs, Leaves, SmartPruningFactor (0
 #for none) and SearchSettings over --search-settings' at isready, the clock's bonuses at each game's first search. Values the

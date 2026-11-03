@@ -29,7 +29,7 @@ the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clon
 | Option | Default | What it sets |
 |---|---|---|
 | `SyzygyPath` | `<empty>` | Syzygy table folders, `:` between them |
-| `SyzygyProbeLimit` | 5 | The most pieces the tables are used for, 5 or 6 |
+| `SyzygyProbeLimit` | 7 | The most pieces the tables are used for, 5 to 7: `SyzygyPath` uses the most its folders hold up to it |
 | `MoveOverhead` | 20 | Milliseconds kept back from each move's time for the GUI's lag |
 | `CachePositions` | 5000000 | Network answers kept by position, ~190-260 bytes each |
 | `RamLimitMb` | 0 | MB the search tree may take (0 for no limit); the cache and the kept tree's copy come on top, so set it to about (memory - cache) / 1.7 |
@@ -46,5 +46,5 @@ the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clon
 (the memory is `RamLimitMb`, the threads follow from the GPUs), and the engine does not ponder.
 
 `engine/linux/tcec.json` is a tournament entry for a box like TCEC's (8x RTX 5090, at most 320 GiB of RAM for an engine):
-`SyzygyProbeLimit` 6, `RamLimitMb` 180000, `CachePositions` 50000000, `AdvanceThreads` 16 and `MoveOverhead` 200,
-with `SyzygyPath` set to the box's tables.
+`RamLimitMb` 180000, `CachePositions` 50000000, `AdvanceThreads` 16 and `MoveOverhead` 200,
+with `SyzygyPath` set to the box's 7 piece tables.

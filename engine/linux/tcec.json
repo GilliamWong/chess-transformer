@@ -6,7 +6,6 @@
     "protocol": "uci",
     "options": [
       {"name": "SyzygyPath", "value": "/path/to/syzygy"},
-      {"name": "SyzygyProbeLimit", "value": 6},
       {"name": "RamLimitMb", "value": 180000},
       {"name": "CachePositions", "value": 50000000},
       {"name": "AdvanceThreads", "value": 16},
