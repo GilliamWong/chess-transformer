@@ -1,4 +1,3 @@
-#selfplay.py's inference process, in a file of its own: it imports torch, which the workers must not
 from collections.abc import Callable
 from multiprocessing import connection
 from pathlib import Path
@@ -25,21 +24,17 @@ def answer_rows(outputs: tuple[torch.Tensor, torch.Tensor] | torch.Tensor) -> to
 
 #the L2 a position's activations take between a block's kernels, per unit of the model's width
 L2_BYTES_PER_POSITION_WIDTH = 1024
-#smaller forwards leave the matmuls too few tiles for a big gpu
 MIN_CHUNK_POSITIONS = 64
 
-#boards a forward takes at once: as many as fit the gpu's L2 with every lane's forward running
 def chunk_positions(width: int, lanes: int) -> int:
     l2_bytes = torch.cuda.get_device_properties(torch.cuda.current_device()).L2_cache_size
     return max(MIN_CHUNK_POSITIONS, l2_bytes // (lanes * width * L2_BYTES_PER_POSITION_WIDTH) // 16 * 16)
 
-#answer_rows for every board, chunk boards at a time (None: all at once)
 def chunked_answer_rows(model: nn.Module, boards: torch.Tensor, chunk: int | None) -> torch.Tensor:
     rows = [answer_rows(model(part)) for part in boards.split(chunk or len(boards))]
     return rows[0] if len(rows) == 1 else torch.cat(rows)
 
 
-#answers the workers' requests until stop is set, gathering and launching the next batch while the last one is on the gpu
 def serve(network, boards: list[np.ndarray], answers: list[np.ndarray], connections: list, stop, served_calls, served_positions) -> None:
     slot_of = {id(connection_): slot for slot, connection_ in enumerate(connections)}
 
@@ -72,17 +67,14 @@ def small_graph_sizes(max_batch: int, chunk: int | None = None) -> list[int]:
     sizes = [whole + step for whole in range(0, max_batch, chunk) for step in steps]
     return sizes[:next(index for index, size in enumerate(sizes) if size >= max_batch) + 1]
 
-#every 64 up to 1024, then every 128 to 2048, then every 256
 def graph_sizes(max_batch: int) -> list[int]:
     sizes = [64]
     while sizes[-1] < max_batch:
         sizes.append(sizes[-1] + (64 if sizes[-1] < 1024 else 128 if sizes[-1] < 2048 else 256))
     return sizes
 
-#a batch in flight's stream, cuda graphs (one per size, in one pool) and buffers. It owns everything its raw handles() point at, so
-#nothing is freed or recorded again while it lives. A lean lane takes a board as a row of bytes (its tokens, then the columns of its
-#answer to send back: LEAN_COLUMNS floats rather than ANSWER_WIDTH). warm_up: the model run once per size first, building every kernel
-#(a network's later lanes skip it)
+#owns everything its raw handles() point at, so nothing is freed or recorded again while it lives. warm_up: the model run once per size
+#first, building every kernel (a network's later lanes skip it)
 class Lane:
     def __init__(self, model: nn.Module, sizes: list[int], chunk: int | None, lean: bool = False, warm_up: bool = True):
         self.stream = torch.cuda.Stream()
@@ -93,18 +85,19 @@ class Lane:
         largest = sizes[-1]
         #recorded on real boards: zero boards hit a device-side assert
         self.boards = torch.tensor([encode_board(chess.Board())], dtype=torch.long, device="cuda").repeat(largest, 1)
-        self.boards_host = torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, pin_memory=True)
-        self.boards_array = self.boards_host.numpy()
         if lean:
-            #a row: the tokens, then the answer columns to gather (padding gathers the expected score's)
+            #a board is a row of bytes: its tokens, then the int16 indices of the answer columns to gather, so the answer has LEAN_COLUMNS
+            #floats rather than ANSWER_WIDTH (padding gathers the expected score's)
             self.rows = torch.zeros(largest, LEAN_ROW, dtype=torch.uint8, device="cuda")
             self.rows[:, :TOKENS_PER_BOARD] = self.boards
             self.rows[:, TOKENS_PER_BOARD:].view(torch.int16).fill_(ANSWER_WIDTH - 1)
             self.rows_host = torch.zeros(largest, LEAN_ROW, dtype=torch.uint8, pin_memory=True)
             self.rows_array = self.rows_host.numpy()
+        else:
+            self.boards_host = torch.zeros(largest, TOKENS_PER_BOARD, dtype=torch.long, pin_memory=True)
+            self.boards_array = self.boards_host.numpy()
         self.answers_host = torch.zeros(largest, LEAN_COLUMNS if lean else ANSWER_WIDTH, dtype=torch.float32, pin_memory=True)
         self.answers_array = self.answers_host.numpy()
-        #recorded after each batch for blocking_wait
         self.done = torch.cuda.Event(blocking=True)
 
         #recording a graph needs warm-up calls off the default stream
@@ -114,7 +107,7 @@ class Lane:
                 self.answer(model, size, chunk)
         torch.cuda.current_stream().wait_stream(self.stream)
 
-        #lanes recorded on one stream into one pool wrote over each other's activations
+        #a pool a lane: lanes recording into one pool wrote over each other's activations
         self.pool = torch.cuda.graph_pool_handle()
         self.graphs, self.answers = {}, {}
         for size in reversed(sizes):
@@ -164,14 +157,13 @@ class GraphedBatches:
         lane.boards_host[:len(boards)] = torch.from_numpy(boards)
         return self.launch_filled(lane, len(boards))
 
-    #the lane the next launch takes; a caller may fill its boards_array for launch_filled
+    #the lane the next launch takes; a caller may fill its boards_array (a lean lane's rows_array) for launch_filled
     def free_lane(self) -> Lane:
         lane = next((lane for lane in self.lanes if not lane.pending), None)
         if lane is None:
             raise RuntimeError("more batches in flight than lanes")
         return lane
 
-    #launch of the count boards already in free_lane's boards_array (a lean lane's rows_array)
     #a lean lane's calls leave the thread's current device (torch's too) at the lane's
     def launch_filled(self, lane: Lane, count: int) -> tuple[Lane, int, int]:
         size = next(size for size in self.sizes if size >= count)
@@ -192,7 +184,7 @@ class GraphedBatches:
                 lane.done.record(lane.stream)
         return lane, size, count
 
-    #copied here, not at launch: the gpu's copies queue, and a copy at launch held the other lane's boards behind it
+    #copied here, not at launch: the gpu's copies queue, so a copy at launch holds the other lane's boards behind it
     def collect(self, launched: tuple[Lane, int, int]) -> np.ndarray:
         lane, size, count = launched
         if lane.lean:
@@ -213,13 +205,12 @@ class GraphedBatches:
         lane.pending = False
         return lane.answers_host[:count].numpy()
 
-    #what Searches' round loop needs of lean lanes; it holds this object, so every handle's lane lives while it runs
+    #Searches' round loop holds this object, so every handle's lane lives while it runs
     def rust_network(self) -> dict:
         if not self.lean:
             raise ValueError("Searches' round loop needs lean lanes")
         return {"blocking_wait": self.blocking_wait, "lanes": [self.handles[id(lane)] for lane in self.lanes]}
 
-    #waits for every batch still on the gpu and frees the lanes, after a search that failed left rounds out
     def settle(self) -> None:
         for lane in self.lanes:
             if lane.pending:
@@ -237,7 +228,7 @@ class ImmediateBatches:
     def collect(self, launched: np.ndarray) -> np.ndarray:
         return launched
 
-#fp16's largest number is 65,504 and one run's residual stream reached ~127k on a channel: it is shrunk, and 1/16 leaves 8x room
+#scales the residual stream down so its channels stay below fp16's largest number, 65,504
 FP16_RESIDUAL_SCALE = 1 / 16
 
 #the network in fp16 with fp16 accumulation, the heads in fp32. It sets torch's matmul flags for the whole process
@@ -264,7 +255,7 @@ class ExactSizeCompiled(nn.Module):
         with torch._dynamo.config.patch(specialize_float=True, recompile_limit=limit):
             return (self.exact if len(boards) == self.exact_size else self.dynamic)(boards)
 
-#fp16_model with every block in int8 (model/int8_blocks.py) but the last and the fp16_blocks whose int8 costs the policy most. Needs sm_80 or newer
+#fp16_model with every block in int8 but the last and the fp16_blocks whose int8 costs the policy most. Needs sm_80 or newer
 #weights: the rounded weights (engine/quantization.py) if already read, else rounded once per checkpoint
 def int8_model(checkpoint_path: Path, fp16_blocks: int, weights: dict | None = None) -> nn.Module:
     from model.int8_blocks import quantize_blocks
@@ -273,7 +264,6 @@ def int8_model(checkpoint_path: Path, fp16_blocks: int, weights: dict | None = N
         weights = int8_weights(checkpoint_path, fp16_blocks)
     return quantize_blocks(fp16_model(checkpoint_path), weights, FP16_RESIDUAL_SCALE)
 
-#bf16 autocast, as train.py trains
 class Bf16(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()

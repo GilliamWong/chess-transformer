@@ -1,4 +1,4 @@
-#syzygy tables: wdl (.rtbw) is the result under perfect play, dtz (.rtbz) the plies to the next capture or pawn move
+#wdl (.rtbw) is the result under perfect play, dtz (.rtbz) the plies to the next capture or pawn move
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -11,7 +11,6 @@ import chess
 import chess.syzygy
 from tqdm import tqdm
 
-#not from data.ARTIFACTS_DIR: data imports torch, and labelling workers import this file
 SYZYGY_DIR = Path(__file__).parent.parent / "artifacts" / "engines" / "syzygy"
 LICHESS_TABLES = "https://tablebase.lichess.ovh/tables/standard/"
 #ranked_moves needs the dtz tables of this many pieces
@@ -23,7 +22,6 @@ RETRY_SECONDS = 30
 TIMEOUT_SECONDS = 60
 
 
-#the tables of positions of up to `pieces` pieces: lichess' <lichess_name>-wdl and -dtz folders, saved in `folder`
 @dataclass(frozen=True)
 class TableSet:
     pieces: int
@@ -34,7 +32,7 @@ class TableSet:
     def count(self, extension: str) -> int:
         return len(list(self.folder.glob(f"*.{extension}")))
 
-#a size's tables probe the smaller sizes' too (the positions after a capture); lichess has the 7 piece ones in subfolders by material
+#a size's tables probe the smaller sizes' too (the positions after a capture)
 TABLE_SETS = (TableSet(5, SYZYGY_DIR, "3-4-5", 145), TableSet(6, SYZYGY_DIR.with_name("syzygy6"), "6", 365),
               TableSet(7, SYZYGY_DIR.with_name("syzygy7"), "7", 1001))
 MOST_PIECES = max(table_set.pieces for table_set in TABLE_SETS)
@@ -44,7 +42,6 @@ def table_sets(pieces: int) -> list[TableSet]:
         raise ValueError(f"there are tables of up to {', '.join(str(table_set.pieces) for table_set in TABLE_SETS)} pieces, not {pieces}")
     return [table_set for table_set in TABLE_SETS if table_set.pieces <= pieces]
 
-#the folders of table_sets(pieces) as a SyzygyPath, for rules.rs Tables
 def tablebase_path(pieces: int) -> str:
     return os.pathsep.join(str(table_set.folder) for table_set in table_sets(pieces))
 
@@ -67,7 +64,7 @@ def download_table(folder: Path, url: str, name: str, size: int, progress: tqdm,
     if not stopping.is_set():
         partial.replace(path)
 
-#the bytes the .part does not have yet, appended to it; raises unless it then has the table's size (lichess drops some connections)
+#appends what the .part lacks; raises unless it then has `size` bytes (lichess drops some connections)
 def download_rest(url: str, partial: Path, size: int, progress: tqdm, stopping: threading.Event) -> None:
     have = partial.stat().st_size if partial.exists() else 0
     if have > size:
@@ -85,7 +82,7 @@ def download_rest(url: str, partial: Path, size: int, progress: tqdm, stopping: 
     if partial.stat().st_size != size:
         raise IOError(f"{partial.name} has {partial.stat().st_size:,} of {size:,} bytes")
 
-#the tables not in the folder yet, wdl first (the search needs only those), each checked against the size lichess lists; run again to resume
+#wdl first, as the search needs only those; run again to resume
 def download(table_set: TableSet, connections: int = CONNECTIONS, dtz: bool = True) -> None:
     if table_set.pieces == 7:
         raise ValueError(f"the 7 piece tables are ~17 TB: put them in {table_set.folder} or give the engine a SyzygyPath")
@@ -112,11 +109,10 @@ def download(table_set: TableSet, connections: int = CONNECTIONS, dtz: bool = Tr
             pool.shutdown(cancel_futures=True)
 
 
-#all the wdl tables, and all the dtz tables or, above TABLEBASE_PIECES, none
+#above TABLEBASE_PIECES the dtz tables may be left out whole: those positions are then searched, not ranked
 def usable(wdl: int, dtz: int, whole: int, pieces: int) -> bool:
     return wdl == whole and (dtz == whole or dtz == 0 and pieces > TABLEBASE_PIECES)
 
-#a bigger size's dtz tables may be left out as a whole: its positions are then searched, not ranked (see ranked_pieces)
 def open_tablebase(pieces: int = TABLEBASE_PIECES) -> chess.syzygy.Tablebase:
     tablebase = chess.syzygy.Tablebase()
     for table_set in table_sets(pieces):
@@ -127,7 +123,7 @@ def open_tablebase(pieces: int = TABLEBASE_PIECES) -> chess.syzygy.Tablebase:
         tablebase.add_directory(str(table_set.folder))
     return tablebase
 
-#open_tablebase for the folders of a SyzygyPath (uci's option), checked by the tables' names; and the most pieces ranked_moves can rank with them
+#for the folders of a SyzygyPath, checked by the tables' names across them; also the most pieces ranked_moves can rank with them
 def open_tablebase_path(path: str, pieces: int) -> tuple[chess.syzygy.Tablebase, int]:
     folders = path_folders(path)
     found = found_tables(folders)
@@ -142,7 +138,7 @@ def open_tablebase_path(path: str, pieces: int) -> tuple[chess.syzygy.Tablebase,
         tablebase.add_directory(folder)
     return tablebase, ranked
 
-#the most pieces, up to `limit`, whose tables the folders of `path` hold as open_tablebase_path asks, as stockfish does; 2 if not even the 3 piece ones
+#the most pieces, up to `limit`, whose tables the folders of `path` hold as open_tablebase_path requires; 2 if not even the 3 piece ones
 def complete_pieces(path: str, limit: int) -> int:
     found = found_tables(path_folders(path))
     pieces = 2
@@ -186,13 +182,10 @@ class TablebaseMove:
     def rank(self) -> tuple[int, int]:
         return (-self.wdl, self.plies_to_zeroing if self.wdl > 0 else -self.plies_to_zeroing if self.wdl < 0 else 0)
 
-#best first; ties keep their order, preferred moves first among them
-def ranked_moves(tablebase: chess.syzygy.Tablebase, board: chess.Board, preferred: list[chess.Move] = []) -> list[TablebaseMove]:
-    legal_moves = list(board.legal_moves)
-    ordered = [move for move in preferred if move in legal_moves] + [move for move in legal_moves if move not in preferred]
-
+#best first; ties keep the order of the legal moves
+def ranked_moves(tablebase: chess.syzygy.Tablebase, board: chess.Board) -> list[TablebaseMove]:
     moves = []
-    for move in ordered:
+    for move in list(board.legal_moves):
         zeroing = board.is_zeroing(move)
         board.push(move)
         #the tables answer for the opponent, hence the minus

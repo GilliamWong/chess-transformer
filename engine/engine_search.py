@@ -1,4 +1,3 @@
-#the uci engine's search: Searches (rust) gathers many leaves a round for one network call, as lc0 does, while the round before is on the gpu
 from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
@@ -19,54 +18,48 @@ from engine.player import MAX_REPORTED_SCORE, ROOT_MOVES_REPORTED, SearchReport,
 from engine.cuda_runtime import cuda_runtime
 from engine.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
 
-#leaves a round (lc0's minibatch), and its descents that may end on a leaf already waiting before it stops gathering
 LEAVES = 64
+#descents that may end on a leaf already waiting before a round stops gathering
 COLLISIONS = 64
-#rounds on a network at once: one is gathered while the last is on the gpu
 ROUNDS_IN_FLIGHT = 2
-#a round takes a leaf per this many simulations done or left, as lc0 grows its batches with the tree; 0 for fixed
+#a round takes a leaf per this many simulations done or left; 0 for fixed
 GROW_LEAVES = 16
 #with a cap, the rounds out on all the networks hold a leaf per this many root visits at most; 0 for none
 VISITS_PER_LEAF_OUT = 0
-#as many simulations as the search can do, for a search with only a deadline
+#the most simulations Searches.start takes, for a search with only a deadline or a stop
 UNLIMITED = 2**32 - 1
-GAME = 0 #the id of the search in Searches: one game at a time
-#a round's network call takes about this long before the first one is timed
+GAME = 0
 FIRST_ROUND_SECONDS = 0.01
-#the median of the last rounds' times is the next round's: one stall is an outlier the median ignores and a running mean would carry on
+#the median of the last rounds' times is the next round's, so that one stall does not carry on
 ROUND_TIMES = 31
-#smart pruning stops once the most visited move leads the second by more than the simulations left / this (lc0 uses 1.33)
+#smart pruning stops once the most visited move leads the second by more than the simulations left / this
 SMART_PRUNING_FACTOR = 1.0
-#seconds after a search's first answers before smart pruning may stop it on the visits (lc0's 0.2); its other stops stay at once
+#seconds after a search's first answers before smart pruning may stop it on the visits; its other stops stay at once
 SMART_PRUNING_WAIT = 0.0
-#with certainty, smart pruning stops at once when the proofs leave one root move not lost, as lc0 does
+#with certainty, smart pruning stops at once when the proofs leave one root move not lost
 STOP_AT_ONE_MOVE_LEFT = False
 #a search on the clock whose score fell more than FALL_START_CP below the last one's runs on when it would stop, by all its extension at FALL_FULL_CP
 FALL_START_CP = 10
 FALL_FULL_CP = 30
-#rounds whose speed estimates the simulations a deadline leaves
 SPEED_ROUNDS = 8
 INFO_SECONDS = 1.0
-#how often the searching thread looks at uci's stop and the info lines meanwhile
 RUST_WAIT_SECONDS = 0.005
-#the network's answers kept by position (search.rs Cache), ~260 bytes each; every self-play worker has a selfplay.CACHE_POSITIONS cache
 CACHE_POSITIONS = 5_000_000
 #the threads that carry the kept tree on after a move, while the opponent thinks; 0 for the next search's start to do it
 ADVANCE_THREADS = 4
-#the engine's own changes to mcts.py's search, which self-play keeps; certainty and transpositions are search.rs SearchSettings'
+#the engine's changes to mcts.py's search, which self-play keeps as it is
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
 
 
-#search.rs sharpen: the value's logit times sharpness; 1 / sharpness undoes it
+#search.rs sharpen: the value's logit times sharpness
 def sharpen(score: float, sharpness: float) -> float:
     return score if sharpness == 1 or score in (0.0, 1.0) else 1 / (1 + ((1 - score) / score) ** sharpness)
 
-#Searches' settings: mcts.py's, the engine's own over them (own), then changes (parse_changes') over those
+#Searches' settings: mcts.py's, the engine's own over them (own), then changes over those
 def engine_search_settings(use_tablebase: bool, changes: dict | None = None, own: bool = True, tablebase_pieces: int = TABLEBASE_PIECES,
                            syzygy_path: str | None = None) -> dict:
     return {**rust_search_settings(use_tablebase, tablebase_pieces, syzygy_path), **(ENGINE_SETTINGS if own else {}), **(changes or {})}
 
-#"name=value,..." as changes to settings, each value of its setting's type
 def parse_changes(text: str, settings: dict) -> dict:
     changes = {}
     for change in filter(None, text.split(",")):
@@ -82,10 +75,10 @@ def parse_changes(text: str, settings: dict) -> dict:
             changes[name] = kind(float(value))
     return changes
 
-#int8 is the engine's, not for self-play or labels: its answers depend on the rest of the batch
+#int8 is not for self-play or labels: its answers depend on the rest of the batch
 PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
 ENGINE_PRECISION = "int8"
-#the int8 network's blocks kept in fp16 besides the last, those whose int8 costs the policy most (quantization.py); 0 is every block but the last in int8
+#the int8 network's blocks kept in fp16 besides the last; 0 is every block but the last in int8
 ENGINE_FP16_BLOCKS = 1
 
 
@@ -105,25 +98,21 @@ def thread_cpus(count: int, topology: tuple | None = None) -> list[int]:
     return cpus[:count] if count <= len(cpus) else []
 
 
-#the gpus whose lanes are lean by default (inference.Lane): sm_120's, where they were timed
 LEAN_CAPABILITIES = {(12, 0)}
 
 
-#the network in a precision as cuda graphs for a round's leaves, from one to max_batch, on gpu device or the current one; lean: lean lanes, by default on LEAN_CAPABILITIES' gpus
+#the network as cuda graphs for a round's leaves, from one to max_batch, on the current gpu
 def engine_network(checkpoint_path: Path, max_batch: int = LEAVES, precision: str = ENGINE_PRECISION,
-                   fp16_blocks: int = ENGINE_FP16_BLOCKS, device: int | None = None, blocking_wait: bool = False,
-                   lean: bool | None = None):
-    with torch.cuda.device(device):
-        return network_graphs(network_model(checkpoint_path, precision, fp16_blocks), max_batch, blocking_wait, lean)
+                   fp16_blocks: int = ENGINE_FP16_BLOCKS, lean: bool | None = None):
+    return network_graphs(network_model(checkpoint_path, precision, fp16_blocks), max_batch, lean=lean)
 
 
-#engine_network on each of devices with the int8 weights read once: the models load in threads, as little of it holds the gil; the graphs are
-#recorded one network at a time (dynamo compiles one frame at a time, and a recording forbids other threads' allocations)
+#engine_network on each of devices with the int8 weights read once: the models load in threads, the graphs are recorded one network at a time
+#(dynamo compiles one frame at a time, and a recording forbids other threads' allocations)
 def engine_networks(checkpoint_path: Path, max_batch: int, precision: str, fp16_blocks: int, devices: list[int],
                     blocking_wait: bool) -> list[GraphedBatches]:
     #imported here, as int8_model imports it: it needs Triton
     from engine.quantization import int8_weights
-    #rounded on the first gpu when not cached, as engine_network's own would
     with torch.cuda.device(devices[0]):
         weights = int8_weights(checkpoint_path, fp16_blocks) if precision == "int8" else None
 
@@ -135,7 +124,7 @@ def engine_networks(checkpoint_path: Path, max_batch: int, precision: str, fp16_
     networks = []
     for model, device in zip(models, devices):
         with torch.cuda.device(device):
-            networks.append(network_graphs(model, max_batch, blocking_wait, None))
+            networks.append(network_graphs(model, max_batch, blocking_wait))
     return networks
 
 
@@ -143,7 +132,7 @@ def network_model(checkpoint_path: Path, precision: str, fp16_blocks: int, weigh
     return int8_model(checkpoint_path, fp16_blocks, weights) if precision == "int8" else PRECISIONS[precision](checkpoint_path)
 
 
-def network_graphs(model: torch.nn.Module, max_batch: int, blocking_wait: bool, lean: bool | None) -> GraphedBatches:
+def network_graphs(model: torch.nn.Module, max_batch: int, blocking_wait: bool = False, lean: bool | None = None) -> GraphedBatches:
     lanes = ROUNDS_IN_FLIGHT if max_batch > 1 else 1
     chunk = chunk_positions(model.d_model, lanes)
     sizes = small_graph_sizes(max_batch, chunk)
@@ -162,7 +151,7 @@ class SearchRun:
                  told: threading.Event | None, info: Callable[[SearchReport], None] | None, next_info: float,
                  root: tuple[int, int, int]):
         self.simulations, self.deadline, self.extension, self.only_move = simulations, deadline, extension, only_move
-        self.told = told #set to stop the search (uci's stop)
+        self.told = told
         self.info, self.next_info = info, next_info
         self.changed = threading.Condition()
         self.report = None
@@ -171,7 +160,7 @@ class SearchRun:
         self.rounds_answered = 0 #rounds with leaves finished
         #rounds_answered when a round last found no leaves (every descent ended on a leaf already out): no network gathers again until another round is back
         self.starved = None
-        self.next_round = 0 #the next round's name in Searches
+        self.next_round = 0
         self.progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
         self.first_answers = None
         #Searches.root_visits' numbers as the newest descend or finish left them, so that no thread asks for them
@@ -191,10 +180,9 @@ class SearchRun:
 class EngineSearch:
     #network has GraphedBatches' launch and collect (inference.ImmediateBatches on the cpu), or is a list of them, one a gpu, each driven by a thread of its own
     #one leaf a round is mcts.py's search: its settings (without ENGINE_SETTINGS), a fresh tree every move, one round on the network, no smart pruning
-    #smart_pruning False searches the whole budget even once the move is decided (lc0's SmartPruningFactor=0); use_tablebase: the tables of positions of up to
-    #tablebase_pieces pieces, from the folders of syzygy_path (a SyzygyPath) rather than the downloaded ones if given; settings: changes to engine_search_settings
-    #memory_limit_mb: Searches' (lc0's RamLimitMb), 0 for none; rust_rounds: the rounds in Searches' own loop (rounds.rs), a thread a network and no python between
-    #them, the python loop's search exactly; concurrent_descents: the networks' threads descend, finish and back up in the tree at once (search/shared.rs); pin_threads:
+    #use_tablebase: the tables of up to tablebase_pieces pieces, from the folders of syzygy_path (a SyzygyPath) rather than the downloaded ones if given
+    #memory_limit_mb: 0 for none; rust_rounds: the rounds in Searches' own loop (rounds.rs), a thread a network and no python between them, the python
+    #loop's search exactly; concurrent_descents: the networks' threads descend, finish and back up in the tree at once (search/shared.rs); pin_threads:
     #the networks' threads each on a cpu of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes, so only on sm_120's)
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
@@ -247,7 +235,6 @@ class EngineSearch:
         pooled = len(self.networks) - self.drives_first
         self.threads = ThreadPoolExecutor(pooled) if pooled else None
 
-    #uci's ucinewgame: the next search starts a fresh tree with an empty cache, as lc0's does
     def new_game(self) -> None:
         self.searches.new_game(GAME)
 
@@ -257,9 +244,9 @@ class EngineSearch:
         return (self.leaves > 1 and self.advance_threads > 0
                 and self.searches.advance(GAME, board.root().fen(), [move.uci() for move in board.move_stack]))
 
-    #searches until `simulations` (counting those of a reused tree, as lc0's go nodes does), until `seconds` have passed or until `stop` is set (uci's reader
-    #thread sets it), whichever comes first; at least one of the three. extension: (the last search's score in centipawns, the seconds this one may add) for a
-    #search on the clock whose score falls (FALL_START_CP). info gets the report as it stands about every INFO_SECONDS, for the gui's info lines
+    #searches until `simulations` (counting those of a reused tree), until `seconds` have passed or until `stop` is set (uci's reader thread sets it), whichever
+    #comes first; at least one of the three. extension: (the last search's score in centipawns, the seconds this one may add) for a search on the clock whose
+    #score falls (FALL_START_CP). info gets the report as it stands about every INFO_SECONDS, for the gui's info lines
     def search(self, board: chess.Board, simulations: int | None = None, seconds: float | None = None,
                extension: tuple[int, float] | None = None, stop: threading.Event | None = None,
                info: Callable[[SearchReport], None] | None = None) -> SearchReport:
@@ -334,7 +321,6 @@ class EngineSearch:
         self.rust_counts[1] += boards
         run.report = report
 
-    #for Searches' own loop (rounds.rs LoopSettings)
     def rust_round_settings(self) -> dict:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
                     visits_per_leaf_out=self.visits_per_leaf_out, collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF,

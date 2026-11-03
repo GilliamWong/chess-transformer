@@ -1,17 +1,13 @@
-#monte carlo tree search over the model: the policy gives the priors, the eval head scores the leaves.
 #scores are expected scores, 0 lost to 1 won
 from __future__ import annotations
-import argparse
 from dataclasses import dataclass, field
 import math
-from pathlib import Path
-import time
 from typing import TYPE_CHECKING
 import chess
 import chess.syzygy
 import numpy as np
 from model.encoding import encode_board, encode_move_to_id
-from engine.tablebase import covers, open_tablebase, ranked_moves, wdl_score
+from engine.tablebase import covers, wdl_score
 #self play's workers import this file and must not import torch
 if TYPE_CHECKING:
     import torch
@@ -28,7 +24,6 @@ FPU_REDUCTION = 0.33 / 2
 ROOT_NOISE_ALPHA = 0.3
 ROOT_NOISE_SHARE = 0.25
 
-#when set (main --tablebase), game_result scores the positions the tables cover
 tablebase: chess.syzygy.Tablebase | None = None
 
 
@@ -78,7 +73,6 @@ def game_result(board: chess.Board) -> float | None:
     return None
 
 
-#PUCT as leela does it, with first play urgency for unvisited children
 def select_child(node: Node) -> tuple[chess.Move, Node]:
     c_puct = C_PUCT + C_PUCT_FACTOR * math.log((node.visit_count + C_PUCT_BASE) / C_PUCT_BASE)
     #at least 1, so the first pick follows the priors
@@ -86,7 +80,7 @@ def select_child(node: Node) -> tuple[chess.Move, Node]:
     visited_policy = sum(child.prior for child in node.children.values() if child.visit_count > 0)
     first_play_urgency = (1 - node.value_sum / node.visit_count) - FPU_REDUCTION * math.sqrt(visited_policy)
 
-    #the first child with the highest score wins ties, as max() would; this loop is the search's hot spot
+    #the first child with the highest score wins ties, as max() would
     best_move, best_child, best_U = None, None, -math.inf
     for move, child in node.children.items():
         N = child.visit_count
@@ -96,10 +90,6 @@ def select_child(node: Node) -> tuple[chess.Move, Node]:
             best_move, best_child, best_U = move, child, U
     return best_move, best_child
 
-
-def expand(node: Node, priors: dict[chess.Move, float]) -> None:
-    for move, prior in priors.items():
-        node.children[move] = Node(prior=prior)
 
 #value is for the side to move at the last node; the score flips at every level up
 def backup(path: list[Node], value: float) -> None:
@@ -133,14 +123,12 @@ def descend(root: Node, board: chess.Board) -> Leaf:
         value = DRAW
     return Leaf(path, value)
 
-#priors is None when the leaf's value was decided without the network
 def finish(leaf: Leaf, priors: dict[chess.Move, float] | None, value: float) -> None:
     if priors is not None:
-        expand(leaf.path[-1], priors)
+        leaf.path[-1].children = {move: Node(prior=prior) for move, prior in priors.items()}
     backup(leaf.path, value)
 
 
-#board is left as it was. root_noise is a self play game's random numbers
 def search(model: nn.Module, board: chess.Board, device: torch.device, simulations: int = SIMULATIONS,
            root_noise: np.random.Generator | None = None) -> Node:
     if game_result(board) is not None:
@@ -176,7 +164,6 @@ def most_visited_move(root: Node) -> chess.Move:
 
     return max(root.children, key=preference)
 
-#the most visited move, then the most visited reply, for as long as the next move was visited
 def principal_variation(root: Node) -> list[chess.Move]:
     line, node = [], root
     while node.children:
@@ -186,52 +173,3 @@ def principal_variation(root: Node) -> list[chess.Move]:
         line.append(move)
         node = node.children[move]
     return line
-
-
-def print_search(root: Node, board: chess.Board) -> None:
-    print(f"{'move':<8}{'prior':>8}{'visits':>8}{'score':>8}")
-    for move, child in sorted(root.children.items(), key=lambda item: item[1].visit_count, reverse=True)[:10]:
-        score = f"{child.value_sum / child.visit_count:.3f}" if child.visit_count > 0 else "-"
-        print(f"{board.san(move):<8}{child.prior:>8.1%}{child.visit_count:>8}{score:>8}")
-
-def main(checkpoint_path: Path, fen: str, simulations: int, device: torch.device, use_tablebase: bool = False) -> None:
-    from engine.player import load_model
-    global tablebase
-    if use_tablebase:
-        tablebase = open_tablebase()
-
-    model = load_model(checkpoint_path, device)
-    board = chess.Board(fen)
-    print(board, "\n")
-
-    #also warms the model up, so its setup is not timed with the search
-    priors, value = evaluate(model, board, device)
-    favourite = max(priors, key=priors.get)
-    side = chess.COLOR_NAMES[board.turn]
-    print(f"network alone: score {value:.3f} for {side}, favourite move {board.san(favourite)} ({priors[favourite]:.1%})")
-
-    if tablebase is not None and covers(board):
-        best = ranked_moves(tablebase, board)[0]
-        print(f"tablebase: score {wdl_score(best.wdl)} for {side}, plays {board.san(best.move)}, nothing to search")
-        return
-
-    start = time.perf_counter()
-    root = search(model, board, device, simulations)
-    seconds = time.perf_counter() - start
-    print(f"search: {simulations} simulations in {seconds:.2f} s ({simulations / seconds:.0f} a second), plays {board.san(most_visited_move(root))}\n")
-    print_search(root, board)
-
-
-if __name__ == "__main__":
-    import torch
-    from model.checkpoint import latest_checkpoint
-    parser = argparse.ArgumentParser(description="one search from a position, to watch what it does")
-    parser.add_argument("checkpoint", nargs="?", type=Path, help="a model.pt, default the run that finished last")
-    parser.add_argument("--fen", default=chess.STARTING_FEN, help="the position to search, default the start")
-    parser.add_argument("--simulations", type=int, default=SIMULATIONS, help="default %(default)s")
-    parser.add_argument("--cpu", action="store_true", help="leave the gpu alone, for when a training run is using it")
-    parser.add_argument("--tablebase", action="store_true", help="score positions of at most 5 pieces from the syzygy tables (python -m engine.tablebase)")
-    arguments = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() and not arguments.cpu else "cpu")
-    main(arguments.checkpoint or latest_checkpoint(), arguments.fen, arguments.simulations, device, arguments.tablebase)

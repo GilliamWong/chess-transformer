@@ -10,11 +10,6 @@ from model.checkpoint import load_checkpoint
 from model.model import ChessTransformer, expected_score
 from engine.tablebase import covers, ranked_moves, wdl_score
 
-#how a move is picked:
-#   argmax            the most likely legal move
-#   sample            drawn at --temperature for the first --sample-plies plies, argmax after
-#   avoid-repetition  argmax, but when clearly ahead play the best move that does not repeat a position
-#   mcts              the move mcts.py's search visits most
 SELECTIONS = ("argmax", "sample", "avoid-repetition", "mcts")
 TEMPERATURE = 0.5
 SAMPLE_PLIES = 1000 #the whole game
@@ -51,10 +46,9 @@ class CudaGraphModel(nn.Module):
         self.graph = torch.cuda.CUDAGraph()
         clear_cublas_workspaces()
         with torch.cuda.graph(self.graph), torch.no_grad():
-            self.outputs = torch.cat(model(self.boards), dim=1) #the move logits, then the eval head's
+            self.outputs = torch.cat(model(self.boards), dim=1)
         clear_cublas_workspaces()
 
-    #boards on the cpu in, the model's two outputs on the cpu out
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if len(boards) > len(self.boards):
             raise ValueError(f"{len(boards)} boards for a graph recorded for {len(self.boards)}")
@@ -71,10 +65,10 @@ class SearchReport:
     simulations: int
     root_moves: list[tuple[chess.Move, int]]
 
-#mcts.py's search, or the tablebase's move where the tables know the position (search refuses those)
 def search_move(model: nn.Module, board: chess.Board, device: torch.device, simulations: int) -> tuple[chess.Move, SearchReport]:
     #mcts.py imports this file
     from engine import mcts
+    #search refuses a position the tables know
     if mcts.tablebase is not None and covers(board):
         best = ranked_moves(mcts.tablebase, board)[0]
         return best.move, SearchReport(wdl_score(best.wdl), [best.move], 0, [])
@@ -87,7 +81,6 @@ def search_move(model: nn.Module, board: chess.Board, device: torch.device, simu
     by_visits = sorted(root.children.items(), key=lambda item: item[1].visit_count, reverse=True)[:ROOT_MOVES_REPORTED]
     return line[0], SearchReport(score, line, simulations, [(move, child.visit_count) for move, child in by_visits])
 
-#the inverse of the training curve, capped since a sure win is infinitely many centipawns
 def score_to_centipawns(score: float) -> int:
     score = min(max(score, 1 - MAX_REPORTED_SCORE), MAX_REPORTED_SCORE)
     return round(math.log(score / (1 - score)) / EXPECTED_SCORE_PER_CENTIPAWN)

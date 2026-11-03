@@ -1,7 +1,4 @@
-#self play for expert iteration: every position is saved with what mcts found there, as a training set for train.py
-#the games run in rust (selfplay_rs/): mirror any change to mcts.py's search or the rules there, tests/test_selfplay_rs.py
-#holds it to the python reference in tests/reference_selfplay.py
-from __future__ import annotations
+#the games run in rust (selfplay_rs/), mirroring mcts.py's search; tests/test_selfplay_rs.py compares the two
 import argparse
 from collections.abc import Callable, Iterable, Iterator
 import ctypes
@@ -28,12 +25,11 @@ from engine import mcts
 import selfplay_rs
 from model.encoding import MOVE_IDS_BY_SQUARES, NO_MOVE, NUM_MOVE_IDS, TOKENS_PER_BOARD
 from engine.tablebase import TABLEBASE_PIECES, open_tablebase, tablebase_path
-#workers import this file, so nothing at the top may import torch (data.py, model.checkpoint, inference.py do)
+#workers import this file, so nothing at the top may import torch (training.data, model.checkpoint, engine.inference and tensorboard do)
 
 SIMULATIONS = 64
 TOP_MOVES = 8
 SAMPLED_PLIES = 30
-#the move played keeps its subtree as the next root
 TREE_REUSE = True
 MAX_PLIES = 600
 VAL_EVERY = 50
@@ -42,25 +38,23 @@ MAX_PROCESSES = 8
 GAMES_PER_PROCESS = 256
 LOG_EVERY_GAMES = 50
 SEED = 42
-#positions whose network answers each process's cache keeps (selfplay_rs' Cache), about 200 bytes each
 CACHE_POSITIONS = 500_000
-#a round's simulations for each leaf it sends to the network: those the cache or a game's end answer at once do not wait for it
+#simulations a round runs for each leaf it sends to the network: cache hits and game ends are answered at once
 SIMULATIONS_PER_LEAF = 3
 RECORD_ATTEMPTS = 20
 #the move logits, then the expected score
 ANSWER_WIDTH = NUM_MOVE_IDS + 1
 
 
-#every position before a move with what the search found there, and the result from white's side
 @dataclass
 class Game:
     number: int
-    boards: np.ndarray #(positions, TOKENS_PER_BOARD)
+    boards: np.ndarray
     visit_moves: np.ndarray #(positions, TOP_MOVES), NO_MOVE where fewer moves were visited
-    visit_shares: np.ndarray #(positions, TOP_MOVES)
+    visit_shares: np.ndarray
     root_scores: np.ndarray #for the side to move
     white_to_move: np.ndarray
-    white_score: float
+    white_score: float #1.0, 0.5 or 0.0
 
     def outcomes(self) -> np.ndarray:
         return np.where(self.white_to_move, self.white_score, 1 - self.white_score).astype(np.float32)
@@ -73,14 +67,11 @@ def move_id_table() -> np.ndarray:
         table[from_square, to_square, promotion or 0] = move_id
     return table
 
-#mcts.py's constants are read at call time, so a test can change them. tablebase_pieces: the tables of up to that many
-#pieces (engine.tablebase.TABLE_SETS), from syzygy_path's folders rather than the downloaded ones if it is given
 def rust_search_settings(use_tablebase: bool, tablebase_pieces: int = TABLEBASE_PIECES, syzygy_path: str | None = None) -> dict:
     return dict(move_id_table=move_id_table().ravel().tolist(), answer_width=ANSWER_WIDTH, c_puct=mcts.C_PUCT, c_puct_factor=mcts.C_PUCT_FACTOR,
                 c_puct_base=mcts.C_PUCT_BASE, fpu_reduction=mcts.FPU_REDUCTION, draw=mcts.DRAW, repetitions_for_a_draw=mcts.REPETITIONS_FOR_A_DRAW,
                 tablebase_folder=(syzygy_path or tablebase_path(tablebase_pieces)) if use_tablebase else None, tablebase_pieces=tablebase_pieces)
 
-#up to `size` games at once in rust. network takes the leaves' boards and gives back ANSWER_WIDTH numbers for each
 class RustSelfPlayBatch:
     def __init__(self, network: Callable[[np.ndarray], np.ndarray], simulations: int, numbers: Iterator[int], size: int, seed: int,
                  board: chess.Board, sampled_plies: int, max_plies: int, tree_reuse: bool, use_tablebase: bool):
@@ -93,12 +84,12 @@ class RustSelfPlayBatch:
         for _ in range(size):
             self.start_next_game()
 
+    #a game already over at its start ends at once, so the next number is tried
     def start_next_game(self) -> None:
         for number in self.numbers:
             if self.games.start_game(number):
                 return
 
-    #one round, returning the games it finished
     def step(self) -> list[Game]:
         leaves = np.frombuffer(self.games.descend(), dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
         ended = self.games.finish(self.network(leaves) if len(leaves) else np.zeros((0, ANSWER_WIDTH), dtype=np.float32))
@@ -109,7 +100,6 @@ class RustSelfPlayBatch:
                      np.frombuffer(root_scores, dtype=np.float32), np.frombuffer(white_to_move, dtype=bool), white_score)
                 for number, boards, visit_moves, visit_shares, root_scores, white_to_move, white_score in self.games.take_finished()]
 
-#the games with these numbers, `size` at a time, each yielded as it ends
 def play_games_in_rust(network: Callable[[np.ndarray], np.ndarray], simulations: int, numbers: Iterable[int], size: int, seed: int = SEED,
                        board: chess.Board | None = None, sampled_plies: int = SAMPLED_PLIES, max_plies: int = MAX_PLIES,
                        tree_reuse: bool = TREE_REUSE, use_tablebase: bool = False) -> Iterator[Game]:
@@ -119,8 +109,7 @@ def play_games_in_rust(network: Callable[[np.ndarray], np.ndarray], simulations:
         yield from batch.step()
 
 
-#a self play set on disk: each game is appended to its split's files, then the record goes to a .part moved over
-#<name>_selfplay.json. Reopening takes the fuller record the files hold, and cuts off whatever was written after it
+#files are appended before the record, so reopening keeps the fullest record the files hold and truncates the rest
 class SelfPlaySet:
     def __init__(self, folder: Path, name: str, settings: dict):
         self.folder = folder
@@ -153,7 +142,6 @@ class SelfPlaySet:
                     with open(path, "r+b") as file:
                         file.truncate(positions * bytes_per_position)
 
-    #None when missing or half written
     @staticmethod
     def read_record(path: Path) -> dict | None:
         try:
@@ -165,7 +153,7 @@ class SelfPlaySet:
         return all((path.stat().st_size if path.exists() else 0) >= record["positions"][split] * bytes_per_position
                    for split in ("train", "val") for path, bytes_per_position in self.files(split).values())
 
-    #every file of a split, with the bytes one position takes in it
+    #each file of a split, with the bytes one position takes in it
     def files(self, split: str) -> dict[str, tuple[Path, int]]:
         from training.data import SELF_PLAY_FILES
         widths = {"boards": TOKENS_PER_BOARD, "visit_moves": TOP_MOVES, "visit_shares": TOP_MOVES, "outcomes": 1, "root_scores": 1}
@@ -175,7 +163,6 @@ class SelfPlaySet:
     def positions(self) -> int:
         return self.record["positions"]["train"] + self.record["positions"]["val"]
 
-    #False when the record could not be moved into place this time
     def add(self, game: Game, seconds: float) -> bool:
         split = "val" if game.number % VAL_EVERY == 0 else "train"
         arrays = {"boards": game.boards, "visit_moves": game.visit_moves, "visit_shares": game.visit_shares, "outcomes": game.outcomes(), "root_scores": game.root_scores}
@@ -190,7 +177,7 @@ class SelfPlaySet:
         self.record["seconds"] += seconds
         return self.write_record()
 
-    #windows refuses the move while another program has the file open for a moment: retried, and the .part keeps the game safe
+    #windows refuses the replace while another program has the file open for a moment: retried, and the .part keeps the game safe
     def write_record(self) -> bool:
         for attempt in range(RECORD_ATTEMPTS):
             try:
@@ -202,8 +189,7 @@ class SelfPlaySet:
         return False
 
 
-#a worker's place at the inference process: shared memory for its boards (a byte a token) and answers, and a pipe.
-#made by the main process, so a worker added later finds it ready
+#shared memory for a worker's boards (a byte a token) and answers, and a pipe; made by the main process so a worker added later finds it ready
 class Slot:
     def __init__(self, games_per_process: int):
         self.boards = shared_memory.SharedMemory(create=True, size=games_per_process * TOKENS_PER_BOARD)
@@ -222,12 +208,12 @@ def slot_arrays(boards_name: str, answers_name: str, games_per_process: int) -> 
     return memories, boards, answers
 
 
-#the network as a worker sees it, through its slot. The answers stay valid until the next call
 class RemoteNetwork:
     def __init__(self, boards_name: str, answers_name: str, connection, games_per_process: int):
         self.memories, self.boards, self.answers = slot_arrays(boards_name, answers_name, games_per_process)
         self.connection = connection
 
+    #the answers are a view of shared memory, valid until the next call
     def __call__(self, boards: np.ndarray) -> np.ndarray:
         count = len(boards)
         self.boards[:count] = boards
@@ -236,8 +222,7 @@ class RemoteNetwork:
         return self.answers[:count]
 
 
-#one cpu-only self play process: sends (worker_id, game) as games end, (worker_id, None) once stopped and finished,
-#or its traceback on failure
+#puts (worker_id, game) as games end, (worker_id, None) once stopped and finished, (worker_id, traceback) on failure
 def worker(worker_id: int, slot_names: tuple[str, str], connection_, simulations: int, games_per_process: int, seed: int, use_tablebase: bool,
            tree_reuse: bool, next_number, stop, results) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -258,8 +243,6 @@ def worker(worker_id: int, slot_names: tuple[str, str], connection_, simulations
         results.put((worker_id, traceback.format_exc()))
 
 
-#the inference process and the workers, which can grow and shrink while it runs. A finished worker's slot is reused,
-#a failed one's is not (its last request may still be answered into it)
 class Workers:
     def __init__(self, context, first_number: int, checkpoint_path: str, compile_model: bool, precision: str, games_per_process: int, worker_arguments: tuple):
         self.context = context
@@ -299,14 +282,13 @@ class Workers:
         self.done.add(worker_id)
         self.free_slots.append(self.slot_of[worker_id])
 
+    #its slot is not reused: its last request may still be answered into it
     def failed(self, worker_id: int) -> None:
         self.done.add(worker_id)
 
-    #the ones still starting new games
     def playing(self) -> list[int]:
         return [worker_id for worker_id in self.processes if worker_id not in self.done and not self.stops[worker_id].is_set()]
 
-    #the newest one finishes its games and goes
     def stop_one(self) -> None:
         self.stops[self.playing()[-1]].set()
 
@@ -317,14 +299,12 @@ class Workers:
     def all_done(self) -> bool:
         return len(self.done) == len(self.processes)
 
-    #the ones killed from outside, now counted as failed
     def dead(self) -> list[int]:
         dead = [worker_id for worker_id, process in self.processes.items() if worker_id not in self.done and not process.is_alive()]
         for worker_id in dead:
             self.failed(worker_id)
         return dead
 
-    #games still being played are lost
     def terminate(self) -> None:
         for process in self.processes.values():
             process.terminate()
@@ -338,7 +318,6 @@ class Workers:
             slot.close()
 
 
-#keys pressed since the last look; none without a windows console
 def pressed_keys() -> list[str]:
     keys = []
     try:
@@ -349,7 +328,7 @@ def pressed_keys() -> list[str]:
     return keys
 
 
-#windows only; child processes inherit it
+#child processes inherit the priority
 def set_priority(priority_class: int) -> None:
     if sys.platform != "win32":
         return
@@ -380,7 +359,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
 
     workers = Workers(multiprocessing.get_context("spawn"), games.record["next_game"], str(checkpoint_path), compile_model, precision, games_per_process,
                       (simulations, games_per_process, seed, use_tablebase, tree_reuse))
-    print("starting the inference process" + (" and compiling the model, 10-30 s" if compile_model else ""))
+    print("starting the inference process" + (" and compiling the model" if compile_model else ""))
     try:
         workers.wait_for_inference()
     except BaseException:
@@ -391,12 +370,10 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
     print(f"{len(workers.playing())} processes playing {games_per_process} games each: the first games end together after a few minutes.\n"
           f"+ or - adds or removes a process (up to {MAX_PROCESSES}), ctrl+c finishes the games being played and saves them, a second ctrl+c stops at once")
 
-    #imported here, it is slow to import
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(log_dir=str(RUNS_DIR / "selfplay" / name))
     progress = tqdm(total=positions, initial=games.positions(), unit="pos", smoothing=0.05, dynamic_ncols=True, desc=name)
 
-    #once finishing, every process finishes its games and starts no more, so every game begun is saved
     finishing = False
     def finish() -> None:
         nonlocal finishing
@@ -476,10 +453,11 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
         progress.close()
 
     record = games.record
+    scores = record["white_scores"]
     print(f"{name}: {record['positions']['train']:,} train and {record['positions']['val']:,} val positions from {record['games']:,} games "
-          f"({games.positions() / record['games']:.0f} plies a game), white {record['white_scores']['1.0']}, draws {record['white_scores']['0.5']}, "
-          f"black {record['white_scores']['0.0']}, {games.positions() / record['seconds'] * 3600:,.0f} positions an hour")
-    print(f"fine-tune on it: python -m training.train --init-checkpoint {checkpoint_path} --training-set {name} --mix-set full_sf8_30M_mix")
+          f"({games.positions() / record['games']:.0f} plies a game), white {scores['1.0']}, draws {scores['0.5']}, "
+          f"black {scores['0.0']}, {games.positions() / record['seconds'] * 3600:,.0f} positions an hour")
+    print(f"fine-tune on it: python -m training.train --init-checkpoint {checkpoint_path} --training-set {name}")
 
 
 if __name__ == "__main__":
@@ -489,13 +467,12 @@ if __name__ == "__main__":
     parser.add_argument("--name", required=True, help="the training set that is made in processed_data/")
     parser.add_argument("--positions", type=int, required=True, help="stop once the set has this many positions, e.g. 1_000_000")
     parser.add_argument("--simulations", type=int, default=SIMULATIONS, help="per move, default %(default)s")
-    parser.add_argument("--tablebase", action="store_true", help="end a game once it has at most 5 pieces, with the syzygy tables' result")
+    parser.add_argument("--tablebase", action="store_true", help=f"end a game once it has at most {TABLEBASE_PIECES} pieces, with the syzygy tables' result")
     parser.add_argument("--processes", type=int, default=PROCESSES, help=f"at the start, + and - change it while it runs (up to {MAX_PROCESSES}). Default %(default)s")
     parser.add_argument("--games-per-process", type=int, default=GAMES_PER_PROCESS, help="games each process plays at once. Default %(default)s")
-    parser.add_argument("--no-tree-reuse", action="store_true", help="start every search from a new root (see TREE_REUSE)")
-    parser.add_argument("--no-compile", action="store_true", help="skip torch.compile in the inference process (10-30 s at the start, 40%% faster gpu)")
-    parser.add_argument("--precision", choices=["fp16", "bf16", "tf32"], default="fp16",
-                        help="of the network in the inference process (see inference.fp16_model and Bf16). Default %(default)s")
+    parser.add_argument("--no-tree-reuse", action="store_true", help="start every search from a new root")
+    parser.add_argument("--no-compile", action="store_true", help="skip torch.compile in the inference process")
+    parser.add_argument("--precision", choices=["fp16", "bf16", "tf32"], default="fp16", help="of the network in the inference process. Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
     arguments = parser.parse_args()
 

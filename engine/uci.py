@@ -1,13 +1,8 @@
-#the model as a uci engine; commands are read on a thread of their own so that stop, isready and quit reach a running search
-#--select mcts keeps to go's movetime, nodes, wtime/btime and ponder (searchmoves, depth and mate are ignored); the other selections ignore the clock
-#   python -m engine.uci [model.pt | random] [--select mcts --gpu]
 import argparse
 from collections.abc import Iterable
-import json
 import os
 from pathlib import Path
 import queue
-import random
 import re
 import subprocess
 import sys
@@ -15,22 +10,17 @@ import threading
 import time
 import chess
 import torch
-from torch import nn
 from engine.inference import cpu_batches
 from model.checkpoint import latest_checkpoint
-from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS,
+from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, LEAVES, PRECISIONS,
                                   SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks,
                                   engine_search_settings, parse_changes)
-from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
-                               load_model, score_to_centipawns)
+from engine.player import SIMULATIONS, SearchReport, load_model, score_to_centipawns
 from engine.tablebase import MOST_PIECES, TABLE_SETS, TABLEBASE_PIECES, complete_pieces, open_tablebase, open_tablebase_path
 
 ENGINE_NAME = "Fry"
 REPOSITORY = Path(__file__).resolve().parent.parent
 
-#one board takes a few ms on the cpu, less than starting cuda
-DEVICE = torch.device("cpu")
-#kept off go's time for the gui to read bestmove (uci option MoveOverhead)
 MOVE_OVERHEAD_SECONDS = 0.02
 
 def engine_version() -> str:
@@ -43,7 +33,6 @@ def engine_version() -> str:
         commit = ""
     return f"{version}-{commit}" if commit else version
 
-#"all" for every cuda device, else devices by number ("0,1,2")
 def parse_gpus(text: str) -> list[int]:
     if text == "all":
         count = torch.cuda.device_count()
@@ -65,23 +54,19 @@ def gpus_argument(text: str) -> list[int]:
 GO_NUMBERS = ("wtime", "btime", "winc", "binc", "movestogo", "movetime", "nodes", "depth", "mate")
 #with wtime/btime and no movestogo, the game is planned to last this many moves a man above the two kings
 MOVES_PER_MAN = 1.5
-#the fewest moves the time left is shared over, so the last of it goes gradually
 LEAST_MOVES_LEFT = 10
 #a move's weight by the men on the board, kings included: (fewest, most, weight)
 PHASE_WEIGHTS = ((26, 32, 0.85), (16, 25, 1.25), (10, 15, 1.0), (3, 9, 0.8))
-#kept back from the time left, for a search that runs over
 RESERVE_SECONDS = 1.0
-#the most of the time left one move gets, 1.0 for no cap as in lc0
 MOST_OF_THE_TIME_LEFT = 1.0
-#a search whose score falls may run on by up to MOST_EXTENSION shares, never past MOST_OF_THE_TIME_LEFT_EXTENDED of the time left
+#a search whose score falls may run on by up to MOST_EXTENSION shares (Clock.share), never past MOST_OF_THE_TIME_LEFT_EXTENDED of the time left
 MOST_EXTENSION = 2.0
 MOST_OF_THE_TIME_LEFT_EXTENDED = 1 / 3
-#lc0's bonus for a game's first search on the clock: its share x (1 + FIRST_MOVE_BONUS + BOOK_PLY_BONUS x ply, ply at most MOST_BOOK_PLIES)
 FIRST_MOVE_BONUS = 0.0
 BOOK_PLY_BONUS = 0.0
 MOST_BOOK_PLIES = 12
 
-#go's whole-number arguments by name, and the ones with another value ("name value"), which are left out
+#depth and mate are read only to flag a value that is not whole; the search ignores them, as searchmoves
 def go_numbers(arguments: list[str]) -> tuple[dict[str, int], list[str]]:
     numbers, bad = {}, []
     for key, value in zip(arguments, arguments[1:]):
@@ -95,11 +80,10 @@ def go_numbers(arguments: list[str]) -> tuple[dict[str, int], list[str]]:
 def phase_weight(men: int) -> float:
     return next((weight for fewest, most, weight in PHASE_WEIGHTS if fewest <= men <= most), 1.0)
 
-#print writes a line and its newline apart, and the reader thread sends readyok during a search
+#one lock: print writes a line and its newline apart, and the reader thread sends readyok during a search; flushed, as the gui reads a pipe
 SENDING = threading.Lock()
 
 def send(line: str) -> None:
-    #flushed: the gui reads a pipe, not a terminal
     with SENDING:
         print(line, flush=True)
 
@@ -111,7 +95,6 @@ def standard_material(board: chess.Board, color: chess.Color) -> bool:
     promoted = sum(max(0, chess.popcount(pieces & ours) - start) for pieces, start in at_the_start)
     return chess.popcount(board.pawns & ours) + promoted <= 8
 
-#"startpos moves e2e4 e7e5" or "fen <6 fen fields> moves ..."; a ValueError for a position the search could not start from
 def parse_position(arguments: list[str]) -> chess.Board:
     moves_index = arguments.index("moves") if "moves" in arguments else len(arguments)
     setup, moves = arguments[:moves_index], arguments[moves_index + 1:]
@@ -135,13 +118,12 @@ def parse_position(arguments: list[str]) -> chess.Board:
 
     return board
 
-#depth is the length of the expected line; cutechess keeps score, depth and time in the pgn
+#depth is the length of the expected line: cutechess keeps score, depth and time in the pgn
 def info_line(report: SearchReport, seconds: float) -> str:
     return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {round(report.simulations / max(seconds, 1e-3))} "
             f"score cp {score_to_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
 
-#go's limits and, on a clock (wtime/btime), a move's time: its weighted share of the time left over the moves still to play, plus the
-#increment and the bank (what earlier searches were given and did not use), as lc0's legacy time manager. A new game needs a new Clock
+#a new game needs a new Clock
 class Clock:
     def __init__(self, moves_per_man: float = MOVES_PER_MAN, least_moves_left: int = LEAST_MOVES_LEFT, reserve_seconds: float = RESERVE_SECONDS,
                  most_of_the_time_left: float = MOST_OF_THE_TIME_LEFT, first_move_bonus: float = FIRST_MOVE_BONUS,
@@ -151,10 +133,10 @@ class Clock:
         self.first_move_bonus, self.book_ply_bonus = first_move_bonus, book_ply_bonus
         self.move_overhead_seconds = move_overhead_seconds
         self.first_search = True
-        self.saved = 0.0 #the bank, in seconds
-        self.allotted: float | None = None #the seconds the search on the clock was given
-        self.share = 0.0 #its move's share of the time left
-        self.last_score: int | None = None #the last search's score, centipawns for us
+        self.saved = 0.0 #the bank: seconds given to earlier searches and not used
+        self.allotted: float | None = None
+        self.share = 0.0 #the move's share of the time left, increment included
+        self.last_score: int | None = None #centipawns for us
         #(last_score, the seconds this search may add if its score falls below it), None off the clock
         self.extension: tuple[int, float] | None = None
 
@@ -197,46 +179,32 @@ class Clock:
     def extra_seconds(self, time_left: float) -> float:
         return max(0.0, min(MOST_EXTENSION * self.share, (time_left - self.reserve_seconds) * MOST_OF_THE_TIME_LEFT_EXTENDED - (self.allotted or 0.0)))
 
-    #after a search: the seconds it took and its score (centipawns for us)
     def searched(self, seconds: float, score: int) -> None:
         if self.allotted:
             self.saved = max(0.0, self.saved + self.allotted - seconds)
         self.last_score = score
 
-#carries the search's tree on to the game after the move, off the engine's clock, on a thread of EngineSearch's own
 def advance_after(player, board: chess.Board, move: chess.Move) -> None:
     if isinstance(player, EngineSearch):
         played = board.copy()
         played.push(move)
         player.advance(played)
 
-#a file per process, so engines playing side by side never share one
-def log_search(log_folder: Path, board: chess.Board, move: chess.Move, report: SearchReport) -> None:
-    record = {
-        "fen": board.fen(), "move": move.uci(), "score": report.score, "simulations": report.simulations,
-        "line": [line_move.uci() for line_move in report.line],
-        "root_moves": [[root_move.uci(), visits] for root_move, visits in report.root_moves]
-    }
-    with open(log_folder / f"{os.getpid()}.jsonl", "a") as log:
-        log.write(json.dumps(record) + "\n")
-
-#the search for --select mcts, else the model. The search gathers `leaves` a round on the gpu (the network in `precision`) on each of `gpus`,
-#a thread driving each, and is mcts.py's on the cpu; search_options are EngineSearch's keyword arguments
+#search_options are EngineSearch's keyword arguments
 def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, tablebase: bool, search_options: dict,
-                precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> nn.Module | EngineSearch:
+                precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> EngineSearch:
     if selection != "mcts":
-        #boards stay on DEVICE either way: CudaGraphModel takes them from the cpu
-        return CudaGraphModel(load_model(checkpoint_path, torch.device("cuda"))) if gpu else load_model(checkpoint_path, DEVICE)
+        raise ValueError(f"mcts is the only selection, not {selection}")
     if not gpu:
-        return EngineSearch(cpu_batches(load_model(checkpoint_path, DEVICE)), 1, use_tablebase=tablebase, **search_options)
+        return EngineSearch(cpu_batches(load_model(checkpoint_path, torch.device("cpu"))), 1, use_tablebase=tablebase, **search_options)
     #on several gpus the networks wait asleep (inference.GraphedBatches' blocking_wait) where each thread would spin a core
     network = engine_network(checkpoint_path, leaves, precision, fp16_blocks) if gpus is None else (
         engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, len(gpus) > 1))
     return EngineSearch(network, leaves, use_tablebase=tablebase, **search_options)
 
 
-#a go as the reader saw it: its arguments and when it came (the gui times the move from then). stop is set by stop or quit, and at the end
-#of the input for a go that waits for a stop (until_stop, ponder); pondered by stop or ponderhit, whose time is kept
+#a go as the reader saw it, received when it came (the gui times the move from then). stop is set by stop, quit and the input's end (for a go
+#that waits for a stop: until_stop, ponder); pondered by stop or ponderhit, whose time is kept
 class Go:
     def __init__(self, arguments: list[str], received: float, until_stop: bool):
         self.arguments, self.received, self.until_stop = arguments, received, until_stop
@@ -253,8 +221,8 @@ class Go:
             self.ponderhit = received
             self.pondered.set()
 
-#stdin read on a thread of its own, so that stop, isready and quit reach the engine while it searches. The main thread takes the other
-#commands in order (next) and keeps every search's state. While the command queued last is an unfinished go, the reader answers isready itself
+#stdin is read on a thread of its own, so that stop, isready and quit reach the engine while it searches; the main thread takes the other
+#commands in order (next). While the command queued last is an unfinished go, the reader answers isready itself
 class Commands:
     def __init__(self, lines: Iterable[str], infinite_until_stop: bool):
         self.infinite_until_stop = infinite_until_stop
@@ -309,10 +277,9 @@ class Commands:
 SPIN_OPTIONS = {"SyzygyProbeLimit": (min(table_set.pieces for table_set in TABLE_SETS), max(table_set.pieces for table_set in TABLE_SETS)),
                 "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000), "AdvanceThreads": (0, 256),
                 "Leaves": (1, 1024)}
-#setoption's decimal options, strings as lc0's (uci has no decimal type), (lowest, highest); SmartPruningFactor 0 is no smart pruning
+#setoption's decimal options, as strings since uci has no decimal type, (lowest, highest); SmartPruningFactor 0 is no smart pruning
 DECIMAL_OPTIONS = {"SmartPruningFactor": (0.0, 100.0), "FirstMoveBonus": (0.0, 100.0), "BookPlyBonus": (0.0, 100.0)}
 GPU_OPTIONS = ("GPUs", "Leaves", "SmartPruningFactor")
-#built into the search at isready or the first go: set later, they take effect when the engine restarts
 BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb", "AdvanceThreads", "GPUs", "Leaves", "SearchSettings",
                  "SmartPruningFactor")
 
@@ -321,8 +288,8 @@ def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
     value_at = arguments.index("value") if "value" in arguments else len(arguments)
     return " ".join(arguments[1:value_at]), " ".join(arguments[value_at + 1:])
 
-#the search's uci options, the command line's choices their defaults (<empty> goes back to the command line's). SyzygyPath: folders of
-#tables, os.pathsep between them. SearchSettings: --search-settings' "name=value,..." as changes over the command line's
+#the uci options, the command line's choices their defaults (<empty> goes back to the command line's). SyzygyPath: folders of tables, os.pathsep
+#between them. SearchSettings: --search-settings' "name=value,..." as changes over the command line's
 class Options:
     def __init__(self, tablebase: bool, tablebase_pieces: int, gpu: bool = False, gpus: list[int] | None = None, leaves: int = LEAVES,
                  search_options: dict | None = None, clock_options: dict | None = None):
@@ -466,7 +433,7 @@ class Options:
             return f"{error}: the tables stay as they were"
         return None
 
-    #load_player's tablebase and search options
+    #(whether the search uses tables, the search options)
     def search(self) -> tuple[bool, dict]:
         options = {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": self.cache_positions,
                    "memory_limit_mb": self.ram_limit_mb, "advance_threads": self.advance_threads}
@@ -478,27 +445,23 @@ class Options:
             options.update(smart_pruning=True, smart_pruning_factor=self.smart_pruning_factor)
         return self.tablebase or self.syzygy_path is not None, options
 
-    #Clock's keyword arguments
     def clock(self) -> dict:
         return {"first_move_bonus": self.first_move_bonus, "book_ply_bonus": self.book_ply_bonus, "move_overhead_seconds": self.move_overhead_seconds}
 
 
-def main(checkpoint_path: Path | None = None, random_mover: bool = False, selection: str = "argmax",
-         temperature: float = TEMPERATURE, sample_plies: int = SAMPLE_PLIES, simulations: int = SIMULATIONS,
-         gpu: bool = False, leaves: int = LEAVES, tablebase: bool = False, search_log: Path | None = None, search_options: dict | None = None,
-         precision: str = ENGINE_PRECISION, fp16_blocks: int = ENGINE_FP16_BLOCKS, clock_options: dict | None = None,
-         infinite_until_stop: bool = False, gpus: list[int] | None = None):
-    torch.set_num_threads(1) #so that parallel games don't fight over cores
+def main(checkpoint_path: Path, selection: str = "mcts", simulations: int = SIMULATIONS, gpu: bool = False, leaves: int = LEAVES,
+         tablebase: bool = False, search_options: dict | None = None, precision: str = ENGINE_PRECISION, fp16_blocks: int = ENGINE_FP16_BLOCKS,
+         clock_options: dict | None = None, infinite_until_stop: bool = False, gpus: list[int] | None = None):
+    torch.set_num_threads(1) #so that engines running side by side don't fight over cores
     search_options = search_options or {}
     clock_options = clock_options or {}
-    searching = selection == "mcts" and not random_mover
     options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES), gpu, gpus, leaves, search_options, clock_options)
     player = None
     board = chess.Board()
     clock = Clock(**{**clock_options, **options.clock()})
     commands = Commands(sys.stdin, infinite_until_stop)
 
-    def load() -> nn.Module | EngineSearch:
+    def load() -> EngineSearch:
         use_tablebase, set_options = options.search()
         return load_player(checkpoint_path, selection, gpu, options.leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
                            options.gpus)
@@ -511,31 +474,24 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         if not any(board.legal_moves):
             send("info string the game is over, there is no move to play")
             return None
-        if player is None and not random_mover:
+        if player is None:
             player = load()
         if go.ponder:
-            pondered = player.search(board, stop=go.pondered) if searching else None
+            pondered = player.search(board, stop=go.pondered)
             go.pondered.wait()
             if go.ponderhit is None:
-                return pondered.line[0] if pondered else next(iter(board.legal_moves))
+                return pondered.line[0]
             started = go.ponderhit
-        if random_mover:
-            move = random.choice(list(board.legal_moves))
-        elif searching:
-            for number in go_numbers(go.arguments)[1]:
-                send(f"info string go's {number} is not a whole number: left out")
-            nodes, seconds = clock.limits(go.arguments, board, simulations)
-            if go.until_stop:
-                nodes = seconds = None
-            running = lambda report: send(info_line(report, time.perf_counter() - started))
-            report = player.search(board, nodes, seconds, clock.extension, go.stop, running)
-            clock.searched(time.perf_counter() - started, score_to_centipawns(report.score))
-            move = report.line[0]
-            send(info_line(report, time.perf_counter() - started))
-            if search_log is not None:
-                log_search(search_log, board, move, report)
-        else:
-            move = choose_move(player, board, DEVICE, selection, temperature, sample_plies)
+        for number in go_numbers(go.arguments)[1]:
+            send(f"info string go's {number} is not a whole number: left out")
+        nodes, seconds = clock.limits(go.arguments, board, simulations)
+        if go.until_stop:
+            nodes = seconds = None
+        running = lambda report: send(info_line(report, time.perf_counter() - started))
+        report = player.search(board, nodes, seconds, clock.extension, go.stop, running)
+        clock.searched(time.perf_counter() - started, score_to_centipawns(report.score))
+        move = report.line[0]
+        send(info_line(report, time.perf_counter() - started))
         if go.until_stop:
             go.stop.wait()
         return move
@@ -544,20 +500,19 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         command, arguments, go = received
 
         if command == "uci":
-            send(f"id name {'RandomMover' if random_mover else f'{ENGINE_NAME} {engine_version()}'}")
+            send(f"id name {ENGINE_NAME} {engine_version()}")
             send("id author William Gong")
-            if searching:
-                for line in options.lines():
-                    send(line)
+            for line in options.lines():
+                send(line)
             send("uciok")
 
         elif command == "isready":
             #loaded here, not at startup, so "uci" is answered at once
-            if player is None and not random_mover:
+            if player is None:
                 player = load()
             send("readyok")
 
-        elif command == "setoption" and searching:
+        elif command == "setoption":
             told = options.set(*option_name_and_value(arguments), built=player is not None)
             for name, value in options.clock().items():
                 setattr(clock, name, value)
@@ -592,76 +547,66 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="the model as a UCI engine")
-    parser.add_argument("checkpoint", nargs="?", help="a model.pt, or 'random' for random moves; default the run that finished last")
-    parser.add_argument("--select", choices=SELECTIONS, default="argmax", help="how a move is picked, see player.py")
-    parser.add_argument("--temperature", type=float, default=TEMPERATURE, help="for --select sample, default %(default)s")
-    parser.add_argument("--sample-plies", type=int, default=SAMPLE_PLIES, help="for --select sample: argmax after this many plies, default the whole game")
+    parser.add_argument("checkpoint", nargs="?", help="a model.pt; default the run that finished last")
+    parser.add_argument("--select", choices=["mcts"], default="mcts", help="how a move is picked: mcts is the only way")
     parser.add_argument("--simulations", type=int, default=SIMULATIONS,
-                        help="for --select mcts: the simulations of a go without movetime, nodes or wtime/btime, default %(default)s")
-    parser.add_argument("--gpu", action="store_true", help="run the model on the gpu: faster for one search, slower when many games share it")
+                        help="the simulations of a go without movetime, nodes or wtime/btime, default %(default)s")
+    parser.add_argument("--gpu", action="store_true", help="run the model on the gpu")
     parser.add_argument("--leaves", type=int, default=LEAVES,
-                        help="for --select mcts --gpu: leaves gathered for each network call, default %(default)s; 1 is mcts.py's search")
+                        help="with --gpu: leaves gathered for each network call, default %(default)s; 1 is mcts.py's search")
     parser.add_argument("--precision", choices=PRECISIONS,
-                        help=f"for --select mcts --gpu: the network's precision (engine_search.PRECISIONS), default {ENGINE_PRECISION}")
+                        help=f"with --gpu: the network's precision (engine_search.PRECISIONS), default {ENGINE_PRECISION}")
     parser.add_argument("--gpus", type=gpus_argument,
-                        help="for --select mcts --gpu: the cuda devices to search on at once, e.g. 0,1,2,3 or all, a thread driving each; "
+                        help="with --gpu: the cuda devices to search on at once, e.g. 0,1,2,3 or all, a thread driving each; "
                              "default the current one. On more than one, for --leaves above 1, the search is another (more leaves out): the "
                              "threads descend in the one tree at once, each pinned to a cpu by the topology and asleep while its gpu works")
     parser.add_argument("--fp16-blocks", type=int,
                         help=f"for the int8 network: the blocks kept in fp16 besides the last, those whose int8 costs the policy most "
                              f"(engine/quantization.py), default {ENGINE_FP16_BLOCKS}; 0 for every other block in int8")
-    parser.add_argument("--tablebase", action="store_true", help="for --select mcts: positions of at most --tablebase-pieces pieces from the syzygy tables")
+    parser.add_argument("--tablebase", action="store_true", help="positions of at most --tablebase-pieces pieces from the syzygy tables")
     parser.add_argument("--tablebase-pieces", type=int, choices=[table_set.pieces for table_set in TABLE_SETS], default=TABLEBASE_PIECES,
                         help="for --tablebase: the most pieces, default %(default)s; 6 needs python -m engine.tablebase --pieces 6, and without "
                              "the 6 piece dtz tables searches those positions rather than playing the tables' move")
-    parser.add_argument("--search-log", type=Path, help="for --select mcts: a folder to add every search to, as <process id>.jsonl")
-    parser.add_argument("--grow-leaves", type=int, default=GROW_LEAVES,
-                        help="for --select mcts --gpu: about one leaf a round per this many simulations done or left, up to --leaves; 0 for --leaves every round")
     parser.add_argument("--visits-per-leaf-out", type=int, default=VISITS_PER_LEAF_OUT,
-                        help="for --select mcts --gpu: at most a leaf out on the network (the rounds out on all of --gpus) per this many "
+                        help="with --gpu: at most a leaf out on the network (the rounds out on all of --gpus) per this many "
                              "root visits; 0 for no cap, the default")
     parser.add_argument("--no-smart-pruning", dest="smart_pruning", action="store_false",
-                        help="for --select mcts --gpu: search all of go's movetime or nodes even once the move is decided (lc0's SmartPruningFactor=0)")
+                        help="with --gpu: search all of go's movetime or nodes even once the move is decided (lc0's SmartPruningFactor=0)")
     parser.add_argument("--smart-pruning-factor", type=float, default=SMART_PRUNING_FACTOR,
-                        help="for --select mcts --gpu: smart pruning stops once the most visited move leads by more than the simulations left / "
+                        help="with --gpu: smart pruning stops once the most visited move leads by more than the simulations left / "
                              "this, default %(default)s; lc0's 1.33 bets that the second move cannot get all of them")
     parser.add_argument("--smart-pruning-wait", type=float, default=SMART_PRUNING_WAIT,
-                        help="for --select mcts --gpu: no smart pruning stop on the visits until this many seconds after a search's first answers, "
+                        help="with --gpu: no smart pruning stop on the visits until this many seconds after a search's first answers, "
                              "default %(default)s; lc0's 0.2")
     parser.add_argument("--stop-at-one-move-left", action="store_true",
-                        help="for --select mcts --gpu: stop at once when certainty's proofs leave one root move not lost, as lc0 does")
+                        help="with --gpu: stop at once when certainty's proofs leave one root move not lost, as lc0 does")
     parser.add_argument("--first-move-bonus", type=float, default=FIRST_MOVE_BONUS,
-                        help="for --select mcts on a clock: the game's first search gets 1 + this + --book-ply-bonus x its ply (at most "
+                        help="on a clock: the game's first search gets 1 + this + --book-ply-bonus x its ply (at most "
                              f"{MOST_BOOK_PLIES}) times its share, default %(default)s; lc0's 1.8")
     parser.add_argument("--book-ply-bonus", type=float, default=BOOK_PLY_BONUS, help="for --first-move-bonus, default %(default)s; lc0's 0.25")
-    parser.add_argument("--search-settings", default="",
-                        help="for --select mcts: changes to the search's settings (engine_search.py), e.g. c_puct=0.6")
+    parser.add_argument("--search-settings", default="", help="changes to the search's settings (engine_search.py), e.g. c_puct=0.6")
     parser.add_argument("--infinite-until-stop", action="store_true",
                         help="go infinite searches until stop, as UCI and analysis guis ask; without it it runs --simulations, which "
                              "cutechess-cli's tc=inf games need")
     arguments = parser.parse_args()
     if arguments.tablebase_pieces != TABLEBASE_PIECES and not arguments.tablebase:
         parser.error("--tablebase-pieces needs --tablebase")
-    if arguments.precision is not None and not (arguments.select == "mcts" and arguments.gpu):
+    if arguments.precision is not None and not arguments.gpu:
         parser.error("--precision needs --select mcts --gpu")
     if arguments.smart_pruning_factor <= 0:
         parser.error("--smart-pruning-factor is positive; --no-smart-pruning for none")
-    if arguments.gpus is not None and not (arguments.select == "mcts" and arguments.gpu and (len(arguments.gpus) == 1 or arguments.leaves > 1)):
+    if arguments.gpus is not None and not (arguments.gpu and (len(arguments.gpus) == 1 or arguments.leaves > 1)):
         parser.error("--gpus needs --select mcts --gpu, and on more than one gpu --leaves above 1")
-    if arguments.fp16_blocks is not None and not (arguments.select == "mcts" and arguments.gpu and arguments.precision in (None, "int8")):
+    if arguments.fp16_blocks is not None and not (arguments.gpu and arguments.precision in (None, "int8")):
         parser.error("--fp16-blocks needs --select mcts --gpu and the int8 network")
     if arguments.fp16_blocks is not None and arguments.fp16_blocks < 0:
         parser.error("--fp16-blocks is 0 or more")
-    if arguments.checkpoint == "random":
-        main(random_mover=True, infinite_until_stop=arguments.infinite_until_stop)
-    else:
-        main(Path(arguments.checkpoint) if arguments.checkpoint else latest_checkpoint(),
-             selection=arguments.select, temperature=arguments.temperature, sample_plies=arguments.sample_plies,
-             simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
-             search_log=arguments.search_log, precision=arguments.precision or ENGINE_PRECISION, infinite_until_stop=arguments.infinite_until_stop,
-             gpus=arguments.gpus, fp16_blocks=ENGINE_FP16_BLOCKS if arguments.fp16_blocks is None else arguments.fp16_blocks,
-             search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces, "grow_leaves": arguments.grow_leaves,
-                             "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
-                             "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
-                             "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out},
-             clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})
+    main(Path(arguments.checkpoint) if arguments.checkpoint else latest_checkpoint(),
+         selection=arguments.select, simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
+         precision=arguments.precision or ENGINE_PRECISION, infinite_until_stop=arguments.infinite_until_stop, gpus=arguments.gpus,
+         fp16_blocks=ENGINE_FP16_BLOCKS if arguments.fp16_blocks is None else arguments.fp16_blocks,
+         search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces,
+                         "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
+                         "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
+                         "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out},
+         clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

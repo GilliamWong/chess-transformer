@@ -1,5 +1,3 @@
-#int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022) and cached
-#   python -m engine.quantization <model.pt>    computes them ahead of a match
 import argparse
 import hashlib
 import os
@@ -25,17 +23,15 @@ CARLSEN_PGN = Path(__file__).resolve().parent / "Carlsen.pgn"
 CACHE = Path.home() / ".cache" / "chess_transformer" / "int8"
 #bumped with the rounding code: it and the settings below name the cached file
 VERSION = 1
-#every CALIBRATION_STEP plies of the games from CALIBRATION_FIRST_GAME on; the games before are the tests' and benchmarks'
 CALIBRATION_POSITIONS = 1024
+#the games before are the tests'
 CALIBRATION_FIRST_GAME = 1000
 CALIBRATION_STEP = 9
-#share of the Hessian's mean diagonal added to its diagonal; columns rounded before their error is passed on
 DAMPENING = 0.01
 GPTQ_COLUMNS = 128
-#the last layer's down matmul alone costs the policy as much as all the others'
 FP16_LAST_LAYERS = 1
 INT8_MAX = 127
-#bumped with block_errors: it and the count name the file of the weights without the blocks kept in fp16
+#bumped with block_errors, like VERSION
 CHOICE_VERSION = 1
 ERROR_BATCH = 256
 
@@ -62,7 +58,7 @@ def encode_positions(positions: list[chess.Board]) -> torch.Tensor:
     return torch.from_numpy(np.array([encode_board(board) for board in positions])).long()
 
 
-#(int8 weight, scale a row) of an N x K weight: each column's error is spread over the later ones through the Hessian
+#GPTQ (Frantar et al. 2022): (int8 weight, scale a row) of an N x K weight, each column's error spread over the later ones through the Hessian
 def gptq(weight: torch.Tensor, hessian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     #fp64: machines summing in other orders round every weight alike
     weight, hessian = weight.double().clone(), hessian.double().clone()
@@ -109,8 +105,8 @@ def input_hessians(model: ChessTransformer, boards: torch.Tensor, batch: int = 1
     return hessians
 
 
-#{layer: {name: (int8 N x K, scale a row)}} of all but the last FP16_LAST_LAYERS blocks, laid out as Int8Block reads them:
-#projection is Q|K|V|template mix, gate_up the gate's rows then up's, down padded to down_inputs and rotated
+#all but the last FP16_LAST_LAYERS blocks, laid out as Int8Block reads them: projection is Q|K|V|template mix,
+#gate_up the gate's rows then up's, down padded to down_inputs and rotated
 @torch.no_grad()
 def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> Int8Weights:
     hessians = input_hessians(model, boards)
@@ -160,8 +156,7 @@ def block_errors(checkpoint_path: Path, weights: Int8Weights) -> dict[int, float
     return errors
 
 
-#named by the checkpoint file's content, everything else that rounds, and the count of blocks kept in fp16; with none
-#kept it is the name weights had before blocks could be kept
+#a count of 0 stays out of the name so the files cached without a count are still read
 def cached_weights_path(checkpoint_path: Path, fp16_blocks: int) -> Path:
     with open(checkpoint_path, "rb") as checkpoint:
         digest = hashlib.file_digest(checkpoint, "sha256").hexdigest()
@@ -204,9 +199,7 @@ if __name__ == "__main__":
     from engine.engine_search import ENGINE_FP16_BLOCKS
     parser = argparse.ArgumentParser(description="the int8 weights of a checkpoint, computed and cached")
     parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("--fp16-blocks", type=int, default=ENGINE_FP16_BLOCKS,
-                        help="the blocks kept in fp16 besides the last (engine_search.ENGINE_FP16_BLOCKS), default %(default)s")
     arguments = parser.parse_args()
-    weights = int8_weights(arguments.checkpoint, arguments.fp16_blocks)
-    print(cached_weights_path(arguments.checkpoint, arguments.fp16_blocks))
+    weights = int8_weights(arguments.checkpoint, ENGINE_FP16_BLOCKS)
+    print(cached_weights_path(arguments.checkpoint, ENGINE_FP16_BLOCKS))
     print("kept in fp16 besides the last:", sorted(set(int8_weights(arguments.checkpoint, 0)) - set(weights)))

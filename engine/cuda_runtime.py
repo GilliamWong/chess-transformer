@@ -1,4 +1,3 @@
-#cuda runtime calls on torch's own library through ctypes, skipping torch's per-call work; Searches' round loop calls the same addresses
 import ctypes
 import functools
 import os

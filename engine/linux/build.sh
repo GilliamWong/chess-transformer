@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-#builds the python environment, rust search, weights and their int8 rounding; safe to run again after a git pull
-#the default cu129 torch runs on driver 570, TORCH_CUDA=cu130 needs 580 or newer; SKIP_INT8=1 leaves the rounding to the engine
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -8,6 +6,7 @@ WEIGHTS=weights/fry-final-117.pt
 WEIGHTS_URL=https://github.com/GilliamWong/chess-transformer/releases/download/fry-final-117/fry-final-117.pt
 WEIGHTS_SHA256=fed2722da0085ef3299eeb72e9f06712a9426b38503aa8889bcf87affc5c0bed
 RUST_AT_LEAST=1.85.0
+#the default cu129 torch runs on driver 570, cu130 needs 580 or newer
 TORCH_CUDA=${TORCH_CUDA:-cu129}
 export RUSTFLAGS=${RUSTFLAGS:--C target-cpu=native}
 
@@ -43,7 +42,6 @@ if ! weights_ok "$WEIGHTS"; then
     mv "$WEIGHTS.partial" "$WEIGHTS"
 fi
 
-#caches the int8 weights where the engine looks first
 if [ "${SKIP_INT8:-0}" != 1 ] && nvidia-smi >/dev/null 2>&1; then
     .venv/bin/python -m engine.quantization "$WEIGHTS"
 else
