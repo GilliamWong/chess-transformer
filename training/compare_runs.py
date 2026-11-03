@@ -1,7 +1,7 @@
-#every finished run side by side, grouped by budget: a table in the terminal and artifacts/progress.html
-#   python -m training.compare_runs
+#every finished run side by side, grouped by budget: python -m training.compare_runs prints a table and writes artifacts/progress.html
 import html
 import json
+from itertools import groupby
 from pathlib import Path
 from model.checkpoint import ARTIFACTS_DIR, RUNS_DIR
 
@@ -13,7 +13,6 @@ def load_runs() -> list[dict]:
     runs = []
     for settings_path in RUNS_DIR.glob("*/settings.json"):
         settings = json.loads(settings_path.read_text())
-        #a run that was stopped early has its settings but no results
         if "final_val_loss" not in settings:
             continue
 
@@ -35,11 +34,9 @@ def load_runs() -> list[dict]:
             "val_acc": f"{settings['final_val_accuracy']:.2%}",
             "commit": settings.get("commit", ""),
             "accuracy": settings["final_val_accuracy"],
-            "finished": settings.get("finished_at", "") or settings_path.stat().st_mtime_ns,
             "order": settings_path.stat().st_mtime_ns,
         })
 
-    #budget groups together, inside a group the best run first
     return sorted(runs, key=lambda run: (run["budget"], run["val_loss"]))
 
 def print_table(runs: list[dict]) -> None:
@@ -52,7 +49,6 @@ def print_table(runs: list[dict]) -> None:
         previous_budget = run["budget"]
         print("  ".join(str(run[column]).ljust(widths[column]) for column in COLUMNS))
 
-#one chart per budget: every run in the order it finished, and a line through the best accuracy so far
 def chart_svg(runs: list[dict]) -> str:
     runs = sorted(runs, key=lambda run: run["order"])
     width, height, left, right, top, bottom = 760, 260, 50, 20, 16, 30
@@ -68,8 +64,9 @@ def chart_svg(runs: list[dict]) -> str:
     parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="val accuracy run after run">']
     for tick in range(5):
         accuracy = low + (high - low) * tick / 4
-        parts.append(f'<line class="grid" x1="{left}" x2="{width - right}" y1="{y(accuracy):.1f}" y2="{y(accuracy):.1f}"/>')
-        parts.append(f'<text class="axis" x="{left - 6}" y="{y(accuracy) + 4:.1f}" text-anchor="end">{accuracy:.1%}</text>')
+        grid_y = y(accuracy)
+        parts.append(f'<line class="grid" x1="{left}" x2="{width - right}" y1="{grid_y:.1f}" y2="{grid_y:.1f}"/>')
+        parts.append(f'<text class="axis" x="{left - 6}" y="{grid_y + 4:.1f}" text-anchor="end">{accuracy:.1%}</text>')
 
     best_so_far, best_points = 0.0, []
     for index, run in enumerate(runs):
@@ -85,17 +82,15 @@ def chart_svg(runs: list[dict]) -> str:
     return "".join(parts)
 
 def write_progress_page() -> Path:
-    runs = load_runs()
+    header = "<th>#</th>" + "".join(f"<th>{column}</th>" for column in COLUMNS[1:])
     sections = []
-    for budget in sorted({run["budget"] for run in runs}):
-        group = [run for run in runs if run["budget"] == budget]
-        by_time = sorted(group, key=lambda run: run["order"])
-        numbers = {run["name"]: index + 1 for index, run in enumerate(by_time)}
+    for budget, runs in groupby(load_runs(), key=lambda run: run["budget"]):
+        group = list(runs)
+        numbers = {run["name"]: number for number, run in enumerate(sorted(group, key=lambda run: run["order"]), 1)}
         rows = "".join(
-            "<tr>" + f"<td>{numbers[run['name']]}</td>" + "".join(f"<td>{html.escape(str(run[column]))}</td>" for column in COLUMNS[1:]) + "</tr>"
+            f"<tr><td>{numbers[run['name']]}</td>" + "".join(f"<td>{html.escape(str(run[column]))}</td>" for column in COLUMNS[1:]) + "</tr>"
             for run in group
         )
-        header = "<th>#</th>" + "".join(f"<th>{column}</th>" for column in COLUMNS[1:])
         sections.append(
             f"<section><h2>budget {html.escape(budget)} <small>{len(group)} runs, best {max(run['accuracy'] for run in group):.2%}</small></h2>"
             f"{chart_svg(group)}<p class='hint'>dots are runs in the order they finished (# in the table), the line is the best so far. Hover a dot for its name.</p>"
@@ -125,7 +120,7 @@ tbody tr:first-child td {{ font-weight: 600; }}
 
 def main():
     runs = load_runs()
-    if len(runs) == 0:
+    if not runs:
         print(f"no finished runs with a settings.json in {RUNS_DIR}")
         return
 

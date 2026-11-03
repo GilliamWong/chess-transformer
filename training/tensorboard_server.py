@@ -1,4 +1,3 @@
-#starts tensorboard for the training runs and opens it in the browser
 import socket
 import subprocess
 import sys
@@ -30,5 +29,5 @@ def start_tensorboard() -> None:
                 return
             time.sleep(0.5)
 
-    #tensorboard takes a few seconds to come up, and training should not wait for it
+    #tensorboard takes seconds to come up; training should not wait
     threading.Thread(target=open_when_ready, daemon=True).start()

@@ -28,15 +28,12 @@ from model.checkpoint import RUNS_DIR, save_checkpoint, warm_start
 from training.compare_runs import write_progress_page
 from training.tensorboard_server import start_tensorboard
 
-#steps between two looks at rank zero's clock under a budget of minutes (see step_budget)
 CLOCK_EVERY = 20
-#a --resume run's saved state in its folder, removed once the run has finished
 RESUME_FILE = "resume.pt"
 
 
-#equal local batches, disjoint across processes, reshuffled every epoch. With mirror every row comes with its coin for
-#being shown mirrored (training.mirror): a function of (seed, epoch, row) alone, so a resumed run, which restores the
-#epoch, draws the coins an unstopped one would, whatever its process count
+#equal local batches, disjoint across processes, reshuffled every epoch; the mirror coins depend on (seed, epoch, row)
+#alone, so a resumed run draws what an unstopped one would, whatever its process count
 class TrainingSampler(Sampler):
     def __init__(self, dataset, batch_size: int, rank: int, world_size: int, seed: int, mirror: bool = False):
         if batch_size <= 0 or batch_size % world_size:
@@ -46,16 +43,16 @@ class TrainingSampler(Sampler):
         self.dataset = dataset
         self.batch_size = batch_size // world_size
         self.global_batch_size = batch_size
-        self.rank, self.world_size, self.seed = rank, world_size, seed
+        self.rank, self.seed = rank, seed
         self.mirror = mirror
         self.epoch = 0
-        self.skip = 0  #batches of this epoch a resumed run already trained on
+        self.skip = 0
 
     def __len__(self):
         return len(self.dataset) // self.global_batch_size
 
     def __iter__(self):
-        #the epoch's order as one int32 tensor: DistributedSampler's python list took 10 GB per process on 290M positions
+        #an int32 tensor, not a python list: a list costs gigabytes per process at hundreds of millions of positions
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
         order = torch.randperm(len(self.dataset), generator=generator, dtype=torch.int32)
         first, self.skip = self.skip, 0
@@ -71,8 +68,6 @@ def endless_batches(loader: DataLoader):
         loader.sampler.epoch += 1
 
 
-#the training set's batches, with a mix set each joined with the mix set's next one (train.py's MixedLoader); each set
-#starts its next epoch when it runs out
 def training_batches(loader: DataLoader, mix_loader: DataLoader | None):
     if mix_loader is None:
         yield from endless_batches(loader)
@@ -87,8 +82,7 @@ def make_budget(args) -> Budget:
             else Budget(args.batch_size, minutes=args.minutes))
 
 
-#counts a step on the budget every rank decides the learning rate and the stop on. clock is rank zero's own timer
-#(None elsewhere); a budget of minutes takes its time every CLOCK_EVERY steps, since a broadcast waits for the gpu
+#clock is rank zero's own timer (None elsewhere); minutes are broadcast only every CLOCK_EVERY steps, as a broadcast waits for the gpu
 def step_budget(budget: Budget, clock: Budget | None, device: torch.device) -> None:
     if budget.steps == 0:
         dist.barrier()  #first-step compilation stays outside the timed budget
@@ -102,7 +96,7 @@ def step_budget(budget: Budget, clock: Budget | None, device: torch.device) -> N
 
 
 def make_scheduler(optimizer, budget: Budget, schedule: str, decay_fraction: float = single.DECAY_FRACTION):
-    #where the decay starts: known in advance for a budget of positions (so a resumed run carries on), measured for minutes
+    #where the decay starts: known in advance for positions (so a resumed run carries on), measured for minutes
     warmup_end = 0.0 if budget.timed else min(1.0, single.WARMUP_STEPS / budget.max_steps)
 
     def multiplier(step):
@@ -117,8 +111,7 @@ def make_scheduler(optimizer, budget: Budget, schedule: str, decay_fraction: flo
     return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
 
-#train.py's val numbers with the batches shared out: every rank measures every world_size-th batch and the totals are
-#added up. Takes the unwrapped model, whose forward waits for no other rank
+#every rank measures every world_size-th batch; takes the unwrapped model, whose forward waits for no other rank
 def evaluate(model, loader, device, max_batches=None):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     count = len(loader) if max_batches is None else min(max_batches, len(loader))
@@ -143,16 +136,14 @@ def log_validation(writer, metrics, step, final=False):
         writer.add_scalar(f"final/{name}" if final else tag, value, step)
 
 
-#model is master_weights' compute model under DDP. best_val_loss is the best evaluation so far (a resumed run's).
-#save_resume(best_val_loss) is rank zero's, called every resume_every_seconds of its wall clock; save_snapshot too,
-#every snapshot_every steps. Each step's local batch goes through in micro_batches equal parts (see --micro-batch)
+#model is master_weights' compute model under DDP; save_resume(best_val_loss) and save_snapshot are rank zero's, called
+#every resume_every_seconds of its wall clock and every snapshot_every steps
 def train(model, master_weights, train_loader, val_loader, optimizers, schedulers, budget, clock, device,
           value_weight, eval_every, writer=None, save_best=None, blunder_weight=single.BLUNDER_WEIGHT,
           best_val_loss=float("inf"), save_resume=None, resume_every_seconds=None, mix_loader=None,
           save_snapshot=None, snapshot_every=0, micro_batches=1):
     rank, world_size = dist.get_rank(), dist.get_world_size()
-    #summed on the device over an eval interval: policy + value loss, the unweighted blunder penalty, and the gradient
-    #norm before clipping
+    #over an eval interval: policy + value loss, unweighted blunder penalty, gradient norm before clipping
     totals = torch.zeros(3, device=device)
     interval_steps = 0
     last_resume_save = time.monotonic()
@@ -162,8 +153,7 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
     try:
         for batch in single.batches_on_device(training_batches(train_loader, mix_loader), device):
             master_weights.zero_grad()
-            #the parts' gradients add up on this rank and DDP averages them across the ranks on the last part's
-            #backward: the same step as the whole local batch at once, in a fraction of the memory
+            #the parts' gradients add up here and DDP averages them across ranks on the last part's backward
             loss = penalty = torch.zeros((), device=device)
             for part, micro_batch in enumerate(zip(*(tensor.chunk(micro_batches) for tensor in batch))):
                 with contextlib.nullcontext() if part == micro_batches - 1 else model.no_sync():
@@ -175,8 +165,7 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
                 penalty = penalty + part_penalty.detach() / micro_batches
             master_weights.gradients_to_master()
             gradient_norm = torch.nn.utils.clip_grad_norm_(master_weights.parameters, 1.0)
-            #the gradients are averaged after backward, so every rank steps all of the weights itself; Muon's orthogonalising
-            #is shared out between them (training.muon)
+            #every rank steps all the weights itself; Muon's orthogonalising is shared out between them (training.muon)
             for optimizer in optimizers:
                 optimizer.step()
             master_weights.weights_to_compute()
@@ -186,7 +175,7 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
             for scheduler in schedulers:
                 scheduler.step()
             progress.update(budget.seconds - before if budget.timed else 1)
-            totals += torch.stack([loss.detach(), penalty.detach(), gradient_norm.detach()]).float()
+            totals += torch.stack([loss, penalty, gradient_norm]).float()
             interval_steps += 1
             finished = budget.finished()  #one shared decision, before rank zero pauses its clock
 
@@ -228,8 +217,7 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
         progress.close()
 
 
-#what a requeued job needs to carry on: weights, optimizer states, schedules and the step (which fixes the data
-#position). Written under another name and renamed, so a job killed mid-write leaves the previous state whole
+#written under another name and renamed, so a job killed mid-write leaves the previous state whole
 def save_resume_state(path: Path, raw_model, optimizers, schedulers, budget: Budget, clock: Budget, best_val_loss: float):
     state = dict(steps=budget.steps, seconds=clock.seconds, best_val_loss=best_val_loss, model=raw_model.state_dict(),
                  optimizers=[optimizer.state_dict() for optimizer in optimizers],
@@ -239,7 +227,6 @@ def save_resume_state(path: Path, raw_model, optimizers, schedulers, budget: Bud
     os.replace(temporary, path)
 
 
-#runs inside an initialized process group (also used by the cpu integration tests)
 def run(args, device: torch.device):
     rank, world_size = dist.get_rank(), dist.get_world_size()
     if args.batch_size <= 0 or args.batch_size % world_size:
@@ -249,7 +236,7 @@ def run(args, device: torch.device):
         raise ValueError(f"--micro-batch must divide the local batch of {local_batch} positions, got {args.micro_batch}")
     micro_batches = local_batch // args.micro_batch if args.micro_batch is not None else 1
     budget = make_budget(args)
-    clock = make_budget(args) if rank == 0 else None  #see step_budget
+    clock = make_budget(args) if rank == 0 else None
     if not budget.timed and budget.max_steps <= single.WARMUP_STEPS:
         raise ValueError(f"the position budget must exceed {single.WARMUP_STEPS} global warmup steps")
     if not 0 < args.decay_fraction <= 1:
@@ -261,19 +248,18 @@ def run(args, device: torch.device):
         if args.name is None or budget.timed:
             #every rank has to find the same folder, and a budget of minutes has no step to carry on at
             raise ValueError("--resume needs --name and a budget of --positions")
-        #the run folder is on a filesystem every rank sees, so each rank reads the state itself
+        #each rank reads the state itself: the run folder is on a filesystem every rank sees
         settings_path = RUNS_DIR / args.name / "settings.json"
         if settings_path.exists() and "finished_at" in json.loads(settings_path.read_text(encoding="utf-8")):
             if rank == 0:
-                print(f"{args.name} has finished already, nothing to resume")  #a job requeued after its run finished
+                print(f"{args.name} has finished already, nothing to resume")
             return
         resume_path = RUNS_DIR / args.name / RESUME_FILE
         if resume_path.exists():
             resumed = torch.load(resume_path, map_location=device, weights_only=True)
     torch.manual_seed(args.seed)
 
-    #a mix set fills --mix-share of every global batch (a fine-tune on self play with stockfish positions), rounded so
-    #both parts divide between the processes
+    #the mix set fills --mix-share of every global batch, rounded so both parts divide between the processes
     mix_batch_size = 0
     if args.mix_set is not None:
         if not 0 < args.mix_share < 1:
@@ -282,7 +268,7 @@ def run(args, device: torch.device):
         if not 0 < mix_batch_size < args.batch_size:
             raise ValueError(f"a mix share of {args.mix_share} leaves no whole batch of {world_size} processes on one side of {args.batch_size}")
 
-    #one process per host warms the file cache; read-only mappings share the cached pages
+    #one process per host warms the file cache that the read-only mappings share
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     def load(name):
         return single.load_training_set(name, args.target_temperature, args.result_weight, args.visit_temperature, args.blunder_threshold)
@@ -311,7 +297,7 @@ def run(args, device: torch.device):
                           qk_ratio=args.qk_ratio[0] if len(args.qk_ratio) == 1 else args.qk_ratio, kv_heads=args.kv_heads,
                           loops=args.loops, value_bins=args.value_bins)
     if args.init_from is not None:
-        #weights only: optimizer and schedule start afresh. The size is the checkpoint's, whatever the size flags say
+        #the size is the checkpoint's, whatever the size flags say
         raw_model, model_settings = warm_start(args.init_from, device, args.value_bins)
     else:
         raw_model = ChessTransformer(**model_settings).to(device)
@@ -321,7 +307,7 @@ def run(args, device: torch.device):
     #DDP averages the compute model's gradients in bf16, as its bf16_compress_hook would
     model = DDP(master_weights.compute_model, device_ids=[device.index] if device.type == "cuda" else None)
     if not args.no_compile:
-        model = torch.compile(model) if args.compile_mode == "default" else torch.compile(model, mode=args.compile_mode)
+        model = torch.compile(model, mode=args.compile_mode)
     optimizers = single.make_optimizers(raw_model, args.lr, device, args.weight_decay, args.muon_momentum, args.embed_lr_multiplier)
     #the schedulers first: making one sets its optimizer's learning rate for step 0, which the saved states then replace
     schedulers = [make_scheduler(optimizer, budget, args.schedule, args.decay_fraction) for optimizer in optimizers]
@@ -334,7 +320,7 @@ def run(args, device: torch.device):
         budget.steps = resumed["steps"]
         if clock is not None:
             clock.steps, clock.seconds = resumed["steps"], resumed["seconds"]
-        #one batch of each set a step, so the step says where in which epoch's order the run was
+        #one batch of each set a step, so the step fixes the epoch and the place in its order
         sampler.epoch, sampler.skip = divmod(resumed["steps"], len(sampler))
         if mix_sampler is not None:
             mix_sampler.epoch, mix_sampler.skip = divmod(resumed["steps"], len(mix_sampler))
@@ -352,8 +338,7 @@ def run(args, device: torch.device):
                                      f"{budget.describe()}_{datetime.now():%Y%m%d_%H-%M-%S_%f}")
             run_dir = RUNS_DIR / run_name
             settings_path = run_dir / "settings.json"
-            #a named run must not overwrite an earlier one, except its own --resume jobs. purge_step hides what an
-            #earlier job logged after the state it left, whose steps this job trains again
+            #purge_step hides what an earlier job logged past the state it left, whose steps this job trains again
             run_dir.mkdir(parents=True, exist_ok=args.resume)
             writer = SummaryWriter(str(run_dir), purge_step=budget.steps + 1 if args.resume else None)
             if resumed is not None:
@@ -379,10 +364,12 @@ def run(args, device: torch.device):
                     snapshot_every=args.snapshot_every,
                 )
             settings_path.write_text(json.dumps(settings, indent=4), encoding="utf-8")
-            print(f"DDP: {world_size} processes on {device.type}, global batch {args.batch_size}"
-                  + (f" ({mix_batch_size} of it from {args.mix_set})" if args.mix_set is not None else "")
-                  + f", local batch {local_batch}" + (f" in {micro_batches} parts" if micro_batches > 1 else "") + "; " + (f"resumed at step {budget.steps:,}, val loss {metrics[0]:.3f}"
-                                                           if resumed is not None else f"{'starting point' if args.init_from is not None else 'untrained'} val loss {metrics[0]:.3f}"))
+            mix_note = f" ({mix_batch_size} of it from {args.mix_set})" if args.mix_set is not None else ""
+            parts_note = f" in {micro_batches} parts" if micro_batches > 1 else ""
+            start = (f"resumed at step {budget.steps:,}, val loss {metrics[0]:.3f}" if resumed is not None
+                     else f"{'starting point' if args.init_from is not None else 'untrained'} val loss {metrics[0]:.3f}")
+            print(f"DDP: {world_size} processes on {device.type}, global batch {args.batch_size}{mix_note}, "
+                  f"local batch {local_batch}{parts_note}; {start}")
             print(f"logging to {run_dir}")
             if not args.no_tensorboard:
                 start_tensorboard()
@@ -403,7 +390,6 @@ def run(args, device: torch.device):
         if rank == 0:
             save_checkpoint(raw_model, model_settings, run_dir / "final.pt")  #model.pt is the best evaluation's
         metrics = evaluate(raw_model, val_loader, device)
-        #the mix set's whole val too: what a fine-tune still knows of it, and a number a run on it alone also has
         mix_metrics = evaluate(raw_model, val_loader_of(mix_val_dataset), device) if args.mix_set is not None else None
         if rank == 0:
             log_validation(writer, metrics, budget.steps, final=True)
@@ -411,7 +397,7 @@ def run(args, device: torch.device):
             if mix_metrics is not None:
                 for name, value in zip(METRIC_NAMES, mix_metrics):
                     writer.add_scalar(f"final/mix_{name}", value, budget.steps)
-                settings.update({f"final_mix_{name}": value for name, value in zip(METRIC_NAMES, mix_metrics)})
+                    settings[f"final_mix_{name}"] = value
             settings.update(train_seconds=clock.seconds, positions_seen=budget.positions,
                             gpu_seconds=clock.seconds * world_size if device.type == "cuda" else 0,
                             finished_at=datetime.now().isoformat(timespec="seconds"))

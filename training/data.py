@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import warnings
 
-#training sets as raw arrays on disk, see processed_data/scripts_used/ for how they were made
 PROCESSED_DATA_DIR = ARTIFACTS_DIR / "processed_data"
 
 #self play value target: this much of the game's result, the rest the search's root score
@@ -15,45 +14,59 @@ RESULT_WEIGHT = 0.5
 #self play policy target: visit shares raised to 1 / VISIT_TEMPERATURE and renormalised (0 = most visited move alone)
 VISIT_TEMPERATURE = 1.0
 
-#labelled moves that give away at least this much expected score against stockfish's best count as blunders.
-#0.1, 0.2 and 0.3 played the same Elo (4000 games each, two seeds); 0.3 costs the policy 0.033 less val loss
+#a labelled move that gives away at least this much expected score against stockfish's best is a blunder
 BLUNDER_THRESHOLD = 0.3
-#optional blunder labels next to a set (tools/label_blunders.py), both (positions, slots), NO_MOVE where empty
+#optional blunder labels next to a set, both (positions, slots) with NO_MOVE where empty
 WORST_FILES = {"worst_moves": np.int16, "worst_losses": np.float16}
-#optional distillation targets next to a set (tools/teacher_targets.py): a bigger model's most likely moves (positions,
-#slots) with its probabilities for them, adding up to 1, and its expected score (positions,)
+#optional teacher targets: top moves (positions, slots), their probabilities (adding up to 1) and its expected score (positions,)
 TEACHER_FILES = {"teacher_moves": np.int16, "teacher_probabilities": np.float16, "teacher_scores": np.float16}
-
-#selfplay.py's files next to <name>_{split}_boards.bin:
-#   visit_moves (positions, top moves) NO_MOVE where fewer, visit_shares adding up to 1,
-#   outcomes and root_scores for the side to move, 0 to 1
+#selfplay.py's files: visit moves (positions, top moves) with NO_MOVE where fewer, shares adding up to 1, and the side to
+#move's outcome and root score from 0 to 1
 SELF_PLAY_FILES = {"visit_moves": np.int16, "visit_shares": np.float32, "outcomes": np.float32, "root_scores": np.float32}
 
-#the arrays may be read-only memory maps; nothing here writes to them, so torch's warning is noise
+#the arrays may be read-only memory maps that nothing here writes to, so torch's warning is noise
 def shared_tensor(array: np.ndarray) -> torch.Tensor:
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="The given NumPy array is not writable")
         return torch.from_numpy(array)
 
-#blunder labels are made from the boards alone, so either kind of set can have them: both arrays or neither, one row
-#per position
-def check_blunder_labels(worst_moves: np.ndarray | None, worst_losses: np.ndarray | None, positions: int) -> None:
-    if (worst_moves is None) != (worst_losses is None):
-        raise ValueError("blunder labels need both worst moves and worst losses")
-    if worst_moves is not None and (worst_moves.shape != worst_losses.shape or len(worst_moves) != positions):
-        raise ValueError(f"worst moves {worst_moves.shape} and losses {worst_losses.shape} for {positions} positions")
 
-#labelled moves at or above the threshold, NO_MOVE elsewhere. Compared in float16: 0.2 is stored as 0.19995 and still
-#counts as at the threshold
-def labelled_blunders(worst_moves: torch.Tensor, worst_losses: torch.Tensor, index: int | list[int], threshold: float) -> torch.Tensor:
-    moves = worst_moves[index].long()
-    return moves.masked_fill(worst_losses[index] < torch.tensor(threshold, dtype=worst_losses.dtype), NO_MOVE)
+#boards and the optional blunder labels (both arrays or neither, a row per position); subclasses add the other targets
+class TrainingDataset(Dataset):
+    def __init__(self, boards: np.ndarray, worst_moves: np.ndarray | None, worst_losses: np.ndarray | None, blunder_threshold: float):
+        if (worst_moves is None) != (worst_losses is None):
+            raise ValueError("blunder labels need both worst moves and worst losses")
+        if worst_moves is not None and (worst_moves.shape != worst_losses.shape or len(worst_moves) != len(boards)):
+            raise ValueError(f"worst moves {worst_moves.shape} and losses {worst_losses.shape} for {len(boards)} positions")
 
-class ChessGamesDataset(Dataset):
-    #boards, stockfish's best moves and the score after each as (positions, top moves), best first. The tensors share
-    #the (possibly memory mapped) arrays' memory. worst_moves and worst_losses are the optional blunder labels
-    #teacher holds TEACHER_FILES' arrays; teacher_weight of the policy and value targets comes from it, the rest from
-    #stockfish
+        self.boards = shared_tensor(boards)
+        self.worst_moves = shared_tensor(worst_moves) if worst_moves is not None else None
+        self.worst_losses = shared_tensor(worst_losses) if worst_losses is not None else None
+        self.blunder_threshold = blunder_threshold
+
+    def __len__(self):
+        return len(self.boards)
+
+    #labelled moves at or above the blunder threshold, NO_MOVE elsewhere; one NO_MOVE column without blunder labels.
+    #mirrored is a bool per position, see training.mirror
+    def blunders_of(self, index: int | list[int], mirrored: torch.Tensor | None = None) -> torch.Tensor:
+        if self.worst_moves is None:
+            return torch.full_like(self.boards[index, :1], NO_MOVE, dtype=torch.long)
+        #compared in float16: 0.2 is stored as 0.19995 and still counts as at the threshold
+        below = self.worst_losses[index] < torch.tensor(self.blunder_threshold, dtype=self.worst_losses.dtype)
+        return mirror_moves(self.worst_moves[index].long().masked_fill(below, NO_MOVE), mirrored)
+
+    #index is one position, a list of positions returned as one batch, or such a batch with a coin for each position to
+    #show it mirrored (training.mirror): boards, target moves, target probabilities, value target, blunders
+    def __getitem__(self, index: int | list[int] | MirrorRows) -> tuple[torch.Tensor, ...]:
+        index, boards, mirrored = read_boards(self.boards, index)
+        target_moves, target_probabilities = self.policy_target(index, mirrored)
+        return boards, target_moves, target_probabilities, self.value_target_of(index), self.blunders_of(index, mirrored)
+
+
+#stockfish's best moves and the evals after each, (positions, top moves) best first. teacher_weight of the policy and
+#value targets comes from the teacher's TEACHER_FILES arrays, the rest from stockfish
+class ChessGamesDataset(TrainingDataset):
     def __init__(self, boards: np.ndarray, stockfish_moves: np.ndarray, stockfish_evals: np.ndarray, target_temperature: float,
                  worst_moves: np.ndarray | None = None, worst_losses: np.ndarray | None = None, blunder_threshold: float = BLUNDER_THRESHOLD,
                  teacher: dict[str, np.ndarray] | None = None, teacher_weight: float = 0.0):
@@ -73,15 +86,11 @@ class ChessGamesDataset(Dataset):
         unlabelled = int((stockfish_moves[:, 0] == NO_MOVE).sum())
         if unlabelled:
             raise ValueError(f"{unlabelled:,} of {len(boards):,} positions are not labelled yet, tools.label_with_stockfish finishes them")
-        check_blunder_labels(worst_moves, worst_losses, len(boards))
+        super().__init__(boards, worst_moves, worst_losses, blunder_threshold)
 
-        self.boards = shared_tensor(boards)
         self.stockfish_moves = shared_tensor(stockfish_moves)
         self.stockfish_evals = shared_tensor(stockfish_evals)
         self.target_temperature = target_temperature
-        self.worst_moves = shared_tensor(worst_moves) if worst_moves is not None else None
-        self.worst_losses = shared_tensor(worst_losses) if worst_losses is not None else None
-        self.blunder_threshold = blunder_threshold
         self.teacher = {kind: shared_tensor(array) for kind, array in teacher.items()} if teacher_weight else None
         self.teacher_weight = teacher_weight
 
@@ -91,13 +100,6 @@ class ChessGamesDataset(Dataset):
         teacher = tuple(self.teacher.values()) if self.teacher is not None else ()
         return self.boards, self.stockfish_moves, self.stockfish_evals, *blunder_labels, *teacher
 
-    #labelled moves at or above the blunder threshold, NO_MOVE elsewhere; one NO_MOVE column without blunder labels.
-    #mirrored is a bool per position, see training.mirror
-    def blunders_of(self, index: int | list[int], mirrored: torch.Tensor | None = None) -> torch.Tensor:
-        if self.worst_moves is None:
-            return torch.full_like(self.stockfish_moves[index][..., :1], NO_MOVE, dtype=torch.long)
-        return mirror_moves(labelled_blunders(self.worst_moves, self.worst_losses, index, self.blunder_threshold), mirrored)
-
     #stockfish's eval of the position (first column) as an expected score from 0 to 1, mixed with the teacher's
     def value_target_of(self, index: int | list[int]) -> torch.Tensor:
         stockfish = torch.sigmoid(EXPECTED_SCORE_PER_CENTIPAWN * self.stockfish_evals[index, 0].float())
@@ -105,12 +107,9 @@ class ChessGamesDataset(Dataset):
             return stockfish
         return (1 - self.teacher_weight) * stockfish + self.teacher_weight * self.teacher["teacher_scores"][index].float()
 
-    def __len__(self):
-        return len(self.boards)
-
-    #(moves, probabilities): a softmax over the expected score after each move / target_temperature.
-    #Empty places are move 0 at probability 0. With a teacher, its moves follow stockfish's: a move in both lists
-    #gets both shares, which the cross entropy adds up
+    #(moves, probabilities): a softmax over the expected score after each move / target_temperature; empty places are
+    #move 0 at probability 0. A teacher's moves follow stockfish's: a move in both lists gets both shares, which the
+    #cross entropy adds up
     def policy_target(self, index: int | list[int], mirrored: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         moves = mirror_moves(self.stockfish_moves[index].long(), mirrored)
         no_move = moves == NO_MOVE
@@ -122,17 +121,9 @@ class ChessGamesDataset(Dataset):
         return (torch.cat([moves, mirror_moves(self.teacher["teacher_moves"][index].long(), mirrored)], dim=-1),
                 torch.cat([(1 - self.teacher_weight) * probabilities, self.teacher_weight * self.teacher["teacher_probabilities"][index].float()], dim=-1))
 
-    #index is one position, a list of positions returned as one batch, or such a batch with a coin for each position to
-    #show it mirrored (training.mirror): boards, target moves, target probabilities, value target, blunders
-    def __getitem__(self, index: int | list[int] | MirrorRows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        index, boards, mirrored = read_boards(self.boards, index)
-        target_moves, target_probabilities = self.policy_target(index, mirrored)
-        return boards, target_moves, target_probabilities, self.value_target_of(index), self.blunders_of(index, mirrored)
 
-
-#selfplay.py's positions: the policy learns the search's visit shares, the value head a blend of result and root score.
-#worst_moves and worst_losses are the optional blunder labels, as for ChessGamesDataset
-class SelfPlayDataset(Dataset):
+#selfplay.py's positions: the policy learns the search's visit shares, the value head a blend of result and root score
+class SelfPlayDataset(TrainingDataset):
     def __init__(self, boards: np.ndarray, visit_moves: np.ndarray, visit_shares: np.ndarray, outcomes: np.ndarray,
                  root_scores: np.ndarray, result_weight: float, visit_temperature: float = VISIT_TEMPERATURE,
                  worst_moves: np.ndarray | None = None, worst_losses: np.ndarray | None = None, blunder_threshold: float = BLUNDER_THRESHOLD):
@@ -145,31 +136,18 @@ class SelfPlayDataset(Dataset):
         if visit_moves.shape != visit_shares.shape or not len(boards) == len(visit_moves) == len(outcomes) == len(root_scores):
             raise ValueError(f"{len(boards)} boards, visit moves {visit_moves.shape}, shares {visit_shares.shape}, "
                              f"{len(outcomes)} outcomes and {len(root_scores)} root scores do not belong together")
-        check_blunder_labels(worst_moves, worst_losses, len(boards))
+        super().__init__(boards, worst_moves, worst_losses, blunder_threshold)
 
-        self.boards = shared_tensor(boards)
         self.visit_moves = shared_tensor(visit_moves)
         self.visit_shares = shared_tensor(visit_shares)
         self.outcomes = shared_tensor(outcomes)
         self.root_scores = shared_tensor(root_scores)
         self.result_weight = result_weight
         self.visit_temperature = visit_temperature
-        self.worst_moves = shared_tensor(worst_moves) if worst_moves is not None else None
-        self.worst_losses = shared_tensor(worst_losses) if worst_losses is not None else None
-        self.blunder_threshold = blunder_threshold
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         blunder_labels = (self.worst_moves, self.worst_losses) if self.worst_moves is not None else ()
         return self.boards, self.visit_moves, self.visit_shares, self.outcomes, self.root_scores, *blunder_labels
-
-    #labelled moves at or above the blunder threshold, NO_MOVE elsewhere; one NO_MOVE column without blunder labels
-    def blunders_of(self, index: int | list[int], mirrored: torch.Tensor | None = None) -> torch.Tensor:
-        if self.worst_moves is None:
-            return torch.full_like(self.visit_moves[index][..., :1], NO_MOVE, dtype=torch.long)
-        return mirror_moves(labelled_blunders(self.worst_moves, self.worst_losses, index, self.blunder_threshold), mirrored)
-
-    def __len__(self):
-        return len(self.boards)
 
     def value_target_of(self, index: int | list[int]) -> torch.Tensor:
         return self.result_weight * self.outcomes[index] + (1 - self.result_weight) * self.root_scores[index]
@@ -183,12 +161,6 @@ class SelfPlayDataset(Dataset):
             shares = sharpened(shares, self.visit_temperature)
         return moves.masked_fill(no_move, 0), shares
 
-    #the same five tensors as ChessGamesDataset, from the same kinds of index
-    def __getitem__(self, index: int | list[int] | MirrorRows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        index, boards, mirrored = read_boards(self.boards, index)
-        target_moves, target_probabilities = self.policy_target(index, mirrored)
-        return boards, target_moves, target_probabilities, self.value_target_of(index), self.blunders_of(index, mirrored)
-
 
 #shares ** (1 / temperature), renormalised. Divided by the max first so a low temperature does not underflow to 0;
 #at 0 the most visited move(s) alone
@@ -196,9 +168,6 @@ def sharpened(shares: torch.Tensor, temperature: float) -> torch.Tensor:
     relative = shares / shares.amax(dim=-1, keepdim=True).clamp_min(1e-30)
     weights = (relative == 1).float() if temperature == 0 else relative ** (1 / temperature)
     return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-30)
-
-
-TrainingDataset = ChessGamesDataset | SelfPlayDataset
 
 
 #every batch takes a fixed share from a second loader (stockfish positions while fine-tuning on self play), which
@@ -224,16 +193,15 @@ class MixedLoader:
 #the narrower target is padded with move 0 at probability 0, the blunders with NO_MOVE
 def concatenate_batches(first: tuple[torch.Tensor, ...], second: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     boards, moves, probabilities, values, blunders = zip(first, second)
-    width = max(part.shape[1] for part in moves)
-    moves = [torch.nn.functional.pad(part, (0, width - part.shape[1])) for part in moves]
-    probabilities = [torch.nn.functional.pad(part, (0, width - part.shape[1])) for part in probabilities]
-    blunder_width = max(part.shape[1] for part in blunders)
-    blunders = [torch.nn.functional.pad(part, (0, blunder_width - part.shape[1]), value=NO_MOVE) for part in blunders]
-    return torch.cat(boards), torch.cat(moves), torch.cat(probabilities), torch.cat(values), torch.cat(blunders)
+    return torch.cat(boards), pad_and_cat(moves), pad_and_cat(probabilities), torch.cat(values), pad_and_cat(blunders, NO_MOVE)
+
+def pad_and_cat(parts: tuple[torch.Tensor, ...], value: int = 0) -> torch.Tensor:
+    width = max(part.shape[1] for part in parts)
+    return torch.cat([torch.nn.functional.pad(part, (0, width - part.shape[1]), value=value) for part in parts])
 
 
-#another sampler's batches, each with the coins that show its rows mirrored at random in this pass over the set (the
-#epoch, counted here by the passes started). train.py's loader has no epoch of its own, unlike train_ddp.TrainingSampler
+#another sampler's batches, each with the coins that show its rows mirrored at random in this pass over the set; the
+#epoch is counted here by the passes started, train.py's loader having none of its own
 class MirroringBatches(Sampler):
     def __init__(self, batches: Sampler, seed: int):
         self.batches = batches
@@ -249,8 +217,7 @@ class MirroringBatches(Sampler):
             yield draw_mirrors(torch.tensor(rows), self.seed, epoch)
 
 
-#the samplers hand the dataset a whole batch of indices (batch_size=None turns off the loader's own batching):
-#one tensor lookup per batch instead of a __getitem__ per position plus a collate, 15x faster.
+#the samplers hand the dataset a whole batch of indices (batch_size=None turns off the loader's own batching).
 #mirror shows the train positions without castling rights mirrored at random (training.mirror), a new draw every pass
 def datasets_to_dataloaders(
     train_dataset: TrainingDataset,
@@ -277,49 +244,52 @@ def datasets_to_dataloaders(
     return train_loader, val_loader
 
 #opens <name>_{train,val}_*.bin from processed_data/ as memory mapped datasets: stockfish labelled sets as
-#ChessGamesDataset, self play sets (SELF_PLAY_FILES) as SelfPlayDataset
-#teacher_weight > 0 mixes the teacher's targets (TEACHER_FILES) into the train split; val keeps stockfish's alone, so
-#val loss compares across runs
+#ChessGamesDataset, self play sets (SELF_PLAY_FILES) as SelfPlayDataset. teacher_weight > 0 mixes the teacher's targets
+#(TEACHER_FILES) into the train split; val keeps stockfish's alone, so val loss compares across runs
 def load_training_set(name: str, target_temperature: float, result_weight: float = RESULT_WEIGHT,
                       visit_temperature: float = VISIT_TEMPERATURE, blunder_threshold: float = BLUNDER_THRESHOLD,
                       teacher_weight: float = 0.0) -> tuple[TrainingDataset, TrainingDataset]:
+    def path(split: str, kind: str) -> Path:
+        return PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin"
+
+    #raw arrays without a header. Mode "r": copy on write ("c") makes windows reserve memory for the whole file
+    def read(split: str, kind: str, dtype: type) -> np.memmap:
+        return np.memmap(path(split, kind), dtype=dtype, mode="r")
+
     datasets = []
     for split in ("train", "val"):
-        boards_path = PROCESSED_DATA_DIR / f"{name}_{split}_boards.bin"
-        stockfish_moves_path = PROCESSED_DATA_DIR / f"{name}_{split}_stockfish_moves.bin"
+        boards_path = path(split, "boards")
         if not boards_path.exists():
             raise FileNotFoundError(f"{boards_path.name} is missing from {PROCESSED_DATA_DIR}")
-
-        #raw arrays without a header. Mode "r": copy on write ("c") makes windows reserve memory for the whole file
-        #(35 GB of reservations for 12 GB of data in one overnight run)
-        boards = np.memmap(boards_path, dtype=np.uint8, mode="r").reshape(-1, TOKENS_PER_BOARD)
+        boards = read(split, "boards", np.uint8).reshape(-1, TOKENS_PER_BOARD)
         worst = {}
-        if (PROCESSED_DATA_DIR / f"{name}_{split}_worst_moves.bin").exists():
-            worst = {kind: np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin", dtype=dtype, mode="r").reshape(len(boards), -1)
-                     for kind, dtype in WORST_FILES.items()}
+        if path(split, "worst_moves").exists():
+            worst = {kind: read(split, kind, dtype).reshape(len(boards), -1) for kind, dtype in WORST_FILES.items()}
 
-        if (PROCESSED_DATA_DIR / f"{name}_{split}_visit_moves.bin").exists():
+        if path(split, "visit_moves").exists():
             if teacher_weight:
                 raise ValueError(f"{name} is a self-play set; teacher targets are only read for stockfish-labelled sets")
-            arrays = {kind: np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin", dtype=dtype, mode="r") for kind, dtype in SELF_PLAY_FILES.items()}
+            arrays = {kind: read(split, kind, dtype) for kind, dtype in SELF_PLAY_FILES.items()}
             datasets.append(SelfPlayDataset(boards, arrays["visit_moves"].reshape(len(boards), -1), arrays["visit_shares"].reshape(len(boards), -1),
                                             arrays["outcomes"], arrays["root_scores"], result_weight, visit_temperature,
                                             worst.get("worst_moves"), worst.get("worst_losses"), blunder_threshold))
             continue
 
+        stockfish_moves_path = path(split, "stockfish_moves")
         if not stockfish_moves_path.exists():
             raise FileNotFoundError(f"{stockfish_moves_path.name} is missing, tools.label_with_stockfish writes it")
         #the file size says how many top moves per position
-        stockfish_moves = np.memmap(stockfish_moves_path, dtype=np.int16, mode="r")
-        stockfish_evals = np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_stockfish_evals.bin", dtype=np.int16, mode="r")
+        stockfish_moves = read(split, "stockfish_moves", np.int16)
+        stockfish_evals = read(split, "stockfish_evals", np.int16)
         if len(stockfish_moves) == 0 or len(stockfish_moves) % len(boards) != 0:
             raise ValueError(f"{len(stockfish_moves):,} stockfish moves cannot be shared between {len(boards):,} positions")
-        teacher, weight = None, teacher_weight if split == "train" else 0.0
+        teacher = None
+        weight = teacher_weight if split == "train" else 0.0
         if weight:
-            missing = [kind for kind in TEACHER_FILES if not (PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin").exists()]
+            missing = [kind for kind in TEACHER_FILES if not path(split, kind).exists()]
             if missing:
                 raise FileNotFoundError(f"{name}_{split}: no {', '.join(missing)}, tools.teacher_targets writes them")
-            teacher = {kind: np.memmap(PROCESSED_DATA_DIR / f"{name}_{split}_{kind}.bin", dtype=dtype, mode="r") for kind, dtype in TEACHER_FILES.items()}
+            teacher = {kind: read(split, kind, dtype) for kind, dtype in TEACHER_FILES.items()}
             for kind in ("teacher_moves", "teacher_probabilities"):
                 teacher[kind] = teacher[kind].reshape(len(boards), -1)
         datasets.append(ChessGamesDataset(boards, stockfish_moves.reshape(len(boards), -1), stockfish_evals.reshape(len(boards), -1), target_temperature,

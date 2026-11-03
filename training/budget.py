@@ -19,7 +19,6 @@ class Budget:
     def timed(self) -> bool:
         return self.max_seconds is not None
 
-    #the length of the progress bar, in steps or in seconds
     @property
     def total(self) -> float:
         return self.max_seconds if self.timed else self.max_steps
@@ -44,7 +43,6 @@ class Budget:
             self._running_since = time.perf_counter()
         return self.seconds - before if self.timed else 1
 
-    #around anything that is not training
     def pause(self) -> None:
         self._catch_up()
         self._running_since = None
@@ -52,7 +50,6 @@ class Budget:
     def resume(self) -> None:
         self._running_since = time.perf_counter()
 
-    #0 at the start, 1 when the budget is used up
     def progress(self) -> float:
         used = self.seconds / self.max_seconds if self.timed else self.steps / self.max_steps
         return min(1.0, used)

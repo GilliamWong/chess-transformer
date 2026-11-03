@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import math
 import queue
 import re
 import subprocess
@@ -14,7 +15,6 @@ from model.checkpoint import ARTIFACTS_DIR, RUNS_DIR, load_checkpoint, save_chec
 from training.muon import BatchedMuon
 import torch
 import torch.nn.functional as F
-import math
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -25,19 +25,17 @@ from model.encoding import NO_MOVE
 from training.tensorboard_server import start_tensorboard
 from model.model import ChessTransformer, expected_score, mlp_hidden_width, value_bin_edges
 
-#the model, each of these has a command line flag (python -m training.train --help)
 D_MODEL = 128
-#at equal compute a d128 reached val loss 1.904 with 6 layers, 1.937 with 4 and 1.901 with 8
 NUM_LAYERS = 6
 N_HEADS = 4
 POSITION_TEMPLATES = 8
-#the eval head's bins over the expected score, 1 for the older single logit
+#bins of the eval head over the expected score, 1 for a single logit
 VALUE_BINS = 128
-#the target over the bins is a gaussian around the score this many bin widths wide
+#the width of the gaussian target over the bins, in bin widths
 VALUE_TARGET_SPREAD = 0.75
 
 PEAK_LEARN_RATE = 6e-3
-#the peak for a fine-tune (--init-checkpoint): at PEAK_LEARN_RATE the warmup undid much of what the start model knew
+#the peak with --init-checkpoint
 FINE_TUNE_LEARN_RATE = 1e-3
 WARMUP_STEPS = 500
 #after the warmup:
@@ -46,39 +44,34 @@ WARMUP_STEPS = 500
 #   hold_sqrt the peak, then 1 - sqrt(t) to zero over the last DECAY_FRACTION (t: the share of the decay done)
 #   constant  the peak throughout
 SCHEDULE = "cosine"
-#4-minute d128 runs: 0.2 was the worst of 0.2 / 0.4 / 0.6, and 0.6 tied cosine
 DECAY_FRACTION = 0.3
 #the input embeddings' learning rate (token, position, square features) as a multiple of everything else's
 EMBED_LR_MULTIPLIER = 1.0
 BATCH_SIZE = 1024
 
-#for Muon and AdamW both: 0.1 beat 0.01 by 0.007 val loss on two seeds (d128 L6, 10M positions)
 WEIGHT_DECAY = 0.1
-#torch's Muon default
 MUON_MOMENTUM = 0.95
 
-#minutes of pure training (compiling and evaluating not counted) unless --minutes or --positions is given
+#minutes of pure training, compiling and evaluating not counted
 TRAIN_MINUTES_BUDGET = 4
 
-EVAL_EVERY = 100  #steps between two looks at the val set
-POSTFIX_EVERY = 20 #reading the loss for the progress bar makes the cpu wait for the gpu
-EVAL_BATCHES = 20 #val batches per look; the whole val set is used at the end
-SEED = 42 #of the first weights and of the training order
+EVAL_EVERY = 100
+#reading the loss for the progress bar makes the cpu wait for the gpu
+POSTFIX_EVERY = 20
+EVAL_BATCHES = 20
+SEED = 42
 
-#at 1 the 128-bin eval head cost the policy 0.02 val loss on a d128, at 0.5 nothing, for the same value error
 VALUE_LOSS_WEIGHT = 0.5
 
-#weight of blunder_loss: +27 Elo at 4 against 0 on a d128 (8 was no better). A set without blunder labels trains as if 0
+#a set without blunder labels trains as if 0
 BLUNDER_WEIGHT = 4.0
 
 #a move that gives up this much expected score gets 1/e of the best move's share of the policy target
 TARGET_TEMPERATURE = 0.02
 
-#30M positions of random whole games of the stockfish labelled full_sf8_20260922, in its mix:
-#lichess elite 68%, fishtest 29%, otb 3%
 TRAINING_SET = "full_sf8_30M_mix"
 
-#with --mix-set, this share of every batch comes from that set
+#with --mix-set, its share of every batch
 MIX_SHARE = 0.25
 
 
@@ -86,7 +79,7 @@ def endless_batches(data_loader: DataLoader | MixedLoader) -> Iterator[tuple[tor
     while True:
         yield from data_loader
 
-#a background thread copies the next batches to the device while the gpu works: 39,500 -> 44,200 positions/s
+#a background thread copies the next batches to the device while the gpu works
 def batches_on_device(batches: Iterator[tuple[torch.Tensor, ...]], device: torch.device, ahead: int = 4) -> Iterator[tuple[torch.Tensor, ...]]:
     ready = queue.Queue(maxsize=ahead)
 
@@ -103,20 +96,19 @@ def batches_on_device(batches: Iterator[tuple[torch.Tensor, ...]], device: torch
         yield ready.get()
 
 
-#cross entropy against several target moves with a probability each, (B, moves); places at probability 0 add nothing
+#cross entropy against several target moves with a probability each, (B, moves); probability 0 adds nothing
 def policy_loss(logits: torch.Tensor, target_moves: torch.Tensor, target_probabilities: torch.Tensor) -> torch.Tensor:
     log_probabilities = torch.log_softmax(logits, dim=-1).gather(1, target_moves)
     return -(target_probabilities * log_probabilities).sum(dim=-1).mean()
 
-#the share of each bin under a gaussian around every target score, (B, bins) adding up to 1: the part of the
-#gaussian outside 0 to 1 is left out
+#the share of each bin under a gaussian around every target score, (B, bins) adding up to 1; the part outside 0 to 1 is left out
 def value_target_bins(targets: torch.Tensor, bins: int) -> torch.Tensor:
     edges = value_bin_edges(bins, targets.device)
     spread = VALUE_TARGET_SPREAD / bins
     cumulative = 0.5 * (1 + torch.erf((edges - targets.unsqueeze(-1)) / (spread * math.sqrt(2))))
     return (cumulative[:, 1:] - cumulative[:, :-1]) / (cumulative[:, -1:] - cumulative[:, :1])
 
-#the target is an expected score from 0 to 1: one logit learns its logit, bins learn the gaussian around it
+#targets are expected scores from 0 to 1: one logit learns the score's logit, bins learn the gaussian around it
 def value_loss(value_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     value_logits = value_logits.float()
     bins = value_logits.shape[-1]
@@ -124,14 +116,13 @@ def value_loss(value_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tenso
         return F.binary_cross_entropy_with_logits(value_logits.squeeze(-1), targets)
     return -(value_target_bins(targets, bins) * torch.log_softmax(value_logits, dim=-1)).sum(dim=-1).mean()
 
-#unlikelihood: -log(1 - the probability given to a position's blunders together), 0 without any.
-#blunder_moves is (B, places), NO_MOVE where there is none
+#unlikelihood: -log(1 - the probability of a position's blunders together), 0 without any; blunder_moves is (B, places), NO_MOVE where none
 def blunder_loss(logits: torch.Tensor, blunder_moves: torch.Tensor) -> torch.Tensor:
     blunders = blunder_moves != NO_MOVE
     probabilities = torch.softmax(logits.float(), dim=-1).gather(1, blunder_moves.clamp(min=0)) * blunders
     return -torch.log1p(-probabilities.sum(dim=-1).clamp(max=1 - 1e-6)).mean()
 
-#positions where the value head gets whether the side to move is ahead (score above a half)
+#positions where the score is above a half exactly when the target is
 def value_correct(value_logits: torch.Tensor, targets: torch.Tensor) -> int:
     return int(((expected_score(value_logits) > 0.5) == (targets > 0.5)).sum().item())
 
@@ -168,8 +159,6 @@ def train(
 
     model.train()
 
-    #dynamic_ncols: otherwise a resized terminal turns every update into a new line.
-    #the bar counts steps, or seconds when the budget is in minutes
     progress = tqdm(total=budget.total, desc="train", dynamic_ncols=True, unit="s" if budget.timed else "it",
                     bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}{postfix}]")
 
@@ -184,7 +173,7 @@ def train(
         (loss + blunder_weight * penalty).backward()
 
         master_weights.gradients_to_master()
-        #before clipping: a runaway (an attention head collapsing, say) shows here first
+        #the norm before clipping: a runaway shows here first
         gradient_norm_total += torch.nn.utils.clip_grad_norm_(master_weights.parameters, 1.0)
         interval_steps += 1
 
@@ -206,7 +195,7 @@ def train(
         #the last step is always evaluated, so the final weights can become the checkpoint
         if step % eval_every == 0 or budget.finished():
             train_loss = loss_total.item() / total_examples #waits for the gpu, so the pause starts when the steps are done
-            budget.pause() #evaluating doesn't count towards a budget in minutes
+            budget.pause()
             val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_value_error = evaluate_model(model, val_data_loader, device, max_batches=EVAL_BATCHES)
             model.train()
 
@@ -295,7 +284,7 @@ def evaluate_model(
                 accuracy=f"{total_correct_preds / total_examples:.1%}"
             )
 
-    return (epoch_loss_total / total_examples), (total_correct_preds / total_examples), (value_loss_total / total_examples), (value_correct_preds / total_examples), (value_error_total / total_examples)
+    return epoch_loss_total / total_examples, total_correct_preds / total_examples, value_loss_total / total_examples, value_correct_preds / total_examples, value_error_total / total_examples
 
 
 def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float = TARGET_TEMPERATURE, seed: int = SEED, batch_size: int = BATCH_SIZE,
@@ -303,27 +292,20 @@ def load_dataloaders(training_set: str = TRAINING_SET, target_temperature: float
                      blunder_threshold: float = BLUNDER_THRESHOLD, teacher_weight: float = 0.0, mirror: bool = False) -> tuple[DataLoader, DataLoader]:
     train_dataset, val_dataset = load_training_set(training_set, target_temperature, result_weight, visit_temperature, blunder_threshold, teacher_weight)
     warm_file_cache(train_dataset, val_dataset)
-    return datasets_to_dataloaders(
-        train_dataset,
-        val_dataset,
-        train_batch_size=batch_size,
-        val_batch_size=batch_size,
-        seed=seed,
-        mirror=mirror
-    )
+    return datasets_to_dataloaders(train_dataset, val_dataset, train_batch_size=batch_size, val_batch_size=batch_size, seed=seed, mirror=mirror)
 
-#reads every file once, front to back, so the OS has them cached before the first batch: random rows from an
-#uncached file are a disk read each, and such runs trained a quarter slower
+#reads every file once, front to back, so the OS has it cached before the first batch: random rows from an uncached file are a disk read each
 def warm_file_cache(*datasets) -> None:
     tensors = [tensor for dataset in datasets for tensor in dataset.tensors()]
     total_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+    chunk = 1 << 28
 
     progress = tqdm(total=total_bytes, desc="reading the training files into memory", unit="B", unit_scale=True, dynamic_ncols=True, leave=False)
     for tensor in tensors:
-        flat = tensor.reshape(-1).view(torch.uint8) if tensor.dtype != torch.uint8 else tensor.reshape(-1)
-        for start in range(0, len(flat), 1 << 28):
-            flat[start:start + (1 << 28)].sum() #touching the pages is what reads them
-            progress.update(min(1 << 28, len(flat) - start))
+        flat = tensor.reshape(-1).view(torch.uint8)
+        for start in range(0, len(flat), chunk):
+            flat[start:start + chunk].sum() #touching the pages is what reads them
+            progress.update(min(chunk, len(flat) - start))
     progress.close()
 
 
@@ -331,54 +313,44 @@ def warm_file_cache(*datasets) -> None:
 def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE, decay_fraction: float = DECAY_FRACTION) -> float:
     if step <= WARMUP_STEPS:
         return (step + 1) / WARMUP_STEPS
-
     if schedule == "cosine":
-        multiplier = 0.5 * (1 + math.cos(math.pi * progress))
-    elif schedule == "hold":
-        multiplier = min(1.0, (1 - progress) / decay_fraction)
-    elif schedule == "hold_sqrt":
-        multiplier = 1 - math.sqrt(min(1.0, max(0.0, (progress - 1 + decay_fraction) / decay_fraction)))
-    elif schedule == "constant":
-        multiplier = 1.0
-    else:
-        raise ValueError(f"unknown schedule {schedule}")
-
-    return multiplier
+        return 0.5 * (1 + math.cos(math.pi * progress))
+    if schedule == "hold":
+        return min(1.0, (1 - progress) / decay_fraction)
+    if schedule == "hold_sqrt":
+        return 1 - math.sqrt(min(1.0, max(0.0, (progress - 1 + decay_fraction) / decay_fraction)))
+    if schedule == "constant":
+        return 1.0
+    raise ValueError(f"unknown schedule {schedule}")
 
 
-#Muon for the weight matrices inside the blocks, AdamW for the rest; match_rms_adamw lets both share one learning rate.
-#d128: val loss 1.9414 against 1.9929 with AdamW alone. AdamW comes first, the training loop logs its learning rate
+#Muon for the weight matrices inside the blocks, AdamW for the rest; AdamW comes first, the training loop logs its learning rate
 def make_optimizers(model: ChessTransformer, learn_rate: float, device: torch.device, weight_decay: float = WEIGHT_DECAY,
                     muon_momentum: float = MUON_MOMENTUM, embed_lr_multiplier: float = EMBED_LR_MULTIPLIER) -> list[torch.optim.Optimizer]:
     if embed_lr_multiplier <= 0:
         raise ValueError(f"the embeddings' learning rate multiplier must be above 0, got {embed_lr_multiplier}")
     block_matrices = [parameter for parameter in model.encoder.parameters() if parameter.ndim == 2]
-    #QK-norm's gains alone set how sharp attention can be: decayed at 0.1 they fell to 0.3 and the heads went near uniform
+    #weight decay would pull QK-norm's gains (they set how sharp attention can be) and the input skip's scales towards 0
     qk_gains = [norm.weight for block in model.encoder for norm in (block.q_norm, block.k_norm)]
-    #the input skip's scales (model.TransformerBlock): decayed, the residual stream's scale would be pulled towards 0
     skip_scales = [scale for block in model.encoder for scale in (block.residual_scale, block.input_scale)]
     undecayed = qk_gains + skip_scales
-    #the input embeddings at their own learning rate. AdamW decays by lr * weight_decay a step, so their decay is divided
-    #by the multiplier: decaying them faster as well would be a second change
     embeddings = [model.embed.weight, model.position_embed, model.square_features.table]
     elsewhere = {id(parameter) for parameter in block_matrices + undecayed + embeddings}
     rest = [parameter for parameter in model.parameters() if id(parameter) not in elsewhere]
     #a tensor: compile_muon_step's graph would bake a float in and recompile whenever the schedule changes it
     muon = BatchedMuon(block_matrices, lr=torch.tensor(learn_rate, device=device), weight_decay=weight_decay, momentum=muon_momentum, adjust_lr_fn="match_rms_adamw") #type: ignore[arg-type]
+    #the embeddings' weight decay is divided by their multiplier, so a step decays them as much as the rest
     groups = [{"params": rest}, {"params": undecayed, "weight_decay": 0.0},
               {"params": embeddings, "lr": learn_rate * embed_lr_multiplier, "weight_decay": weight_decay / embed_lr_multiplier}]
     return [torch.optim.AdamW(groups, lr=learn_rate, weight_decay=weight_decay, fused=device.type == "cuda"), muon]
 
-#Muon's step as one compiled cuda graph: eager 28 ms next to an 80 ms d256 training step, graphed 5 ms.
-#With several processes the gather inside the step splits it into two graphs (training.muon).
-#Call after making the schedulers, which wrap optimizer.step and need it to still be a method
+#call after making the schedulers, which wrap optimizer.step and need it to still be a method
 def compile_muon_step(optimizers: list[torch.optim.Optimizer]) -> None:
     for optimizer in optimizers:
         if isinstance(optimizer, torch.optim.Muon):
             optimizer.step = torch.compile(optimizer.step, mode="reduce-overhead") #type: ignore[method-assign]
 
-#a bf16 copy of the model trains (a d512 step 6% faster than autocast) while the optimizers step the fp32 model, which
-#keeps the updates too small for a bf16 weight (bf16 weights alone: +0.020 val loss on a d128). Checkpoints save model
+#a bf16 copy of the model trains while the optimizers step the fp32 model, whose weights keep updates too small for bf16; checkpoints save model
 class MasterWeights:
     def __init__(self, model: ChessTransformer):
         self.model = model
@@ -392,11 +364,9 @@ class MasterWeights:
     def zero_grad(self) -> None:
         self.compute_model.zero_grad()
 
-    #after backward, before clipping and the optimizers' step
     def gradients_to_master(self) -> None:
         torch._foreach_copy_([parameter.grad for parameter in self.parameters], [parameter.grad for parameter in self.compute_parameters]) #type: ignore
 
-    #after the optimizers' step
     @torch.no_grad()
     def weights_to_compute(self) -> None:
         torch._foreach_copy_(self.compute_parameters, self.parameters) #type: ignore
@@ -466,10 +436,7 @@ def main(
     if peak_learn_rate is None:
         peak_learn_rate = FINE_TUNE_LEARN_RATE if init_checkpoint is not None else PEAK_LEARN_RATE
 
-    if positions_budget is not None:
-        budget = Budget(batch_size, positions=positions_budget)
-    else:
-        budget = Budget(batch_size, minutes=minutes_budget)
+    budget = Budget(batch_size, positions=positions_budget) if positions_budget is not None else Budget(batch_size, minutes=minutes_budget)
     if run_name is None:
         run_name = folder_name(note) if note else f"d{model_settings['d_model']}_L{model_settings['num_layers']}_h{model_settings['n_heads']}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
         #runs started in the same second (several gpus) must not share a folder: mkdir claims the name
@@ -480,7 +447,6 @@ def main(
             except FileExistsError:
                 run_name = run_name.rsplit("_", 1)[0] + f"_{number}" if number > 1 else f"{run_name}_1"
 
-    #a run this short would end during the warmup
     if not budget.timed and budget.max_steps <= WARMUP_STEPS:
         raise ValueError(f"{positions_budget:,} positions is {budget.max_steps} steps, it has to be more than the {WARMUP_STEPS} warmup steps")
     if budget.timed and budget.max_seconds < 60:
@@ -505,8 +471,7 @@ def main(
     print(f"model: {model_settings}, {num_parameters:,} parameters")
 
     master_weights = MasterWeights(model)
-    compute_model = master_weights.compute_model
-    compiled_model = torch.compile(compute_model) if compile_mode == "default" else torch.compile(compute_model, mode=compile_mode)
+    compiled_model = torch.compile(master_weights.compute_model, mode=compile_mode)
     optimizers = make_optimizers(model, peak_learn_rate, device, weight_decay, muon_momentum, embed_lr_multiplier)
 
     #the schedule runs over the part of the budget left when the warmup ends
@@ -522,7 +487,6 @@ def main(
     if device.type == "cuda":
         compile_muon_step(optimizers)
 
-    #untrained: loss about ln(1968) = 7.6, value loss ln(2) = 0.69 and half right. Anything else means broken data or metrics
     val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_value_error = evaluate_model(compiled_model, val_data_loader, device, max_batches=EVAL_BATCHES)
     print(f"{'starting point' if init_checkpoint is not None else 'untrained'}: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}, value error {val_value_error:.4f}")
 
@@ -547,7 +511,6 @@ def main(
         "muon_momentum": muon_momentum,
         "teacher_weight": teacher_weight,
         "mirror": mirror,
-        #the blunder penalty only acts on a set with blunder labels
         "blunder_labels": getattr(train_data_loader.dataset, "worst_moves", None) is not None,
         "budget": budget.describe(),
         "batch_size": batch_size,
@@ -580,7 +543,6 @@ def main(
     #model.pt is the best evaluation's, usually but not always the last
     save_checkpoint(model, model_settings, run_dir / "final.pt")
 
-    #the number to quote: the final weights on the whole val set
     val_loss, val_accuracy, val_value_loss, val_value_accuracy, val_value_error = evaluate_model(compiled_model, val_data_loader, device)
     print(f"final, on all {len(val_data_loader.dataset):,} val positions: val loss {val_loss:.3f}, val accuracy {val_accuracy:.1%}, value loss {val_value_loss:.3f}, value accuracy {val_value_accuracy:.1%}, value error {val_value_error:.4f}")
 
@@ -590,7 +552,6 @@ def main(
     writer.add_scalar("final/val_value_accuracy", val_value_accuracy, budget.steps)
     writer.add_scalar("final/val_value_error", val_value_error, budget.steps)
 
-    #how much of the mix set the model still knows
     if mix_val_loader is not None:
         mix_val_loss, mix_val_accuracy, mix_val_value_loss, mix_val_value_accuracy, mix_val_value_error = evaluate_model(compiled_model, mix_val_loader, device)
         print(f"final, on all {len(mix_val_loader.dataset):,} val positions of {mix_set}: val loss {mix_val_loss:.3f}, val accuracy {mix_val_accuracy:.1%}, value loss {mix_val_value_loss:.3f}, value accuracy {mix_val_value_accuracy:.1%}, value error {mix_val_value_error:.4f}")
@@ -615,7 +576,6 @@ def main(
 
     print(f"progress page: {write_progress_page()}")
 
-    #the standard matches: the policy with avoid-repetition, and the search
     measure = f"python -m tools.play.evaluate_elo --checkpoint {(run_dir / 'model.pt').relative_to(ARTIFACTS_DIR.parent)} --elo 1700 --games 200"
     print(f"measure it: {measure} --select avoid-repetition --concurrency 12\n       and: {measure} --select mcts --simulations 64")
 
@@ -661,44 +621,14 @@ if __name__ == "__main__":
     parser.add_argument("--teacher-weight", type=float, default=0.0, help="share of the train targets from a bigger model's (tools/teacher_targets.py); val keeps stockfish's. Default %(default)s")
     parser.add_argument("--visit-temperature", type=float, default=VISIT_TEMPERATURE, help="self play sets: sharpens the visit shares, 1 as recorded, 0 the most visited move alone. Default %(default)s")
     parser.add_argument("--mirror", action="store_true", help="show train positions without castling rights mirrored left-right at random, a new draw every pass over the set. Val is never mirrored")
-    arguments = parser.parse_args()
+    arguments = vars(parser.parse_args())
 
-    if not arguments.no_tensorboard:
+    if not arguments.pop("no_tensorboard"):
         start_tensorboard()
 
-    main(positions_budget=arguments.positions,
-         minutes_budget=arguments.minutes,
-         run_name=arguments.name,
-         note=arguments.note,
-         d_model=arguments.d_model,
-         num_layers=arguments.layers,
-         n_heads=arguments.heads,
-         peak_learn_rate=arguments.lr,
-         position_templates=arguments.templates,
-         training_set=arguments.training_set,
-         value_loss_weight=arguments.value_weight,
-         schedule=arguments.schedule,
-         decay_fraction=arguments.decay_fraction,
-         seed=arguments.seed,
-         mlp_ratio=arguments.mlp_ratio,
-         target_temperature=arguments.target_temperature,
-         qk_ratio=arguments.qk_ratio[0] if len(arguments.qk_ratio) == 1 else arguments.qk_ratio,
-         kv_heads=arguments.kv_heads,
-         batch_size=arguments.batch_size,
-         init_checkpoint=arguments.init_checkpoint,
-         mix_set=arguments.mix_set,
-         mix_share=arguments.mix_share,
-         result_weight=arguments.result_weight,
-         visit_temperature=arguments.visit_temperature,
-         eval_every=arguments.eval_every,
-         snapshot_every=arguments.snapshot_every,
-         compile_mode=arguments.compile_mode,
-         loops=arguments.loops,
-         blunder_weight=arguments.blunder_weight,
-         value_bins=arguments.value_bins,
-         blunder_threshold=arguments.blunder_threshold,
-         weight_decay=arguments.weight_decay,
-         muon_momentum=arguments.muon_momentum,
-         teacher_weight=arguments.teacher_weight,
-         embed_lr_multiplier=arguments.embed_lr_multiplier,
-         mirror=arguments.mirror)
+    qk_ratio = arguments["qk_ratio"]
+    arguments["qk_ratio"] = qk_ratio[0] if len(qk_ratio) == 1 else qk_ratio
+    #the flags whose name differs from main's parameter
+    renamed = {"minutes": "minutes_budget", "positions": "positions_budget", "name": "run_name", "layers": "num_layers", "heads": "n_heads",
+               "lr": "peak_learn_rate", "templates": "position_templates", "value_weight": "value_loss_weight"}
+    main(**{renamed.get(flag, flag): value for flag, value in arguments.items()})
