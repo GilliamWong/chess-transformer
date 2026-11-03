@@ -16,11 +16,9 @@ match.pgn
 processed_data/
 runs/
 
-# artifacts/ stays local, except the openings the engine and tests read
-artifacts/*
-!artifacts/pgn_data/
-artifacts/pgn_data/*
-!artifacts/pgn_data/Carlsen.pgn
+# local only: experiments' data and results, and the tools that make and measure them
+artifacts/
+tools/
 
 engine/selfplay_rs/target/
 
