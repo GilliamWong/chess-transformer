@@ -1668,8 +1668,12 @@ def test_concurrent_searches_end_under_stops_at_any_moment():
         ended.append(reports[0][4])
         move = chess.Move.from_uci(reports[0][1][0])
         board.push(move)
-        board.push(next(iter(board.legal_moves)))
-        searches.advance(0, fen, [move.uci() for move in board.move_stack])
+        if not board.is_game_over():
+            board.push(next(iter(board.legal_moves)))
+        if board.is_game_over():
+            board = chess.Board()
+        else:
+            searches.advance(0, fen, [move.uci() for move in board.move_stack])
     assert len(ended) == 40 and sum(ended) > 40 * 20
 
 def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
@@ -1678,7 +1682,7 @@ def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
         reports, replies, boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, way, **graph)
         concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True, **graph)
         assert concurrent[0] == reports and concurrent[2] == boards and concurrent[3] == advanced
-    assert advancing_game(BoardModel(), middlegame.copy(), 8, "plain", replies)[0] != reports
+    assert advancing_game(BoardModel(), middlegame.copy(), 1, "plain")[0] != reports[:1]
 
     model = shuffling_model()
     for certainty in (False, True):

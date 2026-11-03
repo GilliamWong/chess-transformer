@@ -21,10 +21,7 @@ def value_bin_centres(bins: int, device: torch.device) -> torch.Tensor:
 
 #0 to 1: a win scores 1, a draw 0.5
 def expected_score(value_logits: torch.Tensor) -> torch.Tensor:
-    bins = value_logits.shape[-1]
-    if bins == 1: #only the fake models in tests/ have a one-logit head, ChessTransformer needs 2 bins
-        return torch.sigmoid(value_logits[..., 0].float())
-    return torch.softmax(value_logits.float(), dim=-1) @ value_bin_centres(bins, value_logits.device)
+    return torch.softmax(value_logits.float(), dim=-1) @ value_bin_centres(value_logits.shape[-1], value_logits.device)
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_hidden: int):

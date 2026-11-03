@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from model.encoding import MOVE_TO_ID, NUM_MOVE_IDS, NUM_SQUARES
-from fake_models import PIECE_VALUES, UniformModel
+from fake_models import PIECE_VALUES, UniformModel, value_logits
 from engine.mcts import DRAW, Node, evaluate, evaluate_many, game_result, most_visited_move, search
 from model.model import ChessTransformer
 
@@ -14,8 +14,8 @@ CPU = torch.device("cpu")
 
 class MaterialModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        material = PIECE_VALUES[boards[:, :NUM_SQUARES]].sum(dim=1, keepdim=True)
-        return torch.zeros(len(boards), NUM_MOVE_IDS), material
+        material = PIECE_VALUES[boards[:, :NUM_SQUARES]].sum(dim=1)
+        return torch.zeros(len(boards), NUM_MOVE_IDS), value_logits(material)
 
 
 class FavouriteMoveModel(nn.Module):
@@ -26,7 +26,7 @@ class FavouriteMoveModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = torch.zeros(len(boards), NUM_MOVE_IDS)
         logits[:, self.move_ids] = 100
-        return logits, torch.zeros(len(boards), 1)
+        return logits, torch.zeros(len(boards), 2)
 
 
 def test_black_moves_get_the_priors_of_their_mirrored_ids():

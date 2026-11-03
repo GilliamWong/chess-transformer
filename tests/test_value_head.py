@@ -30,7 +30,6 @@ def test_the_bins_loss_is_lowest_on_the_target_itself():
 
 
 def test_the_expected_score_is_the_head_output_as_a_score():
-    assert torch.allclose(expected_score(torch.logit(torch.tensor([[0.2], [0.9]]))), torch.tensor([0.2, 0.9]))
     logits = torch.full((1, 4), -1e4)
     logits[0, 2] = 0
     assert torch.allclose(expected_score(logits), torch.tensor([(2 + 0.5) / 4]))
