@@ -58,6 +58,13 @@ def parse_gpus(text: str) -> list[int]:
         raise ValueError(f"{text} is not a list of different cuda devices")
     return devices
 
+#parse_gpus for argparse, which shows an ArgumentTypeError's message but not a ValueError's
+def gpus_argument(text: str) -> list[int]:
+    try:
+        return parse_gpus(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
 #go's arguments that take a number
 GO_NUMBERS =("wtime", "btime", "winc", "binc", "movestogo", "movetime", "nodes", "depth", "mate")
 #with wtime/btime and no movestogo, the time left is planned over the moves the game still has, this many a man above
@@ -639,7 +646,7 @@ if __name__ == "__main__":
                         help="for --select mcts --gpu: leaves gathered for each network call, default %(default)s; 1 is mcts.py's search")
     parser.add_argument("--precision", choices=PRECISIONS,
                         help=f"for --select mcts --gpu: the network's precision (engine_search.PRECISIONS), default {ENGINE_PRECISION}")
-    parser.add_argument("--gpus", type=parse_gpus,
+    parser.add_argument("--gpus", type=gpus_argument,
                         help="for --select mcts --gpu: the cuda devices to search on at once, e.g. 0,1,2,3 or all, a thread driving each; "
                              "default the current one. On more than one, for --leaves above 1, the search is another (more leaves out): the "
                              "threads descend in the one tree at once, each pinned to a cpu by the topology and asleep while its gpu works")
