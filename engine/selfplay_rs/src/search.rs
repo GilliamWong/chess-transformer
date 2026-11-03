@@ -632,10 +632,6 @@ impl Tree {
         (most, second)
     }
 
-    pub fn moves_not_lost(&self) -> usize {
-        self.root().edges().filter(|&edge| !self.proven_lost(self.root, edge)).count()
-    }
-
     //mcts.select_child, with the simulations waiting under a child counted in its visits (lc0's n started); an edge without a node is a
     //child without visits. A proven loss is passed over while any other move is left. With transpositions a move that repeats a position
     //of the path (`repeats`) is worth a draw. Returns the edge and its move's name (NO_LINK for a list's move without a node, a solid

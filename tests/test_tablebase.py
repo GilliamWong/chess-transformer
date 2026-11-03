@@ -16,7 +16,6 @@ from engine.inference import cpu_batches
 from reference_selfplay import final_result
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from engine.engine_search import EngineSearch
-from engine.player import choose_move
 from engine.tablebase import TABLE_SETS, TABLEBASE_PIECES, TableSet, complete_pieces, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces
 from engine.uci import Options
 
@@ -44,14 +43,6 @@ def test_the_search_scores_the_positions_the_tables_cover(tablebase, monkeypatch
     assert root.children[chess.Move.from_uci("d1d5")].visit_count > simulations / 2
     with pytest.raises(ValueError):
         mcts.search(UniformModel(), chess.Board("k7/8/1K6/8/8/8/8/7R b - - 0 1"), CPU)
-
-
-def test_the_player_takes_the_tables_move_once_they_know_the_position(tablebase, monkeypatch):
-    monkeypatch.setattr(mcts, "tablebase", tablebase)
-
-    move = choose_move(UniformModel(), chess.Board("k7/8/1K6/8/8/8/8/7R w - - 0 1"), CPU, "mcts", simulations=16)
-
-    assert move == chess.Move.from_uci("h1h8")
 
 
 def test_self_play_ends_a_game_the_tables_know(tablebase, monkeypatch):

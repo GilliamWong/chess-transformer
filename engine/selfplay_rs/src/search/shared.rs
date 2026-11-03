@@ -283,11 +283,6 @@ impl SharedTree {
         (most, second)
     }
 
-    pub fn moves_not_lost(&self) -> usize {
-        let root = self.root();
-        root.edges().filter(|&edge| !self.proven_lost(root, edge)).count()
-    }
-
     fn most_visited_edge(&self, node: usize) -> usize {
         let parent = self.nodes.get(node);
         let preference = |edge: usize| {

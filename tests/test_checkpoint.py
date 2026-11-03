@@ -5,10 +5,9 @@ import pytest
 import torch
 
 from model import checkpoint
-from model.checkpoint import load_checkpoint, save_checkpoint
+from model.checkpoint import load_checkpoint, load_model, save_checkpoint
 from model.model import ChessTransformer
 from engine import mcts
-from engine.player import load_model
 
 CPU = torch.device("cpu")
 
@@ -37,7 +36,7 @@ def test_a_checkpoint_that_runs_its_blocks_more_than_once_is_refused(tmp_path):
         load_checkpoint(tmp_path / "model.pt", CPU)
 
 
-def test_player_loads_a_model_that_is_not_the_default_size(tmp_path):
+def test_load_model_returns_the_model_in_eval_mode(tmp_path):
     save_checkpoint(ChessTransformer(**SETTINGS), SETTINGS, tmp_path / "model.pt")
 
     model = load_model(tmp_path / "model.pt", CPU)

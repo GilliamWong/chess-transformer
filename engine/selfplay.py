@@ -244,7 +244,7 @@ def worker(worker_id: int, slot_names: tuple[str, str], connection_, simulations
 
 
 class Workers:
-    def __init__(self, context, first_number: int, checkpoint_path: str, compile_model: bool, precision: str, games_per_process: int, worker_arguments: tuple):
+    def __init__(self, context, first_number: int, checkpoint_path: str, compile_model: bool, games_per_process: int, worker_arguments: tuple):
         self.context = context
         self.results = context.Queue()
         self.next_number = context.Value("q", first_number)
@@ -260,7 +260,7 @@ class Workers:
         from engine.inference import inference_process
         slot_names = [(slot.boards.name, slot.answers.name) for slot in self.slots]
         self.inference = context.Process(target=inference_process, daemon=True,
-                                         args=(checkpoint_path, compile_model, precision, games_per_process, slot_names, [slot.server_end for slot in self.slots],
+                                         args=(checkpoint_path, compile_model, games_per_process, slot_names, [slot.server_end for slot in self.slots],
                                                self.inference_ready, self.inference_stop, self.served_calls, self.served_positions))
         self.inference.start()
 
@@ -341,7 +341,7 @@ def set_priority(priority_class: int) -> None:
 
 
 def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use_tablebase: bool, processes: int, games_per_process: int, seed: int,
-         tree_reuse: bool, compile_model: bool, precision: str) -> None:
+         tree_reuse: bool, compile_model: bool) -> None:
     from training.data import PROCESSED_DATA_DIR
     from model.checkpoint import RUNS_DIR
     if simulations < 2:
@@ -357,7 +357,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
         open_tablebase().close() #fails here rather than in every worker
     set_priority(subprocess.BELOW_NORMAL_PRIORITY_CLASS if sys.platform == "win32" else 0)
 
-    workers = Workers(multiprocessing.get_context("spawn"), games.record["next_game"], str(checkpoint_path), compile_model, precision, games_per_process,
+    workers = Workers(multiprocessing.get_context("spawn"), games.record["next_game"], str(checkpoint_path), compile_model, games_per_process,
                       (simulations, games_per_process, seed, use_tablebase, tree_reuse))
     print("starting the inference process" + (" and compiling the model" if compile_model else ""))
     try:
@@ -472,10 +472,10 @@ if __name__ == "__main__":
     parser.add_argument("--games-per-process", type=int, default=GAMES_PER_PROCESS, help="games each process plays at once. Default %(default)s")
     parser.add_argument("--no-tree-reuse", action="store_true", help="start every search from a new root")
     parser.add_argument("--no-compile", action="store_true", help="skip torch.compile in the inference process")
-    parser.add_argument("--precision", choices=["fp16", "bf16", "tf32"], default="fp16", help="of the network in the inference process. Default %(default)s")
+    parser.add_argument("--precision", choices=["fp16"], default="fp16", help="of the network in the inference process; fp16 is the only one")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
     arguments = parser.parse_args()
 
     main(arguments.checkpoint or latest_checkpoint(), arguments.name, arguments.positions, arguments.simulations, arguments.tablebase,
          arguments.processes, arguments.games_per_process, arguments.seed, not arguments.no_tree_reuse,
-         not arguments.no_compile, arguments.precision)
+         not arguments.no_compile)

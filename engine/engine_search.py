@@ -2,6 +2,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import math
 from pathlib import Path
 import statistics
@@ -14,7 +15,6 @@ import torch
 from model.encoding import EXPECTED_SCORE_PER_CENTIPAWN, TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
 from engine.inference import ExactSizeCompiled, GraphedBatches, chunk_positions, fp16_model, int8_model, small_graph_sizes
-from engine.player import MAX_REPORTED_SCORE, ROOT_MOVES_REPORTED, SearchReport, score_to_centipawns
 from engine.cuda_runtime import cuda_runtime
 from engine.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
 
@@ -24,8 +24,6 @@ COLLISIONS = 64
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per this many simulations done or left; 0 for fixed
 GROW_LEAVES = 16
-#with a cap, the rounds out on all the networks hold a leaf per this many root visits at most; 0 for none
-VISITS_PER_LEAF_OUT = 0
 #the most simulations Searches.start takes, for a search with only a deadline or a stop
 UNLIMITED = 2**32 - 1
 GAME = 0
@@ -34,10 +32,6 @@ FIRST_ROUND_SECONDS = 0.01
 ROUND_TIMES = 31
 #smart pruning stops once the most visited move leads the second by more than the simulations left / this
 SMART_PRUNING_FACTOR = 1.0
-#seconds after a search's first answers before smart pruning may stop it on the visits; its other stops stay at once
-SMART_PRUNING_WAIT = 0.0
-#with certainty, smart pruning stops at once when the proofs leave one root move not lost
-STOP_AT_ONE_MOVE_LEFT = False
 #a search on the clock whose score fell more than FALL_START_CP below the last one's runs on when it would stop, by all its extension at FALL_FULL_CP
 FALL_START_CP = 10
 FALL_FULL_CP = 30
@@ -49,6 +43,21 @@ CACHE_POSITIONS = 5_000_000
 ADVANCE_THREADS = 4
 #the engine's changes to mcts.py's search, which self-play keeps as it is
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
+ROOT_MOVES_REPORTED = 3
+MAX_REPORTED_SCORE = 0.9999 #about 25 pawns
+
+
+#score is for the side to move (0 lost to 1 won), line starts with the move played
+@dataclass
+class SearchReport:
+    score: float
+    line: list[chess.Move]
+    simulations: int
+    root_moves: list[tuple[chess.Move, int]]
+
+def score_to_centipawns(score: float) -> int:
+    score = min(max(score, 1 - MAX_REPORTED_SCORE), MAX_REPORTED_SCORE)
+    return round(math.log(score / (1 - score)) / EXPECTED_SCORE_PER_CENTIPAWN)
 
 
 #search.rs sharpen: the value's logit times sharpness
@@ -162,7 +171,6 @@ class SearchRun:
         self.starved = None
         self.next_round = 0
         self.progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
-        self.first_answers = None
         #Searches.root_visits' numbers as the newest descend or finish left them, so that no thread asks for them
         self.root = root
 
@@ -186,10 +194,9 @@ class EngineSearch:
     #the networks' threads each on a cpu of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes, so only on sm_120's)
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
-                 smart_pruning_factor: float = SMART_PRUNING_FACTOR, smart_pruning_wait: float = SMART_PRUNING_WAIT,
-                 stop_at_one_move_left: bool = STOP_AT_ONE_MOVE_LEFT, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
-                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, visits_per_leaf_out: int = VISITS_PER_LEAF_OUT,
-                 rust_rounds: bool | None = None, concurrent_descents: bool | None = None, pin_threads: bool | None = None):
+                 smart_pruning_factor: float = SMART_PRUNING_FACTOR, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
+                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, rust_rounds: bool | None = None,
+                 concurrent_descents: bool | None = None, pin_threads: bool | None = None):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched, several = leaves > 1, len(self.networks) > 1
@@ -207,11 +214,9 @@ class EngineSearch:
         self.collisions = COLLISIONS if batched else 0
         self.rounds_in_flight = ROUNDS_IN_FLIGHT if batched else 1 #on each network
         self.grow_leaves = grow_leaves if batched else 0
-        self.visits_per_leaf_out = visits_per_leaf_out if batched else 0
         self.rounds_at_once = batched and len(getattr(self.networks[0], "lanes", ())) > 1
         self.smart_pruning = batched and smart_pruning
-        self.smart_pruning_factor, self.smart_pruning_wait = smart_pruning_factor, smart_pruning_wait
-        self.stop_at_one_move_left = stop_at_one_move_left
+        self.smart_pruning_factor = smart_pruning_factor
         self.advance_threads = advance_threads
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
         pinned = several if pin_threads is None else pin_threads
@@ -323,10 +328,8 @@ class EngineSearch:
 
     def rust_round_settings(self) -> dict:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
-                    visits_per_leaf_out=self.visits_per_leaf_out, collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF,
-                    smart_pruning=self.smart_pruning,
-                    smart_pruning_factor=self.smart_pruning_factor, smart_pruning_wait=self.smart_pruning_wait,
-                    stop_at_one_move_left=self.stop_at_one_move_left, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
+                    collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF, smart_pruning=self.smart_pruning,
+                    smart_pruning_factor=self.smart_pruning_factor, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
                     speed_rounds=SPEED_ROUNDS, round_times_kept=ROUND_TIMES, fall_start_cp=float(FALL_START_CP), fall_full_cp=float(FALL_FULL_CP),
                     max_reported_score=MAX_REPORTED_SCORE, expected_score_per_centipawn=EXPECTED_SCORE_PER_CENTIPAWN,
                     value_sharpness=self.value_sharpness)
@@ -414,11 +417,8 @@ class EngineSearch:
                     visits, most, second = run.root
                     now = time.perf_counter()
                     run.progress.append((now, visits))
-                    run.first_answers = now if run.first_answers is None else run.first_answers
-                    decided = (most - second > self.simulations_left(run.simulations, run.deadline, run.progress) / self.smart_pruning_factor
-                               and now - run.first_answers >= self.smart_pruning_wait)
-                    proven = self.certainty and (self.searches.decided(GAME)
-                                                 or self.stop_at_one_move_left and self.searches.moves_not_lost(GAME) <= 1)
+                    decided = most - second > self.simulations_left(run.simulations, run.deadline, run.progress) / self.smart_pruning_factor
+                    proven = self.certainty and self.searches.decided(GAME)
                     #once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
                     extra = 0.0
                     if decided and not (run.only_move or proven) and run.extension is not None:
@@ -436,18 +436,15 @@ class EngineSearch:
         share = min(1.0, max(0.0, (fall - FALL_START_CP) / (FALL_FULL_CP - FALL_START_CP)))
         return share * seconds
 
-    #the next round's leaves, and the rounds out at once over all the networks (GROW_LEAVES, VISITS_PER_LEAF_OUT; at least one); visits: the root's, if known
+    #the next round's leaves, and the rounds out at once over all the networks (GROW_LEAVES; at least one); visits: the root's, if known
     def round_leaves(self, simulations: int | None, visits: int | None = None) -> tuple[int, int]:
         count, rounds = self.leaves, self.rounds_in_flight * len(self.networks)
-        if not self.grow_leaves and not self.visits_per_leaf_out:
+        if not self.grow_leaves:
             return count, rounds
         visits = self.searches.root_visits(GAME)[0] if visits is None else visits
-        if self.grow_leaves:
-            done_or_left = visits if simulations is None else min(visits, simulations - visits)
-            count = max(1, min(self.leaves, done_or_left // self.grow_leaves))
-            rounds = rounds if count == self.leaves else 1
-        if self.visits_per_leaf_out:
-            rounds = max(1, min(rounds, visits // (self.visits_per_leaf_out * count)))
+        done_or_left = visits if simulations is None else min(visits, simulations - visits)
+        count = max(1, min(self.leaves, done_or_left // self.grow_leaves))
+        rounds = rounds if count == self.leaves else 1
         return count, rounds
 
     #the simulations the search has left: those waiting for the network count as left, so a move is only decided if they could not change it either.

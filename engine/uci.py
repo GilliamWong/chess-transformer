@@ -11,11 +11,11 @@ import time
 import chess
 import torch
 from engine.inference import cpu_batches
-from model.checkpoint import latest_checkpoint
+from model.checkpoint import latest_checkpoint, load_model
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, LEAVES, PRECISIONS,
-                                  SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks,
-                                  engine_search_settings, parse_changes)
-from engine.player import SIMULATIONS, SearchReport, load_model, score_to_centipawns
+                                  SMART_PRUNING_FACTOR, EngineSearch, SearchReport, engine_network, engine_networks, engine_search_settings,
+                                  parse_changes, score_to_centipawns)
+from engine.mcts import SIMULATIONS
 from engine.tablebase import MOST_PIECES, TABLE_SETS, TABLEBASE_PIECES, complete_pieces, open_tablebase, open_tablebase_path
 
 ENGINE_NAME = "Fry"
@@ -191,10 +191,8 @@ def advance_after(player, board: chess.Board, move: chess.Move) -> None:
         player.advance(played)
 
 #search_options are EngineSearch's keyword arguments
-def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, tablebase: bool, search_options: dict,
+def load_player(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, search_options: dict,
                 precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> EngineSearch:
-    if selection != "mcts":
-        raise ValueError(f"mcts is the only selection, not {selection}")
     if not gpu:
         return EngineSearch(cpu_batches(load_model(checkpoint_path, torch.device("cpu"))), 1, use_tablebase=tablebase, **search_options)
     #on several gpus the networks wait asleep (inference.GraphedBatches' blocking_wait) where each thread would spin a core
@@ -449,7 +447,7 @@ class Options:
         return {"first_move_bonus": self.first_move_bonus, "book_ply_bonus": self.book_ply_bonus, "move_overhead_seconds": self.move_overhead_seconds}
 
 
-def main(checkpoint_path: Path, selection: str = "mcts", simulations: int = SIMULATIONS, gpu: bool = False, leaves: int = LEAVES,
+def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = False, leaves: int = LEAVES,
          tablebase: bool = False, search_options: dict | None = None, precision: str = ENGINE_PRECISION, fp16_blocks: int = ENGINE_FP16_BLOCKS,
          clock_options: dict | None = None, infinite_until_stop: bool = False, gpus: list[int] | None = None):
     torch.set_num_threads(1) #so that engines running side by side don't fight over cores
@@ -463,7 +461,7 @@ def main(checkpoint_path: Path, selection: str = "mcts", simulations: int = SIMU
 
     def load() -> EngineSearch:
         use_tablebase, set_options = options.search()
-        return load_player(checkpoint_path, selection, gpu, options.leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
+        return load_player(checkpoint_path, gpu, options.leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
                            options.gpus)
 
     #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by itself, as UCI asks. A go
@@ -548,7 +546,8 @@ def main(checkpoint_path: Path, selection: str = "mcts", simulations: int = SIMU
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="the model as a UCI engine")
     parser.add_argument("checkpoint", nargs="?", help="a model.pt; default the run that finished last")
-    parser.add_argument("--select", choices=["mcts"], default="mcts", help="how a move is picked: mcts is the only way")
+    parser.add_argument("--select", choices=["mcts"], default="mcts",
+                        help="accepted for the launch scripts (engine/linux/engine.sh passes it); mcts is the only way a move is picked")
     parser.add_argument("--simulations", type=int, default=SIMULATIONS,
                         help="the simulations of a go without movetime, nodes or wtime/btime, default %(default)s")
     parser.add_argument("--gpu", action="store_true", help="run the model on the gpu")
@@ -567,19 +566,11 @@ if __name__ == "__main__":
     parser.add_argument("--tablebase-pieces", type=int, choices=[table_set.pieces for table_set in TABLE_SETS], default=TABLEBASE_PIECES,
                         help="for --tablebase: the most pieces, default %(default)s; 6 needs python -m engine.tablebase --pieces 6, and without "
                              "the 6 piece dtz tables searches those positions rather than playing the tables' move")
-    parser.add_argument("--visits-per-leaf-out", type=int, default=VISITS_PER_LEAF_OUT,
-                        help="with --gpu: at most a leaf out on the network (the rounds out on all of --gpus) per this many "
-                             "root visits; 0 for no cap, the default")
     parser.add_argument("--no-smart-pruning", dest="smart_pruning", action="store_false",
                         help="with --gpu: search all of go's movetime or nodes even once the move is decided (lc0's SmartPruningFactor=0)")
     parser.add_argument("--smart-pruning-factor", type=float, default=SMART_PRUNING_FACTOR,
                         help="with --gpu: smart pruning stops once the most visited move leads by more than the simulations left / "
                              "this, default %(default)s; lc0's 1.33 bets that the second move cannot get all of them")
-    parser.add_argument("--smart-pruning-wait", type=float, default=SMART_PRUNING_WAIT,
-                        help="with --gpu: no smart pruning stop on the visits until this many seconds after a search's first answers, "
-                             "default %(default)s; lc0's 0.2")
-    parser.add_argument("--stop-at-one-move-left", action="store_true",
-                        help="with --gpu: stop at once when certainty's proofs leave one root move not lost, as lc0 does")
     parser.add_argument("--first-move-bonus", type=float, default=FIRST_MOVE_BONUS,
                         help="on a clock: the game's first search gets 1 + this + --book-ply-bonus x its ply (at most "
                              f"{MOST_BOOK_PLIES}) times its share, default %(default)s; lc0's 1.8")
@@ -592,21 +583,20 @@ if __name__ == "__main__":
     if arguments.tablebase_pieces != TABLEBASE_PIECES and not arguments.tablebase:
         parser.error("--tablebase-pieces needs --tablebase")
     if arguments.precision is not None and not arguments.gpu:
-        parser.error("--precision needs --select mcts --gpu")
+        parser.error("--precision needs --gpu")
     if arguments.smart_pruning_factor <= 0:
         parser.error("--smart-pruning-factor is positive; --no-smart-pruning for none")
     if arguments.gpus is not None and not (arguments.gpu and (len(arguments.gpus) == 1 or arguments.leaves > 1)):
-        parser.error("--gpus needs --select mcts --gpu, and on more than one gpu --leaves above 1")
+        parser.error("--gpus needs --gpu, and on more than one gpu --leaves above 1")
     if arguments.fp16_blocks is not None and not (arguments.gpu and arguments.precision in (None, "int8")):
-        parser.error("--fp16-blocks needs --select mcts --gpu and the int8 network")
+        parser.error("--fp16-blocks needs --gpu and the int8 network")
     if arguments.fp16_blocks is not None and arguments.fp16_blocks < 0:
         parser.error("--fp16-blocks is 0 or more")
     main(Path(arguments.checkpoint) if arguments.checkpoint else latest_checkpoint(),
-         selection=arguments.select, simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
+         simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
          precision=arguments.precision or ENGINE_PRECISION, infinite_until_stop=arguments.infinite_until_stop, gpus=arguments.gpus,
          fp16_blocks=ENGINE_FP16_BLOCKS if arguments.fp16_blocks is None else arguments.fp16_blocks,
          search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces,
                          "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),
-                         "smart_pruning_factor": arguments.smart_pruning_factor, "smart_pruning_wait": arguments.smart_pruning_wait,
-                         "stop_at_one_move_left": arguments.stop_at_one_move_left, "visits_per_leaf_out": arguments.visits_per_leaf_out},
+                         "smart_pruning_factor": arguments.smart_pruning_factor},
          clock_options={"first_move_bonus": arguments.first_move_bonus, "book_ply_bonus": arguments.book_ply_bonus})

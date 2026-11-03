@@ -1,6 +1,5 @@
 mod affinity;
 mod concurrent;
-mod fake_cuda;
 mod games;
 mod rounds;
 mod rules;
@@ -1009,15 +1008,6 @@ impl Searches {
         })
     }
 
-    fn moves_not_lost(&self, py: Python<'_>, id: u64) -> PyResult<usize> {
-        py.detach(|| {
-            if self.concurrent_descents {
-                return Ok(self.shared_running(id)?.moves_not_lost());
-            }
-            Ok(find_search(&*self.lock()?, id)?.tree.moves_not_lost())
-        })
-    }
-
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
         py.detach(|| {
             let state = self.lock()?;
@@ -1052,8 +1042,6 @@ fn selfplay_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<rounds::RoundLoop>()?;
     module.add_function(wrap_pyfunction!(cpu_topology, module)?)?;
     module.add_function(wrap_pyfunction!(pin_thread, module)?)?;
-    module.add_function(wrap_pyfunction!(fake_cuda::fake_cuda_addresses, module)?)?;
-    module.add_function(wrap_pyfunction!(fake_cuda::fake_cuda_graph, module)?)?;
     module.add("LEAN_COLUMNS", LEAN_COLUMNS)?;
     module.add("LEAN_ROW", LEAN_ROW)?;
     Ok(())

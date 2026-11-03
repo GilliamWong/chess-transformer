@@ -32,3 +32,7 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[ChessT
     model = ChessTransformer(**model_settings)
     model.load_state_dict(checkpoint["state_dict"])
     return model.to(device), model_settings
+
+def load_model(checkpoint_path: Path, device: torch.device) -> ChessTransformer:
+    model, _ = load_checkpoint(checkpoint_path, device)
+    return model.eval()

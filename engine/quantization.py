@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from engine.inference import FP16_RESIDUAL_SCALE, answer_rows, fp16_model
-from engine.player import load_model
+from model.checkpoint import load_model
 from model.encoding import NUM_MOVE_IDS, encode_board, encode_move_to_id
 from model.fused_blocks import link_input_mixes
 from model.int8_blocks import DOWN_INPUT_MULTIPLE, HADAMARD_BLOCK, Int8Block, down_inputs, hadamard

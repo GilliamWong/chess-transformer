@@ -183,13 +183,10 @@ pub(crate) struct LoopSettings {
     leaves: u32,
     rounds_in_flight: usize,
     grow_leaves: u32,
-    visits_per_leaf_out: u32,
     collisions: u32,
     simulations_per_leaf: u32,
     smart_pruning: bool,
     smart_pruning_factor: f64,
-    smart_pruning_wait: f64,
-    stop_at_one_move_left: bool,
     certainty: bool,
     rounds_at_once: bool,
     speed_rounds: usize,
@@ -215,7 +212,6 @@ struct Run {
     starved: Option<u64>,
     next_round: u64,
     progress: VecDeque<(f64, u32)>,
-    first_answers: Option<f64>,
     root: RootNumbers,
     round_times: VecDeque<f64>,
     round_seconds: f64,
@@ -304,9 +300,6 @@ impl Rounds<'_> {
             let done_or_left = simulations.map_or(visits, |simulations| visits.min(i64::from(simulations) - visits));
             count = done_or_left.div_euclid(i64::from(settings.grow_leaves)).clamp(1, i64::from(settings.leaves)) as u32;
             rounds = if count == settings.leaves { rounds } else { 1 };
-        }
-        if settings.visits_per_leaf_out > 0 {
-            rounds = rounds.min((visits / (settings.visits_per_leaf_out * count)) as usize).max(1);
         }
         (count, rounds)
     }
@@ -447,18 +440,14 @@ impl Rounds<'_> {
                 while run.progress.len() > settings.speed_rounds {
                     run.progress.pop_front();
                 }
-                let first_answers = *run.first_answers.get_or_insert(now);
-                let decided = f64::from(most - second) > run.simulations_left() / settings.smart_pruning_factor
-                    && now - first_answers >= settings.smart_pruning_wait;
+                let decided = f64::from(most - second) > run.simulations_left() / settings.smart_pruning_factor;
                 let proven = settings.certainty
                     && if self.searches.concurrent_descents {
-                        self.searches.shared_tree(settings.game)?.is_some_and(|tree| {
-                            tree.root_decided() || settings.stop_at_one_move_left && tree.moves_not_lost() <= 1
-                        })
+                        self.searches.shared_tree(settings.game)?.is_some_and(|tree| tree.root_decided())
                     } else {
                         let state = self.searches.lock()?;
                         let tree = &running_search(&state, settings.game)?.tree;
-                        tree.root_decided() || settings.stop_at_one_move_left && tree.moves_not_lost() <= 1
+                        tree.root_decided()
                     };
                 //once: a stop smart pruning would make is extended instead when the score has fallen
                 let mut extra = 0.0;
@@ -587,7 +576,6 @@ pub(crate) fn start_loop(
             starved: None,
             next_round: 0,
             progress: VecDeque::new(),
-            first_answers: None,
             root,
             round_times,
             round_seconds,

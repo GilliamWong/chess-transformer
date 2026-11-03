@@ -29,8 +29,7 @@ from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from model.checkpoint import save_checkpoint
 from engine.tablebase import SYZYGY_DIR
 from engine import engine_search
-from engine.engine_search import EngineSearch, engine_search_settings, parse_changes
-from engine.player import SearchReport
+from engine.engine_search import EngineSearch, SearchReport, engine_search_settings, parse_changes
 from engine import uci
 from engine.uci import MOST_EXTENSION, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
 
@@ -192,7 +191,7 @@ def test_a_failed_search_settles_its_network():
 
 @gpu
 @pytest.mark.parametrize("blocking_wait, leaves, settings", [(False, 16, {}), (True, 16, {}), (False, 1, {}),
-                                                             (False, 16, {"visits_per_leaf_out": 8, "smart_pruning": False}),
+                                                             (False, 16, {"smart_pruning": False}),
                                                              (True, 16, {"pin_threads": True})])
 def test_rust_rounds_search_as_the_python_loop(blocking_wait, leaves, settings):
     board, reports = chess.Board(), {}
@@ -484,15 +483,6 @@ def test_the_leaves_of_a_round(visits, simulations, expected):
 
     assert search.round_leaves(simulations) == expected
 
-#a cap holds the rounds out on all the networks to a leaf per visits_per_leaf_out root visits at most; without one, two rounds a network
-@pytest.mark.parametrize("visits, cap, networks, expected", [(1024, 0, 4, (64, 8)), (1024, 16, 4, (64, 1)), (5000, 16, 4, (64, 4)),
-                                                             (100_000, 16, 4, (64, 8)), (160, 16, 1, (10, 1)), (50, 64, 1, (3, 1))])
-def test_a_cap_keeps_the_leaves_out_to_the_trees_size(visits, cap, networks, expected):
-    search = EngineSearch([cpu_batches(BoardModel())] * networks, 64, grow_leaves=16, visits_per_leaf_out=cap)
-    search.searches = RootVisits(visits)
-
-    assert search.round_leaves(None) == expected
-
 #a free queen, which the material count finds, and mates in one, which a flat eval finds only by searching
 @pytest.mark.parametrize("model, fen, best", [
     (BoardModel(), FREE_QUEEN, "e4d5"),
@@ -588,15 +578,6 @@ def test_a_network_without_leaves_waits_for_the_others(concurrent_descents):
     empty = written.count(0)
     assert empty < len(written) - empty, (empty, len(written) - empty)
 
-#a leaf out per 64 root visits holds two rounds out, where three networks take six without a cap
-@pytest.mark.parametrize("concurrent_descents", [False, None])
-def test_a_cap_holds_on_several_networks(concurrent_descents):
-    group = SlowNetworks(3, 0.003, BoardModel())
-    search = EngineSearch(group.networks, 16, smart_pruning=False, visits_per_leaf_out=64, concurrent_descents=concurrent_descents)
-    report = search.search(chess.Board(FREE_QUEEN), simulations=3000)
-
-    assert 3000 <= report.simulations <= 3000 + overrun(concurrent_descents) and group.most_out == 2
-
 def test_one_network_in_a_list_is_the_search_on_it(carlsen_games):
     board = carlsen_position(carlsen_games, 1, 10)
     alone, listed = (EngineSearch(network, 16).search(board, simulations=2000) for network in (cpu_batches(BoardModel()), [cpu_batches(BoardModel())]))
@@ -688,7 +669,7 @@ def run_uci(monkeypatch, script: list[str], **main_arguments) -> tuple[list, lis
     monkeypatch.setattr(uci, "load_player", lambda *arguments: built.append(arguments) or player)
     monkeypatch.setattr(uci, "send", sent.append)
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(script)))
-    uci.main(Path("unused.pt"), **{"selection": "mcts", **main_arguments})
+    uci.main(Path("unused.pt"), **main_arguments)
     return player.searches, sent, built
 
 def searched_gos(monkeypatch, gos: list[str]) -> tuple[list, list[str]]:
@@ -903,25 +884,17 @@ class SixteenthsNetwork:
         self.now[0] += 1 / 16
         return answers_of_0_6(boards)
 
-#the wait runs from the first answers and ends at the first round since; one legal move and a proven root stop at the first answers regardless
-@pytest.mark.parametrize("fen, proven, wait, stopped_at", [
-    (chess.STARTING_FEN, False, 0.0, 1 / 16), (chess.STARTING_FEN, False, 0.2, 5 / 16), (chess.STARTING_FEN, False, 0.25, 5 / 16),
-    (chess.STARTING_FEN, True, 0.2, 1 / 16), ("k7/8/8/8/8/8/r7/K1q5 w - - 0 1", False, 0.2, 1 / 16)])
-def test_smart_pruning_waits_after_the_first_answers(monkeypatch, fen, proven, wait, stopped_at):
+#a decided root (more than the 400 left behind), a proven one and a single legal move stop at the first answers; an undecided root goes on
+@pytest.mark.parametrize("fen, root, proven, stopped_at", [
+    (chess.STARTING_FEN, (600, 600, 0), False, 1 / 16), (chess.STARTING_FEN, (600, 300, 290), True, 1 / 16),
+    ("k7/8/8/8/8/8/r7/K1q5 w - - 0 1", (600, 300, 290), False, 1 / 16), (chess.STARTING_FEN, (600, 300, 290), False, None)])
+def test_a_decided_proven_or_only_move_search_stops_at_the_first_answers(monkeypatch, fen, root, proven, stopped_at):
     now = [0.0]
     monkeypatch.setattr(engine_search.time, "perf_counter", lambda: now[0])
-    search = EngineSearch(SixteenthsNetwork(now), 16, grow_leaves=0, smart_pruning_wait=wait, settings={"certainty": True})
-    search.searches = ScriptedSearches(600, 600, 0, proven)
+    search = EngineSearch(SixteenthsNetwork(now), 16, grow_leaves=0, settings={"certainty": True})
+    search.searches = ScriptedSearches(*root, proven)
     search.search(chess.Board(fen), simulations=1000)
     assert search.searches.stopped_at == stopped_at
-
-#every white move but Rxf7 lets black mate at once
-def test_a_search_with_one_move_left_stops():
-    board = chess.Board("8/4Rq2/7K/5P2/5Prk/8/8/8 w - - 0 1")
-    searched = {stop: EngineSearch(cpu_batches(UniformModel()), 16, settings={"certainty": True}, stop_at_one_move_left=stop).search(board, simulations=20_000)
-                for stop in (False, True)}
-    assert searched[True].line[0].uci() == searched[False].line[0].uci() == "e7f7"
-    assert searched[True].simulations < 1000 and searched[False].simulations > 5000
 
 def engine_command(model_path: Path | str, *options: str) -> list[str]:
     return [sys.executable, "-m", "engine.uci", str(model_path), "--select", "mcts", *options]
@@ -958,40 +931,25 @@ uci_as_main = pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modul
 def test_the_engine_takes_a_precision(monkeypatch, model_path):
     built = []
     monkeypatch.setattr(uci, "engine_network", fake_engine_network(built))
-    search = uci.load_player(model_path, "mcts", True, 4, False, {"smart_pruning": False}, "fp16", 1)
-    uci.load_player(model_path, "mcts", True, 4, False, {"smart_pruning": False}, "int8", 0)
+    search = uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "fp16", 1)
+    uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 0)
     refused = [run_engine(model_path, *options) for options in (["--precision", "fp16"], ["--gpu", "--precision", "fp16", "--fp16-blocks", "0"])]
 
     assert [(precision, fp16_blocks) for precision, fp16_blocks, _ in built] == [("fp16", 1), ("int8", 0)] and search.search(chess.Board(), simulations=20).simulations == 20
-    assert refused[0].returncode == 2 and "--precision needs --select mcts --gpu" in refused[0].stderr
-    assert refused[1].returncode == 2 and "--fp16-blocks needs --select mcts --gpu and the int8 network" in refused[1].stderr
+    assert refused[0].returncode == 2 and "--precision needs --gpu" in refused[0].stderr
+    assert refused[1].returncode == 2 and "--fp16-blocks needs --gpu and the int8 network" in refused[1].stderr
 
 def test_the_engine_takes_gpus(monkeypatch, tmp_path):
     built = []
     monkeypatch.setattr(uci, "engine_networks", lambda checkpoint, leaves, precision, fp16_blocks, devices, blocking_wait:
                         [built.append((fp16_blocks, device, blocking_wait)) or cpu_batches(BoardModel()) for device in devices])
-    uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {"smart_pruning": False}, "int8", 1, [1])
-    search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 2])
+    uci.load_player(tmp_path / "model.pt", True, 4, False, {"smart_pruning": False}, "int8", 1, [1])
+    search = uci.load_player(tmp_path / "model.pt", True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 2])
     refused = [run_engine("unused.pt", *options, "--gpus", "0,1") for options in (["--leaves", "4"], ["--gpu", "--leaves", "1"])]
 
     assert built == [(1, 1, False), (1, 0, True), (1, 2, True)] and len(search.networks) == 2 and search.concurrent_descents
     assert search.network_cpus == engine_search.thread_cpus(2) != [] and search.search(chess.Board(), simulations=200).simulations >= 200
-    assert all(run.returncode == 2 and "--gpus needs --select mcts --gpu" in run.stderr for run in refused)
-
-@uci_as_main
-@pytest.mark.parametrize("arguments, cap", [([], 0), (["--visits-per-leaf-out", "16"], 16)])
-def test_the_engine_takes_a_cap_on_the_leaves_out(monkeypatch, arguments, cap):
-    built = []
-
-    class Recorded(EngineSearch):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            built.append(self.visits_per_leaf_out)
-    monkeypatch.setattr(engine_search, "engine_network", fake_engine_network())
-    monkeypatch.setattr(engine_search, "EngineSearch", Recorded)
-    run_uci_main(monkeypatch, *arguments)
-
-    assert built == [cap]
+    assert all(run.returncode == 2 and "--gpus needs --gpu" in run.stderr for run in refused)
 
 @uci_as_main
 def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
@@ -1006,18 +964,17 @@ def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
 def test_the_engine_takes_lc0s_time_options(monkeypatch):
     given = []
     def search(self, board, nodes, seconds, extension, stop, info=None):
-        given.append((seconds, self.smart_pruning_factor, self.smart_pruning_wait, self.stop_at_one_move_left))
+        given.append((seconds, self.smart_pruning_factor))
         return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
     monkeypatch.setattr(engine_search, "engine_network", fake_engine_network())
     monkeypatch.setattr(EngineSearch, "search", search)
     go = "go " + " ".join(CLOCK_60)
     script = ["isready", "position startpos", go, "position startpos moves e2e4 e7e5", go, "ucinewgame", "position startpos", go, "quit"]
-    options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25", "--smart-pruning-factor", "1.33", "--smart-pruning-wait", "0.2",
-               "--stop-at-one-move-left"]
+    options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25", "--smart-pruning-factor", "1.33"]
     run_uci_main(monkeypatch, *options, stdin="\n".join(script))
 
     first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
-    assert given[0] == (first, 1.33, 0.2, True) and given[1][0] != first and given[2] == given[0]
+    assert given[0] == (first, 1.33) and given[1][0] != first and given[2] == given[0]
     with pytest.raises(SystemExit) as refused:
         run_uci_main(monkeypatch, "--smart-pruning-factor", "0")
     assert refused.value.code == 2
@@ -1271,7 +1228,7 @@ class Gui:
         monkeypatch.setattr(uci, "send", lambda line: self.sent.append((time.perf_counter(), line)))
         if make_player is not None:
             monkeypatch.setattr(uci, "load_player", lambda *arguments: make_player())
-        self.engine = threading.Thread(target=self.run, args=(checkpoint,), kwargs={"selection": "mcts", **main_arguments}, daemon=True)
+        self.engine = threading.Thread(target=self.run, args=(checkpoint,), kwargs=main_arguments, daemon=True)
         self.engine.start()
 
     def run(self, checkpoint: Path, **main_arguments) -> None:
@@ -1424,8 +1381,8 @@ def test_the_options_reach_the_search(monkeypatch):
     assert [line.split()[2] for line in sent if line.startswith("option name")] == ["SyzygyPath", "SyzygyProbeLimit", "MoveOverhead", "CachePositions",
                                                                                      "RamLimitMb", "AdvanceThreads", "FirstMoveBonus", "BookPlyBonus",
                                                                                      "SearchSettings"]
-    assert len(built) == 1 and built[0][4] is False
-    assert built[0][5] == {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64,
+    assert len(built) == 1 and built[0][3] is False
+    assert built[0][4] == {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64,
                            "advance_threads": 12}
     assert [seconds for _, _, seconds, _ in searches] == [pytest.approx(0.5), pytest.approx(0.9), pytest.approx(0.9)]
     told = [line for line in sent if line.startswith("info string")]
@@ -1444,7 +1401,7 @@ def test_the_competition_options_reach_the_search(monkeypatch):
     names = [line.split()[2] for line in sent if line.startswith("option name")]
     assert names[6:] == ["Leaves", "GPUs", "SmartPruningFactor", "FirstMoveBonus", "BookPlyBonus", "SearchSettings"]
     assert "option name GPUs type string default 0" in sent
-    (_, _, _, leaves, _, options, _, _, gpus), = built
+    (_, _, leaves, _, options, _, _, gpus), = built
     assert (leaves, gpus) == (32, [0, 1, 2])
     assert options["smart_pruning"] is False and options["settings"] == {"c_puct": 0.7, "fpu_reduction": 0.3}
     first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])

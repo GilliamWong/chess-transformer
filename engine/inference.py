@@ -11,7 +11,7 @@ from torch import nn
 from model.encoding import TOKENS_PER_BOARD, encode_board
 from model.model import expected_score
 from engine.selfplay import ANSWER_WIDTH, set_priority, slot_arrays
-from engine.player import clear_cublas_workspaces, load_model
+from model.checkpoint import load_model
 from engine.cuda_runtime import DEVICE_TO_HOST, HOST_TO_DEVICE, cuda_runtime
 from selfplay_rs import LEAN_COLUMNS, LEAN_ROW
 
@@ -72,6 +72,13 @@ def graph_sizes(max_batch: int) -> list[int]:
     while sizes[-1] < max_batch:
         sizes.append(sizes[-1] + (64 if sizes[-1] < 1024 else 128 if sizes[-1] < 2048 else 256))
     return sizes
+
+#a workspace cublas makes while a graph records lands in that graph's pool and breaks later calls (cuda error 700)
+def clear_cublas_workspaces() -> None:
+    #a private torch function, absent from some versions
+    clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+    if clear is not None:
+        clear()
 
 #owns everything its raw handles() point at, so nothing is freed or recorded again while it lives. warm_up: the model run once per size
 #first, building every kernel (a network's later lanes skip it)
@@ -264,15 +271,6 @@ def int8_model(checkpoint_path: Path, fp16_blocks: int, weights: dict | None = N
         weights = int8_weights(checkpoint_path, fp16_blocks)
     return quantize_blocks(fp16_model(checkpoint_path), weights, FP16_RESIDUAL_SCALE)
 
-class Bf16(nn.Module):
-    def __init__(self, model: nn.Module):
-        super().__init__()
-        self.model = model
-
-    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            return self.model(boards)
-
 def cpu_batches(model: nn.Module) -> ImmediateBatches:
     def evaluate_boards(boards: np.ndarray) -> np.ndarray:
         with torch.no_grad():
@@ -280,26 +278,20 @@ def cpu_batches(model: nn.Module) -> ImmediateBatches:
     return ImmediateBatches(evaluate_boards)
 
 #ready is set once the graphs are recorded
-def inference_process(checkpoint_path: str, compile_model: bool, precision: str, games_per_process: int, slot_names: list[tuple[str, str]], connections: list,
+def inference_process(checkpoint_path: str, compile_model: bool, games_per_process: int, slot_names: list[tuple[str, str]], connections: list,
                       ready, stop, served_calls, served_positions) -> None:
     #ctrl+c reaches every process in the console, the main process decides what it means
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     #every worker waits on this process, so it runs at normal priority, above theirs
     set_priority(subprocess.NORMAL_PRIORITY_CLASS if sys.platform == "win32" else 0)
-    torch.backends.cuda.matmul.allow_tf32 = True
     checkpoint = Path(checkpoint_path)
     arrays = [slot_arrays(boards_name, answers_name, games_per_process) for boards_name, answers_name in slot_names]
     if torch.cuda.is_available():
         #the cpu only copies: torch's threads would spin on every core for large batches
         torch.set_num_threads(1)
-        if precision == "fp16":
-            model = fp16_model(checkpoint)
-        else:
-            model = load_model(checkpoint, torch.device("cuda"))
+        model = fp16_model(checkpoint)
         #serve keeps two batches out
         chunk = chunk_positions(model.d_model, lanes=2)
-        if precision == "bf16":
-            model = Bf16(model)
         if compile_model:
             #most of a big batch's forwards are whole chunks
             model = ExactSizeCompiled(model, chunk)

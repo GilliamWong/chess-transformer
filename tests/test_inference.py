@@ -21,7 +21,6 @@ from fake_models import BoardModel
 from selfplay_rs import LEAN_COLUMNS, LEAN_ROW
 from model.model import VALUE_BINS, ChessTransformer, expected_score
 from model.checkpoint import save_checkpoint
-from engine.player import CudaGraphModel
 from tests.test_model import mix_in_the_input
 
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
@@ -85,11 +84,9 @@ def test_graphs_answer_like_the_model():
 
     graphs = GraphedBatches(model, graph_sizes(4))
     answers = graphs.collect(graphs.launch(boards))
-    logits, value = CudaGraphModel(model)(torch.from_numpy(boards[:1]).long())
     torch.cuda.synchronize()
 
     assert np.allclose(answers, expected, atol=1e-3)
-    assert np.allclose(answer_rows((logits, value)).numpy(), expected[:1], atol=1e-3)
 
 
 def test_exact_size_compiled_runs_each_size_through_its_compile(monkeypatch):
