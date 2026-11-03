@@ -2,13 +2,12 @@ import pytest
 import torch
 
 from training.budget import Budget
-from training.train import DECAY_FRACTION, WARMUP_STEPS, lr_multiplier
-from training.train_ddp import make_scheduler
+from training.train import DECAY_FRACTION, WARMUP_STEPS, lr_multiplier, make_scheduler
 
 AFTER_WARMUP = WARMUP_STEPS + 1
 
 
-@pytest.mark.parametrize("schedule", ["cosine", "hold", "hold_sqrt", "constant"])
+@pytest.mark.parametrize("schedule", ["cosine", "hold", "hold_sqrt"])
 def test_every_schedule_warms_up_to_the_peak(schedule):
     assert lr_multiplier(0, 0.0, schedule) == pytest.approx(1 / WARMUP_STEPS)
     assert lr_multiplier(WARMUP_STEPS - 1, 0.0, schedule) == pytest.approx(1.0)
@@ -45,10 +44,6 @@ def test_a_resumed_run_with_a_larger_budget_holds_until_its_new_decay():
     assert scheduler.lr_lambdas[0](budget.steps) == 1.0
     budget.steps = budget.max_steps
     assert scheduler.lr_lambdas[0](budget.steps) == pytest.approx(0.0)
-
-
-def test_constant_never_decays():
-    assert lr_multiplier(AFTER_WARMUP, 1.0, "constant") == 1.0
 
 
 def test_unknown_schedule_is_rejected():

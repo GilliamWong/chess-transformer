@@ -14,7 +14,6 @@ from training.data import BLUNDER_THRESHOLD, RESULT_WEIGHT, VISIT_TEMPERATURE, M
 from model.checkpoint import ARTIFACTS_DIR, RUNS_DIR, load_checkpoint, save_checkpoint
 from training.muon import BatchedMuon
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -42,8 +41,6 @@ BATCH_SIZE = 1024
 
 WEIGHT_DECAY = 0.1
 MUON_MOMENTUM = 0.95
-
-TRAIN_MINUTES_BUDGET = 4
 
 EVAL_EVERY = 100
 #reading the loss for the progress bar makes the cpu wait for the gpu
@@ -99,8 +96,6 @@ def value_target_bins(targets: torch.Tensor, bins: int) -> torch.Tensor:
 def value_loss(value_logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     value_logits = value_logits.float()
     bins = value_logits.shape[-1]
-    if bins == 1:
-        return F.binary_cross_entropy_with_logits(value_logits.squeeze(-1), targets)
     return -(value_target_bins(targets, bins) * torch.log_softmax(value_logits, dim=-1)).sum(dim=-1).mean()
 
 #unlikelihood of a position's blunders together; blunder_moves is (B, places), NO_MOVE where none
@@ -144,7 +139,7 @@ def train(
 
     model.train()
 
-    progress = tqdm(total=budget.total, desc="train", dynamic_ncols=True, unit="s" if budget.timed else "it",
+    progress = tqdm(total=budget.max_steps, desc="train", dynamic_ncols=True, unit="it",
                     bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f} [{elapsed}<{remaining}{postfix}]")
 
     for batch, target_moves, target_probabilities, values, blunders in batches_on_device(endless_batches(train_data_loader), device):
@@ -164,7 +159,8 @@ def train(
         for optimizer in optimizers:
             optimizer.step()
         master_weights.weights_to_compute()
-        progress.update(budget.step_done())
+        budget.step_done()
+        progress.update(1)
         for scheduler in schedulers:
             scheduler.step()
         step = budget.steps
@@ -298,9 +294,19 @@ def lr_multiplier(step: int, progress: float, schedule: str = SCHEDULE, decay_fr
         return min(1.0, (1 - progress) / decay_fraction)
     if schedule == "hold_sqrt":
         return 1 - math.sqrt(min(1.0, max(0.0, (progress - 1 + decay_fraction) / decay_fraction)))
-    if schedule == "constant":
-        return 1.0
     raise ValueError(f"unknown schedule {schedule}")
+
+def make_scheduler(optimizer, budget: Budget, schedule: str, decay_fraction: float = DECAY_FRACTION):
+    #where the decay starts is known in advance, so a resumed run carries on
+    warmup_end = min(1.0, WARMUP_STEPS / budget.max_steps)
+
+    def multiplier(step):
+        if step <= WARMUP_STEPS:
+            return lr_multiplier(step, 0.0, schedule, decay_fraction)
+        progress = (budget.progress() - warmup_end) / max(1 - warmup_end, 1e-12)
+        return lr_multiplier(step, progress, schedule, decay_fraction)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
 
 def make_optimizers(model: ChessTransformer, learn_rate: float, device: torch.device, weight_decay: float = WEIGHT_DECAY,
@@ -363,8 +369,7 @@ def folder_name(note: str) -> str:
     return re.sub(r"[^A-Za-z0-9.-]+", "_", note).strip("_")[:60]
 
 def main(
-    positions_budget: int | None = None,
-    minutes_budget: float = TRAIN_MINUTES_BUDGET,
+    positions_budget: int,
     run_name: str | None = None,
     note: str = "",
     d_model: int = D_MODEL,
@@ -388,9 +393,7 @@ def main(
     result_weight: float = RESULT_WEIGHT,
     visit_temperature: float = VISIT_TEMPERATURE,
     eval_every: int = EVAL_EVERY,
-    compile_mode: str = "default",
     blunder_weight: float = BLUNDER_WEIGHT,
-    value_bins: int = VALUE_BINS,
     blunder_threshold: float = BLUNDER_THRESHOLD,
     weight_decay: float = WEIGHT_DECAY,
     muon_momentum: float = MUON_MOMENTUM,
@@ -403,13 +406,13 @@ def main(
     if init_checkpoint is not None:
         initial_model, model_settings = load_checkpoint(init_checkpoint, torch.device("cpu"))
     else:
-        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_hidden": mlp_hidden_width(d_model, mlp_ratio), "qk_ratio": qk_ratio, "kv_heads": kv_heads, "value_bins": value_bins}
+        model_settings = {"d_model": d_model, "num_layers": num_layers, "n_heads": n_heads, "position_templates": position_templates, "mlp_hidden": mlp_hidden_width(d_model, mlp_ratio), "qk_ratio": qk_ratio, "kv_heads": kv_heads, "value_bins": VALUE_BINS}
     if mix_set is not None and not 0 < mix_share < 1:
         raise ValueError(f"--mix-share is the share of every batch from {mix_set}, between 0 and 1, got {mix_share}")
     if peak_learn_rate is None:
         peak_learn_rate = FINE_TUNE_LEARN_RATE if init_checkpoint is not None else PEAK_LEARN_RATE
 
-    budget = Budget(batch_size, positions=positions_budget) if positions_budget is not None else Budget(batch_size, minutes=minutes_budget)
+    budget = Budget(batch_size, positions=positions_budget)
     if run_name is None:
         run_name = folder_name(note) if note else f"d{model_settings['d_model']}_L{model_settings['num_layers']}_h{model_settings['n_heads']}_lr{peak_learn_rate:g}_{budget.describe()}_{datetime.now():%H-%M-%S}"
         #runs started in the same second (several gpus) must not share a folder: mkdir claims the name
@@ -420,10 +423,8 @@ def main(
             except FileExistsError:
                 run_name = run_name.rsplit("_", 1)[0] + f"_{number}" if number > 1 else f"{run_name}_1"
 
-    if not budget.timed and budget.max_steps <= WARMUP_STEPS:
+    if budget.max_steps <= WARMUP_STEPS:
         raise ValueError(f"{positions_budget:,} positions is {budget.max_steps} steps, it has to be more than the {WARMUP_STEPS} warmup steps")
-    if budget.timed and budget.max_seconds < 60:
-        raise ValueError(f"{minutes_budget} minutes is too short, the warmup alone takes a good part of a minute")
 
     torch.manual_seed(seed)
 
@@ -444,18 +445,10 @@ def main(
     print(f"model: {model_settings}, {num_parameters:,} parameters")
 
     master_weights = MasterWeights(model)
-    compiled_model = torch.compile(master_weights.compute_model, mode=compile_mode)
+    compiled_model = torch.compile(master_weights.compute_model)
     optimizers = make_optimizers(model, peak_learn_rate, device, weight_decay, muon_momentum, embed_lr_multiplier)
 
-    warmup_end = 0.0
-    def current_lr_multiplier(step: int) -> float:
-        nonlocal warmup_end
-        if step <= WARMUP_STEPS:
-            warmup_end = budget.progress()
-            return lr_multiplier(step, 0.0, schedule, decay_fraction)
-        return lr_multiplier(step, (budget.progress() - warmup_end) / (1 - warmup_end), schedule, decay_fraction)
-
-    schedulers = [torch.optim.lr_scheduler.LambdaLR(optimizer, current_lr_multiplier) for optimizer in optimizers]
+    schedulers = [make_scheduler(optimizer, budget, schedule, decay_fraction) for optimizer in optimizers]
     if device.type == "cuda":
         compile_muon_step(optimizers)
 
@@ -493,7 +486,6 @@ def main(
         "result_weight": result_weight,
         "visit_temperature": visit_temperature,
         "eval_every": eval_every,
-        "compile_mode": compile_mode,
         "snapshot_every": snapshot_every,
         "optimizer": "muon",
         "note": note,
@@ -549,9 +541,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="train the chess transformer")
-    budget_flags = parser.add_mutually_exclusive_group()
-    budget_flags.add_argument("--minutes", type=float, default=TRAIN_MINUTES_BUDGET, help="minutes of training, compiling and evaluating not counted, default %(default)s")
-    budget_flags.add_argument("--positions", type=int, help="train on this many positions instead of for a number of minutes")
+    parser.add_argument("--positions", type=int, required=True, help="positions to train on")
     parser.add_argument("--note", default="", help="what this run tries, shown on the progress page")
     parser.add_argument("--name", help="name of this run in tensorboard, default the date and time")
     parser.add_argument("--no-tensorboard", action="store_true", help="do not start tensorboard or open the browser")
@@ -566,9 +556,9 @@ if __name__ == "__main__":
     parser.add_argument("--blunder-threshold", type=float, default=BLUNDER_THRESHOLD, help="a labelled move losing at least this much expected score is a blunder. Default %(default)s")
     parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="for Muon and AdamW both, default %(default)s")
     parser.add_argument("--muon-momentum", type=float, default=MUON_MOMENTUM, help="default %(default)s")
-    parser.add_argument("--schedule", choices=["cosine", "hold", "hold_sqrt", "constant"], default=SCHEDULE,
+    parser.add_argument("--schedule", choices=["cosine", "hold", "hold_sqrt"], default=SCHEDULE,
                         help="the learning rate after the warmup: cosine to zero over the run; hold the peak, then a straight line to zero over the last --decay-fraction; "
-                             "hold_sqrt the same with 1 - sqrt(t), t the share of the decay done; constant the peak throughout. Default %(default)s")
+                             "hold_sqrt the same with 1 - sqrt(t), t the share of the decay done. Default %(default)s")
     parser.add_argument("--decay-fraction", type=float, default=DECAY_FRACTION, help="for hold and hold_sqrt: the share of the run the decay takes, default %(default)s")
     parser.add_argument("--embed-lr-multiplier", type=float, default=EMBED_LR_MULTIPLIER, help="the input embeddings' (token, position, square features) learning rate as a multiple of the rest's. Default %(default)s")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
@@ -576,7 +566,6 @@ if __name__ == "__main__":
     parser.add_argument("--target-temperature", type=float, default=TARGET_TEMPERATURE, help="how stockfish's moves share the target, see TARGET_TEMPERATURE. Default %(default)s")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="positions per step, for train and val. Default %(default)s")
     parser.add_argument("--kv-heads", type=int, help="key/value heads, each shared by a group of heads (grouped-query attention). Default one per head")
-    parser.add_argument("--value-bins", type=int, default=VALUE_BINS, help="bins of the expected score the eval head predicts a distribution over, 1 for a single logit. Default %(default)s")
     parser.add_argument("--qk-ratio", type=float, nargs="+", default=[1.0], help="query/key width as a multiple of the values', one for every block or one per block, e.g. 0.25 0.5 0.5 0.75. Default 1")
     parser.add_argument("--init-checkpoint", type=Path, help="fine-tune from this model.pt; the model is the checkpoint's size and the size flags are ignored")
     parser.add_argument("--mix-set", help="a second training set that fills --mix-share of every batch")
@@ -584,7 +573,6 @@ if __name__ == "__main__":
     parser.add_argument("--result-weight", type=float, default=RESULT_WEIGHT, help="self play sets: share of the value target from the game's result, the rest the search's score. Default %(default)s")
     parser.add_argument("--eval-every", type=int, default=EVAL_EVERY, help="steps between two looks at the val set, default %(default)s")
     parser.add_argument("--snapshot-every", type=int, default=0, help="steps between two copies of the weights kept in the run folder (snapshot_<positions>.pt), 0 for none")
-    parser.add_argument("--compile-mode", choices=["default", "max-autotune-no-cudagraphs"], default="default", help="torch.compile's mode, default %(default)s")
     parser.add_argument("--teacher-weight", type=float, default=0.0, help="share of the train targets from a bigger model's; val keeps stockfish's. Default %(default)s")
     parser.add_argument("--visit-temperature", type=float, default=VISIT_TEMPERATURE, help="self play sets: sharpens the visit shares, 1 as recorded, 0 the most visited move alone. Default %(default)s")
     parser.add_argument("--mirror", action="store_true", help="show train positions without castling rights mirrored left-right at random, a new draw every pass over the set. Val is never mirrored")
@@ -595,6 +583,6 @@ if __name__ == "__main__":
 
     qk_ratio = arguments["qk_ratio"]
     arguments["qk_ratio"] = qk_ratio[0] if len(qk_ratio) == 1 else qk_ratio
-    renamed = {"minutes": "minutes_budget", "positions": "positions_budget", "name": "run_name", "layers": "num_layers", "heads": "n_heads",
+    renamed = {"positions": "positions_budget", "name": "run_name", "layers": "num_layers", "heads": "n_heads",
                "lr": "peak_learn_rate", "templates": "position_templates", "value_weight": "value_loss_weight"}
     main(**{renamed.get(flag, flag): value for flag, value in arguments.items()})

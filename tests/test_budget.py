@@ -15,26 +15,28 @@ def clock(monkeypatch):
 def test_positions_budget_counts_steps():
     budget = Budget(batch_size=100, positions=350)
 
-    assert not budget.timed and budget.total == 3
-    assert [budget.step_done() for _ in range(2)] == [1, 1]
+    assert budget.max_steps == 3
+    budget.step_done()
+    budget.step_done()
     assert budget.progress() == pytest.approx(2 / 3) and not budget.finished()
     budget.step_done()
     assert budget.finished() and budget.positions == 300
     assert budget.describe() == "0.00035M"
 
 
-def test_minutes_budget_does_not_count_the_first_step(clock):
-    budget = Budget(batch_size=100, minutes=1)
+def test_the_stopwatch_does_not_count_the_first_step(clock):
+    budget = Budget(batch_size=100, positions=10_000)
 
     clock.now += 25
-    assert budget.step_done() == 0
+    budget.step_done()
+    assert budget.seconds == 0
     clock.now += 30
-    assert budget.step_done() == 30
-    assert budget.progress() == pytest.approx(0.5) and budget.describe() == "1min"
+    budget.step_done()
+    assert budget.seconds == 30
 
 
-def test_minutes_budget_does_not_count_evaluation(clock):
-    budget = Budget(batch_size=100, minutes=1)
+def test_the_stopwatch_does_not_count_evaluation(clock):
+    budget = Budget(batch_size=100, positions=10_000)
     budget.step_done()
     clock.now += 20
     budget.step_done()
@@ -45,11 +47,4 @@ def test_minutes_budget_does_not_count_evaluation(clock):
 
     clock.now += 40
     budget.step_done()
-    assert budget.seconds == pytest.approx(60) and budget.finished()
-
-
-def test_budget_needs_exactly_one_of_positions_and_minutes():
-    with pytest.raises(ValueError):
-        Budget(batch_size=100)
-    with pytest.raises(ValueError):
-        Budget(batch_size=100, positions=1000, minutes=1)
+    assert budget.seconds == pytest.approx(60)

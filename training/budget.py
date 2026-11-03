@@ -1,26 +1,14 @@
 import time
 
 class Budget:
-    def __init__(self, batch_size: int, positions: int | None = None, minutes: float | None = None):
-        if (positions is None) == (minutes is None):
-            raise ValueError("give either positions or minutes")
-
+    def __init__(self, batch_size: int, positions: int):
         self.batch_size = batch_size
         self.positions_budget = positions
-        self.max_steps = None if positions is None else positions // batch_size
-        self.max_seconds = None if minutes is None else minutes * 60
+        self.max_steps = positions // batch_size
 
         self.steps = 0
         self.seconds = 0.0 #training only: the first step (torch.compile) and evaluation are not counted
         self._running_since = None
-
-    @property
-    def timed(self) -> bool:
-        return self.max_seconds is not None
-
-    @property
-    def total(self) -> float:
-        return self.max_seconds if self.timed else self.max_steps
 
     @property
     def positions(self) -> int:
@@ -32,13 +20,11 @@ class Budget:
             self.seconds += now - self._running_since
             self._running_since = now
 
-    def step_done(self) -> float:
-        before = self.seconds
+    def step_done(self) -> None:
         self._catch_up()
         self.steps += 1
         if self._running_since is None:
             self._running_since = time.perf_counter()
-        return self.seconds - before if self.timed else 1
 
     def pause(self) -> None:
         self._catch_up()
@@ -48,11 +34,10 @@ class Budget:
         self._running_since = time.perf_counter()
 
     def progress(self) -> float:
-        used = self.seconds / self.max_seconds if self.timed else self.steps / self.max_steps
-        return min(1.0, used)
+        return min(1.0, self.steps / self.max_steps)
 
     def finished(self) -> bool:
         return self.progress() >= 1.0
 
     def describe(self) -> str:
-        return f"{self.max_seconds / 60:g}min" if self.timed else f"{self.positions_budget / 1e6:g}M"
+        return f"{self.positions_budget / 1e6:g}M"

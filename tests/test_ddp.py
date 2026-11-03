@@ -21,7 +21,6 @@ from model.encoding import BLACK_QUEENSIDE_INDEX, BOARD_VOCAB_SIZE, CASTLING_TOK
 from model.model import ChessTransformer
 from training import train_ddp
 from training.muon import BatchedMuon
-from training.budget import Budget
 from model.checkpoint import load_checkpoint
 
 
@@ -120,32 +119,6 @@ def compare_update(rank, compiled=False):
         torch.testing.assert_close(actual, wanted, rtol=2e-5, atol=2e-6)
 
 
-def check_shared_clock(rank):
-    #every rank takes rank zero's clock every CLOCK_EVERY steps and keeps it in between
-    budget = Budget(16, minutes=1)
-    clock = Budget(16, minutes=1) if rank == 0 else None
-    optimizer = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.1)
-    scheduler = train_ddp.make_scheduler(optimizer, budget, "cosine")
-    now = [100.0 + 1000 * rank]
-    with patch("training.budget.time.perf_counter", side_effect=lambda: now[0]), patch.object(train_ddp, "CLOCK_EVERY", 2):
-        for step, expected_seconds in enumerate((0, 30, 30, 90), start=1):
-            now[0] += 30 if rank == 0 else 300  #the other ranks' clocks differ on purpose
-            optimizer.step()
-            train_ddp.step_budget(budget, clock, CPU)
-            scheduler.step()
-            assert budget.steps == step
-            assert budget.positions == 16 * step
-            assert budget.seconds == expected_seconds
-            assert budget.finished() == (step == 4)
-            assert_same_on_every_rank((budget.progress(), scheduler.get_last_lr()))
-            if step == 2:
-                if rank == 0:
-                    clock.pause()
-                now[0] += 600  #validation is outside the budget
-                if rank == 0:
-                    clock.resume()
-
-
 def check_shared_evaluation():
     rows = np.random.default_rng(5)
     size = 11
@@ -180,7 +153,6 @@ def distributed_worker(rank, folder, world_size):
         compare_update(rank, compiled=True)
         check_shared_evaluation()
         single.WARMUP_STEPS = 1
-        check_shared_clock(rank)
 
         use_folder(folder)
         single.BATCH_SIZE = 8  #the 10 validation rows end in an incomplete batch

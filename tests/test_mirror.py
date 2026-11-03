@@ -341,6 +341,6 @@ def test_mirroring_without_a_seed_is_rejected():
 
 
 def test_mirroring_is_off_unless_asked_for():
-    assert parse_args([]).mirror is False
-    assert parse_args(["--mirror"]).mirror is True
+    assert parse_args(["--positions", "100"]).mirror is False
+    assert parse_args(["--positions", "100", "--mirror"]).mirror is True
     assert TrainingSampler(list(range(32)), 16, 0, 1, 0).mirror is False

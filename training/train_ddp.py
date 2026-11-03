@@ -1,11 +1,10 @@
 """Multi-GPU DDP trainer, from the repository root on Linux:
-uv run torchrun --standalone --nproc-per-node=2 -m training.train_ddp --minutes 30
+uv run torchrun --standalone --nproc-per-node=2 -m training.train_ddp --positions 100000000
 --batch-size and --positions are global, across all processes."""
 
 import argparse
 import contextlib
 import json
-import math
 import os
 import time
 from datetime import datetime, timedelta
@@ -28,7 +27,6 @@ from model.checkpoint import RUNS_DIR, save_checkpoint
 from training.compare_runs import write_progress_page
 from training.tensorboard_server import start_tensorboard
 
-CLOCK_EVERY = 20
 RESUME_FILE = "resume.pt"
 
 
@@ -76,38 +74,13 @@ def training_batches(loader: DataLoader, mix_loader: DataLoader | None):
         yield concatenate_batches(batch, next(mix_batches))
 
 
-def make_budget(args) -> Budget:
-    return (Budget(args.batch_size, positions=args.positions) if args.positions is not None
-            else Budget(args.batch_size, minutes=args.minutes))
-
-
-#clock is rank zero's own timer (None elsewhere); minutes are broadcast only every CLOCK_EVERY steps, as a broadcast waits for the gpu
-def step_budget(budget: Budget, clock: Budget | None, device: torch.device) -> None:
+#clock is rank zero's own timer (None elsewhere)
+def step_budget(budget: Budget, clock: Budget | None) -> None:
     if budget.steps == 0:
-        dist.barrier()  #first-step compilation stays outside the timed budget
+        dist.barrier()  #first-step compilation stays outside the clock
     budget.steps += 1
     if clock is not None:
         clock.step_done()
-    if budget.timed and budget.steps % CLOCK_EVERY == 0:
-        seconds = torch.tensor(clock.seconds if clock is not None else 0.0, dtype=torch.float64, device=device)
-        dist.broadcast(seconds, src=0)
-        budget.seconds = seconds.item()
-
-
-def make_scheduler(optimizer, budget: Budget, schedule: str, decay_fraction: float = single.DECAY_FRACTION):
-    #where the decay starts: known in advance for positions (so a resumed run carries on), measured for minutes
-    warmup_end = 0.0 if budget.timed else min(1.0, single.WARMUP_STEPS / budget.max_steps)
-
-    def multiplier(step):
-        nonlocal warmup_end
-        if step <= single.WARMUP_STEPS:
-            if budget.timed:
-                warmup_end = budget.progress()
-            return single.lr_multiplier(step, 0.0, schedule, decay_fraction)
-        progress = (budget.progress() - warmup_end) / max(1 - warmup_end, 1e-12)
-        return single.lr_multiplier(step, progress, schedule, decay_fraction)
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
 
 METRIC_TAGS = {"val_loss": "loss/val", "val_accuracy": "accuracy/val", "val_value_loss": "loss/val_value",
@@ -142,8 +115,8 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
     totals = torch.zeros(3, device=device)
     interval_steps = 0
     last_resume_save = time.monotonic()
-    progress = tqdm(total=budget.total, initial=0 if budget.timed else budget.steps, desc="train", dynamic_ncols=True,
-                    disable=rank != 0, unit="s" if budget.timed else "it")
+    progress = tqdm(total=budget.max_steps, initial=budget.steps, desc="train", dynamic_ncols=True,
+                    disable=rank != 0, unit="it")
     model.train()
     try:
         for batch in single.batches_on_device(training_batches(train_loader, mix_loader), device):
@@ -165,11 +138,10 @@ def train(model, master_weights, train_loader, val_loader, optimizers, scheduler
                 optimizer.step()
             master_weights.weights_to_compute()
 
-            before = budget.seconds
-            step_budget(budget, clock, device)
+            step_budget(budget, clock)
             for scheduler in schedulers:
                 scheduler.step()
-            progress.update(budget.seconds - before if budget.timed else 1)
+            progress.update(1)
             totals += torch.stack([loss, penalty, gradient_norm]).float()
             interval_steps += 1
             finished = budget.finished()  #one shared decision, before rank zero pauses its clock
@@ -227,18 +199,16 @@ def run(args, device: torch.device):
     if args.micro_batch is not None and (args.micro_batch <= 0 or local_batch % args.micro_batch):
         raise ValueError(f"--micro-batch must divide the local batch of {local_batch} positions, got {args.micro_batch}")
     micro_batches = local_batch // args.micro_batch if args.micro_batch is not None else 1
-    budget = make_budget(args)
-    clock = make_budget(args) if rank == 0 else None
-    if not budget.timed and budget.max_steps <= single.WARMUP_STEPS:
+    budget = Budget(args.batch_size, positions=args.positions)
+    clock = Budget(args.batch_size, positions=args.positions) if rank == 0 else None
+    if budget.max_steps <= single.WARMUP_STEPS:
         raise ValueError(f"the position budget must exceed {single.WARMUP_STEPS} global warmup steps")
     if not 0 < args.decay_fraction <= 1:
         raise ValueError(f"--decay-fraction is a share of the run, above 0 and at most 1, got {args.decay_fraction}")
-    if budget.timed and (not math.isfinite(args.minutes) or args.minutes < 1):
-        raise ValueError("--minutes must be finite and at least 1")
     resumed = None
     if args.resume:
-        if args.name is None or budget.timed:
-            raise ValueError("--resume needs --name and a budget of --positions")
+        if args.name is None:
+            raise ValueError("--resume needs --name")
         #each rank reads the state itself: the run folder is on a filesystem every rank sees
         settings_path = RUNS_DIR / args.name / "settings.json"
         if settings_path.exists() and "finished_at" in json.loads(settings_path.read_text(encoding="utf-8")):
@@ -295,7 +265,7 @@ def run(args, device: torch.device):
         model = torch.compile(model)
     optimizers = single.make_optimizers(raw_model, args.lr, device, args.weight_decay, args.muon_momentum, args.embed_lr_multiplier)
     #the schedulers first: making one sets its optimizer's learning rate for step 0, which the saved states then replace
-    schedulers = [make_scheduler(optimizer, budget, args.schedule, args.decay_fraction) for optimizer in optimizers]
+    schedulers = [single.make_scheduler(optimizer, budget, args.schedule, args.decay_fraction) for optimizer in optimizers]
     best_val_loss = float("inf")
     if resumed is not None:
         for optimizer, state in zip(optimizers, resumed["optimizers"]):
@@ -316,8 +286,6 @@ def run(args, device: torch.device):
     writer = None
     try:
         if rank == 0:
-            budget_label = (f"{budget.describe()}_{world_size}{'gpu' if device.type == 'cuda' else 'cpu'}"
-                            if budget.timed else budget.describe())
             run_name = args.name or (single.folder_name(args.note) if args.note else
                                      f"ddp{world_size}_d{args.d_model}_L{args.layers}_h{args.heads}_"
                                      f"{budget.describe()}_{datetime.now():%Y%m%d_%H-%M-%S_%f}")
@@ -337,7 +305,7 @@ def run(args, device: torch.device):
                     value_loss_weight=args.value_weight, blunder_weight=args.blunder_weight, blunder_threshold=args.blunder_threshold,
                     weight_decay=args.weight_decay, muon_momentum=args.muon_momentum, mirror=args.mirror,
                     blunder_labels=train_dataset.worst_moves is not None,
-                    budget=budget_label, batch_size=args.batch_size, per_gpu_batch_size=local_batch, micro_batches=micro_batches,
+                    budget=budget.describe(), batch_size=args.batch_size, per_gpu_batch_size=local_batch, micro_batches=micro_batches,
                     training_set=args.training_set, target_temperature=args.target_temperature,
                     result_weight=args.result_weight, visit_temperature=args.visit_temperature,
                     mix_set=args.mix_set, mix_share=mix_batch_size / args.batch_size if args.mix_set is not None else None,
@@ -398,17 +366,14 @@ def run(args, device: torch.device):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    budgets = parser.add_mutually_exclusive_group()
-    budgets.add_argument("--minutes", type=float, default=single.TRAIN_MINUTES_BUDGET,
-                         help="wall minutes of training, excluding first-step compilation and evaluation")
-    budgets.add_argument("--positions", type=int, help="positions across all GPUs, rounded down to full global batches")
+    parser.add_argument("--positions", type=int, required=True, help="positions across all GPUs, rounded down to full global batches")
     parser.add_argument("--batch-size", type=int, default=single.BATCH_SIZE, help="GLOBAL batch size, default %(default)s")
     parser.add_argument("--micro-batch", type=int,
                         help="positions a GPU puts through at once: the local batch goes in equal parts whose gradients add up "
                              "(gradient accumulation), the same step in less memory. Default the whole local batch")
     parser.add_argument("--name", help="new run folder name; existing folders are rejected (except by --resume)")
     parser.add_argument("--resume", action="store_true",
-                        help="carry on the --name run from its last saved state, or start it. Needs --positions")
+                        help="carry on the --name run from its last saved state, or start it")
     parser.add_argument("--checkpoint-minutes", type=float, default=10,
                         help="with --resume: wall minutes between two saved states. Default %(default)s")
     parser.add_argument("--snapshot-every", type=int, default=0,
