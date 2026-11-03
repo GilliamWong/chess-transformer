@@ -15,14 +15,12 @@ engines/
 match.pgn
 processed_data/
 runs/
-artifacts/runs_archive/
-artifacts/progress.html
-artifacts/match_searches/
-artifacts/pgn_data/lichess_elite/
-artifacts/pgn_data/lumbras_otb_elite/
-artifacts/pgn_data/*.7z
-artifacts/pgn_data/fishtest/*.pgn.gz
-artifacts/puzzles/lichess_db_puzzle.csv
+
+# artifacts/ stays local, except the openings the engine and tests read
+artifacts/*
+!artifacts/pgn_data/
+artifacts/pgn_data/*
+!artifacts/pgn_data/Carlsen.pgn
 
 engine/selfplay_rs/target/
 
@@ -31,8 +29,3 @@ engine/selfplay_rs/target/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/
-
-# large local evaluation outputs
-artifacts/d768_search_gap_20261014/
-artifacts/history_sweep_20260922/
-artifacts/leela_matches_20261005_11/
