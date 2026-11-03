@@ -798,9 +798,10 @@ impl SharedTree {
         path.len() >= 3 && self.proof_from_moves(path[path.len() - 2]).is_some()
     }
 
-    //room for one more descent: the root's own visits and the leaves waiting are within the simulations
+    //room for one more descent: the root's own visits and the leaves waiting are within the simulations, the leaves read
+    //first (a finished leaf adds its visit before it stops waiting, so it is never missed)
     fn has_room(&self, visit_limit: u32) -> bool {
-        self.root().visits() as usize + self.pending() < visit_limit as usize && !self.closed.load(Ordering::Acquire)
+        self.pending() + (self.root().visits() as usize) < visit_limit as usize && !self.closed.load(Ordering::Acquire)
     }
 
     //no call gathers any more; the caller has the tree to itself (quiet)
