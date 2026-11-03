@@ -19,6 +19,7 @@ runs/
 # local only: experiments' data and results, and the tools that make and measure them
 artifacts/
 tools/
+notes.txt
 
 engine/selfplay_rs/target/
 
