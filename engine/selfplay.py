@@ -112,6 +112,7 @@ def play_games_in_rust(network: Callable[[np.ndarray], np.ndarray], simulations:
 #files are appended before the record, so reopening keeps the fullest record the files hold and truncates the rest
 class SelfPlaySet:
     def __init__(self, folder: Path, name: str, settings: dict):
+        folder.mkdir(parents=True, exist_ok=True)
         self.folder = folder
         self.name = name
         self.record_path = folder / f"{name}_selfplay.json"
