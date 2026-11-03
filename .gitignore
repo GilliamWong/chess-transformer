@@ -31,3 +31,8 @@ engine/selfplay_rs/target/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/
+
+# large local evaluation outputs
+artifacts/d768_search_gap_20261014/
+artifacts/history_sweep_20260922/
+artifacts/leela_matches_20261005_11/
