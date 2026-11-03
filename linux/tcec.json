@@ -1,6 +1,6 @@
 [
   {
-    "name": "ChessTransformer",
+    "name": "Fry",
     "command": "./linux/engine.sh",
     "workingDirectory": "chess-transformer",
     "protocol": "uci",

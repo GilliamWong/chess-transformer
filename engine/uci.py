@@ -29,7 +29,7 @@ from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, C
                                load_model, score_to_centipawns)
 from engine.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
 
-ENGINE_NAME = "ChessTransformer"
+ENGINE_NAME = "Fry"
 REPOSITORY = Path(__file__).resolve().parent.parent
 
 #one board takes a few ms on the cpu, less than starting cuda; one thread so parallel games don't fight over cores
