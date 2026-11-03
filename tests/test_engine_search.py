@@ -632,6 +632,12 @@ class SlowNetwork:
         return self.network.collect(answers)
 
 
+#the simulations past the search's that a search on several networks may end at: none under the tree's lock, one a
+#thread after the first in concurrent descents (a check and a leaf are not one step, SharedTree::gather)
+def overrun(concurrent_descents: bool | None, networks: int = 3) -> int:
+    return 0 if concurrent_descents is False else networks - 1
+
+
 #on several networks (gpus) a search keeps two rounds out on each, every one of them busy, and ends at its simulations
 #with the move one network finds, in the tree under its lock and in concurrent descents (the default)
 @pytest.mark.parametrize("concurrent_descents", [False, None])
@@ -640,7 +646,7 @@ def test_a_search_on_several_networks_keeps_them_all_busy(concurrent_descents):
     search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=concurrent_descents)
     report = search.search(chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"), simulations=3000)
 
-    assert report.simulations == 3000 and report.line[0].uci() == "e4d5"
+    assert 3000 <= report.simulations <= 3000 + overrun(concurrent_descents) and report.line[0].uci() == "e4d5"
     assert group.most_out == 6 and all(network.rounds > 5 for network in group.networks)
 
 
@@ -670,7 +676,7 @@ def test_a_network_without_leaves_waits_for_the_others(concurrent_descents):
     search = EngineSearch(SlowNetworks(3, 0.005, BoardModel()).networks, 64, smart_pruning=False, grow_leaves=0, concurrent_descents=concurrent_descents)
     search.searches = rounds = CountingRounds(search.searches)
 
-    assert search.search(chess.Board(), simulations=4000).simulations == 4000
+    assert 4000 <= search.search(chess.Board(), simulations=4000).simulations <= 4000 + overrun(concurrent_descents)
     assert rounds.empty < rounds.with_leaves, (rounds.empty, rounds.with_leaves)
 
 
@@ -682,7 +688,7 @@ def test_a_cap_holds_on_several_networks(concurrent_descents):
     search = EngineSearch(group.networks, 16, smart_pruning=False, visits_per_leaf_out=64, concurrent_descents=concurrent_descents)
     report = search.search(chess.Board("4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"), simulations=3000)
 
-    assert report.simulations == 3000 and group.most_out == 2
+    assert 3000 <= report.simulations <= 3000 + overrun(concurrent_descents) and group.most_out == 2
 
 
 #one network in a list is the search on that network; one leaf a round, mcts.py's search, is for one network only
