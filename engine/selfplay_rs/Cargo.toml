@@ -20,3 +20,5 @@ shakmaty-syzygy = { version = "0.28.1", features = ["mmap"] }
 [profile.release]
 codegen-units = 1
 lto = "fat"
+#line tables kept for a crash's backtrace, as TCEC asks: no change to the code
+debug = "line-tables-only"

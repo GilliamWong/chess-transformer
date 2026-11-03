@@ -10,7 +10,6 @@ dependencies = [
     "matplotlib>=3.8", # tools/plot_templates.py
     "numpy>=1.26", # torch warns on every start without it
     "tensorboard>=2.15",
-    "torch>=2.9",
     "tqdm>=4.66",
     # torch.compile needs triton; on Windows only this community build exists
     "triton-windows>=3.5; sys_platform == 'win32'",
@@ -21,20 +20,32 @@ dependencies = [
 dev = ["pytest>=8"]
 # engine/selfplay_rs/, needs Rust (https://rustup.rs). A training-only machine can skip it: uv sync --no-group selfplay
 selfplay = ["selfplay-rs"]
+# torch's CUDA 13.0 build, for NVIDIA drivers 580 and newer: the default
+cu130 = ["torch>=2.9"]
+# torch's CUDA 12.9 build (torch 2.13, its newest) for drivers from 570, by CUDA 12's minor version compatibility: TCEC's
+# box has 570. uv sync --no-group cu130 --group cu129
+cu129 = ["torch>=2.9"]
 
 # scripts run from the repository root, not an installable package
 [tool.uv]
 package = false
-default-groups = ["dev", "selfplay"]
+default-groups = ["dev", "selfplay", "cu130"]
+conflicts = [[{ group = "cu130" }, { group = "cu129" }]]
 
-# PyPI's Windows torch is CPU only, so torch comes from PyTorch's CUDA 13.0 index (RTX 50 needs CUDA 12.8+)
+# PyPI's Windows torch is CPU only, so torch comes from PyTorch's CUDA indexes (RTX 50 needs CUDA 12.8+)
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
+torch = [{ index = "pytorch-cu130", group = "cu130", marker = "sys_platform == 'win32' or sys_platform == 'linux'" },
+         { index = "pytorch-cu129", group = "cu129", marker = "sys_platform == 'win32' or sys_platform == 'linux'" }]
 selfplay-rs = { path = "engine/selfplay_rs" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.pytest.ini_options]

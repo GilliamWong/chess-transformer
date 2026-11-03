@@ -8,6 +8,6 @@ name = "selfplay-rs"
 version = "0.1.0"
 requires-python = ">=3.10"
 
-#rebuilt whenever the rust changes, not only when the version does
+#rebuilt whenever the rust changes, not only when the version does, and when RUSTFLAGS do (linux/build.sh's target cpu)
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "Cargo.lock" }, { file = "src/**/*.rs" }]
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "Cargo.lock" }, { file = "src/**/*.rs" }, { env = "RUSTFLAGS" }]

@@ -10,7 +10,7 @@ The architecture, the experiments behind it and an in-browser explorer are on th
 
 ## Download and use
 
-On Linux with an NVIDIA GPU (driver 580 or newer), git, curl and a C compiler (`build-essential`):
+On Linux with an NVIDIA GPU (driver 570 or newer), git, curl and a C compiler (`build-essential`):
 
 ```
 git clone https://github.com/GilliamWong/chess-transformer.git
@@ -18,7 +18,9 @@ chess-transformer/engine/linux/build.sh
 chess-transformer/engine/linux/engine.sh
 ```
 
-`build.sh` installs uv and Rust if they are missing, builds the Python environment, downloads the network
+`build.sh` installs uv and Rust if they are missing, builds the Python environment (PyTorch's CUDA 12.9 build, which
+runs on driver 570; `TORCH_CUDA=cu130` for CUDA 13.0 on drivers from 580) with the Rust search compiled for the
+machine's CPU, downloads the network
 [`fry-final-117`](https://github.com/GilliamWong/chess-transformer/releases/tag/fry-final-117) (453 MB, SHA-256
 `fed2722da0085ef3299eeb72e9f06712a9426b38503aa8889bcf87affc5c0bed`) into `weights/` and prepares its int8 weights on
 the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clones or pulls and builds in one step.
@@ -45,6 +47,6 @@ the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clon
 `isready` or `go`. A value the engine cannot take is refused with an `info string`. There is no `Hash` or `Threads`
 (the memory is `RamLimitMb`, the threads follow from the GPUs), and the engine does not ponder.
 
-`engine/linux/tcec.json` is a tournament entry for a box like TCEC's (8x RTX 5090, at most 320 GiB of RAM for an engine):
-`RamLimitMb` 180000, `CachePositions` 50000000, `AdvanceThreads` 16 and `MoveOverhead` 200,
-with `SyzygyPath` set to the box's 7 piece tables.
+`engine/linux/tcec.json` is a tournament entry for TCEC's GPU server (2x EPYC 9175F, 8x RTX 5090, driver 570, at most
+320 GiB of RAM for an engine, both engines on the one machine): `RamLimitMb` 180000, `CachePositions` 50000000 and
+`MoveOverhead` 200, with `SyzygyPath` set to the box's 7 piece tables.

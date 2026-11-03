@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #builds the engine on linux from inside its checkout: the python environment with the rust search, the network's
 #weights, and the int8 rounding of those weights on the gpu. Safe to run again after a git pull: each step skips what is
-#done. Needs git, curl, a C compiler (build-essential) and an NVIDIA driver for CUDA 13.0 (580 or newer).
+#done. Needs git, curl, a C compiler (build-essential) and an NVIDIA driver of 570 or newer: torch's CUDA 12.9 build,
+#which CUDA 12's minor version compatibility runs on TCEC's 570 (TORCH_CUDA=cu130 for CUDA 13.0, drivers 580 and newer).
+#The rust search is compiled for this machine's cpu (AVX-512 on TCEC's EPYCs); a RUSTFLAGS already set replaces that.
 #SKIP_INT8=1 leaves the rounding to the engine's first isready
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -11,6 +13,8 @@ WEIGHTS_URL=https://github.com/GilliamWong/chess-transformer/releases/download/f
 WEIGHTS_SHA256=fed2722da0085ef3299eeb72e9f06712a9426b38503aa8889bcf87affc5c0bed
 #the rust search is edition 2024
 RUST_AT_LEAST=1.85.0
+TORCH_CUDA=${TORCH_CUDA:-cu129}
+export RUSTFLAGS=${RUSTFLAGS:--C target-cpu=native}
 
 command -v cc >/dev/null || { echo "build.sh needs a C compiler: sudo apt install build-essential" >&2; exit 1; }
 
@@ -32,7 +36,7 @@ if [ "$(printf '%s\n' "$RUST_AT_LEAST" "$rust" | sort -V | head -1)" != "$RUST_A
     exit 1
 fi
 
-uv sync --frozen --no-group dev --python 3.12
+uv sync --frozen --no-group dev --no-group cu130 --group "$TORCH_CUDA" --python 3.12
 
 if ! echo "$WEIGHTS_SHA256  $WEIGHTS" | sha256sum --check --status 2>/dev/null; then
     mkdir -p weights
