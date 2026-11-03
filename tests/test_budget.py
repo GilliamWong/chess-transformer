@@ -4,7 +4,6 @@ from training import budget as budget_module
 from training.budget import Budget
 
 
-#a clock the test moves by hand: clock.now += seconds
 @pytest.fixture
 def clock(monkeypatch):
     class Clock:
@@ -14,7 +13,7 @@ def clock(monkeypatch):
 
 
 def test_positions_budget_counts_steps():
-    budget = Budget(batch_size=100, positions=350)  #3 whole batches
+    budget = Budget(batch_size=100, positions=350)
 
     assert not budget.timed and budget.total == 3
     assert [budget.step_done() for _ in range(2)] == [1, 1]
@@ -41,7 +40,7 @@ def test_minutes_budget_does_not_count_evaluation(clock):
     budget.step_done()
 
     budget.pause()
-    clock.now += 500  #a long evaluation
+    clock.now += 500
     budget.resume()
 
     clock.now += 40

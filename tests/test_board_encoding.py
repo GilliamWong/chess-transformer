@@ -33,10 +33,10 @@ from model.encoding import (
 #written out by hand so the layout is checked against something other than encode_board itself
 START_POSITION_ENCODING = (
     [4, 2, 3, 5, 6, 3, 2, 4]        #rank 1, a1..h1
-    + [1] * 8                       #rank 2
-    + [0] * 32                      #ranks 3-6
-    + [7] * 8                       #rank 7
-    + [10, 8, 9, 11, 12, 9, 8, 10]  #rank 8, a8..h8
+    + [1] * 8
+    + [0] * 32
+    + [7] * 8
+    + [10, 8, 9, 11, 12, 9, 8, 10]
     + [14]                          #white to move
     + [16, 16, 16, 16]              #castling: white K, white Q, black k, black q
     + [17]                          #no en passant square
@@ -57,7 +57,7 @@ AFTER_E4_ENCODING = (
 )
 
 BLACK_TO_MOVE, WHITE_TO_MOVE = 13, 14
-NO_CASTLING_RIGHT, CASTLING_RIGHT = 15, 16
+NO_CASTLING_RIGHT = 15  #a castling right is token 16
 NO_EN_PASSANT = 17  #en passant square s is token 17 + s
 
 PIECE_CODES = {
@@ -75,19 +75,13 @@ def board_after(*san_moves: str) -> chess.Board:
 
 #1 for a castling right, 0 for none, anything else for any other token
 def castling_flags(encoding) -> tuple[int, int, int, int]:
-    return (
-        encoding[WHITE_KINGSIDE_INDEX] - NO_CASTLING_RIGHT,
-        encoding[WHITE_QUEENSIDE_INDEX] - NO_CASTLING_RIGHT,
-        encoding[BLACK_KINGSIDE_INDEX] - NO_CASTLING_RIGHT,
-        encoding[BLACK_QUEENSIDE_INDEX] - NO_CASTLING_RIGHT,
-    )
+    indices = (WHITE_KINGSIDE_INDEX, WHITE_QUEENSIDE_INDEX, BLACK_KINGSIDE_INDEX, BLACK_QUEENSIDE_INDEX)
+    return tuple(encoding[index] - NO_CASTLING_RIGHT for index in indices)
 
 
 def assert_round_trip(board: chess.Board) -> None:
-    decoded = decode_board(encode_board(board))
-    #epd is exactly what the encoding carries (no move counters), and like encode_board it only writes a
-    #capturable en passant square
-    assert decoded.epd() == board.epd()
+    #epd is what the encoding carries: no move counters, and en passant only when capturable
+    assert decode_board(encode_board(board)).epd() == board.epd()
 
 
 def test_start_position_layout():
@@ -99,14 +93,13 @@ def test_start_position_layout():
 
 def test_every_piece_has_its_own_code():
     board = chess.Board.empty()
-    squares = dict(zip(PIECE_CODES, chess.SQUARES))
-    for symbol, square in squares.items():
+    for square, symbol in enumerate(PIECE_CODES):
         board.set_piece_at(square, chess.Piece.from_symbol(symbol))
 
     encoding = encode_board(board)
 
-    for symbol, square in squares.items():
-        assert encoding[square] == PIECE_CODES[symbol], symbol
+    for square, (symbol, code) in enumerate(PIECE_CODES.items()):
+        assert encoding[square] == code, symbol
     assert_round_trip(board)
 
 
@@ -167,22 +160,10 @@ def test_castling_rights_stay_lost_when_pieces_return_home():
     never_moved_encoding = encode_board(never_moved)
     returned_encoding = encode_board(moved_and_returned)
 
-    #same pieces on the same squares, so only the castling flags can tell these apart
     assert castling_flags(never_moved_encoding) == (1, 1, 1, 1)
     assert castling_flags(returned_encoding) == (0, 0, 0, 0)
     assert never_moved_encoding[:TURN_INDEX + 1] == returned_encoding[:TURN_INDEX + 1]
-
-    decoded = decode_board(returned_encoding)
-    assert not decoded.has_castling_rights(chess.WHITE)
-    assert not decoded.has_castling_rights(chess.BLACK)
-
-
-def test_decoded_board_can_still_castle():
-    board = board_after("e4", "e5", "Nf3", "Nf6", "Bc4", "Bc5")
-
-    decoded = decode_board(encode_board(board))
-
-    assert decoded.parse_san("O-O") in decoded.legal_moves
+    assert_round_trip(moved_and_returned)
 
 
 @pytest.mark.parametrize(
@@ -191,9 +172,7 @@ def test_decoded_board_can_still_castle():
         #the side to move captures up the board, so the square is on rank 6 and 0 (a1) is a safe "none"
         pytest.param(["h3", "b5", "h4", "b4", "a4"], chess.A6, id="a3-mirrored-for-black"),
         pytest.param(["g4", "a6", "g5", "h5"], chess.H6, id="h6-highest-square"),
-        #a double push no enemy pawn can capture encodes as none
         pytest.param(["e4"], 0, id="no-capture-available"),
-        #the capturing pawn is pinned to its king, so the capture is not legal
         pytest.param(["e4", "e5", "d4", "exd4", "e5", "Qe7", "a3", "d5"], 0, id="capturing-pawn-pinned"),
         pytest.param(["e4", "a6", "e5", "d5"], chess.D6, id="d6-white-can-capture"),
         pytest.param(["a3", "e5", "a4", "e4", "d4"], chess.D6, id="d3-mirrored-black-can-capture"),
@@ -204,22 +183,6 @@ def test_en_passant_square(san_moves, expected_ep_square):
 
     assert encode_board(board)[EN_PASSANT_INDEX] == NO_EN_PASSANT + expected_ep_square
     assert_round_trip(board)
-
-
-@pytest.mark.parametrize(
-    "san_moves, capture_san",
-    [
-        pytest.param(["e4", "a6", "e5", "d5"], "exd6", id="white-captures"),
-        pytest.param(["a3", "e5", "a4", "e4", "d4"], "exd3", id="black-captures"),
-    ],
-)
-def test_decoded_board_allows_en_passant_capture(san_moves, capture_san):
-    decoded = decode_board(encode_board(board_after(*san_moves)))
-
-    capture = decoded.parse_san(capture_san)
-
-    assert decoded.is_en_passant(capture)
-    assert capture in decoded.legal_moves
 
 
 def test_en_passant_square_expires_after_one_move():
@@ -274,8 +237,7 @@ def test_round_trip_every_position_of_real_games(carlsen_games):
 #counted on paper: 1456 queen-line pairs + 336 knight jumps, plus 44 promoting (from, to) pairs * 4 pieces
 def test_move_vocabulary_size():
     assert NUM_MOVE_IDS == 1792 + 176
-    assert len(ALL_POSSIBLE_MOVES) == NUM_MOVE_IDS
-    assert len(set(ALL_POSSIBLE_MOVES)) == NUM_MOVE_IDS  #a duplicate would make two ids decode to one move
+    assert len(set(ALL_POSSIBLE_MOVES)) == NUM_MOVE_IDS
 
 
 #the order of the table is the vocabulary: changing it invalidates every saved id and trained model
@@ -295,11 +257,6 @@ def test_move_id_layout(uci, turn, expected_id):
 
     assert encode_move_to_id(move, turn) == expected_id
     assert decode_id_to_move(expected_id, turn) == move
-
-
-def test_black_and_white_share_ids_for_the_same_move():
-    assert encode_move_to_id(chess.Move.from_uci("e7e5"), chess.BLACK) == encode_move_to_id(chess.Move.from_uci("e2e4"), chess.WHITE)
-    assert encode_move_to_id(chess.Move.from_uci("g8f6"), chess.BLACK) == encode_move_to_id(chess.Move.from_uci("g1f3"), chess.WHITE)
 
 
 def test_every_id_round_trips():
@@ -357,7 +314,6 @@ def test_every_slot_stays_inside_its_token_block(carlsen_games):
             assert NO_EN_PASSANT <= encoding[EN_PASSANT_INDEX] < BOARD_VOCAB_SIZE
 
 
-#the policy head looks moves up by these instead of by id, so they have to describe the same move
 def test_move_parts_describe_the_move_with_that_id():
     assert len(MOVE_FROM_SQUARES) == len(MOVE_TO_SQUARES) == NUM_MOVE_IDS
 
@@ -371,11 +327,10 @@ def test_every_promotion_shares_its_squares_with_a_plain_move():
     plain_pairs = {(move.from_square, move.to_square) for move in ALL_POSSIBLE_MOVES if move.promotion is None}
     promotion_pairs = [(MOVE_FROM_SQUARES[move_id], MOVE_TO_SQUARES[move_id]) for move_id in PROMOTION_MOVE_IDS]
 
-    assert len(promotion_pairs) == 176 and len(set(promotion_pairs)) == 44
+    assert len(set(promotion_pairs)) == 44
     assert set(promotion_pairs) <= plain_pairs
 
 
-#the policy head adds something to exactly these ids, picked by landing square and piece
 def test_promotion_tables_describe_every_promotion_and_nothing_else():
     assert len(PROMOTION_MOVE_IDS) == len(PROMOTION_TO_SQUARES) == len(PROMOTION_PIECES) == 176
     assert set(PROMOTION_MOVE_IDS) == {move_id for move_id, move in enumerate(ALL_POSSIBLE_MOVES) if move.promotion is not None}

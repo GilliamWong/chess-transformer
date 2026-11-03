@@ -1,4 +1,3 @@
-#stand-in networks shared by the search and self play tests
 import numpy as np
 import torch
 from torch import nn
@@ -24,7 +23,6 @@ class BoardModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return boards.float() @ self.weights / 100, PIECE_VALUES[boards[:, :64].long()].sum(dim=1, keepdim=True)
 
-#the model on the cpu, counting the boards it evaluates
 class CountingNetwork:
     def __init__(self, model):
         self.network = cpu_batches(model)

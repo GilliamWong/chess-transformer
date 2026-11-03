@@ -17,56 +17,46 @@ def small_model() -> ChessTransformer:
     return ChessTransformer(d_model=32, num_layers=2, n_heads=4, position_templates=2, qk_ratio=[0.5, 1.0], kv_heads=2)
 
 
-def names_in(optimizer: torch.optim.Optimizer, model: ChessTransformer) -> set[str]:
+def names_in(groups: list[dict], model: ChessTransformer) -> set[str]:
     names = {id(parameter): name for name, parameter in model.named_parameters()}
-    return {names[id(parameter)] for group in optimizer.param_groups for parameter in group["params"]}
+    return {names[id(parameter)] for group in groups for parameter in group["params"]}
 
 
-#every parameter goes to exactly one of the two
 def test_muon_takes_the_weight_matrices_inside_the_blocks_and_adamw_the_rest():
     model = small_model()
 
     adamw, muon = make_optimizers(model, 1e-3, CPU)
 
     assert isinstance(adamw, torch.optim.AdamW) and isinstance(muon, torch.optim.Muon)
-    in_muon, in_adamw = names_in(muon, model), names_in(adamw, model)
+    in_muon, in_adamw = names_in(muon.param_groups, model), names_in(adamw.param_groups, model)
     assert in_muon == {f"encoder.{block}.{layer}.weight" for block in range(2) for layer in BLOCK_LINEAR_LAYERS}
     assert in_muon.isdisjoint(in_adamw)
     assert in_muon | in_adamw == {name for name, _ in model.named_parameters()}
     assert {"embed.weight", "position_embed", "templates", "from_projection.weight", "encoder.0.Q.bias", "encoder.0.ln1.weight"} <= in_adamw
-    #the same decay and learning rate for both
     assert muon.param_groups[0]["weight_decay"] == adamw.param_groups[0]["weight_decay"] == WEIGHT_DECAY
     assert muon.param_groups[0]["lr"].item() == pytest.approx(adamw.param_groups[0]["lr"])
 
-    #the sweep settings reach both
     adamw, muon = make_optimizers(model, 1e-3, CPU, weight_decay=0.1, muon_momentum=0.9)
     assert muon.param_groups[0]["weight_decay"] == adamw.param_groups[0]["weight_decay"] == 0.1
     assert muon.param_groups[0]["momentum"] == 0.9
 
 
-#QK-norm's gains set how sharp attention can be and the input skip's scales how big the residual stream is, so weight
-#decay must not pull them to zero
 def test_the_qk_norm_gains_and_input_skip_scales_are_not_decayed():
     model = small_model()
-    adamw, muon = make_optimizers(model, 1e-3, CPU, weight_decay=0.1)
+    adamw, _ = make_optimizers(model, 1e-3, CPU, weight_decay=0.1)
 
-    names = {id(parameter): name for name, parameter in model.named_parameters()}
-    undecayed = {names[id(parameter)] for group in adamw.param_groups if group["weight_decay"] == 0 for parameter in group["params"]}
+    undecayed = names_in([group for group in adamw.param_groups if group["weight_decay"] == 0], model)
     qk_gains = {f"encoder.{block}.{norm}.weight" for block in range(2) for norm in ("q_norm", "k_norm")}
     skip_scales = {f"encoder.{block}.{scale}" for block in range(2) for scale in ("residual_scale", "input_scale")}
     assert undecayed == qk_gains | skip_scales
-    assert names_in(muon, model) | names_in(adamw, model) == set(names.values())
 
 
-#catches the embeddings left at the shared learning rate, their decay sped up along with it, or the schedule moving
-#them apart from the rest
 def test_the_embeddings_get_their_own_learning_rate():
     model = small_model()
     adamw, _ = make_optimizers(model, 1e-3, CPU, weight_decay=0.1, embed_lr_multiplier=10)
 
-    names = {id(parameter): name for name, parameter in model.named_parameters()}
-    embeddings = next(group for group in adamw.param_groups if any(names[id(parameter)] == "embed.weight" for parameter in group["params"]))
-    assert {names[id(parameter)] for parameter in embeddings["params"]} == {"embed.weight", "position_embed", "square_features.table"}
+    embeddings = next(group for group in adamw.param_groups if "embed.weight" in names_in([group], model))
+    assert names_in([embeddings], model) == {"embed.weight", "position_embed", "square_features.table"}
     assert embeddings["lr"] == pytest.approx(1e-2)
     assert embeddings["lr"] * embeddings["weight_decay"] == pytest.approx(1e-3 * 0.1)
 
@@ -76,7 +66,7 @@ def test_the_embeddings_get_their_own_learning_rate():
     assert embeddings["lr"] == pytest.approx(10 * adamw.param_groups[0]["lr"])
 
 
-#Muon's learning rate is a tensor; the schedule has to move it just like AdamW's float
+#Muon's learning rate is a tensor, which the schedule has to move just like AdamW's float
 def test_the_schedule_moves_both_learning_rates_alike():
     model = small_model()
     optimizers = make_optimizers(model, 1e-3, CPU)
@@ -96,14 +86,15 @@ def test_the_schedule_moves_both_learning_rates_alike():
         assert muon_lr.item() == pytest.approx(adamw_lr)
 
 
-#both optimizers really step their weights
 def test_training_with_muon_learns_a_batch():
     model = small_model()
     boards = torch.randint(0, 13, (16, 70))
     target_moves = torch.randint(0, 1968, (16, 1))
     target_probabilities = torch.ones(16, 1)
     optimizers = make_optimizers(model, 3e-3, CPU)
-    weights_before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    stepped = ["encoder.0.Q.weight", "encoder.1.mlp.down_projection.weight", "embed.weight", "from_projection.weight"]
+    parameters = dict(model.named_parameters())
+    weights_before = {name: parameters[name].detach().clone() for name in stepped}
 
     losses = []
     for _ in range(30):
@@ -116,20 +107,23 @@ def test_training_with_muon_learns_a_batch():
             optimizer.step()
 
     assert losses[-1] < losses[0] / 2
-    for name in ["encoder.0.Q.weight", "encoder.1.mlp.down_projection.weight", "embed.weight", "from_projection.weight"]:
-        assert not torch.equal(dict(model.named_parameters())[name], weights_before[name]), name
+    for name in stepped:
+        assert not torch.equal(parameters[name], weights_before[name]), name
 
 
-#a step of train.train's: the bf16 copy's gradients reach the fp32 weights whole, and the copy then has the stepped
-#weights. A copy that kept its own weights, or optimizers stepping it directly, would train in bf16 alone
+#a step of train.train's: the bf16 copy's gradients reach the fp32 weights whole, and the copy then has the stepped weights
 def test_master_weights_step_the_fp32_model_and_the_bf16_copy_follows():
     model = small_model()
     master_weights = MasterWeights(model)
     compute_model = master_weights.compute_model
     assert compute_model.encoder[0].Q.weight.dtype == torch.bfloat16 and compute_model.eval_head[0].weight.dtype == torch.float32
-    #from the start too: a resumed run starts from a new copy, whose heads must not be rounded to bf16
-    for parameter, compute_parameter in zip(model.parameters(), compute_model.parameters()):
-        assert torch.equal(compute_parameter, parameter.to(compute_parameter.dtype))
+
+    def assert_copy_has_the_weights():
+        for parameter, compute_parameter in zip(model.parameters(), compute_model.parameters()):
+            assert torch.equal(compute_parameter, parameter.to(compute_parameter.dtype))
+
+    #a resumed run starts from a new copy, whose heads must not be rounded to bf16
+    assert_copy_has_the_weights()
     optimizers = make_optimizers(model, 3e-3, CPU)
     query_weights_before = model.encoder[0].Q.weight.detach().clone()
 
@@ -145,16 +139,14 @@ def test_master_weights_step_the_fp32_model_and_the_bf16_copy_follows():
 
     assert all(parameter.dtype == torch.float32 for parameter in model.parameters())
     assert not torch.equal(model.encoder[0].Q.weight, query_weights_before)
-    for parameter, compute_parameter in zip(model.parameters(), compute_model.parameters()):
-        assert torch.equal(compute_parameter, parameter.to(compute_parameter.dtype))
+    assert_copy_has_the_weights()
 
 
 def test_the_blunder_loss_is_minus_log_of_the_probability_left_to_other_moves():
     logits = torch.log(torch.tensor([[0.5, 0.3, 0.2]]))
 
-    #no blunders: nothing to push off
     assert blunder_loss(logits, torch.tensor([[NO_MOVE, NO_MOVE]])).item() == pytest.approx(0.0, abs=1e-6)
-    #moves 1 and 2 are blunders: they hold 0.5 of the probability together
+    #moves 1 and 2 hold 0.5 together
     assert blunder_loss(logits, torch.tensor([[1, 2]])).item() == pytest.approx(-torch.log(torch.tensor(0.5)).item(), rel=1e-5)
 
 
@@ -173,7 +165,7 @@ MUON_SHAPES = [(24, 40), (40, 24), (32, 32), (24, 40), (40, 24), (32, 32), (8, 4
 MUON_SETTINGS = dict(weight_decay=0.5, momentum=0.9, adjust_lr_fn="match_rms_adamw")
 
 
-#torch's Muon and BatchedMuon on the same weights, each with its own copies
+#torch's Muon and BatchedMuon on copies of the same weights
 def muon_pair(device: torch.device = CPU, nesterov: bool = True) -> list[tuple[torch.optim.Muon, list[torch.nn.Parameter]]]:
     torch.manual_seed(0)
     weights = [torch.randn(shape, device=device) for shape in MUON_SHAPES]
@@ -198,9 +190,6 @@ def assert_moved_alike(expected_parameters, actual_parameters, starts, tolerance
         assert (actual - expected).norm() <= tolerance * (expected - start).norm()
 
 
-#catches an update that differs from torch's by more than bf16 rounding: one norm shared by a shape's matrices (the
-#gradients are scaled apart for it), a tall matrix not transposed, the decay or the shape scaling of the learning rate
-#left out, a learning rate tensor that the schedule's changes do not reach, a momentum buffer that differs
 @pytest.mark.parametrize("nesterov", [True, False])
 def test_batched_muon_steps_like_torchs_muon(nesterov):
     (reference, reference_parameters), (batched, batched_parameters) = muon_pair(nesterov=nesterov)
@@ -219,7 +208,7 @@ def test_batched_muon_steps_like_torchs_muon(nesterov):
         assert torch.equal(reference.state[expected]["momentum_buffer"], batched.state[actual]["momentum_buffer"])
 
 
-#a run resumes from the Muon state it saved: the saved layout is torch's, and either class continues from the other's
+#a run resumes from the saved Muon state: the layout is torch's, and either class continues from the other's
 def test_batched_muon_and_torchs_muon_load_each_others_saved_state():
     for saving_class, loading_class in ((torch.optim.Muon, BatchedMuon), (BatchedMuon, torch.optim.Muon)):
         torch.manual_seed(0)
@@ -234,13 +223,14 @@ def test_batched_muon_and_torchs_muon_load_each_others_saved_state():
         loaded_parameters = [torch.nn.Parameter(parameter.detach().clone()) for parameter in saved_parameters]
         loading = loading_class(loaded_parameters, lr=torch.tensor(5e-3), **MUON_SETTINGS)
         loading.load_state_dict(state)
-        assert loading.state_dict()["param_groups"][0].keys() == state["param_groups"][0].keys()
-        assert all(state_of.keys() == {"momentum_buffer"} for state_of in loading.state_dict()["state"].values())
+        reloaded = loading.state_dict()
+        assert reloaded["param_groups"][0].keys() == state["param_groups"][0].keys()
+        assert all(state_of.keys() == {"momentum_buffer"} for state_of in reloaded["state"].values())
         assert loading.param_groups[0]["lr"].item() == pytest.approx(1e-2)
         for saved, loaded in zip(saved_parameters, loaded_parameters):
             assert torch.equal(saving.state[saved]["momentum_buffer"], loading.state[loaded]["momentum_buffer"])
 
-        #both go on with the same gradients: without the momentum the steps would differ
+        #without the loaded momentum these steps would differ
         starts = [parameter.detach().clone() for parameter in saved_parameters]
         for _ in range(3):
             give_same_gradients([saved_parameters, loaded_parameters], generator)
@@ -249,8 +239,7 @@ def test_batched_muon_and_torchs_muon_load_each_others_saved_state():
         assert_moved_alike(saved_parameters, loaded_parameters, starts, 1e-2)
 
 
-#the compiled step is a cuda graph in the run, and the matrices go through cuBLAS in batches: a different rounding, so the
-#tolerance is that of bf16 rather than of the cpu test
+#looser tolerance than the cpu test: the compiled step is a cuda graph and cuBLAS batches round differently
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 def test_the_compiled_step_of_batched_muon_matches_torchs_muon_on_the_gpu():
     (reference, reference_parameters), (batched, batched_parameters) = muon_pair(torch.device("cuda"))
