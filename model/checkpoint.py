@@ -10,7 +10,7 @@ RUNS_DIR = ARTIFACTS_DIR / "runs"
 
 PRE_CLEANUP_SETTINGS = ("history", "future", "dropout", "swiglu", "value_target")
 
-#the mlp width of checkpoints from before mlp_hidden was a setting; rounds differently from mlp_hidden_width
+#rounds differently from mlp_hidden_width
 def legacy_mlp_hidden(d_model: int, mlp_ratio: float | None) -> int:
     if mlp_ratio is None:
         return 8 * math.ceil(d_model / 3)
@@ -31,7 +31,7 @@ def latest_checkpoint() -> Path:
 def save_checkpoint(model: ChessTransformer, model_settings: dict, checkpoint_path: Path) -> None:
     torch.save({"model_settings": model_settings, "state_dict": model.state_dict()}, checkpoint_path)
 
-#the model on device, in training mode, and its settings
+#the model is in training mode
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[ChessTransformer, dict]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if "model_settings" not in checkpoint:
@@ -51,7 +51,7 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[ChessT
     model_settings.setdefault("value_bins", 1)
     if "mlp_hidden" not in model_settings:
         model_settings["mlp_hidden"] = legacy_mlp_hidden(model_settings["d_model"], model_settings.pop("mlp_ratio", None))
-    #the runs of 2026-10-07, when these two were settings, name them
+    #always on now, so no longer settings
     for name in ("input_skip", "rms_norm"):
         model_settings.pop(name, None)
     state_dict = checkpoint["state_dict"]
@@ -63,7 +63,7 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[ChessT
 
     return model.to(device), model_settings
 
-#the checkpoint's size and weights to train on, with value_bins eval head bins: other bins renew only the head's last layer
+#other value_bins renew only the eval head's last layer
 def warm_start(checkpoint_path: Path, device: torch.device, value_bins: int) -> tuple[ChessTransformer, dict]:
     model, model_settings = load_checkpoint(checkpoint_path, device)
     if value_bins == model_settings["value_bins"]:

@@ -5,21 +5,17 @@ import math
 from model.encoding import BOARD_VOCAB_SIZE, TOKENS_PER_BOARD, MOVE_FROM_SQUARES, MOVE_TO_SQUARES, NUM_SQUARES, NUM_PIECE_CODES, NUM_PIECE_TYPES, PROMOTION_MOVE_IDS, PROMOTION_TO_SQUARES, PROMOTION_PIECES
 
 VALUE_TOKEN_DIM = 16
-
-#the eval head's bins over the expected score (HL-Gauss); 1 is one logit of the score
 VALUE_BINS = 128
-
-#the mlp's hidden width is rounded down to whole tensor core tiles; a multiple of 16 is not enough
 MLP_WIDTH_MULTIPLE = 32
 
 def mlp_hidden_width(d_model: int, mlp_ratio: float | None = None) -> int:
     ratio = 8 / 3 if mlp_ratio is None else mlp_ratio
     return max(MLP_WIDTH_MULTIPLE, int(ratio * d_model) // MLP_WIDTH_MULTIPLE * MLP_WIDTH_MULTIPLE)
 
-def value_bin_edges(bins: int, device: torch.device | None = None) -> torch.Tensor:
+def value_bin_edges(bins: int, device: torch.device) -> torch.Tensor:
     return torch.linspace(0, 1, bins + 1, device=device)
 
-#the eval head's output as the expected score, 0 to 1
+#0 to 1: a win scores 1, a draw 0.5
 def expected_score(value_logits: torch.Tensor) -> torch.Tensor:
     bins = value_logits.shape[-1]
     if bins == 1:
@@ -40,14 +36,13 @@ class SwiGLU(nn.Module):
         return self.down_projection(F.silu(self.gate_projection(x)) * self.up_projection(x))
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, position_templates: int, mlp_hidden: int, qk_ratio: float = 1.0, kv_heads: int | None = None):
+    def __init__(self, d_model: int, n_heads: int, position_templates: int, mlp_hidden: int, qk_ratio: float, kv_heads: int | None):
         super().__init__()
 
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads #n_heads must divide d_model
         self.d_qk_head = max(1, round(qk_ratio * self.d_head))
-        #grouped-query attention: each key/value head is shared by a group of neighbouring heads, None is one per head
         self.kv_heads = kv_heads or n_heads
         if n_heads % self.kv_heads != 0:
             raise ValueError(f"{n_heads} heads cannot be split into groups for {self.kv_heads} key/value heads")
@@ -71,12 +66,10 @@ class TransformerBlock(nn.Module):
 
         self.template_mix = nn.Linear(d_model, position_templates * n_heads)
 
-        #how much of the stream and of the input embedding the block reads; 1 and 0 start it as a plain block
         self.residual_scale = nn.Parameter(torch.ones(1))
         self.input_scale = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor, templates: torch.Tensor, original_board_embed: torch.Tensor) -> torch.Tensor:
-        #x is B T d_model, templates is position_templates 64 64 and shared by every block
         B, T, _ = x.shape
         residual = self.residual_scale * x + self.input_scale * original_board_embed
         x_norm = self.ln1(residual)
@@ -85,19 +78,18 @@ class TransformerBlock(nn.Module):
         K = self.K(x_norm)
         V = self.V(x_norm)
 
-        Q_heads = self.q_norm(Q.reshape(B, T, self.n_heads, self.d_qk_head)).transpose(1, 2) #B n_heads T d_qk_head
+        Q_heads = self.q_norm(Q.reshape(B, T, self.n_heads, self.d_qk_head)).transpose(1, 2)
         K_heads = self.k_norm(K.reshape(B, T, self.kv_heads, self.d_qk_head)).transpose(1, 2)
         V_heads = V.reshape(B, T, self.kv_heads, self.d_head).transpose(1, 2)
 
         #head h reads key/value head h // heads_per_kv
         K_heads = K_heads.repeat_interleave(self.heads_per_kv, dim=1)
-        V_heads = V_heads.repeat_interleave(self.heads_per_kv, dim=1) #B n_heads T d_head
+        V_heads = V_heads.repeat_interleave(self.heads_per_kv, dim=1)
 
-        attention = (Q_heads @ K_heads.transpose(-2, -1)) / math.sqrt(self.d_qk_head) #B n_heads T T
+        attention = (Q_heads @ K_heads.transpose(-2, -1)) / math.sqrt(self.d_qk_head)
 
         coefficients = self.template_mix(x_norm[:, :NUM_SQUARES]).reshape(B, NUM_SQUARES, self.n_heads, self.position_templates)
-        bias = torch.einsum("biht,tij->bhij", coefficients, templates) #B n_heads 64 64
-        #padded with zeros for the metadata tokens
+        bias = torch.einsum("biht,tij->bhij", coefficients, templates)
         metadata_tokens = T - NUM_SQUARES
         attention = attention + F.pad(bias, (0, metadata_tokens, 0, metadata_tokens))
 
@@ -117,7 +109,6 @@ EDGE = NUM_PIECE_CODES #the code past every edge of the board
 DIRECTIONS = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (-1, 1), (1, -1), (-1, -1)]
 KNIGHT_JUMPS = [(1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1), (-2, 1), (-1, 2)]
 
-#rows of each square feature
 NO_PIECE = 15 * 15 #the offset feature's row when there is no such piece
 OFFSET_ROWS = NO_PIECE + 1 #where the square is from a piece: (rank step + 7) * 15 + file step + 7
 NEIGHBOUR_ROWS = NUM_PIECE_CODES + 1 #a neighbour's code, or the edge
@@ -140,7 +131,6 @@ class SquareFeatures(nn.Module):
     #file. 23 learned vectors, summed
     def __init__(self, d_model: int):
         super().__init__()
-        #the row each of the 23 features starts at, in the order of indices()
         slot_rows = [OFFSET_ROWS] * 4 + [NEIGHBOUR_ROWS] * 8 + [LINE_ROWS] * 8 + [KNIGHT_ROWS] + [PAWN_ROWS] * 2
         self.register_buffer("row_offsets", torch.tensor([0] + slot_rows[:-1]).cumsum(0), persistent=False)
         #zeros: a new model starts without the features and draws no random numbers
@@ -157,16 +147,16 @@ class SquareFeatures(nn.Module):
     #B 64 23: each square's row within each feature's rows
     def indices(self, board_state: torch.Tensor) -> torch.Tensor:
         squares = board_state[:, :NUM_SQUARES]
-        padded = F.pad(squares, (0, 1), value=EDGE) #B 65, the square past the edge last
+        padded = F.pad(squares, (0, 1), value=EDGE) #index 64 is past the edge
 
         offsets = []
         for code in (KING, KING + THEIRS, QUEEN, QUEEN + THEIRS):
             present = squares == code
-            square = present.int().argmax(dim=1) #the first one; a second queen is rare
+            square = present.int().argmax(dim=1) #the first one only
             offsets.append(torch.where(present.any(dim=1, keepdim=True), self.offsets[:, square].T, NO_PIECE))
 
-        #the neighbours are the first squares out along the lines, then the first piece and how far
-        along = padded[:, self.rays] #B 64 8 7
+        #neighbours: the first square out each way; lines: the first piece and how far
+        along = padded[:, self.rays]
         first, distance = first_along(along, (along != 0) & (along != EDGE))
         lines = torch.where(first > 0, 1 + (first - 1) * 7 + distance, 0)
 
@@ -180,7 +170,6 @@ class SquareFeatures(nn.Module):
         return torch.cat([torch.stack(offsets, dim=-1), along[..., 0], lines, knights.unsqueeze(-1), pawns], dim=-1)
 
     def forward(self, board_state: torch.Tensor) -> torch.Tensor:
-        #embedding_bag sums the 23 rows without holding them all
         B = board_state.shape[0]
         rows = self.indices(board_state) + self.row_offsets
         return F.embedding_bag(rows.reshape(B * NUM_SQUARES, -1), self.table, mode="sum").reshape(B, NUM_SQUARES, -1)
@@ -202,7 +191,6 @@ class ChessTransformer(nn.Module):
 
         self.square_features = SquareFeatures(d_model)
 
-        #attention bias templates, each 64x64, shared by every block
         self.templates = nn.Parameter(torch.zeros(position_templates, NUM_SQUARES, NUM_SQUARES))
 
         qk_ratios = list(qk_ratio) if isinstance(qk_ratio, (list, tuple)) else [qk_ratio] * num_layers
@@ -225,19 +213,18 @@ class ChessTransformer(nn.Module):
         self.register_buffer("from_squares", torch.tensor(MOVE_FROM_SQUARES, dtype=torch.long))
         self.register_buffer("to_squares", torch.tensor(MOVE_TO_SQUARES, dtype=torch.long))
 
-        #the 176 promotions: move id, landing square and piece (0-3)
+        #per promotion move: its id, landing square and piece (0-3)
         self.register_buffer("promotion_move_ids", torch.tensor(PROMOTION_MOVE_IDS, dtype=torch.long))
         self.register_buffer("promotion_to_squares", torch.tensor(PROMOTION_TO_SQUARES, dtype=torch.long))
         self.register_buffer("promotion_pieces", torch.tensor(PROMOTION_PIECES, dtype=torch.long))
 
         self.from_projection = nn.Linear(d_model, d_model)
         self.to_projection = nn.Linear(d_model, d_model)
-        self.promotion_projection = nn.Linear(d_model, 4) #one per piece a pawn can become
+        self.promotion_projection = nn.Linear(d_model, 4) #knight, bishop, rook, queen
 
         self.ln = nn.RMSNorm(d_model, eps=1e-5)
 
-    #bf16 (or fp16) weights for all but the heads, which forward runs in fp32 on fp32 inputs; converting them back would
-    #round their weights to the half precision
+    #all but the heads, which forward runs in fp32: weights rounded to half precision would stay rounded
     def half_except_heads(self, dtype: torch.dtype = torch.bfloat16) -> "ChessTransformer":
         heads = (self.from_projection, self.to_projection, self.promotion_projection, self.board_down_project, self.eval_head)
         for child in self.children():
@@ -248,7 +235,7 @@ class ChessTransformer(nn.Module):
         return self
 
     #every read of the residual stream is an RMSNorm, which ignores its scale (all but eps), so scaling everything written
-    #into it changes no output; fp16 inference shrinks it this way (inference.fp16_model)
+    #into it changes no output
     def scale_residual_stream(self, scale: float) -> "ChessTransformer":
         with torch.no_grad():
             for weight in (self.embed.weight, self.position_embed, self.square_features.table):
@@ -262,7 +249,6 @@ class ChessTransformer(nn.Module):
     def forward(self, board_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B = board_state.shape[0]
 
-        #the squares' features; the metadata tokens have none
         embed_state = self.embed(board_state) + self.position_embed + F.pad(self.square_features(board_state), (0, 0, 0, TOKENS_PER_BOARD - NUM_SQUARES))
         original_board_embed = embed_state
 
@@ -272,20 +258,18 @@ class ChessTransformer(nn.Module):
         model_output = self.ln(embed_state)
 
         with torch.autocast(device_type=board_state.device.type, enabled=False):
-            #from and to vectors for the 64 squares, the metadata tokens left out
-            from_vector = self.from_projection(model_output[:, :NUM_SQUARES].float()) #B 64 d_model
+            from_vector = self.from_projection(model_output[:, :NUM_SQUARES].float())
             to_vector = self.to_projection(model_output[:, :NUM_SQUARES].float())
-            promotion_logits = self.promotion_projection(model_output[:, :NUM_SQUARES].float()) #B 64 4
+            promotion_logits = self.promotion_projection(model_output[:, :NUM_SQUARES].float())
 
-            #how much the piece on each square wants to go to each other square, like attention scores
-            logits = (from_vector @ to_vector.transpose(1, 2)) / math.sqrt(self.d_model) #B 64 64
+            logits = (from_vector @ to_vector.transpose(1, 2)) / math.sqrt(self.d_model)
 
-            combined_logits = logits[:, self.from_squares, self.to_squares] #B NUM_MOVE_IDS
+            combined_logits = logits[:, self.from_squares, self.to_squares]
 
-            #only promotions get the promotion term: on every move a constant drifted up until bf16 could not tell logits apart
+            #promotions only: a term on every move can drift without limit
             combined_logits[:, self.promotion_move_ids] += promotion_logits[:, self.promotion_to_squares, self.promotion_pieces]
 
-            compressed_board = self.board_down_project(model_output.float()).reshape(B, -1) #B T * VALUE_TOKEN_DIM
-            board_eval_logits = self.eval_head(compressed_board) #B value_bins
+            compressed_board = self.board_down_project(model_output.float()).reshape(B, -1)
+            board_eval_logits = self.eval_head(compressed_board)
 
         return combined_logits, board_eval_logits

@@ -1,7 +1,4 @@
-#the int8 matmuls of small batches (CONFIGS' rows: 1 and 2 boards) as CUDA kernels: compiled once per process by NVRTC
-#(the copy torch ships) and launched through the CUDA driver on torch's stream, so inside its cuda graphs too. The int32
-#sums are exact in any order (integer atomics) and the epilogue repeats int8_linear_kernel's fp32 operations: the answers
-#are int8_linear's bits. Only on the gpus in CONFIGS; int8_linear's Triton kernel does the rest, and all when these do not compile
+#small-batch int8 matmuls as NVRTC kernels, bit-identical to int8_linear's Triton kernel: exact int32 sums in any order, the same fp32 epilogue
 import ctypes
 import sys
 import warnings
@@ -26,8 +23,7 @@ DEV float div_full(float a, float b) { float y; asm("div.full.f32 %0, %1, %2;" :
 //out[M, N] = epilogue(x[M, K] @ w[N, K]^T), x and w int8. A CTA takes MT m16 tiles x WN * NT n8 tiles: a warp NT of
 //them, WN warps across and WK warps down K, each CK 64-deep chunks. Thread t of a quad loads 16 contiguous bytes of a
 //row's chunk for both operands (the chunk's k order permuted alike in x and w, which leaves the int32 sums unchanged).
-//EPI: 0 bias, 1 silu(gate) * up (w's rows: gate then up), 2 residual, 3 residual then the next block's input mix. The
-//weights are read before the wait for the previous kernel
+//EPI: 0 bias, 1 silu(gate) * up (w's rows: gate then up), 2 residual, 3 residual then the next block's input mix
 template <int MT, int NT, int WN, int WK, int CK, int EPI>
 __global__ void __launch_bounds__(WN * WK * 32) small_int8(
     const signed char* __restrict__ x, const float* __restrict__ x_scale, const signed char* __restrict__ w,
@@ -75,6 +71,7 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
     for (int i = threadIdx.x * 4; i < G * BM * ROW; i += THREADS * 4)
         *reinterpret_cast<int4*>(partial + i) = make_int4(0, 0, 0, 0);
 
+    //what the previous kernel writes (x, residual, original) is read after the wait, the weights before
     asm volatile("griddepcontrol.wait;" ::: "memory");
     //rows past M read row M - 1: their sums are never stored
     uint4 xv[CK][MT][2];
@@ -97,7 +94,6 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
         if (EPI == 3)
             mix[k] = valid[k] ? *reinterpret_cast<const uint2*>(original + offset) : make_uint2(0, 0);
     }
-    //the zeroed partial sums
     __syncthreads();
 
     int acc[G][MT][NT][4];
@@ -131,15 +127,10 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
             #pragma unroll
             for (int j = 0; j < NT; j++) {
                 int* p = partial + (h * BM + i * 16 + g) * ROW + nw * NT * 8 + j * 8 + t * 2;
-                if (WK > 1) {
-                    atomicAdd(p, acc[h][i][j][0]);
-                    atomicAdd(p + 1, acc[h][i][j][1]);
-                    atomicAdd(p + 8 * ROW, acc[h][i][j][2]);
-                    atomicAdd(p + 8 * ROW + 1, acc[h][i][j][3]);
-                } else {
-                    *reinterpret_cast<int2*>(p) = make_int2(acc[h][i][j][0], acc[h][i][j][1]);
-                    *reinterpret_cast<int2*>(p + 8 * ROW) = make_int2(acc[h][i][j][2], acc[h][i][j][3]);
-                }
+                atomicAdd(p, acc[h][i][j][0]);
+                atomicAdd(p + 1, acc[h][i][j][1]);
+                atomicAdd(p + 8 * ROW, acc[h][i][j][2]);
+                atomicAdd(p + 8 * ROW + 1, acc[h][i][j][3]);
             }
     __syncthreads();
 
@@ -183,13 +174,13 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
 }
 """
 
-#(MT, NT, WN, WK, CK) by (compute capability, multiprocessors: 70 RTX 5070 Ti, 170 RTX 5090) and kind, by the most rows each takes
+#(compute capability, multiprocessors: 70 RTX 5070 Ti, 170 RTX 5090) -> kind -> [(most rows, (MT, NT, WN, WK, CK))]
 CONFIGS = {(12, 0, 70): {"projection": [(70, (5, 4, 1, 12, 1))], "gate_up": [(70, (5, 1, 1, 12, 1))], "down": [(70, (3, 4, 1, 8, 2))]},
-           (12, 0, 170): {"projection": [(70, (3, 4, 1, 12, 1)), (140, (3, 4, 1, 12, 1))],
+           (12, 0, 170): {"projection": [(140, (3, 4, 1, 12, 1))],
                           "gate_up": [(70, (3, 2, 1, 12, 1)), (140, (3, 2, 2, 6, 2))],
                           "down": [(70, (3, 3, 1, 8, 2)), (140, (3, 4, 1, 8, 2))]}}
 EPILOGUES = {"projection": 0, "gate_up": 1, "down": 2, "mixing down": 3}
-#off: int8_linear's Triton kernel everywhere (the tests of that kernel)
+#tests turn it off to run int8_linear's Triton kernel everywhere
 ENABLED = True
 
 CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION = 6
@@ -255,7 +246,6 @@ def compile_cubin(source: str, names: list[str], capability: tuple[int, int]) ->
 
 
 class Kernels:
-    #the configs of one gpu, compiled and loaded into torch's context on it
     def __init__(self, device: torch.device, configs: dict[str, list[tuple[int, tuple]]]):
         self.configs = configs
         self.driver = ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
@@ -265,13 +255,14 @@ class Kernels:
         names = {key: kernel_name(*key) for key in wanted}
         cubin, lowered = compile_cubin(SOURCE, list(names.values()), torch.cuda.get_device_capability(device))
         with torch.cuda.device(device):
+            #makes torch's context current, which the module loads into
             torch.empty(0, device=device)
-            self.module = ctypes.c_void_p()
-            self.check(self.driver.cuModuleLoadData(ctypes.byref(self.module), cubin))
+            module = ctypes.c_void_p()
+            self.check(self.driver.cuModuleLoadData(ctypes.byref(module), cubin))
         self.functions = {}
         for key, name in names.items():
             function = ctypes.c_void_p()
-            self.check(self.driver.cuModuleGetFunction(ctypes.byref(function), self.module, lowered[name].encode()))
+            self.check(self.driver.cuModuleGetFunction(ctypes.byref(function), module, lowered[name].encode()))
             self.functions[key] = function
 
     def check(self, result: int) -> None:
@@ -282,7 +273,7 @@ class Kernels:
 
     #tensors: the kernel's pointer arguments in order (None for unused ones); with programmatic dependent launch
     def launch(self, config: tuple, epilogue: int, tensors: list, M: int, N: int, K: int) -> None:
-        mt, nt, wn, wk, ck = config
+        mt, nt, wn, wk, _ = config
         attribute = (LaunchAttribute * 1)()
         attribute[0].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
         attribute[0].value[0] = 1
@@ -294,7 +285,7 @@ class Kernels:
         self.check(self.driver.cuLaunchKernelEx(ctypes.byref(launch), self.functions[config, epilogue], pointers, None))
 
 
-#Kernels by gpu index, or None where they are not used
+#None for a gpu without configs, or whose kernels did not compile
 KERNELS: dict[int, Kernels | None] = {}
 
 
@@ -311,7 +302,6 @@ def kernels(device: torch.device) -> Kernels | None:
     return KERNELS[index]
 
 
-#the kernels and config that take a kind's matmul of M rows and depth K on this gpu, or None (Triton's then)
 def config_for(device: torch.device, kind: str, M: int, K: int) -> tuple[Kernels, tuple] | None:
     found = kernels(device) if ENABLED and device.type == "cuda" else None
     if found is None:
@@ -321,7 +311,7 @@ def config_for(device: torch.device, kind: str, M: int, K: int) -> tuple[Kernels
     return (found, config) if config is not None and K == config[3] * config[4] * 64 else None
 
 
-#whether one of kinds' matmuls of M rows and depth K would run here (the kernel before it may then let it launch early)
+#whether one of kinds' matmuls of M rows and depth K would run here: the kernel before it may then let it launch early
 def takes_rows(device: torch.device, kinds: tuple[str, ...], M: int, K: int) -> bool:
     return any(config_for(device, kind, M, K) is not None for kind in kinds)
 

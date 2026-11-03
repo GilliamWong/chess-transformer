@@ -1,6 +1,3 @@
-#the d768's template attention as one NVRTC kernel (launched as model/int8_cuda.py launches its kernels): a CTA makes its 8 heads'
-#template bias 16 squares at a time in shared memory and attends with it, the metadata rows last. Used only on the gpus in
-#TIMED; fused_blocks.template_attention runs its Triton kernels elsewhere
 import ctypes
 import math
 import sys
@@ -31,13 +28,13 @@ DEV float quad_sum(float x) { x += __shfl_xor_sync(0xffffffff, x, 1); return x +
 DEV float quad_max(float x) { x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, 1)); return fmaxf(x, __shfl_xor_sync(0xffffffff, x, 2)); }
 #define NEG_INF __int_as_float(0xff800000)
 
-//a board is 64 squares then 6 metadata tokens, attended in PHASES: slabs of 16 squares, then the metadata
+//a board is 64 squares then 6 metadata tokens, attended in slabs of 16 squares, then the metadata
 //a CTA takes 8 of the 24 query heads: a warp a head, 2 heads to a key/value head
 constexpr int TOKENS = 70, SQUARES = 64, DV = 32, TEMPLATES = 8, HEADS = 24, SLAB = 16, PHASES = SQUARES / SLAB + 1;
 constexpr int HB = @HB@, GROUPS = HB / 2, THREADS = HB * 32;
-//9 key tiles of 8 cover 72 keys (2 never real); KEYS is 5 steps of 16
+//9 key tiles of 8 cover 72 keys, 2 never real; KEYS is 5 steps of 16
 constexpr int KEY_TILES = 9, KEYS = @KEYS@;
-//halves in a value row and a bias row, padded against bank conflicts; a head's bias has a slab's 16 squares and a pad row
+//halves in a value row and a bias row, padded against bank conflicts; a head's bias is a slab's 16 squares and a pad row
 constexpr int VALUE_ROW = @VALUE_ROW@, BIAS_ROW = @BIAS_ROW@, BIAS_ROWS = @BIAS_ROWS@;
 
 //a board's row of projected is q (24 x DQ) | k (12 x DQ) | v (12 x DV) | the template mix (24 x TEMPLATES)
@@ -58,7 +55,7 @@ DEV void load_queries(const u16* board, int head, int first, int g, int t, u32 (
         }
 }
 
-//a warp's mma operands for the bias of its pair of squares: their templates (B, depth 0-7 one square and 8-15 the other)
+//a warp's mma operands for its pair of squares: their templates (B, depth 0-7 one square and 8-15 the other)
 //and the 8 heads' template coefficients (A, rows 0-7 one square and 8-15 the other)
 struct BiasOperands {
     u32 templates[SQUARES / 8][2], coefficients[2];
@@ -82,7 +79,7 @@ DEV void load_bias_operands(BiasOperands& operands, const u16* board, const u32*
     }
 }
 
-//a slab's bias for the 8 heads, rounded to fp16 as template_bias_kernel stores it
+//rounded to fp16 as template_bias_kernel stores it
 DEV void make_bias(const BiasOperands& operands, u16* to_bias, int warp, int g, int t)
 {
     #pragma unroll
@@ -97,7 +94,7 @@ DEV void make_bias(const BiasOperands& operands, u16* to_bias, int warp, int g, 
 
 //out[b, token, head * DV + :] for the 8 heads from blockIdx.x * 8 of position blockIdx.y
 template <int DQ>
-__global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
+__global__ void __launch_bounds__(THREADS, @CTAS_PER_MULTIPROCESSOR@) template_attention_cuda(
     const u16* __restrict__ projected, const u32* __restrict__ templates, const u16* __restrict__ q_gain,
     const u16* __restrict__ k_gain, u16* __restrict__ out, float eps, float scale)
 {
@@ -108,7 +105,7 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int b = blockIdx.y, head = blockIdx.x * HB + warp, group = warp >> 1, kv = blockIdx.x * GROUPS + group;
 
-    //the queries' gains are read where used at 24 dims: registers run out
+    //at 24 dims the queries' gains are read where used: registers run out
     constexpr bool HOLD_QUERY_GAINS = DQ <= 16;
     float q_gains[BLOCKS][2], k_gains[BLOCKS][2];
     #pragma unroll
@@ -121,7 +118,6 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
     asm volatile("griddepcontrol.wait;" ::: "memory");
     const u16* board = projected + (size_t)b * TOKENS * WIDTH;
 
-    //the values copy to shared memory asynchronously while the rest of the prologue loads
     #pragma unroll
     for (int round = 0; round < GROUPS * KEYS * 4 / THREADS; round++) {
         const int item = threadIdx.x + round * THREADS;
@@ -174,7 +170,6 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
             make_bias(operands, bias, warp, g, t);
             __syncthreads();
         }
-        //the next slab's loads overlap this one's attention
         u32 next_queries[BLOCKS][2];
         if (!metadata) {
             load_queries<DQ>(board, head, phase + 1 < PHASES - 1 ? (phase + 1) * SLAB : SQUARES, g, t, next_queries);
@@ -302,20 +297,19 @@ __global__ void __launch_bounds__(THREADS, 2) template_attention_cuda(
 """
 
 HEADS_PER_CTA, KEYS, VALUE_ROW, BIAS_ROW, BIAS_ROWS = 8, 80, 40, 72, 17
-for name, value in {"HB": HEADS_PER_CTA, "KEYS": KEYS, "VALUE_ROW": VALUE_ROW, "BIAS_ROW": BIAS_ROW, "BIAS_ROWS": BIAS_ROWS}.items():
+CTAS_PER_MULTIPROCESSOR = 2
+for name, value in {"HB": HEADS_PER_CTA, "KEYS": KEYS, "VALUE_ROW": VALUE_ROW, "BIAS_ROW": BIAS_ROW, "BIAS_ROWS": BIAS_ROWS,
+                    "CTAS_PER_MULTIPROCESSOR": CTAS_PER_MULTIPROCESSOR}.items():
     SOURCE = SOURCE.replace(f"@{name}@", str(value))
 THREADS = HEADS_PER_CTA * 32
 #fp16 bytes: a key/value head's values for each 2 query heads, and a slab of bias for each
 SHARED_BYTES = 2 * (HEADS_PER_CTA // 2 * KEYS * VALUE_ROW + HEADS_PER_CTA * BIAS_ROWS * BIAS_ROW)
 
-#(compute capability, multiprocessors) of the gpus the kernel is timed on -> (fewest positions it takes, share of the CTA slots
-#its last wave must fill: a few CTAs past a wave take as long as another)
+#(compute capability, multiprocessors) -> (fewest positions the kernel takes, share of the CTA slots its last wave must fill:
+#a few CTAs past a wave take as long as another)
 TIMED = {(12, 0, 70): (36, 0.55), (12, 0, 170): (32, 0.0)}
 CTAS_PER_POSITION = 24 // HEADS_PER_CTA
-#as the source's __launch_bounds__
-CTAS_PER_MULTIPROCESSOR = 2
 DQS = (8, 16, 24)
-#tests turn it off to run the Triton kernels
 ENABLED = True
 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
 
@@ -349,7 +343,6 @@ class Kernels:
             self.driver.cuGetErrorString(result, ctypes.byref(message))
             raise RuntimeError(f"CUDA driver: {message.value.decode() if message.value else result}")
 
-    #whether the kernel is timed faster than the Triton kernels for this many positions
     def takes(self, positions: int) -> bool:
         ctas = CTAS_PER_POSITION * positions
         waves = -(-ctas // self.slots)
@@ -368,7 +361,6 @@ class Kernels:
         self.check(self.driver.cuLaunchKernelEx(ctypes.byref(launch), self.functions[dq], pointers, None))
 
 
-#Kernels by gpu index, None where they are not used
 KERNELS: dict[int, Kernels | None] = {}
 
 
@@ -385,15 +377,14 @@ def kernels(device: torch.device) -> Kernels | None:
     return KERNELS[index]
 
 
-#by data_ptr: the templates [template][square][key] as the kernel's bias operands read them, [square][key % 8][template // 2][key // 8]
-#of pairs of templates, and the version they were made at; the entry holds the tensor so that its memory is not another's.
-#Models pair theirs on threads, one a gpu
+#by data_ptr: the templates, their version and the pairs of templates [square][key % 8][template // 2][key // 8] made from them;
+#the entry holds the templates so that their memory is not another's. Models pair theirs on threads, one a gpu
 PAIRED: dict[int, tuple[torch.Tensor, int, torch.Tensor]] = {}
 PAIRED_LOCK = threading.Lock()
 PAIRED_MOST = 64
 
 
-#the count of in-place updates of a tensor (an inference tensor has none)
+#an inference tensor counts no in-place updates
 def version(tensor: torch.Tensor) -> int:
     return 0 if tensor.is_inference() else tensor._version
 
@@ -419,7 +410,7 @@ def prepare(templates: torch.Tensor) -> None:
         paired_templates(templates)
 
 
-#template_attention's answer from the CUDA kernel, or None where it takes neither these shapes, this gpu nor this many positions
+#None where the shapes, the gpu or the number of positions are not the kernel's
 def cuda_template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain: torch.Tensor, k_gain: torch.Tensor, heads: int, kv_heads: int,
                             dq: int, dv: int, templates_count: int, eps: float) -> torch.Tensor | None:
     if not (ENABLED and projected.is_cuda):
@@ -432,7 +423,7 @@ def cuda_template_attention(projected: torch.Tensor, templates: torch.Tensor, q_
         return None
     paired = paired_templates(templates)
     projected, q_gain, k_gain = projected.contiguous(), q_gain.contiguous(), k_gain.contiguous()
-    #the kernel's vector loads
+    #the kernel's vector loads need 16 byte alignment
     if paired is None or projected.data_ptr() % 16:
         return None
     out = torch.empty(B, T, heads * dv, device=projected.device, dtype=projected.dtype)

@@ -1,4 +1,3 @@
-#the engine's int8 blocks: weights scaled per output channel, inputs per token, combine_heads left in fp16
 import math
 
 import torch
@@ -16,7 +15,7 @@ from model.int8_cuda import kernels, small_int8_linear, takes_rows
 HADAMARD_BLOCK = 32
 #down's input width is the mlp's hidden zero-padded to a multiple of this, so every BLOCK_K divides it
 DOWN_INPUT_MULTIPLE = 128
-#int8 matmul tiles (rows, columns, depth, warps, stages[, max registers]) by compute capability and matmul, for tile_for; within 99 KB of shared memory
+#int8 matmul tiles (rows, columns, depth, warps, stages[, max registers]) by compute capability and matmul, within 99 KB of shared memory
 INT8_TILES = {(12, 0): {"projection": [(2, (32, 64, 64, 4, 4)), (4, (64, 64, 64, 4, 4)), (math.inf, (128, 128, 64, 8, 3))],
                         "gate_up": [(2, (32, 64, 64, 4, 4)), (4, (64, 32, 64, 4, 4)), (8, (128, 32, 64, 4, 3)),
                                     (math.inf, (128, 64, 64, 4, 2))],
@@ -124,7 +123,7 @@ def launch_int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Ten
     return out
 
 
-#opaque to torch.compile, gives fp16; matmul is projection, gate_up or down; original, residual_scale and input_scale make it give the next block's input
+#matmul is projection, gate_up or down, which picks the tile; original, residual_scale and input_scale make it give the next block's input
 @torch.library.custom_op("chess::int8_linear", mutates_args=())
 def int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias: torch.Tensor | None,
                 residual: torch.Tensor | None, gated: bool, matmul: str, original: torch.Tensor | None = None,
@@ -248,7 +247,7 @@ def _(h, hadamard_signs, width):
 
 
 class Int8Block(nn.Module):
-    #takes over a FusedBlock with its int8 weights; output_scale multiplies down's, as fp16 inference shrinks the residual
+    #output_scale multiplies down's, as fp16 inference shrinks the residual
     def __init__(self, block: FusedBlock, weights: dict[str, tuple[torch.Tensor, torch.Tensor]], output_scale: float):
         super().__init__()
         self.heads, self.kv_heads, self.dq, self.dv, self.templates_count = block.heads, block.kv_heads, block.dq, block.dv, block.templates_count
@@ -284,8 +283,7 @@ class Int8Block(nn.Module):
         return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, "down", original_board_embed, *self.next_scales)
 
 
-#the fused model with the blocks of the layers in weights swapped for Int8Blocks; the small-batch CUDA kernels compile now,
-#not while a cuda graph records
+#the small-batch CUDA kernels compile now, not while a cuda graph records
 def quantize_blocks(model: nn.Module, weights: dict[int, dict], output_scale: float) -> nn.Module:
     blocks = [Int8Block(block, weights[layer], output_scale) if layer in weights else block for layer, block in enumerate(model.encoder)]
     link_input_mixes(blocks)

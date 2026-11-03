@@ -12,15 +12,15 @@ EN_PASSANT_INDEX = 69
 
 TOKENS_PER_BOARD = 70
 
-#each slot kind has its own block of token ids so no embedding row is shared across slots; rules.rs repeats the offsets
+#a block of token ids per slot kind; rules.rs repeats the offsets
 NUM_PIECE_CODES = 1 + 2 * NUM_PIECE_TYPES #0 empty, then the side to move's piece types, then the other side's
 NUM_FLAG_VALUES = 2
 
 TURN_TOKEN_OFFSET = NUM_PIECE_CODES
-CASTLING_TOKEN_OFFSET = TURN_TOKEN_OFFSET + NUM_FLAG_VALUES #shared by all four castling slots
+CASTLING_TOKEN_OFFSET = TURN_TOKEN_OFFSET + NUM_FLAG_VALUES
 EN_PASSANT_TOKEN_OFFSET = CASTLING_TOKEN_OFFSET + NUM_FLAG_VALUES
 
-BOARD_VOCAB_SIZE = EN_PASSANT_TOKEN_OFFSET + NUM_SQUARES #en passant is 0 for none, otherwise the square
+BOARD_VOCAB_SIZE = EN_PASSANT_TOKEN_OFFSET + NUM_SQUARES #the en passant slot is 0 for none, otherwise the square
 
 def _build_all_possible_moves() -> tuple[chess.Move, ...]:
     board = chess.Board.empty()
@@ -37,7 +37,7 @@ def _build_all_possible_moves() -> tuple[chess.Move, ...]:
 
         moves.extend(chess.Move(square, destination) for destination in destinations)
 
-    #both colours' promotions: the move ids are fixed by trained checkpoints
+    #both colours' promotions; the order fixes the move ids trained checkpoints use
     for from_rank, to_rank in [(6, 7), (1, 0)]:
         for from_file in range(8):
             for to_file in range(max(from_file - 1, 0), min(from_file + 2, 8)):
@@ -51,7 +51,7 @@ def _build_all_possible_moves() -> tuple[chess.Move, ...]:
 ALL_POSSIBLE_MOVES = _build_all_possible_moves()
 NUM_MOVE_IDS = len(ALL_POSSIBLE_MOVES)
 
-#no eval is the int16 minimum, as in the fishtest set; no move also marks a position not labelled yet
+#no eval is the int16 minimum; no move also marks a position not labelled yet
 NO_EVAL = -32768
 NO_MOVE = -1
 #expected score (0 lost, 1 won) is sigmoid(EXPECTED_SCORE_PER_CENTIPAWN * centipawns), lichess's fit
@@ -68,9 +68,7 @@ PROMOTION_MOVE_IDS = tuple(move_id for move_id, move in enumerate(ALL_POSSIBLE_M
 PROMOTION_TO_SQUARES = tuple(ALL_POSSIBLE_MOVES[move_id].to_square for move_id in PROMOTION_MOVE_IDS)
 PROMOTION_PIECES = tuple(ALL_POSSIBLE_MOVES[move_id].promotion - chess.KNIGHT for move_id in PROMOTION_MOVE_IDS)
 
-#the board is encoded from the side to move: with black to move it is mirrored (ranks flipped, colours swapped),
-#so "white" means the side to move. The turn token keeps the real colour so decode_board can mirror back.
-#square ^ 56 flips the rank; board.mirror() would copy the whole move stack, too slow for the search
+#encoded from the side to move: with black to move the ranks are flipped (square ^ 56) and the colours swapped; the turn token keeps the real colour
 def encode_board(board: chess.Board) -> list[int]:
     turn = board.turn
     opponent = not turn
@@ -111,9 +109,6 @@ def decode_board(encoding: list[int]) -> chess.Board:
 
     return board
 
-def mirror_move(move: chess.Move) -> chess.Move:
-    return chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square), promotion=move.promotion)
-
 #turn is the side playing the move: black's moves are mirrored to match encode_board
 def encode_move_to_id(move: chess.Move, turn: chess.Color) -> int:
     flip = 0 if turn == chess.WHITE else 56
@@ -121,7 +116,9 @@ def encode_move_to_id(move: chess.Move, turn: chess.Color) -> int:
 
 def decode_id_to_move(move_id: int, turn: chess.Color) -> chess.Move:
     move = ALL_POSSIBLE_MOVES[move_id]
-    return mirror_move(move) if turn == chess.BLACK else move
+    if turn == chess.BLACK:
+        return chess.Move(chess.square_mirror(move.from_square), chess.square_mirror(move.to_square), promotion=move.promotion)
+    return move
 
 def integer_to_piece(piece: int) -> chess.Piece | None:
     if piece == 0: return None
