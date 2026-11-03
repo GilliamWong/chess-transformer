@@ -4,7 +4,6 @@ from itertools import islice
 import json
 import time
 from datetime import timedelta
-from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
@@ -30,7 +29,7 @@ CPU = torch.device("cpu")
 needs_gloo = pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires the Gloo backend")
 
 
-#random boards as the data holds them: a piece code on every square (the square features index by it), any token after
+#every square holds a piece code, which the square features index by
 def random_boards(rows: np.random.Generator, size: int) -> np.ndarray:
     squares = rows.integers(0, NUM_PIECE_CODES, (size, NUM_SQUARES))
     metadata = rows.integers(0, BOARD_VOCAB_SIZE, (size, TOKENS_PER_BOARD - NUM_SQUARES))
@@ -130,7 +129,7 @@ def check_shared_clock(rank):
     now = [100.0 + 1000 * rank]
     with patch("training.budget.time.perf_counter", side_effect=lambda: now[0]), patch.object(train_ddp, "CLOCK_EVERY", 2):
         for step, expected_seconds in enumerate((0, 30, 30, 90), start=1):
-            now[0] += 30 if rank == 0 else 300  #the other ranks have deliberately different clocks
+            now[0] += 30 if rank == 0 else 300  #the other ranks' clocks differ on purpose
             optimizer.step()
             train_ddp.step_budget(budget, clock, CPU)
             scheduler.step()
@@ -148,14 +147,13 @@ def check_shared_clock(rank):
 
 
 def check_shared_evaluation():
-    #the ranks' shares add up to train.py's numbers, also when some ranks get no batch
     rows = np.random.default_rng(5)
     size = 11
     val_dataset = data.ChessGamesDataset(
         random_boards(rows, size),
         rows.integers(0, 1968, (size, 2)).astype(np.int16), rows.integers(-300, 300, (size, 2)).astype(np.int16),
         single.TARGET_TEMPERATURE)
-    _, val_loader = data.datasets_to_dataloaders(val_dataset, val_dataset, val_batch_size=4, seed=0)  #batches of 4, 4 and 3
+    _, val_loader = data.datasets_to_dataloaders(val_dataset, val_dataset, val_batch_size=4, seed=0)  #batches of 4, 4 and 3: some ranks get none
     torch.manual_seed(7)
     model = ChessTransformer(d_model=16, num_layers=1, n_heads=2, position_templates=2)
     for max_batches in (None, 2):
@@ -163,15 +161,17 @@ def check_shared_evaluation():
         assert train_ddp.evaluate(model, val_loader, CPU, max_batches) == pytest.approx(expected, rel=1e-6)
 
 
+def write_bins(folder, name, split, **arrays):
+    for field, array in arrays.items():
+        (folder / f"{name}_{split}_{field}.bin").write_bytes(array.tobytes())
+
+
 def write_set(folder, name):
     for split, size in (("train", 32), ("val", 10)):
-        arrays = dict(
-            boards=np.full((size, TOKENS_PER_BOARD), 5, dtype=np.uint8),
-            stockfish_moves=np.tile(np.array([0, 1], dtype=np.int16), (size, 1)),
-            stockfish_evals=np.tile(np.array([120, -60], dtype=np.int16), (size, 1)),
-        )
-        for field, array in arrays.items():
-            (folder / f"{name}_{split}_{field}.bin").write_bytes(array.tobytes())
+        write_bins(folder, name, split,
+                   boards=np.full((size, TOKENS_PER_BOARD), 5, dtype=np.uint8),
+                   stockfish_moves=np.tile(np.array([0, 1], dtype=np.int16), (size, 1)),
+                   stockfish_evals=np.tile(np.array([120, -60], dtype=np.int16), (size, 1)))
 
 
 def distributed_worker(rank, folder, world_size):
@@ -183,7 +183,7 @@ def distributed_worker(rank, folder, world_size):
         check_shared_clock(rank)
 
         use_folder(folder)
-        single.BATCH_SIZE = 8  #10 validation rows includes an incomplete final batch
+        single.BATCH_SIZE = 8  #the 10 validation rows end in an incomplete batch
         single.EVAL_EVERY, single.EVAL_BATCHES = 2, 1
         args = train_ddp.parse_args([
             "--device", "cpu", "--no-compile", "--no-tensorboard", "--name", "smoke",
@@ -199,25 +199,20 @@ def distributed_worker(rank, folder, world_size):
 
 
 def write_varied_set(folder, name, seed=11, castling_free=False):
-    #different rows and blunder labels, so a resumed run that trained on the wrong batches ends with different weights.
     #castling_free: no row has a castling right, so every row can be mirrored
     rows = np.random.default_rng(seed)
     for split, size in (("train", 32), ("val", 10)):
         boards = random_boards(rows, size)
         if castling_free:
             boards[:, WHITE_KINGSIDE_INDEX:BLACK_QUEENSIDE_INDEX + 1] = CASTLING_TOKEN_OFFSET
-        arrays = dict(
-            boards=boards,
-            stockfish_moves=rows.integers(0, 1968, (size, 2)).astype(np.int16),
-            stockfish_evals=rows.integers(-300, 300, (size, 2)).astype(np.int16),
-            worst_moves=np.where(rows.random((size, 4)) < 0.5, rows.integers(0, 1968, (size, 4)), -1).astype(np.int16),
-            worst_losses=np.full((size, 4), 0.5, dtype=np.float16),
-        )
-        for field, array in arrays.items():
-            (folder / f"{name}_{split}_{field}.bin").write_bytes(array.tobytes())
+        write_bins(folder, name, split,
+                   boards=boards,
+                   stockfish_moves=rows.integers(0, 1968, (size, 2)).astype(np.int16),
+                   stockfish_evals=rows.integers(-300, 300, (size, 2)).astype(np.int16),
+                   worst_moves=np.where(rows.random((size, 4)) < 0.5, rows.integers(0, 1968, (size, 4)), -1).astype(np.int16),
+                   worst_losses=np.full((size, 4), 0.5, dtype=np.float16))
 
 
-#a job killed between two steps, as a preempted slurm job stops
 class Preempted(Exception):
     pass
 
@@ -230,7 +225,7 @@ RESUME_FLAGS = ["--device", "cpu", "--no-compile", "--no-tensorboard", "--positi
 def prepare_resume_run(folder):
     use_folder(folder)
     single.BATCH_SIZE, single.EVAL_BATCHES = 8, 1
-    single.WARMUP_STEPS = 2  #the stop comes after the warmup, where the schedule needs the warmup's end
+    single.WARMUP_STEPS = 2  #the stop comes after the warmup, which the schedule needs
 
 
 def run_training(flags, name):
@@ -252,16 +247,13 @@ def resume_worker(rank, folder, world_size, mix, mirror):
     with process_group(rank, folder, world_size):
         prepare_resume_run(folder)
         #20 steps of 2 batches an epoch: the stop after step 7 is in the middle of the fourth epoch
-        #with a mix set, 4 of the 16 come from c: 8 batches an epoch there, so the stop is in c's first epoch and the
-        #resumed run has to carry on into its second
+        #with a mix set, c gives 4 of the 16 and has 8 batches an epoch: the stop is in its first and the resume carries into its second
         flags = RESUME_FLAGS + (["--mix-set", "c", "--mix-share", "0.25"] if mix else [])
         if mirror:
-            #the same run without mirroring, to tell that the flag changed what the others trained on
-            run_training(flags, "plain")
+            run_training(flags, "plain")  #the same run without mirroring
             flags += ["--mirror"]
         with patch.object(train_ddp, "TrainingSampler", wraps=train_ddp.TrainingSampler) as samplers:
             run_training(flags, "whole")
-        #the training set's sampler and the mix set's both get the flag, or both don't
         assert [call.args[-1] for call in samplers.call_args_list] == [mirror] * (2 if mix else 1)
 
         run_until_preempted(flags, "stopped")
@@ -277,9 +269,6 @@ def saved_weights(runs, run, checkpoint):
 @needs_gloo
 @pytest.mark.parametrize("mix, mirror", [(False, False), (True, False), (True, True)])
 def test_a_stopped_and_resumed_run_ends_with_the_weights_of_one_that_never_stopped(tmp_path, mix, mirror):
-    #catches anything the saved state misses: optimizer moments, schedule, position in the epoch (in both sets with a
-    #mix set), best evaluation, and snapshots from before the stop and after it. With mirror, the coins of the mirrored
-    #positions, which come from the epoch the resume restores (the stop is in the middle of the fourth)
     write_varied_set(tmp_path, "b", castling_free=mirror)
     write_varied_set(tmp_path, "c", seed=12, castling_free=mirror)
     mp.spawn(resume_worker, args=(tmp_path, 2, mix, mirror), nprocs=2)
@@ -312,30 +301,24 @@ def micro_batch_worker(rank, folder, world_size):
         run_training(RESUME_FLAGS, "whole")
         run_until_preempted(RESUME_FLAGS, "parts")
         dist.barrier()
-        #carried on where 48 GB cards hold only half the local batch at once
         run_training(RESUME_FLAGS + ["--micro-batch", "4"], "parts")
 
 
 @needs_gloo
 def test_a_run_resumed_in_micro_batches_trains_like_one_in_whole_batches(tmp_path):
-    #catches parts that do not add up to the whole local batch's step, such as boards split from their targets (the
-    #optimizers and clipping hide a gradient scale, and syncing every part averages the same sum)
     write_varied_set(tmp_path, "b")
     mp.spawn(micro_batch_worker, args=(tmp_path, 2), nprocs=2)
     runs = tmp_path / "runs"
     def weights(run, checkpoint):
         state = saved_weights(runs, run, checkpoint)
         return torch.cat([tensor.flatten().float() for tensor in state.values() if tensor.is_floating_point()])
-    #bf16 rounds the parts' gradients differently from the whole batch's, ~0.5% of how far training moved the weights
-    #after step 5 (before the stop); a part split from its targets moves them about as far as training does
+    #bf16 rounds the parts' gradients differently from the whole batch's, so the tolerance is a share of how far training moved the weights
     whole, parts = weights("whole", "final.pt"), weights("parts", "final.pt")
     assert (parts - whole).norm() < 0.03 * (whole - weights("whole", "snapshot_80.pt")).norm()
     settings = json.loads((runs / "parts" / "settings.json").read_text())
     assert settings["micro_batches"] == 1 and settings["resumed"][0]["micro_batches"] == 2
 
 
-#every mixed batch is the training set's local batch and then the mix set's, and each set moves on to its next epoch
-#when it runs out: a mix set whose rows never reached training, or came in the wrong share, would pass silently
 def test_mixed_training_batches_are_the_training_sets_rows_then_the_mix_sets():
     def dataset(token, positions):
         rows = np.random.default_rng(token)
@@ -383,8 +366,8 @@ def test_distributed_gradients_budgets_and_complete_training(tmp_path, world_siz
     assert (tmp_path / "progress.html").exists()
 
 
-#shapes with 4, 2 and 1 matrices once the tall ones are transposed: none of them splits evenly between 3 processes, and the
-#last has fewer matrices than there are processes
+#shapes with 4, 2 and 1 matrices once the tall ones are transposed: none splits evenly between 3 processes, and the last
+#has fewer matrices than there are processes
 SHARDED_MUON_SHAPES = [(24, 40), (40, 24), (32, 32), (24, 40), (40, 24), (32, 32), (8, 40)]
 
 
@@ -410,12 +393,11 @@ def sharded_muon_worker(rank, folder, world_size):
 
         for expected, actual, weight in zip(reference_parameters, sharded_parameters, weights):
             assert (actual - expected).norm() <= 1e-2 * (expected - weight).norm()
+        #DDP training's loss would not show ranks ending with different weights
         assert_same_on_every_rank([parameter.tolist() for parameter in sharded_parameters])
 
 
 @needs_gloo
 @pytest.mark.parametrize("world_size", [2, 3])
 def test_muon_matrices_shared_out_between_processes_step_like_one_process_and_alike_on_every_rank(tmp_path, world_size):
-    #catches shares that are gathered in the wrong order or padded wrong (against torch's Muon), and ranks that end with
-    #different weights, which DDP's training would never notice in its loss
     mp.spawn(sharded_muon_worker, args=(tmp_path, world_size), nprocs=world_size)

@@ -32,7 +32,6 @@ def tiny_model() -> ChessTransformer:
     return ChessTransformer(d_model=32, num_layers=1, n_heads=2).eval()
 
 
-#the engine's boards after each move of a game
 def boards_after(moves: str) -> np.ndarray:
     board, boards = chess.Board(), []
     for san in moves.split():
@@ -56,7 +55,6 @@ def restoring_matmul_flags():
         torch.backends.cuda.matmul.allow_fp16_accumulation, torch.backends.cuda.matmul.allow_tf32 = flags
 
 
-#padding stays under 4 boards or a sixteenth past 16 boards, and a batch past a chunk pads only its last forward
 @pytest.mark.parametrize("max_batch, chunk", [(64, None), (300, None), (64, 64), (256, 64), (300, 48)])
 def test_small_graph_sizes_pad_little(max_batch, chunk):
     sizes = small_graph_sizes(max_batch, chunk)
@@ -71,7 +69,6 @@ def test_small_graph_sizes_pad_little(max_batch, chunk):
     assert all(whole in sizes for whole in range(every, max_batch + 1, every))
 
 
-#a forward takes as many boards as the L2 holds for every lane at once, at least 64
 @pytest.mark.parametrize("l2_mb, width, lanes, chunk", [(96, 768, 2, 64), (96, 768, 1, 128), (48, 768, 2, 64), (48, 256, 2, 96),
                                                         (48, 128, 2, 192), (6, 768, 1, 64)])
 def test_chunk_positions_fit_the_l2(monkeypatch, l2_mb, width, lanes, chunk):
@@ -80,7 +77,6 @@ def test_chunk_positions_fit_the_l2(monkeypatch, l2_mb, width, lanes, chunk):
     assert inference.chunk_positions(width, lanes) == chunk
 
 
-#batches smaller than the graph, and one board through CudaGraphModel
 @gpu
 def test_graphs_answer_like_the_model():
     model = tiny_model().cuda()
@@ -96,7 +92,6 @@ def test_graphs_answer_like_the_model():
     assert np.allclose(answer_rows((logits, value)).numpy(), expected[:1], atol=1e-3)
 
 
-#a batch of the exact size goes through the forward compiled for it, any other through the dynamic one
 def test_exact_size_compiled_runs_each_size_through_its_compile(monkeypatch):
     compiled_for = []
     monkeypatch.setattr(torch, "compile", lambda model, dynamic: lambda boards: compiled_for.append((len(boards), dynamic)) or model(boards))
@@ -141,7 +136,6 @@ def test_the_network_of_every_gpu_is_compiled(monkeypatch):
     assert len(compiles) == 8 * 3
 
 
-#a batch past a chunk runs as forwards of that many, the last part padding
 @gpu
 def test_chunked_graphs_answer_like_the_model():
     model = tiny_model().cuda()
@@ -154,7 +148,6 @@ def test_chunked_graphs_answer_like_the_model():
     assert np.allclose(answers, expected, atol=1e-3)
 
 
-#GraphedBatches must keep alive a model nothing else holds: its graphs read the weights in place
 @gpu
 def test_graphs_keep_their_model_alive():
     model = tiny_model().cuda()
@@ -215,7 +208,6 @@ def test_blocking_wait_sleeps_through_the_batch():
     assert waited > 0.05 and cpu < 0.25 * waited
 
 
-#boards a search writes into a free lane (Searches.descend_into) answer as launch's copy of them does, on either lane
 @gpu
 def test_boards_written_into_the_lane_answer_as_launched():
     model = tiny_model().cuda()
@@ -233,7 +225,6 @@ def test_boards_written_into_the_lane_answer_as_launched():
         searches.finish(expected)
 
 
-#a lean lane answers a search's rows (legal_columns) with the columns of a whole-row lane's answers, by event or by copy
 @gpu
 @pytest.mark.parametrize("blocking_wait", [False, True])
 def test_lean_lanes_answer_the_columns_of_whole_rows(blocking_wait):
@@ -252,10 +243,10 @@ def test_lean_lanes_answer_the_columns_of_whole_rows(blocking_wait):
         searches.finish(answers)
 
 
-#two batches in flight in two lanes answer with the bits each gets alone; the model is big enough for them to overlap
 @gpu
 def test_batches_in_flight_together_answer_as_alone():
     torch.manual_seed(0)
+    #big enough for the two batches to overlap
     model = ChessTransformer(d_model=256, num_layers=4, n_heads=4).cuda().eval()
     random = np.random.default_rng(0)
     board, boards = chess.Board(), []
@@ -273,7 +264,6 @@ def test_batches_in_flight_together_answer_as_alone():
         answers = [together.collect(batch_launched).copy() for batch_launched in launched]
         assert np.array_equal(answers, expected)
 
-    #lean lanes: rows of the boards and some columns of their answers
     columns = random.integers(0, ANSWER_WIDTH, size=(2, 256, LEAN_COLUMNS))
     rows = np.zeros((2, 256, LEAN_ROW), dtype=np.uint8)
     rows[:, :, :TOKENS_PER_BOARD] = batches
@@ -290,7 +280,6 @@ def test_batches_in_flight_together_answer_as_alone():
         assert np.array_equal(answers, expected)
 
 
-#a residual stream past fp16's 65,504 on the en-passant token must not turn every board NaN
 @gpu
 def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
     torch.manual_seed(0)
@@ -313,12 +302,12 @@ def test_fp16_model_stays_finite_past_fp16s_range(tmp_path):
     assert torch.allclose(rows[:, -1], expected_score(expected_value_logits), atol=0.01)
 
 
-#InputEmbedding (a width that fills no power of two) gives the model's embedding, feature rows summed in the table's precision
 @gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_the_input_embedding_is_the_models(dtype):
     from model.fused_blocks import InputEmbedding
     torch.manual_seed(0)
+    #a width that fills no power of two
     model = ChessTransformer(d_model=96, num_layers=1, n_heads=4).cuda().eval()
     with torch.no_grad():
         model.square_features.table.normal_()
@@ -336,13 +325,13 @@ def test_the_input_embedding_is_the_models(dtype):
     assert found.dtype == dtype and torch.allclose(found, expected, rtol=rtol, atol=atol)
 
 
-#the board embedding kernel finds each square's feature rows as SquareFeatures.indices does: whole-number tables make sums exact
 @gpu
 def test_the_board_embedding_finds_the_feature_rows_of_square_features(monkeypatch):
     from model import fused_blocks
     monkeypatch.setattr(fused_blocks, "fused_ends", lambda device: True)
     model = tiny_model().cuda()
     with torch.no_grad():
+        #whole-number tables make the sums exact
         for weight in (model.embed.weight, model.position_embed, model.square_features.table):
             weight.copy_(torch.randint(-512, 512, weight.shape))
     fens = ["Q6k/1Q6/8/8/8/8/1q6/K6q w - - 0 1", "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3",
@@ -362,9 +351,9 @@ def test_the_board_embedding_finds_the_feature_rows_of_square_features(monkeypat
     assert torch.equal(found, expected)
 
 
-#the fused heads give the model's move logits and expected score to fp32 rounding; 71 boards take several eval-head programs
 @gpu
 @pytest.mark.parametrize("value_bins", [16, 1])
+#71 boards take several eval-head programs
 @pytest.mark.parametrize("boards", [1, 5, 71])
 def test_the_fused_heads_compute_the_models_heads(monkeypatch, value_bins, boards):
     from model import fused_blocks
@@ -397,10 +386,9 @@ def test_the_fused_heads_compute_the_models_heads(monkeypatch, value_bins, board
     assert torch.allclose(rows[:, -1], expected_score(value_logits), rtol=1e-5, atol=1e-6)
 
 
-#the fused board embedding and heads run only on sm_120, where they were timed; sm_80, 86 and 89 keep the model's outputs
 @gpu
 @pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (12, 0)])
-def test_the_fused_ends_only_on_the_gpus_they_were_timed_on(monkeypatch, capability):
+def test_the_fused_ends_only_on_sm_120(monkeypatch, capability):
     from model.fused_blocks import FusedTransformer
     torch.manual_seed(0)
     model = ChessTransformer(d_model=64, num_layers=1, n_heads=2, value_bins=16).cuda().eval()
@@ -412,13 +400,13 @@ def test_the_fused_ends_only_on_the_gpus_they_were_timed_on(monkeypatch, capabil
     with torch.no_grad():
         outputs = fused(boards)
 
-    timed = capability == (12, 0)
-    assert fused.fused_heads == fused.input_embedding.from_boards == timed
-    assert isinstance(outputs, torch.Tensor) == timed
+    is_sm_120 = capability == (12, 0)
+    assert fused.fused_heads == fused.input_embedding.from_boards == is_sm_120
+    assert isinstance(outputs, torch.Tensor) == is_sm_120
     assert torch.allclose(answer_rows(outputs), expected, atol=1e-2)
 
 
-#programmatic dependent launch (griddepcontrol) only from sm_90: a kernel using it does not compile for older gpus
+#a kernel using griddepcontrol does not compile for gpus older than sm_90
 @pytest.mark.parametrize("capability", [(8, 6), (9, 0)])
 def test_dependent_launch_only_from_sm_90(monkeypatch, capability):
     import triton
@@ -440,7 +428,6 @@ def test_dependent_launch_only_from_sm_90(monkeypatch, capability):
     assert launch["PDL"] == launch["launch_pdl"] == (capability >= (9, 0)) == ("griddepcontrol" in ptx)
 
 
-#a down mixes the next block's input only when both blocks are of one kind, and linking again clears the old links
 def test_downs_mix_the_inputs_of_neighbours_of_one_kind():
     from model.fused_blocks import link_input_mixes
 
@@ -461,7 +448,6 @@ def test_downs_mix_the_inputs_of_neighbours_of_one_kind():
                                                        (blocks[3].residual_scale, blocks[3].input_scale), None]
 
 
-#FusedBlock, InputEmbedding and the heads of FusedTransformer match the model's, in fp32 and in fp16 as the engine runs it
 @gpu
 @pytest.mark.parametrize("fp16", [False, True])
 def test_fused_blocks_compute_what_the_model_does(tmp_path, fp16):
@@ -488,7 +474,6 @@ def test_fused_blocks_compute_what_the_model_does(tmp_path, fp16):
     assert torch.allclose(rows[:, -1], expected_score(value_logits), atol=1e-3)
 
 
-#fp16 template_attention matches fp32 attention at the d768's shapes, for 1 to 3 query heads per kv head and padded qk widths
 @gpu
 @pytest.mark.parametrize("cuda", [False, True])
 @pytest.mark.parametrize("heads, kv_heads, dq", [(24, 12, 24), (24, 12, 8), (4, 4, 16), (6, 2, 16)])
@@ -516,7 +501,6 @@ def test_template_attention_in_fp16(monkeypatch, cuda, heads, kv_heads, dq):
     assert torch.allclose(out.float(), expected, atol=1e-2)
 
 
-#template_attention's eager chunks and two overlapping cuda graphs (bias made on a second stream) give the bits of one chunk
 @gpu
 def test_template_attention_in_cuda_graphs(monkeypatch):
     from model import attention_cuda, fused_blocks
@@ -554,7 +538,6 @@ def test_template_attention_in_cuda_graphs(monkeypatch):
     assert torch.equal(in_chunks, expected) and mismatches.tolist() == [0, 0]
 
 
-#linear accumulating in fp16: with the bias and residual added (attention's output projection) or silu(gate) * up (mlp)
 @gpu
 @pytest.mark.parametrize("gated", [False, True])
 def test_linear_kernel_in_fp16(gated):
@@ -578,7 +561,6 @@ def test_linear_kernel_in_fp16(gated):
     assert torch.allclose(out.float(), expected, atol=0.03, rtol=0.01)
 
 
-#a tile's extra rows (linear_extra_rows) change no row's bits, in plain, gated and fp32 accumulating matmuls
 @gpu
 @pytest.mark.parametrize("gated, accumulate_fp32", [(False, False), (True, False), (False, True)])
 def test_extra_rows_leave_every_row_the_same(monkeypatch, gated, accumulate_fp32):
@@ -598,12 +580,11 @@ def test_extra_rows_leave_every_row_the_same(monkeypatch, gated, accumulate_fp32
 
 #64 positions' 140 tiles take two waves of 128 multiprocessors, so 16 extra rows make 128 tiles; 56 positions fill their wave
 def test_extra_rows_save_a_wave():
-    fused_blocks = pytest.importorskip("model.fused_blocks")
+    from model import fused_blocks
     assert fused_blocks.linear_extra_rows(64 * 70, 128, 4, 128) == 16
     assert fused_blocks.linear_extra_rows(56 * 70, 128, 4, 128) == 0
 
 
-#every tile in linear's tables gives the same bits, in plain (with the residual), gated and fp32 accumulating matmuls
 @gpu
 @pytest.mark.parametrize("gated, accumulate_fp32", [(False, False), (True, False), (False, True)])
 def test_linear_tiles_give_the_same_bits(gated, accumulate_fp32):
@@ -620,24 +601,23 @@ def test_linear_tiles_give_the_same_bits(gated, accumulate_fp32):
     assert len(outs) > 1 and all(torch.equal(out, outs[0]) for out in outs[1:])
 
 
-#a tile is picked by rows per multiprocessor: 170 multiprocessors take the 70-multiprocessor tile for 70/170 of its rows
+#the thresholds are rows per multiprocessor, so they scale with the multiprocessor count
 def test_tiles_are_picked_by_rows_per_multiprocessor():
-    fused_blocks = pytest.importorskip("model.fused_blocks")
+    from model import fused_blocks
     tiles = [(1, "a board each"), (8, "eight"), (math.inf, "more")]
 
     assert [fused_blocks.tile_for(tiles, rows, 70) for rows in (70, 71, 560, 561, 10**6)] == ["a board each", "eight", "eight", "more", "more"]
     assert [fused_blocks.tile_for(tiles, rows, 170) for rows in (170, 171, 1360, 1361)] == ["a board each", "eight", "eight", "more"]
 
 
-#gpus other than sm_120 (A100, A40, RTX 4090 / L40S, and the untimed H100) keep one tile per matmul at every size
+#sm_80 (A100), 86 (A40), 89 (RTX 4090, L40S) and 90 (H100) take one tile per matmul at every size
 @pytest.mark.parametrize("capability, multiprocessors, expected", [
     ((8, 0), 108, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 32, 64, 4, 3), "down": (128, 64, 128, 4, 3)}),
     ((8, 6), 84, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (64, 128, 128, 4, 3)}),
     ((8, 9), 142, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (128, 64, 128, 4, 3)}),
     ((9, 0), 132, {"projection": (128, 128, 64, 8, 3), "gate_up": (128, 64, 64, 4, 2), "down": (128, 128, 64, 8, 3, 128)})])
 def test_other_gpus_keep_their_tiles_at_every_size(monkeypatch, capability, multiprocessors, expected):
-    fused_blocks = pytest.importorskip("model.fused_blocks")
-    int8_blocks = pytest.importorskip("model.int8_blocks")
+    from model import fused_blocks, int8_blocks
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: SimpleNamespace(multi_processor_count=multiprocessors))
     device = torch.device("cuda")
@@ -647,7 +627,6 @@ def test_other_gpus_keep_their_tiles_at_every_size(monkeypatch, capability, mult
         assert {matmul: int8_blocks.int8_tile(device, matmul, 70 * boards) for matmul in expected} == expected
 
 
-#fp16 inputs accumulating in fp32 and giving fp32 (the heads' matmul), as close to the fp32 matmul as fp16 weights allow
 @gpu
 def test_linear_kernel_accumulating_in_fp32():
     from model.fused_blocks import linear
@@ -662,7 +641,6 @@ def test_linear_kernel_accumulating_in_fp32():
     assert torch.allclose(out, x.float() @ weight.float() + bias, atol=1e-4)
 
 
-#the last number of a row is the expected score, which the search backs up as it is, not a logit
 def test_an_answer_row_ends_with_the_expected_score():
     model = tiny_model()
     boards = torch.tensor([encode_board(chess.Board())])

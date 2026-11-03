@@ -1,5 +1,3 @@
-#self play in python, with mcts.py's search: the reference the rust games (selfplay_rs) are held to in test_selfplay_rs.py
-from collections.abc import Iterator
 import chess
 import numpy as np
 import torch
@@ -22,11 +20,10 @@ def final_result(board: chess.Board, max_plies: int = MAX_PLIES) -> float | None
         return 0.5
     return None
 
-#its random numbers come from the seed and its number alone, so a game can be played again
 class GameInProgress:
-    def __init__(self, number: int, seed: int, board: chess.Board, tree_reuse: bool):
+    def __init__(self, number: int, board: chess.Board, tree_reuse: bool):
         self.number = number
-        self.random = np.random.default_rng([seed, number])
+        self.random = np.random.default_rng([SEED, number])
         self.board = board.copy()
         self.tree_reuse = tree_reuse
         self.boards, self.visit_moves, self.visit_shares, self.root_scores, self.white_to_move = [], [], [], [], []
@@ -35,12 +32,11 @@ class GameInProgress:
     #with tree reuse root is the node of the move just played, whose visits count towards this search's
     def new_search(self, root: mcts.Node) -> None:
         self.root = root
-        #the search walks down on the game's own board and is taken back here after every simulation
+        #descents leave board at the leaf, for the network; play_game pops it back to root_plies
         self.root_plies = len(self.board.move_stack)
         self.noised = False
         self.add_noise_once_expanded()
 
-    #once the root has children, before any is chosen: at once for a reused root, after the first simulation otherwise
     def add_noise_once_expanded(self) -> None:
         if not self.noised and self.root.children:
             mcts.add_root_noise(self.root, self.random)
@@ -77,67 +73,22 @@ class GameInProgress:
                     np.array(self.root_scores, dtype=np.float32), np.array(self.white_to_move, dtype=bool), white_score)
 
 
-#up to `size` games at once, one simulation of each per round, their leaves through the network in one call
-class SelfPlayBatch:
-    def __init__(self, model: nn.Module, device: torch.device, simulations: int, numbers: Iterator[int], size: int, seed: int,
-                 board: chess.Board, sampled_plies: int, max_plies: int, tree_reuse: bool):
-        self.model, self.device, self.simulations = model, device, simulations
-        self.numbers, self.seed, self.start_board = numbers, seed, board
-        self.sampled_plies, self.max_plies, self.tree_reuse = sampled_plies, max_plies, tree_reuse
-        self.games: list[GameInProgress] = []
-        self.finished: list[Game] = []
-        for _ in range(size):
-            self.start_next_game()
-
-    def start_next_game(self) -> None:
-        for number in self.numbers:
-            game = GameInProgress(number, self.seed, self.start_board, self.tree_reuse)
-            white_score = final_result(game.board, self.max_plies)
-            if white_score is None:
-                self.games.append(game)
-                return
-            self.finished.append(game.to_game(white_score)) #over before it began: a game without positions
-
-    #a move is played once its root has `simulations` visits, and a game that ends makes room for the next number
-    def step(self) -> list[Game]:
-        waiting = []
-        for game in self.games:
-            leaf = mcts.descend(game.root, game.board)
-            if leaf.value is None:
-                waiting.append((game, leaf))
-            else:
-                mcts.finish(leaf, None, leaf.value)
-        if waiting:
-            #every waiting game's board is still at its leaf
-            evaluations = mcts.evaluate_many(self.model, [game.board for game, _ in waiting], self.device)
-            for (game, leaf), (priors, value) in zip(waiting, evaluations):
-                mcts.finish(leaf, priors, value)
-
-        playing = []
-        for game in self.games:
-            while len(game.board.move_stack) > game.root_plies:
-                game.board.pop()
-            game.add_noise_once_expanded()
-            if game.root.visit_count >= self.simulations:
-                game.play_move(self.sampled_plies)
-                white_score = final_result(game.board, self.max_plies)
-                if white_score is not None:
-                    self.finished.append(game.to_game(white_score))
-                    continue
-            playing.append(game)
-
-        replacements = len(self.games) - len(playing)
-        self.games = playing
-        for _ in range(replacements):
-            self.start_next_game()
-        finished, self.finished = self.finished, []
-        return finished
-
-def play_game(model: nn.Module, device: torch.device, simulations: int, number: int, seed: int = SEED, board: chess.Board | None = None,
+def play_game(model: nn.Module, device: torch.device, simulations: int, number: int, board: chess.Board | None = None,
               sampled_plies: int = SAMPLED_PLIES, max_plies: int = MAX_PLIES, tree_reuse: bool = TREE_REUSE) -> Game:
-    batch = SelfPlayBatch(model, device, simulations, iter([number]), 1, seed, board if board is not None else chess.Board(), sampled_plies,
-                          max_plies, tree_reuse)
-    while True:
-        finished = batch.step()
-        if finished:
-            return finished[0]
+    game = GameInProgress(number, board if board is not None else chess.Board(), tree_reuse)
+    white_score = final_result(game.board, max_plies)
+    while white_score is None:
+        leaf = mcts.descend(game.root, game.board)
+        if leaf.value is None:
+            (priors, value), = mcts.evaluate_many(model, [game.board], device)
+            mcts.finish(leaf, priors, value)
+        else:
+            mcts.finish(leaf, None, leaf.value)
+
+        while len(game.board.move_stack) > game.root_plies:
+            game.board.pop()
+        game.add_noise_once_expanded()
+        if game.root.visit_count >= simulations:
+            game.play_move(sampled_plies)
+            white_score = final_result(game.board, max_plies)
+    return game.to_game(white_score)

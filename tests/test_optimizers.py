@@ -66,7 +66,6 @@ def test_the_embeddings_get_their_own_learning_rate():
     assert embeddings["lr"] == pytest.approx(10 * adamw.param_groups[0]["lr"])
 
 
-#Muon's learning rate is a tensor, which the schedule has to move just like AdamW's float
 def test_the_schedule_moves_both_learning_rates_alike():
     model = small_model()
     optimizers = make_optimizers(model, 1e-3, CPU)
@@ -111,7 +110,6 @@ def test_training_with_muon_learns_a_batch():
         assert not torch.equal(parameters[name], weights_before[name]), name
 
 
-#a step of train.train's: the bf16 copy's gradients reach the fp32 weights whole, and the copy then has the stepped weights
 def test_master_weights_step_the_fp32_model_and_the_bf16_copy_follows():
     model = small_model()
     master_weights = MasterWeights(model)
@@ -146,7 +144,6 @@ def test_the_blunder_loss_is_minus_log_of_the_probability_left_to_other_moves():
     logits = torch.log(torch.tensor([[0.5, 0.3, 0.2]]))
 
     assert blunder_loss(logits, torch.tensor([[NO_MOVE, NO_MOVE]])).item() == pytest.approx(0.0, abs=1e-6)
-    #moves 1 and 2 hold 0.5 together
     assert blunder_loss(logits, torch.tensor([[1, 2]])).item() == pytest.approx(-torch.log(torch.tensor(0.5)).item(), rel=1e-5)
 
 
@@ -159,13 +156,12 @@ def test_the_blunder_loss_pushes_the_blunder_down_and_the_rest_up():
     assert (logits.grad[0, [0, 1, 3]] < 0).all()
 
 
-#tall, wide and square matrices, two or more of a shape, as the model's blocks have them
+#tall, wide and square, most shapes twice, as BatchedMuon batches by shape and transposes the tall ones
 MUON_SHAPES = [(24, 40), (40, 24), (32, 32), (24, 40), (40, 24), (32, 32), (8, 40)]
 #a weight decay big enough to show in a step
 MUON_SETTINGS = dict(weight_decay=0.5, momentum=0.9, adjust_lr_fn="match_rms_adamw")
 
 
-#torch's Muon and BatchedMuon on copies of the same weights
 def muon_pair(device: torch.device = CPU, nesterov: bool = True) -> list[tuple[torch.optim.Muon, list[torch.nn.Parameter]]]:
     torch.manual_seed(0)
     weights = [torch.randn(shape, device=device) for shape in MUON_SHAPES]
@@ -176,7 +172,6 @@ def muon_pair(device: torch.device = CPU, nesterov: bool = True) -> list[tuple[t
     return pair
 
 
-#the same gradients for every list of parameters, three orders of magnitude apart between matrices
 def give_same_gradients(parameter_lists: list[list[torch.nn.Parameter]], generator: torch.Generator) -> None:
     for parameters in zip(*parameter_lists):
         gradient = torch.randn(parameters[0].shape, generator=generator) * 10 ** (3 * torch.rand(1, generator=generator).item())
@@ -184,7 +179,6 @@ def give_same_gradients(parameter_lists: list[list[torch.nn.Parameter]], generat
             parameter.grad = gradient.to(parameter.device, copy=True)
 
 
-#how far the weights are from the reference's, against how far the reference moved them from where they started
 def assert_moved_alike(expected_parameters, actual_parameters, starts, tolerance: float) -> None:
     for expected, actual, start in zip(expected_parameters, actual_parameters, starts):
         assert (actual - expected).norm() <= tolerance * (expected - start).norm()
@@ -208,7 +202,6 @@ def test_batched_muon_steps_like_torchs_muon(nesterov):
         assert torch.equal(reference.state[expected]["momentum_buffer"], batched.state[actual]["momentum_buffer"])
 
 
-#a run resumes from the saved Muon state: the layout is torch's, and either class continues from the other's
 def test_batched_muon_and_torchs_muon_load_each_others_saved_state():
     for saving_class, loading_class in ((torch.optim.Muon, BatchedMuon), (BatchedMuon, torch.optim.Muon)):
         torch.manual_seed(0)
@@ -230,7 +223,6 @@ def test_batched_muon_and_torchs_muon_load_each_others_saved_state():
         for saved, loaded in zip(saved_parameters, loaded_parameters):
             assert torch.equal(saving.state[saved]["momentum_buffer"], loading.state[loaded]["momentum_buffer"])
 
-        #without the loaded momentum these steps would differ
         starts = [parameter.detach().clone() for parameter in saved_parameters]
         for _ in range(3):
             give_same_gradients([saved_parameters, loaded_parameters], generator)

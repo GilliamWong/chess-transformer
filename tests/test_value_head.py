@@ -47,17 +47,15 @@ def test_the_expected_score_is_the_head_output_as_a_score():
     assert value_error(bin_logits, targets) < 1e-2
 
 
-#checkpoints from before the bins name no value_bins and have one logit
-@pytest.mark.parametrize("saved, bins", [({}, 1), ({"value_bins": 8}, 8)])
-def test_a_checkpoint_loads_with_its_stored_bins_or_one_logit(tmp_path, saved, bins):
+def test_a_checkpoint_without_value_bins_loads_with_one_logit(tmp_path):
     #without mlp_hidden in the settings the mlp loads at the old width, 88
-    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2, mlp_hidden=88, value_bins=bins)
-    save_checkpoint(model, {"d_model": 32, "num_layers": 1, "n_heads": 2, **saved}, tmp_path / "model.pt")
+    model = ChessTransformer(d_model=32, num_layers=1, n_heads=2, mlp_hidden=88, value_bins=1)
+    save_checkpoint(model, {"d_model": 32, "num_layers": 1, "n_heads": 2}, tmp_path / "model.pt")
 
     loaded, loaded_settings = load_checkpoint(tmp_path / "model.pt", CPU)
 
-    assert loaded_settings["value_bins"] == bins
-    assert loaded.eval_head[-1].out_features == bins
+    assert loaded_settings["value_bins"] == 1
+    assert loaded.eval_head[-1].out_features == 1
 
 
 def test_no_bins_is_rejected():

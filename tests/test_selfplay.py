@@ -119,7 +119,6 @@ def test_a_set_from_before_tree_reuse_carries_on_without_it(tmp_path):
     assert SelfPlaySet(tmp_path, "played", {**SETTINGS, "tree_reuse": False}).positions() == 2
 
 
-#the inference process's loop in a thread, with a RemoteNetwork for each slot
 @contextmanager
 def serving(slots: list[Slot], network, games_per_process: int):
     stop = threading.Event()
@@ -141,7 +140,6 @@ def serving(slots: list[Slot], network, games_per_process: int):
             slot.close()
 
 
-#two workers asking at once are served in one batch, each getting the answers to its own boards
 def test_every_worker_gets_the_answers_to_its_own_boards():
     network = BoardModel()
     asked = [np.random.default_rng(index).integers(0, 13, (count, TOKENS_PER_BOARD), dtype=np.uint8) for index, count in enumerate((5, 8))]
@@ -173,7 +171,6 @@ def test_games_through_the_inference_process_are_the_games_played_directly():
         assert np.allclose(direct.root_scores, through.root_scores)
 
 
-#torch would cost every worker about half a gigabyte
 def test_a_worker_does_not_import_torch():
     imported = subprocess.check_output([sys.executable, "-c", "import sys, engine.selfplay; print('torch' in sys.modules)"], text=True,
                                        cwd=Path(selfplay.__file__).parent.parent)

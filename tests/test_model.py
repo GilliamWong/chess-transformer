@@ -17,7 +17,7 @@ def small_model() -> ChessTransformer:
     return ChessTransformer(d_model=32, num_layers=2, n_heads=2)
 
 
-#the input skip's scales away from their 1 and 0, where an input embedding that went missing would not show
+#moves the input skip's scales off their initial 1 and 0, where a missing input embedding would not show
 def mix_in_the_input(model: ChessTransformer) -> None:
     with torch.no_grad():
         for block in model.encoder:
@@ -45,16 +45,16 @@ def test_one_set_of_move_logits_per_board(batch):
     assert value_logits.shape == (BATCH_SIZE, VALUE_BINS)
 
 
-#without the positional embedding the model sees which pieces exist but not where they are
 def test_moving_a_piece_changes_the_output(batch):
     model = small_model().eval()
     start_position = batch[0][:1]
-    assert start_position[0, 1] != start_position[0, 12]
+    knight, pawn = chess.B1, chess.E2
+    assert start_position[0, knight] != start_position[0, pawn]
 
     swapped = start_position.clone()
-    swapped[0, [1, 12]] = start_position[0, [12, 1]]  #knight b1 <-> pawn e2
+    swapped[0, [knight, pawn]] = start_position[0, [pawn, knight]]
 
-    #with no position information the two outputs differ only by float rounding, around 1e-7
+    #without position information the outputs differ only by float rounding, around 1e-7
     difference = (model(start_position)[0] - model(swapped)[0]).abs().max().item()
     assert difference > 1e-4
 
@@ -67,7 +67,6 @@ def test_a_board_gets_the_same_logits_alone_or_in_a_batch(batch):
         assert torch.allclose(alone, in_a_batch[:1], atol=1e-5)
 
 
-#a term added to every move can drift without limit, so the promotion term may only reach the promotions
 def test_promotion_term_only_changes_promotion_logits(batch):
     model = small_model().eval()
     boards, _ = batch
@@ -83,7 +82,6 @@ def test_promotion_term_only_changes_promotion_logits(batch):
     assert (change[:, ~is_promotion] == 0).all()
 
 
-#the templates start at zero so that a new model is exactly the model without them, whatever template_mix holds
 def test_attention_bias_starts_at_zero(batch):
     model = small_model().eval()
     boards, _ = batch
@@ -96,7 +94,6 @@ def test_attention_bias_starts_at_zero(batch):
     assert torch.equal(model(boards)[0], before)
 
 
-#QK-norm: the scores depend on the directions of the queries and keys, not their size
 def test_the_size_of_the_queries_and_keys_does_not_matter(batch):
     boards, _ = batch
     model = small_model().eval()
@@ -111,7 +108,7 @@ def test_the_size_of_the_queries_and_keys_does_not_matter(batch):
         assert torch.allclose(block(x, model.templates, x), before, atol=1e-4)
 
 
-#the search runs the model in fp16, whose largest number is 65,504: queries and keys this big made every score inf
+#fp16 tops out at 65,504, so queries and keys this big overflow every score unless they are normalised
 def test_fp16_stays_finite_with_huge_queries_and_keys(batch):
     boards, _ = batch
     model = small_model().eval()
@@ -125,7 +122,6 @@ def test_fp16_stays_finite_with_huge_queries_and_keys(batch):
     assert torch.isfinite(logits).all() and torch.isfinite(value_logits).all()
 
 
-#fp16 inference shrinks the residual stream (inference.fp16_model); anything writing into it that the scaling misses would change the moves
 def test_scaling_the_residual_stream_changes_no_output(batch):
     boards, _ = batch
     model = small_model().eval()
@@ -152,11 +148,11 @@ def test_a_new_block_does_not_read_the_input_embedding(batch):
         assert torch.equal(block(x, model.templates, x), block(x, model.templates, torch.randn_like(x)))
 
 
-#with residual_scale 0 and input_scale 1 every block restarts from the input embedding, so the first block's weights cannot reach the output
 def test_the_input_skip_mixes_in_the_input_embedding(batch):
     boards, _ = batch
     model = small_model().eval()
     with torch.no_grad():
+        #the last block reads only the input embedding, so the first block's weights cannot reach the output
         for block in model.encoder:
             block.residual_scale.fill_(0.0)
             block.input_scale.fill_(1.0)
@@ -177,7 +173,7 @@ def test_the_square_features_of_a_known_position():
     assert features[e4, :4].tolist() == [(3 + 7) * 15 + 7, (-4 + 7) * 15 + 7, 15 * 15, (-1 + 7) * 15 + 1 + 7]
     #neighbours up, down, right, left, then the diagonals: only d5 (up-left) holds a piece, their queen
     assert features[e4, 4:12].tolist() == [0, 0, 0, 0, 0, 5 + 6, 0, 0]
-    #first piece up the file their king 4 away, down it our pawn 2 away, up-left their queen next door; nothing else
+    #first piece up the file their king 4 away, down it our pawn 2 away, up-left their queen next door
     king, pawn, queen = 1 + (6 + 6 - 1) * 7 + 3, 1 + (1 - 1) * 7 + 1, 1 + (5 + 6 - 1) * 7 + 0
     assert features[e4, 12:20].tolist() == [king, pawn, 0, 0, 0, queen, 0, 0]
     #our knight on c3 attacks e4, none of theirs: 1 * 3 + 0
@@ -201,16 +197,14 @@ def test_the_square_features_start_at_zero_and_reach_the_output(batch):
     assert not torch.allclose(model(boards)[0], before)
 
 
-#a layer that forward never uses gets no gradient and would silently never train
 def test_every_parameter_gets_a_gradient(batch):
     model = small_model()
     boards, moves = batch
 
-    #while the templates are zero template_mix gets no gradient; in training they leave zero on the first step
+    #template_mix gets no gradient while the templates are zero; they leave zero on the first training step
     with torch.no_grad():
         model.templates.normal_(std=0.1)
 
-    #both heads have to be in the loss, or the one left out gets no gradient
     logits, value_logits = model(boards)
     values = torch.full((len(boards),), 0.7)
     (nn.CrossEntropyLoss()(logits, moves) + value_loss(value_logits, values)).backward()
@@ -248,8 +242,8 @@ def test_can_overfit_one_batch(batch):
         loss.backward()
         optimizer.step()
 
-    assert first_loss > 5  #an untrained guess over 1968 moves is about ln(1968) = 7.6
-    assert loss.item() < 0.3  #the final layer norm bounds the pooled vector, so the loss no longer races to zero
+    assert first_loss > 5  #an untrained guess over NUM_MOVE_IDS moves is about ln(NUM_MOVE_IDS) = 7.6
+    assert loss.item() < 0.3
     assert (model(boards)[0].argmax(dim=1) == moves).all()
 
 
@@ -260,13 +254,13 @@ def test_a_smaller_qk_ratio_narrows_only_the_queries_and_keys(batch, qk_ratio, q
 
     for block, width in zip(model.encoder, qk_widths, strict=True):
         assert block.Q.weight.shape == block.K.weight.shape == (width, 32)
-        assert block.V.weight.shape == (32, 32)  #the values each head brings back keep their 16 dims
+        assert block.V.weight.shape == (32, 32)
     assert model(boards)[0].shape == (BATCH_SIZE, NUM_MOVE_IDS)
 
 
 @pytest.mark.parametrize("settings", [
     {"loops": 0},
-    {"qk_ratio": [0.25, 0.5, 1.0]},  #a list that does not match the blocks would otherwise quietly miss some
+    {"qk_ratio": [0.25, 0.5, 1.0]},
     {"n_heads": 4, "kv_heads": 3},
 ], ids=["no loops", "a ratio per block that does not match", "key/value heads that do not divide the heads"])
 def test_sizes_that_do_not_fit_are_rejected(settings):
@@ -282,7 +276,6 @@ def test_the_mlp_width_is_rounded_down_to_a_multiple_of_32():
 
 
 def test_grouped_query_attention_is_heads_sharing_their_keys_and_values(batch):
-    #2 key/value heads for 4 heads must give what 4 give when heads 0, 1 and heads 2, 3 have the same key/value weights
     boards, _ = batch
     torch.manual_seed(0)
     grouped = ChessTransformer(d_model=32, num_layers=2, n_heads=4, kv_heads=2).eval()

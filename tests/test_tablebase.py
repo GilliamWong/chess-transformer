@@ -21,7 +21,7 @@ from engine.tablebase import TABLE_SETS, TABLEBASE_PIECES, TableSet, complete_pi
 from engine.uci import Options
 
 CPU = torch.device("cpu")
-#Qxd5+ wins: from 7 pieces it leaves 6 (a 6 piece table's), from 6 pieces it leaves 5
+#Qxd5+ wins, leaving 6 pieces from SEVEN_PIECES and 5 from SIX_PIECES
 SEVEN_PIECES = "6k1/1p5p/8/3r4/8/8/P7/3Q2K1 w - - 0 1"
 SIX_PIECES = "6k1/7p/8/3r4/8/8/P7/3Q2K1 w - - 0 1"
 
@@ -35,7 +35,6 @@ def test_the_best_move_keeps_the_roots_result_at_the_50_move_edge(tablebase, fen
     assert ranked_moves(tablebase, board)[0].wdl == 1
 
 
-#6 pieces at the root; taking the rook leaves 5 and a won position, which only the tables can tell the search
 def test_the_search_scores_the_positions_the_tables_cover(tablebase, monkeypatch):
     monkeypatch.setattr(mcts, "tablebase", tablebase)
     simulations = 200
@@ -47,7 +46,6 @@ def test_the_search_scores_the_positions_the_tables_cover(tablebase, monkeypatch
         mcts.search(UniformModel(), chess.Board("k7/8/1K6/8/8/8/8/7R b - - 0 1"), CPU)
 
 
-#search refuses a position the tables know, so the player plays their move instead
 def test_the_player_takes_the_tables_move_once_they_know_the_position(tablebase, monkeypatch):
     monkeypatch.setattr(mcts, "tablebase", tablebase)
 
@@ -61,10 +59,10 @@ def test_self_play_ends_a_game_the_tables_know(tablebase, monkeypatch):
 
     assert final_result(chess.Board("k7/8/1K6/8/8/8/8/7R b - - 0 1")) == 1.0 #black to move, and lost
     assert final_result(chess.Board("6k1/5r2/8/8/8/8/1R6/2K5 w - - 0 1")) == 0.5
-    assert final_result(chess.Board(SIX_PIECES)) is None #6 pieces
+    assert final_result(chess.Board(SIX_PIECES)) is None
 
 
-#6 pieces are the 6 piece tables' (--tablebase-pieces 6), not the default's; castling rights are no one's
+#the tables have no positions with castling rights
 def test_the_tables_cover_the_pieces_asked_for():
     six, seven = chess.Board(SIX_PIECES), chess.Board(SEVEN_PIECES)
 
@@ -73,7 +71,7 @@ def test_the_tables_cover_the_pieces_asked_for():
     assert not covers(chess.Board("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1"), 6)
 
 
-#empty table files of each half (python-chess and shakmaty only take files named for a table), a folder for each size
+#empty files for each half and a folder for each size; python-chess and shakmaty skip files not named for a table
 def fake_table_sets(folder: Path, monkeypatch, tables: dict[int, tuple[int, int]]) -> tuple[TableSet, ...]:
     table_sets = tuple(TableSet(pieces, folder / str(pieces), str(pieces), 3) for pieces in (5, 6))
     for table_set in table_sets:
@@ -84,8 +82,7 @@ def fake_table_sets(folder: Path, monkeypatch, tables: dict[int, tuple[int, int]
     monkeypatch.setattr("engine.tablebase.TABLE_SETS", table_sets)
     return table_sets
 
-#every wdl table and every 3-5 piece dtz table must be there; the 6 piece dtz tables may all be left out (then 6 pieces
-#are searched, not ranked). An unfinished download is refused
+#all wdl tables and the 3-5 piece dtz ones are required; the 6 piece dtz ones may all be left out (then searched, not ranked), not partly
 @pytest.mark.parametrize("five, six, ranked", [((3, 3), (3, 3), 6), ((3, 3), (3, 0), 5), ((3, 3), (2, 3), None),
                                                ((3, 3), (3, 1), None), ((3, 0), (3, 3), None)])
 def test_which_tables_open(tmp_path, monkeypatch, five, six, ranked):
@@ -98,12 +95,9 @@ def test_which_tables_open(tmp_path, monkeypatch, five, six, ranked):
         open_tablebase(6).close()
         assert ranked_pieces(6) == ranked
 
-#empty files named for every table of up to `pieces` pieces but those left out: the 3-5 piece ones in one folder, each
-#bigger size's in its own, as a SyzygyPath
 def fake_syzygy_path(folder: Path, left_out: tuple[str, ...] = (), pieces: int = 6) -> str:
     names = list(chess.syzygy.tablenames(piece_count=pieces))
     sizes = [(3, 4, 5), *((size,) for size in range(6, pieces + 1))]
-    #as many as the downloaded sets have
     assert [sum(len(name) - 1 in group for name in names) for group in sizes] == [table_set.tables_per_half for table_set in TABLE_SETS[:len(sizes)]]
     folders = [folder / "".join(map(str, group)) for group in sizes]
     for size_folder in folders:
@@ -119,14 +113,13 @@ def tables_of(pieces: int) -> list[str]:
 
 SEVEN_PIECE_TABLES = tables_of(7)
 
-#a SyzygyPath gives the most pieces it holds up to the limit, as stockfish does: a 7 piece table left out gives 6, the 7
-#piece dtz tables left out as a whole still 7 (searched, not ranked), a 5 piece dtz table 4
+#the most pieces a SyzygyPath holds up to the limit, as stockfish counts them; above 5 pieces the dtz tables may all be left out (searched, not ranked)
 @pytest.mark.parametrize("left_out, limit, pieces", [((), 7, 7), ((), 6, 6), ((f"{SEVEN_PIECE_TABLES[0]}.rtbw",), 7, 6),
                                                      (tuple(f"{name}.rtbz" for name in SEVEN_PIECE_TABLES), 7, 7), (("KQRvKR.rtbz",), 7, 4)])
 def test_a_syzygy_path_gives_the_most_pieces_it_holds(tmp_path, left_out, limit, pieces):
     assert complete_pieces(fake_syzygy_path(tmp_path, left_out, pieces=7), limit) == pieces
 
-#SyzygyProbeLimit defaults to 7, so TCEC's tables need no limit set. A folder without every table up to 5 pieces is refused
+#SyzygyProbeLimit defaults to 7 so TCEC's tables need no limit set; a folder missing a table of up to 5 pieces is refused
 def test_the_engine_takes_the_7_piece_tables_it_is_given(tmp_path):
     for name in ("seven", "six", "none"):
         (tmp_path / name).mkdir()
@@ -142,7 +135,6 @@ def test_the_engine_takes_the_7_piece_tables_it_is_given(tmp_path):
     assert options.set("SyzygyPath", str(tmp_path / "none"), built=False).endswith("the tables stay as they were")
     assert options.search()[1]["syzygy_path"] == seven
 
-#a SyzygyPath's folders are checked as test_which_tables_open does, by the tables' names across them
 @pytest.mark.parametrize("left_out, ranked", [((), 6), (tuple(f"{name}.rtbz" for name in tables_of(6)), 5),
                                               (("KRPvKRP.rtbz",), None), (("KRPvKRP.rtbw",), None), (("KQvKR.rtbz",), None)])
 def test_which_tables_open_from_a_syzygy_path(tmp_path, left_out, ranked):
@@ -175,7 +167,7 @@ def test_the_default_tables_are_the_5_piece_ones(tmp_path, monkeypatch):
     assert rust_search_settings(True, 6)["tablebase_folder"] == os.pathsep.join([str(five.folder), str(six.folder)])
 
 
-#one rust search to its end with a uniform network: its line and the visits of its root moves
+#(line, visits by root move) of one rust search run to its end
 def search_in_rust(fen: str, simulations: int, tablebase_pieces: int = 5) -> tuple[list[str], dict[str, int]]:
     searches = selfplay_rs.Searches(**rust_search_settings(True, tablebase_pieces))
     searches.start(0, fen, [], simulations)
@@ -187,8 +179,7 @@ def search_in_rust(fen: str, simulations: int, tablebase_pieces: int = 5) -> tup
             _, line, _, root_moves, _ = reports[0]
             return line, dict(root_moves)
 
-#a root the tables cover is searched, and below it only the moves after a capture or pawn move are the tables': the rook
-#taken, or the mate, gets the visits rather than sharing them with every move the tables call a win (lc0 probes so)
+#a covered root is searched; below it only positions after a capture or pawn move are probed, so the winning move takes the visits
 @pytest.mark.parametrize("fen, best", [("6k1/8/8/3r4/8/8/8/3Q2K1 w - - 0 1", "d1d5"), ("k7/8/1K6/8/8/8/8/7R w - - 0 1", "h1h8")])
 def test_rust_searches_a_root_the_tables_cover(tablebase, fen, best):
     simulations = 400
@@ -208,14 +199,12 @@ def tablebase6():
     yield tables
     tables.close()
 
-#a 6 piece position (6 piece folder) and the 5 piece one after its capture (5 piece folder), both lost for black per lichess
 def test_python_probes_both_folders(tablebase6):
     six, five = chess.Board("6k1/1p5p/8/3Q4/8/8/P7/6K1 b - - 0 1"), chess.Board("6k1/7p/8/3Q4/8/8/P7/6K1 b - - 0 1")
 
     assert tablebase6.probe_wdl(six) == tablebase6.probe_wdl(five) == -2
 
-#from 7 pieces, taking the rook leaves a won 6 piece position that only the 6 piece tables tell the search; rust probes
-#them with the 5 piece ones (the positions after a capture)
+#from 7 pieces the rook taken leaves a won 6 piece position, which only the 6 piece tables tell the search
 @pytest.mark.parametrize("tablebase_pieces", [5, 6])
 def test_rust_probes_the_6_piece_tables_when_asked(tablebase6, tablebase_pieces):
     simulations = 400
@@ -237,8 +226,7 @@ def test_the_engine_takes_the_tables_move_at_6_pieces(tablebase6):
     assert report.simulations == 0 and report.line == [ranked_moves(tablebase6, board)[0].move]
     assert default.simulations > 0
 
-#the table sets with the 6 piece one as its wdl tables alone: hard links in a folder of their own, removed afterwards (a
-#link left in pytest's temporary folders would keep 73 GB on the disk after the tables are deleted)
+#the 6 piece table set as its wdl tables alone: hard links in a folder of their own, removed after (pytest's temporary folders would keep the disk space)
 @pytest.fixture(scope="module")
 def wdl_only_table_sets(tablebase6, tmp_path_factory):
     five, six = TABLE_SETS[:2]
@@ -253,14 +241,13 @@ def wdl_only_table_sets(tablebase6, tmp_path_factory):
     finally:
         shutil.rmtree(wdl_only.folder)
 
-#with only the 6 piece wdl tables the engine searches a 6 piece root (probing no dtz table) and takes the rook, which the
-#tables call a win; from 7 pieces its search sees that win in the 6 pieces after the capture
+#without dtz tables a 6 piece root is searched, not ranked, and still takes the rook; from 7 pieces the search sees the win after the capture
 @pytest.mark.parametrize("fen", [SIX_PIECES, SEVEN_PIECES])
 def test_the_engine_searches_6_pieces_without_their_dtz_tables(wdl_only_table_sets, monkeypatch, fen):
     monkeypatch.setattr("engine.tablebase.TABLE_SETS", wdl_only_table_sets)
 
     report = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True, tablebase_pieces=6).search(chess.Board(fen), 400)
 
-    #certainty proves the capture won by the tables, and the search stops once its move is proven
+    #certainty proves the capture won, and the search stops once its move is proven
     takes_the_rook = chess.Move.from_uci("d1d5")
     assert report.simulations > 0 and report.line[0] == takes_the_rook and report.score == 1.0

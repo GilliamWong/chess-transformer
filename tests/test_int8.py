@@ -26,6 +26,7 @@ from tests.test_model import mix_in_the_input
 from model.checkpoint import save_checkpoint
 
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+sm_90 = pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), reason="no sm_90 gpu")
 
 
 def test_gptq_without_correlated_inputs_rounds_to_nearest():
@@ -86,9 +87,9 @@ def test_int8_linear_is_the_dequantised_matmul(matmul, boards):
         assert torch.allclose(out.reshape(-1, width).double(), expected, atol=1e-3, rtol=2e-3), tile
 
 
-#(x, x_scale, weight, weight_scale, bias, residual, gated, mix) at the d768's depths
-def int8_operands(matmul: str, rows: int, width: int = 196) -> tuple:
+def int8_operands(matmul: str, rows: int) -> tuple:
     torch.manual_seed(rows)
+    width = 196
     down, gated = matmul.endswith("down"), matmul == "gate_up"
     depth = 1024 if down else 768
     x = torch.randint(-127, 128, (rows, depth), device="cuda", dtype=torch.int8)
@@ -118,7 +119,7 @@ def only_configs(monkeypatch, configs: dict) -> None:
     monkeypatch.setattr(int8_cuda, "KERNELS", {})
 
 
-#the (most rows, config) entries of a kind for every gpu of this compute capability: the multiprocessor count only changes which is fastest
+#the entries of every gpu of this compute capability: the multiprocessor count only changes which config is fastest
 def configs_of_this_capability(kind: str) -> list[tuple[int, tuple]]:
     found = [entry for key, table in int8_cuda.CONFIGS.items() if key[:2] == gpu_key()[:2] for entry in table[kind]]
     if not found:
@@ -126,7 +127,6 @@ def configs_of_this_capability(kind: str) -> list[tuple[int, tuple]]:
     return found
 
 
-#every config timed on this compute capability, at its most rows and below one tile
 @gpu
 @pytest.mark.parametrize("matmul", ["projection", "gate_up", "down", "mixing down"])
 def test_the_small_batch_cuda_kernels_give_int8_linears_bits(matmul, monkeypatch):
@@ -182,7 +182,7 @@ def test_int8_linear_falls_back_to_triton_when_the_cuda_kernels_do_not_compile(m
     assert torch.equal(out, triton_int8_linear(monkeypatch, "projection", operands))
 
 
-#sm_80 (the A100), sm_86 and sm_89 with this gpu's multiprocessors, and this compute capability with another number of them
+#sm_80 is the A100; "multiprocessors" keeps this gpu's capability and changes its multiprocessor count
 @gpu
 @pytest.mark.parametrize("untimed", [(8, 0), (8, 6), (8, 9), "multiprocessors"])
 def test_untimed_gpus_never_use_the_cuda_kernels(untimed, monkeypatch):
@@ -222,7 +222,7 @@ def test_norm_quant_rounds_the_rmsnorm():
         assert ((integers.float() * scale[..., None] - normed).abs() <= 0.501 * step[..., None]).all()
 
 
-#992 into 1024 slots is the d768's; 320 into 384 is not a power of two
+#992 into 1024 slots is the shipped network's; 320 into 384 is not a power of two
 @gpu
 @pytest.mark.parametrize("hidden, width", [(992, 1024), (320, 384)])
 def test_rotate_quant_rounds_the_rotated_rows(hidden, width):
@@ -253,7 +253,7 @@ def test_rotate_quant_rows_change_no_bits(monkeypatch):
     assert all(torch.equal(integers, found[0][0]) and torch.equal(scale, found[0][1]) for integers, scale in found[1:])
 
 
-#sm_120 takes fewer rows a program up to 4 rows a multiprocessor; the untimed gpus (an A100, A40 and L40S) take 8 at any batch
+#sm_120 takes fewer rows a program up to 4 rows a multiprocessor; the untimed gpus (A100, A40, L40S) take 8 at any batch
 @pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (12, 0)])
 def test_rotate_rows_by_compute_capability(monkeypatch, capability):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
@@ -267,7 +267,6 @@ def test_rotate_rows_by_compute_capability(monkeypatch, capability):
 SMALL_SETTINGS = {"d_model": 128, "num_layers": 3, "n_heads": 4, "kv_heads": 2, "qk_ratio": [0.25, 0.5, 0.75], "mlp_hidden": 320, "value_bins": 16}
 
 
-#a small model saved in tmp_path and real positions to check it on
 def small_checkpoint(tmp_path, settings: dict = SMALL_SETTINGS) -> tuple[ChessTransformer, torch.Tensor]:
     torch.manual_seed(0)
     model = ChessTransformer(**settings).eval()
@@ -346,7 +345,7 @@ def test_down_mixes_the_next_blocks_input_to_the_bit(tmp_path, small_calibration
     assert linked == [False, True] and torch.equal(mixed_in_down, mixed_by_each)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), reason="no sm_90 gpu")
+@sm_90
 def test_dependent_launch_changes_no_bits(tmp_path, small_calibration, restore_matmul_flags, monkeypatch):
     _, boards = small_checkpoint(tmp_path)
     boards = boards.numpy().astype("uint8")
@@ -361,7 +360,6 @@ def test_dependent_launch_changes_no_bits(tmp_path, small_calibration, restore_m
     assert np.array_equal(answers, expected)
 
 
-#graphs whose matmuls all take their tables' last tile give the bits of the graphs that pick tiles by rows
 @gpu
 def test_tiles_by_rows_change_no_answer(tmp_path, small_calibration, restore_matmul_flags, monkeypatch):
     _, boards = small_checkpoint(tmp_path)
@@ -390,7 +388,6 @@ def test_the_engine_network_runs_in_int8(tmp_path, small_calibration, restore_ma
     assert abs(answers - expected).max() < 0.05
 
 
-#a lean lane gets random answer columns beside the boards
 def answers_by_lane_and_size(network, boards: np.ndarray) -> list[np.ndarray]:
     columns = np.random.default_rng(0).integers(0, ANSWER_WIDTH, size=(len(boards), LEAN_COLUMNS)).astype("<u2")
     answers = []
@@ -418,7 +415,6 @@ def test_the_engine_networks_answer_as_engine_networks(tmp_path, small_calibrati
     assert all(np.array_equal(answer, expected_answer) for answers in found for answer, expected_answer in zip(answers, expected))
 
 
-#the lanes after the first skip the warmup: the first's compiled and loaded every kernel
 @gpu
 @pytest.mark.parametrize("lean", [False, True])
 def test_later_lanes_answer_as_warmed_up_lanes(tmp_path, small_calibration, restore_matmul_flags, monkeypatch, lean):
@@ -442,7 +438,7 @@ def test_the_engines_compile_traces_each_size_once(tmp_path, small_calibration, 
     log.addHandler(handler)
     log.setLevel(logging.INFO)
     try:
-        #a fresh start: dynamo keeps the floats it made constant for the rest of the process
+        #dynamo keeps the floats it made constant for the rest of the process
         torch._dynamo.reset()
         model = ExactSizeCompiled(int8_model(tmp_path / "model.pt", 1), 4)
         with torch.no_grad():
@@ -455,8 +451,8 @@ def test_the_engines_compile_traces_each_size_once(tmp_path, small_calibration, 
     assert not [message for message in messages if message.startswith("Restarting analysis")]
 
 
-#configs for the small model's depths up to 2 boards; the 4-board graph runs Triton beside them
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0), reason="no sm_90 gpu")
+#140 rows is 2 boards: the 4-board graph runs Triton beside the CUDA kernels
+@sm_90
 def test_the_int8_model_gives_the_same_bits_with_the_small_batch_cuda_kernels(tmp_path, small_calibration, restore_matmul_flags, monkeypatch):
     _, boards = small_checkpoint(tmp_path)
     boards = boards.numpy().astype("uint8")
@@ -515,7 +511,7 @@ def test_the_int8_weights_are_cached_by_the_checkpoints_content(tmp_path, small_
     assert quantization.cached_weights_path(tmp_path / "model.pt", 0) != path
 
 
-#the all-int8 weights keep the name of the files cached before fp16 blocks existed, so those are read, not rounded again
+#no fp16 blocks kept: the file name from before blocks could be kept
 @gpu
 def test_the_weights_without_fp16_blocks_are_cached_by_their_count(tmp_path, small_calibration, monkeypatch):
     path = tmp_path / "model.pt"

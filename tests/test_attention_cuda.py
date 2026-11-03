@@ -17,7 +17,6 @@ def gpu_key() -> tuple[int, int, int]:
     return (*torch.cuda.get_device_capability(), torch.cuda.get_device_properties(0).multi_processor_count)
 
 
-#this gpu timed for every number of positions, with fresh kernels
 @pytest.fixture
 def timed_here(monkeypatch):
     monkeypatch.setattr(attention_cuda, "TIMED", {gpu_key(): (1, 0.0)})
@@ -61,7 +60,6 @@ def reference(arguments: tuple) -> torch.Tensor:
     return (torch.softmax(scores, -1) @ v).transpose(1, 2).reshape(B, T, heads * dv)
 
 
-#1 and 5 positions leave a CTA's slots part empty, 64 fills them, 100 spills into another wave
 @sm_120
 @pytest.mark.parametrize("dq", [8, 16, 24])
 @pytest.mark.parametrize("positions", [1, 5, 37, 64, 100])
@@ -81,7 +79,6 @@ def test_the_cuda_attention_follows_the_triton_kernels(timed_here, monkeypatch, 
     assert (out.float() - triton_attention(monkeypatch, arguments).float()).abs().max() < 4e-3
 
 
-#zero coefficients and zero templates both leave the attention without bias
 @sm_120
 def test_the_cuda_attention_reads_the_templates_and_their_coefficients(timed_here):
     projected, templates, *rest = operands(8, 16)
@@ -125,7 +122,6 @@ def test_positions_take_the_kernel_by_the_waves_they_fill():
     assert [positions for positions in range(1, 12) if takes(exact, positions)] == [3, 6, 9]
 
 
-#compute capabilities (sm_80, sm_86, sm_89) and multiprocessor counts that were not timed never compile
 @sm_120
 @pytest.mark.parametrize("untimed", [(8, 0), (8, 6), (8, 9), "multiprocessors"])
 def test_untimed_gpus_never_use_the_cuda_attention(monkeypatch, untimed):
@@ -159,7 +155,7 @@ def test_the_triton_kernels_run_when_the_cuda_attention_does_not_compile(timed_h
 def test_the_cuda_attention_leaves_other_inputs_to_the_triton_kernels(timed_here):
     arguments = operands(64, 16)
     projected, templates, q_gain, k_gain, *rest = arguments
-    assert attention_cuda.cuda_template_attention(*arguments) is not None
+    cuda_attention(arguments)
     four = torch.randn(64, TOKENS, 4 * 16 + 4 * 16 + 4 * DV + 4 * TEMPLATES, device="cuda").half()
     assert attention_cuda.cuda_template_attention(four, templates, q_gain, k_gain, 4, 4, 16, DV, TEMPLATES, EPS) is None
     in_fp32 = [tensor.float() for tensor in arguments[:4]]
@@ -170,7 +166,7 @@ def test_the_cuda_attention_leaves_other_inputs_to_the_triton_kernels(timed_here
     assert attention_cuda.cuda_template_attention(shifted, templates, q_gain, k_gain, *rest) is None
 
 
-#layout [square][key % 8][template // 2][key // 8] of template pairs, made again after an update and not while a graph records
+#layout [square][key % 8][template // 2][key // 8] of template pairs
 @sm_120
 def test_paired_templates_are_the_templates_rearranged_and_follow_them(monkeypatch):
     monkeypatch.setattr(attention_cuda, "PAIRED", {})

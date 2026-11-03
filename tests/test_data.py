@@ -22,7 +22,6 @@ def write_arrays(folder, name, split, **arrays) -> None:
         (folder / f"{name}_{split}_{kind}.bin").write_bytes(array.tobytes())
 
 
-#the best move is the row number; a second label place per position, empty
 def write_training_set(folder, name, positions_per_split) -> None:
     for split, positions in positions_per_split.items():
         write_arrays(folder, name, split,
@@ -59,7 +58,6 @@ def test_items_have_the_dtype_and_shape_the_model_needs(tiny):
     assert target_moves.dtype == torch.long and target_moves.shape == (2,)
     assert target_probabilities.tolist() == [1.0, 0.0]
     assert value.dtype == torch.float and value.shape == ()
-    #a set without blunder labels: one place, no blunder
     assert blunders.dtype == torch.long and blunders.tolist() == [NO_MOVE]
 
 
@@ -85,7 +83,6 @@ def test_train_loader_reshuffles_and_val_loader_does_not(tiny):
 
 
 def test_train_order_depends_on_the_seed_alone(tiny):
-    #building a model draws a different amount of random numbers for every architecture
     def first_batches(seed: int, draws_before: int) -> list[list[int]]:
         torch.manual_seed(0)
         torch.randn(draws_before)
@@ -107,7 +104,7 @@ def test_training_set_without_stockfish_labels_is_reported(folder):
     for split in ("train", "val"):
         (folder / f"unlabelled_{split}_stockfish_moves.bin").unlink()
 
-    with pytest.raises(FileNotFoundError, match="label_with_stockfish"):
+    with pytest.raises(FileNotFoundError, match="unlabelled_train_stockfish_moves.bin"):
         load_training_set("unlabelled", TEMPERATURE)
 
 
@@ -174,7 +171,6 @@ def test_blunders_are_the_labelled_moves_that_give_away_enough(folder):
     assert lenient[[0]][4].tolist() == [[700, 701, 702]]
 
 
-#ignored labels would train without the blunder penalty, silently
 def test_self_play_sets_take_blunder_labels_too(folder):
     for split, positions in (("train", 4), ("val", 2)):
         write_arrays(folder, "selfplay", split,
@@ -205,7 +201,6 @@ def test_blunder_labels_must_come_in_pairs_of_the_same_shape():
         ChessGamesDataset(boards, labels, labels, TEMPERATURE, np.zeros((2, 3), dtype=np.int16), np.zeros((2, 2), dtype=np.float16))
 
 
-#moves 900 and 901 at 0.75 / 0.25, expected score 0.9
 def write_teacher_targets(folder, name, positions_per_split):
     for split, positions in positions_per_split.items():
         write_arrays(folder, name, split,
@@ -214,7 +209,6 @@ def write_teacher_targets(folder, name, positions_per_split):
                      teacher_scores=np.full(positions, 0.9, dtype=np.float16))
 
 
-#teacher moves follow stockfish's with weights scaled to still add up to 1; val stays stockfish's alone
 def test_teacher_targets_take_their_share_of_the_train_targets(folder):
     write_training_set(folder, "taught", {"train": 4, "val": 2})
     write_teacher_targets(folder, "taught", {"train": 4, "val": 2})
@@ -231,13 +225,11 @@ def test_teacher_targets_take_their_share_of_the_train_targets(folder):
     assert val_moves.tolist() == [[1, 0]] and val_probabilities[0].tolist() == pytest.approx([1.0, 0.0])
     assert val_values.item() == pytest.approx(stockfish_value, abs=1e-6)
 
-    #weight 0 ignores the teacher files
     plain, _ = load_training_set("taught", TEMPERATURE)
     assert plain[[1]][1].tolist() == [[1, 0]]
 
 
-#a run asked to distil must not quietly train on stockfish alone
 def test_a_teacher_weight_without_teacher_targets_is_reported(folder):
     write_training_set(folder, "untaught", {"train": 4, "val": 2})
-    with pytest.raises(FileNotFoundError, match="teacher_targets"):
+    with pytest.raises(FileNotFoundError, match="teacher_moves"):
         load_training_set("untaught", TEMPERATURE, teacher_weight=0.5)

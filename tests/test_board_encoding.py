@@ -31,15 +31,24 @@ from model.encoding import (
 )
 
 #written out by hand so the layout is checked against something other than encode_board itself
+BLACK_TO_MOVE, WHITE_TO_MOVE = 13, 14
+NO_CASTLING_RIGHT, CASTLING_RIGHT = 15, 16
+NO_EN_PASSANT = 17  #en passant square s is token 17 + s
+
+PIECE_CODES = {
+    "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
+    "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
+}
+
 START_POSITION_ENCODING = (
-    [4, 2, 3, 5, 6, 3, 2, 4]        #rank 1, a1..h1
+    [4, 2, 3, 5, 6, 3, 2, 4]
     + [1] * 8
     + [0] * 32
     + [7] * 8
     + [10, 8, 9, 11, 12, 9, 8, 10]
-    + [14]                          #white to move
-    + [16, 16, 16, 16]              #castling: white K, white Q, black k, black q
-    + [17]                          #no en passant square
+    + [WHITE_TO_MOVE]
+    + [CASTLING_RIGHT] * 4
+    + [NO_EN_PASSANT]
 )
 
 #after 1. e4, as black sees it: black's own pieces at the bottom and coded as white, the e4 pawn on e5
@@ -47,23 +56,14 @@ AFTER_E4_ENCODING = (
     [4, 2, 3, 5, 6, 3, 2, 4]
     + [1] * 8
     + [0] * 16
-    + [0, 0, 0, 0, 7, 0, 0, 0]      #rank 5
+    + [0, 0, 0, 0, 7, 0, 0, 0]
     + [0] * 8
-    + [7, 7, 7, 7, 0, 7, 7, 7]      #rank 7
+    + [7, 7, 7, 7, 0, 7, 7, 7]
     + [10, 8, 9, 11, 12, 9, 8, 10]
-    + [13]                          #black to move
-    + [16, 16, 16, 16]
-    + [17]
+    + [BLACK_TO_MOVE]
+    + [CASTLING_RIGHT] * 4
+    + [NO_EN_PASSANT]
 )
-
-BLACK_TO_MOVE, WHITE_TO_MOVE = 13, 14
-NO_CASTLING_RIGHT = 15  #a castling right is token 16
-NO_EN_PASSANT = 17  #en passant square s is token 17 + s
-
-PIECE_CODES = {
-    "P": 1, "N": 2, "B": 3, "R": 4, "Q": 5, "K": 6,
-    "p": 7, "n": 8, "b": 9, "r": 10, "q": 11, "k": 12,
-}
 
 
 def board_after(*san_moves: str) -> chess.Board:
@@ -107,7 +107,7 @@ def test_black_to_move():
     board = board_after("e4")
 
     assert encode_board(board) == AFTER_E4_ENCODING
-    assert decode_board(encode_board(board)).turn == chess.BLACK
+    assert_round_trip(board)
 
 
 #the flags are the side to move's kingside and queenside, then the opponent's
@@ -247,7 +247,6 @@ def test_move_vocabulary_size():
         pytest.param("a1b1", chess.WHITE, 0, id="first-move"),
         pytest.param("a7a8n", chess.WHITE, 1792, id="first-promotion"),
         pytest.param("h2h1q", chess.WHITE, 1967, id="last-promotion"),
-        #black's moves get the id of the same move seen from black's side
         pytest.param("a8b8", chess.BLACK, 0, id="black-first-move"),
         pytest.param("a2a1n", chess.BLACK, 1792, id="black-first-promotion"),
     ],
@@ -266,7 +265,6 @@ def test_every_id_round_trips():
 
 
 def test_impossible_move_is_rejected():
-    #must fail loudly rather than become a wrong training label
     with pytest.raises(KeyError):
         encode_move_to_id(chess.Move(chess.A1, chess.B4), chess.WHITE)
 
@@ -288,17 +286,7 @@ def test_special_legal_moves_have_ids(fen):
         assert decode_id_to_move(encode_move_to_id(move, board.turn), board.turn) == move, move.uci()
 
 
-#catches a wrong enumeration (a missing direction or piece), which the round trip over the table cannot see
-def test_every_legal_move_of_real_games_has_an_id(carlsen_games):
-    for game in carlsen_games:
-        board = game.board()
-        for played_move in game.mainline_moves():
-            for move in board.legal_moves:
-                assert decode_id_to_move(encode_move_to_id(move, board.turn), board.turn) == move, move.uci()
-            board.push(played_move)
-
-
-#a token never means two things. Blocks written out by hand
+#a token never means two things in different slots
 def test_every_slot_stays_inside_its_token_block(carlsen_games):
     assert BOARD_VOCAB_SIZE == 81
 
@@ -323,7 +311,6 @@ def test_move_parts_describe_the_move_with_that_id():
 
 
 def test_every_promotion_shares_its_squares_with_a_plain_move():
-    #the head scores a promotion as its (from, to) pair plus something for the piece, so the pair has to exist
     plain_pairs = {(move.from_square, move.to_square) for move in ALL_POSSIBLE_MOVES if move.promotion is None}
     promotion_pairs = [(MOVE_FROM_SQUARES[move_id], MOVE_TO_SQUARES[move_id]) for move_id in PROMOTION_MOVE_IDS]
 

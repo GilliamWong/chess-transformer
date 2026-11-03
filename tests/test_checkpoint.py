@@ -7,12 +7,13 @@ import torch
 from model import checkpoint
 from model.checkpoint import load_checkpoint, save_checkpoint, warm_start
 from model.model import ChessTransformer
-from engine.player import choose_move, load_model
+from engine import mcts
+from engine.player import load_model
 
 CPU = torch.device("cpu")
 
-#not the default size, so loading only works if the settings really come from the file
-SETTINGS = {"d_model": 48, "num_layers": 3, "n_heads": 6, "mlp_hidden": 96, "qk_ratio": [0.5, 0.25, 1.0], "kv_heads": 3, "loops": 2, "value_bins": 16}
+#not the default size, so loading only works if the settings come from the file
+SETTINGS = {"d_model": 48, "num_layers": 3, "n_heads": 6, "mlp_hidden": 96, "qk_ratio": [0.5, 0.25, 1.0], "kv_heads": 3, "value_bins": 16}
 
 
 @pytest.mark.parametrize("extra_settings", [{}, {"template_maps": 0}, {"input_skip": True, "rms_norm": True}],
@@ -44,7 +45,7 @@ def test_a_checkpoint_from_before_mlp_hidden_loads_at_its_old_width(tmp_path, d_
 
 def test_a_warm_start_with_other_bins_renews_only_the_last_layer_of_the_eval_head(tmp_path):
     torch.manual_seed(0)
-    old_settings = {"d_model": 32, "num_layers": 2, "n_heads": 2, "mlp_hidden": 40, "value_bins": 1}
+    old_settings = {"d_model": 32, "num_layers": 2, "n_heads": 2, "mlp_hidden": 40, "value_bins": 8}
     old = ChessTransformer(**old_settings)
     save_checkpoint(old, old_settings, tmp_path / "model.pt")
 
@@ -56,7 +57,7 @@ def test_a_warm_start_with_other_bins_renews_only_the_last_layer_of_the_eval_hea
     changed = {name for name in new_weights if new_weights[name].shape != old_weights[name].shape or not torch.equal(new_weights[name], old_weights[name])}
     assert changed == {"eval_head.2.weight", "eval_head.2.bias"}
     assert model.eval_head[-1].out_features == 16
-    same, _ = warm_start(tmp_path / "model.pt", CPU, value_bins=1)
+    same, _ = warm_start(tmp_path / "model.pt", CPU, value_bins=8)
     assert all(torch.equal(tensor, old_weights[name]) for name, tensor in same.state_dict().items())
 
 
@@ -98,7 +99,7 @@ def test_player_loads_a_model_that_is_not_the_default_size(tmp_path):
     model = load_model(tmp_path / "model.pt", CPU)
 
     assert not model.training
-    assert choose_move(model, chess.Board(), CPU) in chess.Board().legal_moves
+    assert mcts.most_visited_move(mcts.search(model, chess.Board(), CPU, 8)) in chess.Board().legal_moves
 
 
 def test_latest_checkpoint_is_the_run_that_finished_last(tmp_path, monkeypatch):

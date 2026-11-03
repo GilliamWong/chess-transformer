@@ -26,7 +26,7 @@ def test_positions_budget_counts_steps():
 def test_minutes_budget_does_not_count_the_first_step(clock):
     budget = Budget(batch_size=100, minutes=1)
 
-    clock.now += 25  #the first step is where torch.compile compiles
+    clock.now += 25
     assert budget.step_done() == 0
     clock.now += 30
     assert budget.step_done() == 30

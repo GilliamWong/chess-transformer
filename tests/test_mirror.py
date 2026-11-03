@@ -48,7 +48,6 @@ def with_three_legal_moves(boards: list[chess.Board]) -> list[chess.Board]:
     return [board for board in boards if board.legal_moves.count() >= 3]
 
 
-#en passant on the edge files and the middle, and promotions (pushing, capturing, on the edge files), for both colours
 SPECIAL_FENS = [
     "4k3/8/8/pP6/8/8/8/4K3 w - a6 0 1",
     "4k3/8/8/6Pp/8/8/8/4K3 w - h6 0 1",
@@ -99,7 +98,7 @@ def test_mirrored_tokens_are_the_encoding_of_the_mirrored_board(castling_free):
 
     wrong = (mirrored != expected).any(dim=1).nonzero().flatten().tolist()
     assert not wrong, [castling_free[row].fen() for row in wrong[:3]]
-    assert (mirrored != boards).any(dim=1).float().mean() > 0.9 #most positions are not symmetric
+    assert (mirrored != boards).any(dim=1).float().mean() > 0.9
 
 
 def test_mirrored_move_ids_are_the_mirrored_legal_moves_for_both_colours(castling_free):
@@ -151,23 +150,22 @@ def test_a_castling_right_keeps_a_position_from_being_mirrored(fen):
     assert can_mirror(tokens([without_rights])).item()
 
 
-#flip says which rows are written mirrored
-def labelled_arrays(positions: list[chess.Board], flip: list[bool]) -> dict[str, np.ndarray]:
+def labelled_arrays(positions: list[chess.Board], written_mirrored: list[bool]) -> dict[str, np.ndarray]:
     random = Random(1)
     legal = [list(board.legal_moves) for board in positions]
 
     def ids(labelled: int, places: int) -> np.ndarray:
         chosen = [random.sample(moves, labelled) for moves in legal]
-        rows = [[encode_move_to_id(flip_move(move) if flip_row else move, board.turn) for move in moves] + [NO_MOVE] * (places - labelled)
-                for board, moves, flip_row in zip(positions, chosen, flip)]
+        rows = [[encode_move_to_id(flip_move(move) if mirror_row else move, board.turn) for move in moves] + [NO_MOVE] * (places - labelled)
+                for board, moves, mirror_row in zip(positions, chosen, written_mirrored)]
         return np.array(rows, dtype=np.int16)
 
-    boards = np.array([encode_board(flipped(board) if flip_row else board) for board, flip_row in zip(positions, flip)], dtype=np.uint8)
+    boards = np.array([encode_board(flipped(board) if mirror_row else board) for board, mirror_row in zip(positions, written_mirrored)], dtype=np.uint8)
     return dict(boards=boards, stockfish_moves=ids(2, 3), worst_moves=ids(1, 2), teacher_moves=ids(2, 2), visit_moves=ids(3, 4))
 
-#a stockfish labelled and a self play set; every position needs 3 or more legal moves
-def make_sets(positions: list[chess.Board], flip: list[bool]):
-    arrays = labelled_arrays(positions, flip)
+#every position needs 3 or more legal moves
+def make_sets(positions: list[chess.Board], written_mirrored: list[bool]) -> tuple[ChessGamesDataset, SelfPlayDataset]:
+    arrays = labelled_arrays(positions, written_mirrored)
     size = len(positions)
     rng = np.random.default_rng(3)
     losses = np.stack([np.full(size, 0.6), np.zeros(size)], axis=1).astype(np.float16)
@@ -186,13 +184,12 @@ def choose_rows(coins: torch.Tensor, mirrored_batch, plain_batch):
 
 @pytest.mark.parametrize("kind", [0, 1], ids=["stockfish labelled", "self play"])
 def test_a_dataset_mirrors_the_board_and_every_kind_of_target_move(positions, kind):
-    #rows with castling rights are in the set too: their mirror is the position itself
     rows_in_set = with_three_legal_moves(positions)
     rows_in_set = rows_in_set[::max(1, len(rows_in_set) // 400)] + [chess.Board(fen) for fen in RIGHTS_FENS]
     eligible = [has_no_castling_right(board) for board in rows_in_set]
     assert 0 < sum(eligible) < len(eligible)
     dataset = make_sets(rows_in_set, [False] * len(rows_in_set))[kind]
-    mirror_image = make_sets(rows_in_set, eligible)[kind] #written by python-chess's mirror
+    mirror_image = make_sets(rows_in_set, eligible)[kind]
     rows = torch.randperm(len(rows_in_set), generator=torch.Generator().manual_seed(0))[:200]
     coins = draw_mirrors(rows, 5, 0).coins
     assert coins.any() and not coins.all()
@@ -203,8 +200,8 @@ def test_a_dataset_mirrors_the_board_and_every_kind_of_target_move(positions, ki
     wanted = choose_rows(coins, mirror_image[rows.tolist()], plain)
     for name, actual, expected in zip(("boards", "target moves", "target probabilities", "values", "blunders"), got, wanted):
         assert torch.equal(actual, expected), name
-    assert (got[0] != plain[0]).any() and (got[1] != plain[1]).any() and (got[4] != plain[4]).any() #some rows really changed
-    untouched = dataset[MirrorRows(rows, torch.zeros_like(coins))] #all coins False reads like a plain index
+    assert (got[0] != plain[0]).any() and (got[1] != plain[1]).any() and (got[4] != plain[4]).any()
+    untouched = dataset[MirrorRows(rows, torch.zeros_like(coins))]
     assert all(torch.equal(actual, expected) for actual, expected in zip(untouched, plain))
 
 
@@ -234,16 +231,17 @@ def test_coins_are_fair_and_independent_across_rows_epochs_and_seeds():
     epochs = 7
     rows = torch.arange(200_000)
     coins = {(seed, epoch): draw_mirrors(rows, seed, epoch).coins for seed in (42, 43) for epoch in range(epochs)}
-    #0.005 is about 4 standard deviations (0.0011 each) of a fair coin's mean; two independent fair coins agree half the time
+    #about 4 standard deviations (0.0011 each) of a fair coin's mean; two independent fair coins agree half the time
+    tolerance = 0.005
     def gap(agreement: torch.Tensor) -> float:
         return abs(agreement.float().mean().item() - 0.5)
-    assert all(gap(flips) < 0.005 for flips in coins.values())
+    assert all(gap(flips) < tolerance for flips in coins.values())
     first = coins[42, 0]
-    assert all(gap(first == coins[42, epoch]) < 0.005 for epoch in range(1, epochs))
-    assert gap(first == coins[43, 0]) < 0.005
-    assert gap(first[1:] == first[:-1]) < 0.005 and gap(first[2:] == first[:-2]) < 0.005
+    assert all(gap(first == coins[42, epoch]) < tolerance for epoch in range(1, epochs))
+    assert gap(first == coins[43, 0]) < tolerance
+    assert gap(first[1:] == first[:-1]) < tolerance and gap(first[2:] == first[:-2]) < tolerance
     times_mirrored = torch.stack([coins[42, epoch] for epoch in range(epochs)]).sum(dim=0)
-    assert abs(((times_mirrored > 0) & (times_mirrored < epochs)).float().mean().item() - (1 - 2 / 2 ** epochs)) < 0.005
+    assert abs(((times_mirrored > 0) & (times_mirrored < epochs)).float().mean().item() - (1 - 2 / 2 ** epochs)) < tolerance
 
 
 #a resumed run draws the coins this function gives: changing it changes the data of every saved run
@@ -268,7 +266,6 @@ def epoch_steps(world_size: int, epoch: int, skip: int = 0, mirror: bool = True)
 
 def test_a_resumed_epoch_draws_the_coins_of_one_that_was_not_stopped():
     uninterrupted = epoch_steps(2, epoch=3)
-    #a resume restores the epoch and skips the batches already trained on
     assert epoch_steps(2, epoch=3, skip=5) == uninterrupted[5:]
     assert len(uninterrupted) == STEPS
 
@@ -327,7 +324,7 @@ def test_the_train_loader_mirrors_a_new_set_of_rows_every_pass_and_the_val_loade
 
 
 def test_rows_with_castling_rights_and_the_shuffle_come_out_as_without_the_flag():
-    dataset = numbered_set(100, rights_token=CASTLING_TOKEN_OFFSET + 1) #every row holds a right
+    dataset = numbered_set(100, rights_token=CASTLING_TOKEN_OFFSET + 1)
     plain_loader, _ = datasets_to_dataloaders(dataset, dataset, train_batch_size=16, seed=7)
     mirror_loader, _ = datasets_to_dataloaders(dataset, dataset, train_batch_size=16, seed=7, mirror=True)
 

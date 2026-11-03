@@ -40,9 +40,8 @@ MATE_IN_ONE = "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1"
 MATE_IN_TWO = "k7/8/2K5/8/8/8/8/7R w - - 0 1"
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 
-#the expectations here were set by mcts.py's constants; the engine's own changes over them are test_the_engines_settings'
 @pytest.fixture(autouse=True)
-def mcts_constants(monkeypatch):
+def without_engine_settings(monkeypatch):
     monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {})
 
 @pytest.fixture
@@ -263,7 +262,6 @@ class ThreadEntry(ctypes.Structure):
 class GroupAffinity(ctypes.Structure):
     _fields_ = [("mask", ctypes.c_size_t), ("group", ctypes.c_uint16), ("reserved", ctypes.c_uint16 * 3)]
 
-#the threads of this process that may run on one cpu only, counted by that cpu
 def pinned_threads() -> Counter:
     pinned = Counter()
     if sys.platform != "win32":
@@ -479,7 +477,6 @@ def test_a_rounds_leaves_grow_with_the_search(carlsen_games):
     assert growing.sizes[:4] == [1, 1, 1, 1] and max(growing.sizes) == 64
     assert fixed.sizes[1] > 16 and len(growing.sizes) > len(fixed.sizes)
 
-#a leaf per 16 simulations done or left (the fewer), one round out until a round takes all 64
 @pytest.mark.parametrize("visits, simulations, expected", [(0, 1000, (1, 1)), (160, 1000, (10, 1)), (1024, None, (64, 2)), (995, 1000, (1, 1))])
 def test_the_leaves_of_a_round(visits, simulations, expected):
     search = EngineSearch(cpu_batches(BoardModel()), 64, grow_leaves=16)
@@ -748,7 +745,6 @@ def test_the_clock_follows_the_material_and_never_runs_out():
         left += 0.6 - seconds - MOVE_OVERHEAD_SECONDS
         spent.setdefault("opening" if men >= 26 else "middle game" if men >= 16 else "late", []).append(seconds)
         low = min(low, left)
-    #the last 30 moves are at 6 men
     opening, middle_game, endgame = (sum(moves) / len(moves) for moves in (spent["opening"], spent["middle game"], spent["late"][-30:]))
     assert middle_game > 1.1 * opening and endgame < 0.7
     assert late_middlegame_left > 12 and low > RESERVE_SECONDS / 2
@@ -957,6 +953,8 @@ def run_uci_main(monkeypatch, *options: str, stdin: str = "isready\nquit\n") -> 
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
     runpy.run_module("engine.uci", run_name="__main__")
 
+uci_as_main = pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+
 def test_the_engine_takes_a_precision(monkeypatch, model_path):
     built = []
     monkeypatch.setattr(uci, "engine_network", fake_engine_network(built))
@@ -974,13 +972,13 @@ def test_the_engine_takes_gpus(monkeypatch, tmp_path):
                         [built.append((fp16_blocks, device, blocking_wait)) or cpu_batches(BoardModel()) for device in devices])
     uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {"smart_pruning": False}, "int8", 1, [1])
     search = uci.load_player(tmp_path / "model.pt", "mcts", True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 2])
-    refused = [run_engine("unused.pt", *gpu, "--gpus", "0,1") for gpu in (["--leaves", "4"], ["--gpu", "--leaves", "1"])]
+    refused = [run_engine("unused.pt", *options, "--gpus", "0,1") for options in (["--leaves", "4"], ["--gpu", "--leaves", "1"])]
 
     assert built == [(1, 1, False), (1, 0, True), (1, 2, True)] and len(search.networks) == 2 and search.concurrent_descents
     assert search.network_cpus == engine_search.thread_cpus(2) != [] and search.search(chess.Board(), simulations=200).simulations >= 200
     assert all(run.returncode == 2 and "--gpus needs --select mcts --gpu" in run.stderr for run in refused)
 
-@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+@uci_as_main
 @pytest.mark.parametrize("arguments, cap", [([], 0), (["--visits-per-leaf-out", "16"], 16)])
 def test_the_engine_takes_a_cap_on_the_leaves_out(monkeypatch, arguments, cap):
     built = []
@@ -995,7 +993,7 @@ def test_the_engine_takes_a_cap_on_the_leaves_out(monkeypatch, arguments, cap):
 
     assert built == [cap]
 
-@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+@uci_as_main
 def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
     built = []
     monkeypatch.setattr(engine_search, "engine_network", fake_engine_network(built))
@@ -1004,7 +1002,7 @@ def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):
 
     assert built == [("int8", 1, False), ("int8", 0, False)]
 
-@pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modules")
+@uci_as_main
 def test_the_engine_takes_lc0s_time_options(monkeypatch):
     given = []
     def search(self, board, nodes, seconds, extension, stop, info=None):
@@ -1108,7 +1106,6 @@ class LikesMoves(nn.Module):
         logits[:, self.move_ids] = self.logit
         return logits, values
 
-#the network likes a king move, the search finds the rook's mate
 def test_certainty_plays_a_proven_win_over_the_most_visited_move():
     board = chess.Board(MATE_IN_ONE)
     model = LikesMoves([("g1f1", chess.WHITE)], 5.0)
@@ -1236,7 +1233,6 @@ def advancing_game(model, board: chess.Board, moves: int, way: str, replies: lis
         played.append(reply.uci())
     return reports, played, network.boards, advanced, search
 
-#a middlegame that reuses its trees (dropping them changes the reports) and a game whose knights shuffle so that draws go stale
 def test_advancing_the_tree_changes_no_search(middlegame):
     reports, replies, boards, _, _ = advancing_game(BoardModel(), middlegame.copy(), 8, "plain")
     advanced_reports, _, advanced_boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, "advance", replies)
@@ -1634,7 +1630,6 @@ def test_rust_rounds_with_concurrent_descents_drive_every_network(count):
     assert search.rust_counts[0] > 40 * count // 2 and all(not lane.pending for network in networks for lane in network.lanes)
     assert search.search(board, simulations=report.simulations + 500).simulations >= report.simulations + 500
 
-#a stop comes at any moment, also while a thread is midway through gathering
 def test_concurrent_searches_end_under_stops_at_any_moment():
     evaluate = cpu_batches(BoardModel()).evaluate_boards
     searches = selfplay_rs.Searches(**engine_search_settings(False), tree_reuse=True, cache_positions=100_000, concurrent_descents=True)
@@ -1677,7 +1672,6 @@ def test_concurrent_searches_end_under_stops_at_any_moment():
         searches.advance(0, fen, [move.uci() for move in board.move_stack])
     assert len(ended) == 40 and sum(ended) > 40 * 20
 
-#with transpositions (search.rs SearchSettings') the shared tree searches as the plain tree on one network, and otherwise than without them
 def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
     graph = {"settings": {"transpositions": True}}
     for way in ("plain", "advance", "drop"):

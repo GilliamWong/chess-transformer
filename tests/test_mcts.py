@@ -12,13 +12,12 @@ from model.model import ChessTransformer
 CPU = torch.device("cpu")
 
 
-#every move equally likely; the value logit is the side to move's material, a pawn is 1
 class MaterialModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         material = PIECE_VALUES[boards[:, :NUM_SQUARES]].sum(dim=1, keepdim=True)
         return torch.zeros(len(boards), NUM_MOVE_IDS), material
 
-#nearly all of the policy on these moves, split among those that are legal
+
 class FavouriteMoveModel(nn.Module):
     def __init__(self, *ucis: str):
         super().__init__()
@@ -30,7 +29,6 @@ class FavouriteMoveModel(nn.Module):
         return logits, torch.zeros(len(boards), 1)
 
 
-#black's moves reach the model mirrored: its e7e5 is the model's e2e4
 def test_black_moves_get_the_priors_of_their_mirrored_ids():
     board = chess.Board()
     board.push_san("e4")
@@ -153,7 +151,7 @@ def test_root_noise_moves_the_priors_the_same_way_for_the_same_seed():
 
     assert sum(priors[0]) == pytest.approx(1.0)
     assert priors[0] == priors[1] != priors[2]
-    assert max(priors[0]) > 1 / 20 + 0.01 #20 moves at the start, equally likely without the noise
+    assert max(priors[0]) > 1 / len(priors[0]) + 0.01
 
 
 def test_positions_evaluated_together_get_what_they_get_alone(carlsen_games):
