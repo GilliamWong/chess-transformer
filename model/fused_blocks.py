@@ -1,10 +1,4 @@
-#the engine's transformer blocks for inference on the gpu: the same arithmetic as model.TransformerBlock, arranged
-#for speed (tests/test_inference.py checks they agree, so a change to the block must be made here too). Q, K, V and
-#the template mix are one matmul, the mlp's gate and up another, and attention is a Triton kernel: it RMS-normalises
-#the queries and keys (QK-norm), adds the template bias (made by a kernel of its own), takes the softmax and mixes the
-#values without writing the scores or any transposed copy to memory, and reads each key/value head once for all the
-#query heads of its group instead of a copy for each (repeat_interleave). The matmuls are a Triton kernel too, with
-#the bias, the mlp's silu(gate) * up, the residual add and the next block's input mix in the same kernel
+#model.TransformerBlock's arithmetic arranged for speed on the gpu: a change to the block must be made here too (tests/test_inference.py checks they agree)
 import math
 
 import torch
@@ -21,9 +15,7 @@ from model.model import EDGE, KING, KNIGHT, NO_PIECE, NUM_SQUARES, PAWN, QUEEN, 
 
 #warps an attention instance has for each 64 of its square rows, and for its metadata rows
 SQUARE_WARPS, META_WARPS = 2, 2
-#the most warps Triton gives an instance
 MAX_WARPS = 32
-#rows of template_bias_kernel's matmuls: (position, head) pairs
 BIAS_PAIRS = 64
 #positions whose template bias is made and read at a time: a buffer that stays in L2
 BIAS_POSITIONS = 32
@@ -31,21 +23,19 @@ BIAS_POSITIONS = 32
 GRAPHED_BIAS_POSITIONS = 16
 
 
-#programmatic dependent launch (sm_90 and newer): a kernel starts as the blocks of the one before it finish and waits
-#for that one before touching memory. No early trigger: kernels launched early slowed small batches
+#programmatic dependent launch (sm_90 and newer): a kernel waits for the one before it before touching memory
 @triton.jit
 def dependent_launch_wait(PDL: tl.constexpr):
     if PDL:
         gdc_wait()
 
 
-#the launch keywords of a kernel that starts with dependent_launch_wait: griddepcontrol is sm_90 ptx
 def dependent_launch(device: torch.device) -> dict:
     supported = torch.cuda.get_device_capability(device) >= (9, 0)
     return {"PDL": supported, "launch_pdl": supported}
 
 
-#bias[(b, h), i] = c[(b, h), i] @ templates[:, i] for each query square i, on tensor cores (in the attention it was slow)
+#bias[(b, h), i] = c[(b, h), i] @ templates[:, i] for each query square i
 @triton.jit
 def template_bias_kernel(c_ptr, templates_ptr, bias_ptr, pairs_count, stride_b, stride_t,
                          HEADS: tl.constexpr, TEMPLATES: tl.constexpr, BLOCK_TEMPLATES: tl.constexpr, PAIRS: tl.constexpr,
@@ -65,7 +55,7 @@ def template_bias_kernel(c_ptr, templates_ptr, bias_ptr, pairs_count, stride_b, 
     tl.store(bias_ptr + pairs[:, None] * 4096 + i * 64 + squares[None, :], bias.to(bias_ptr.dtype.element_ty), mask=pair_ok[:, None])
 
 
-#the keys are the 64 squares (template bias) and the metadata tokens (none), 64 + 16 columns rather than 70 padded to 128
+#the keys are the 64 squares (with template bias) and the metadata tokens (without)
 @triton.jit
 def template_attention_kernel(q_ptr, k_ptr, v_ptr, bias_ptr, q_gain_ptr, k_gain_ptr, out_ptr,
                               stride_b, stride_t, out_stride_b, out_stride_t, eps, scale,
@@ -113,11 +103,10 @@ def template_attention_kernel(q_ptr, k_ptr, v_ptr, bias_ptr, q_gain_ptr, k_gain_
              mask=row_ok[:, None])
 
 
-#template_attention's second stream for each stream a cuda graph is captured on
 SIDE_STREAMS: dict[torch.cuda.Stream, torch.cuda.Stream] = {}
 
 
-#an opaque op for torch.compile: compiling through the kernel call made it ~15x slower
+#an opaque op, so that torch.compile does not compile through the kernel calls
 @torch.library.custom_op("chess::template_attention", mutates_args=())
 def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain: torch.Tensor, k_gain: torch.Tensor, heads: int, kv_heads: int,
                        dq: int, dv: int, templates_count: int, eps: float) -> torch.Tensor:
@@ -126,7 +115,7 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
         return found
     B, T, _ = projected.shape
     q, k, v, c = projected.split([heads * dq, kv_heads * dq, kv_heads * dv, heads * templates_count], dim=-1)
-    out = torch.empty(B, T, heads * dv, device=projected.device, dtype=projected.dtype)
+    out = projected.new_empty(B, T, heads * dv)
     heads_per_kv, block_meta = heads // kv_heads, max(16, triton.next_power_of_2(T - NUM_SQUARES))
     square_rows = triton.next_power_of_2(heads_per_kv * NUM_SQUARES)
     square_warps = SQUARE_WARPS * square_rows // NUM_SQUARES
@@ -153,9 +142,9 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
         template_attention_kernel[(kv_heads, B)](q, k, v, bias, q_gain, k_gain, out, *scalars, FIRST_ROW=NUM_SQUARES, ROWS_PER_HEAD=block_meta,
                                                  BLOCK_ROWS=triton.next_power_of_2(heads_per_kv * block_meta), num_warps=META_WARPS, **shapes, **launch)
 
-    #uncaptured, a second stream's waits and twice the launches halved the speed of callers without cuda graphs
+    #uncaptured, a second stream costs more than it saves
     if not torch.cuda.is_current_stream_capturing():
-        bias = torch.empty(min(B, BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
+        bias = projected.new_empty(min(B, BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES)
         for start in range(0, B, BIAS_POSITIONS):
             positions = slice(start, min(B, start + BIAS_POSITIONS))
             make_bias(positions, bias)
@@ -164,8 +153,7 @@ def template_attention(projected: torch.Tensor, templates: torch.Tensor, q_gain:
         return out
 
     chunks = [slice(start, min(B, start + GRAPHED_BIAS_POSITIONS)) for start in range(0, B, GRAPHED_BIAS_POSITIONS)]
-    biases = [torch.empty(min(B, GRAPHED_BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES, device=projected.device, dtype=projected.dtype)
-              for _ in range(min(2, len(chunks)))]
+    biases = [projected.new_empty(min(B, GRAPHED_BIAS_POSITIONS), heads, NUM_SQUARES, NUM_SQUARES) for _ in range(min(2, len(chunks)))]
     main = torch.cuda.current_stream(projected.device)
     if main not in SIDE_STREAMS:
         SIDE_STREAMS[main] = torch.cuda.Stream(projected.device)
@@ -197,37 +185,28 @@ def _(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_c
     return projected.new_empty(B, T, heads * dv)
 
 
-#a tile of the blocks' matmuls is its rows (+ linear_extra_rows()) x its columns, LINEAR_DEPTH deep (a gated matmul's
-#is columns / 2 columns of the gate and the same of up), and GROUP_M row tiles go through the columns together so their
-#rows stay in L2. LINEAR_ROWS x LINEAR_COLUMNS with LINEAR_WARPS and LINEAR_STAGES was the fastest on an RTX 4090 at 64
-#positions of 32 to 128 rows, 64 to 256 columns, 2 to 4 stages and 4 or 8 warps
-LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_DEPTH, LINEAR_WARPS, LINEAR_STAGES, GROUP_M = 128, 128, 32, 4, 3, 8
-#linear's tiles (rows, columns, warps, stages) by compute capability, as tile_for lists; a gpu not timed takes them all
-#at LINEAR_ROWS x LINEAR_COLUMNS. sm_120's were timed as int8_blocks.INT8_TILES' (on the int8 network's fp16 matmuls).
-#Any tile gives the same bits: it changes neither the depth's order nor the instructions
-UNTIMED_LINEAR_TILES = [(math.inf, (LINEAR_ROWS, LINEAR_COLUMNS, LINEAR_WARPS, LINEAR_STAGES))]
+#a tile is its rows (+ linear_extra_rows()) x its columns, LINEAR_DEPTH deep (a gated matmul's columns / 2 columns of the gate and the same of up);
+#GROUP_M row tiles go through the columns together so their rows stay in L2
+LINEAR_DEPTH, GROUP_M = 32, 8
+#linear's tiles (rows, columns, warps, stages) by compute capability, as tile_for lists; a gpu not timed takes UNTIMED_LINEAR_TILES. Any tile gives the same bits
+UNTIMED_LINEAR_TILES = [(math.inf, (128, 128, 4, 3))]
 LINEAR_TILES = {(12, 0): [(2, (32, 64, 4, 5)), (8, (64, 64, 4, 4)), (12, (64, 128, 4, 3))] + UNTIMED_LINEAR_TILES}
-#a tile's extra rows each cost about this many of its rows (they are a smaller matmul of their own)
 EXTRA_ROW_COST = 1.5
 
 
-#a tile from tiles, [(the most rows a multiprocessor's share may be, tile), ...] with the last for any: a matmul runs
-#in waves of tiles over the multiprocessors, so a tile for a share times out the same on a card with more of them. On
-#a 70 multiprocessor card (RTX 5070 Ti) a board's 70 rows are one per multiprocessor
+#the first tile in tiles, [(the most rows a multiprocessor's share may be, tile), ...] with the last for any: a matmul runs in waves of tiles over
+#the multiprocessors, so a tile for a share times out the same on a card with more of them
 def tile_for(tiles: list[tuple[float, tuple[int, ...]]], M: int, multiprocessors: int) -> tuple[int, ...]:
     share = M / multiprocessors
     return next(tile for most, tile in tiles if share <= most)
 
 
-#linear's tile for a matmul of M rows on the gpu
 def linear_tile(device: torch.device, M: int) -> tuple[int, ...]:
     tiles = LINEAR_TILES.get(torch.cuda.get_device_capability(device), UNTIMED_LINEAR_TILES)
     return tile_for(tiles, M, torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-#the rows (0, 16, 32 or 64) a tile of rows takes after them: a matmul runs in waves of a tile per multiprocessor, and
-#a few tiles more than a whole number of waves cost a whole wave. At 64 positions (4,480 rows) a 512 column matmul has
-#140 tiles of 128 rows for 128 multiprocessors, or 128 tiles of 144
+#the rows (0, 16, 32 or 64) a tile of rows takes after them: a few tiles more than a whole number of waves cost a whole wave
 def linear_extra_rows(M: int, rows: int, column_tiles: int, multiprocessors: int) -> int:
     def cost(extra: int) -> float:
         waves = triton.cdiv(triton.cdiv(M, rows + extra) * column_tiles, multiprocessors)
@@ -257,9 +236,8 @@ def linear_epilogue(acc, up, rows, cols, M, N, bias_ptr, residual_ptr, original_
     tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-#out = x @ w (w is in_features x out_features), then in the same kernel the bias, silu(gate) * up (gated: w's first
-#half of columns is the gate, the second up) and the residual added. ACC_TYPE is the accumulators' type: fp16 for the
-#blocks, as cuBLAS did with allow_fp16_accumulation (twice fp32 accumulation's speed on a geforce card)
+#out = x @ w (w is in_features x out_features), then in the same kernel the bias, silu(gate) * up (gated: w's first half of columns is the gate,
+#the second up) and the residual added. ACC_TYPE is the accumulators' type: fp16 for the blocks, as cuBLAS did with allow_fp16_accumulation
 @triton.jit
 def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr, M, N, K, stride_w,
                   HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, MIX: tl.constexpr, ACC_TYPE: tl.constexpr,
@@ -282,8 +260,7 @@ def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, original_ptr, residual_s
     w_ptrs = w_ptr + depth[:, None] * stride_w + cols[None, :]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     up = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
-    #the tile's EXTRA_M rows after its BLOCK_M, a matmul of their own on the same weights (a row's sums are the same
-    #bits in either)
+    #the tile's EXTRA_M rows after its BLOCK_M, a matmul of their own on the same weights (a row's sums are the same bits in either)
     if EXTRA_M > 0:
         extra_rows = pid_m * TILE_M + BLOCK_M + tl.arange(0, EXTRA_M)
         extra_ptrs = x_ptr + extra_rows[:, None] * K + depth[None, :]
@@ -313,7 +290,6 @@ def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, original_ptr, residual_s
                         HAS_BIAS, HAS_RESIDUAL, GATED, MIX)
 
 
-#linear with a tile of LINEAR_TILES'
 def launch_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, residual: torch.Tensor | None, gated: bool,
                   accumulate_fp32: bool, original: torch.Tensor | None, residual_scale: torch.Tensor | None, input_scale: torch.Tensor | None,
                   tile: tuple[int, ...]) -> torch.Tensor:
@@ -340,9 +316,9 @@ def launch_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     return out
 
 
-#an opaque op for torch.compile, as template_attention. fp16 inputs accumulate in fp16 and give fp16, or with
-#accumulate_fp32 accumulate in fp32 and give fp32; fp32 inputs accumulate in fp32 (tf32 products). With original (the
-#input embedding) and the next block's residual_scale and input_scale it gives the next block's input (linear_epilogue)
+#an opaque op, as template_attention. fp16 inputs accumulate in fp16 and give fp16, or with accumulate_fp32 accumulate in fp32 and give fp32; fp32
+#inputs accumulate in fp32 (tf32 products). With original (the input embedding) and the next block's residual_scale and input_scale it gives the
+#next block's input (linear_epilogue)
 @torch.library.custom_op("chess::linear", mutates_args=())
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None, residual: torch.Tensor | None = None,
            gated: bool = False, accumulate_fp32: bool = False, original: torch.Tensor | None = None, residual_scale: torch.Tensor | None = None,
@@ -356,13 +332,11 @@ def _(x, weight, bias=None, residual=None, gated=False, accumulate_fp32=False, o
     return x.new_empty(*x.shape[:-1], weight.shape[1] // 2 if gated else weight.shape[1], dtype=torch.float32 if accumulate_fp32 else x.dtype)
 
 
-#a linear layer's weight as linear_kernel reads it, in_features x out_features
 def transposed(weight: torch.Tensor) -> nn.Parameter:
     return nn.Parameter(weight.detach().t().contiguous())
 
 
 class FusedBlock(nn.Module):
-    #takes over a trained block's weights (copied into the joined, transposed matmuls, or shared)
     def __init__(self, block: TransformerBlock):
         super().__init__()
         self.heads, self.kv_heads = block.n_heads, block.kv_heads
@@ -395,9 +369,8 @@ class FusedBlock(nn.Module):
         return linear(hidden, self.down, residual=x, original=original_board_embed, residual_scale=self.next_scales[0], input_scale=self.next_scales[1])
 
 
-#each block's down mixes the input of the block after it (next_scales, input_mixed) when both are of one kind: an fp16
-#block after an int8 one (the last, or one kept in fp16 for its int8 error) mixes its own input, as an int8 block after
-#an fp16 one does
+#each block's down mixes the input of the block after it (next_scales, input_mixed) when both are of one kind; a block after one of the other kind
+#(an fp16 block after an int8 one: the last, or one kept in fp16 for its int8 error) mixes its own input, as an int8 block after an fp16 one does
 def link_input_mixes(blocks: list[nn.Module]) -> None:
     for block in blocks:
         block.next_scales, block.input_mixed = None, False
@@ -406,8 +379,18 @@ def link_input_mixes(blocks: list[nn.Module]) -> None:
             block.next_scales, following.input_mixed = (following.residual_scale, following.input_scale), True
 
 
-#tokens and columns a program of input_embedding_kernel takes: whole rows in one program were slower
 EMBEDDING_TOKENS, EMBEDDING_COLUMNS = 8, 256
+
+
+#embed[code] + position[place] + the features' sum, stored; the features' sum is in the table's precision, as SquareFeatures gives it
+@triton.jit
+def store_embedding(boards_ptr, embed_ptr, position_ptr, out_ptr, features, token, place, d, D, token_ok, d_ok):
+    code = tl.load(boards_ptr + token, mask=token_ok, other=0)
+    mask = token_ok[:, None] & d_ok[None, :]
+    total = tl.load(embed_ptr + code[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
+    total += tl.load(position_ptr + place[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
+    total += features.to(out_ptr.dtype.element_ty).to(tl.float32)
+    tl.store(out_ptr + token[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 #the input embedding in one kernel, so that every block reads one buffer: inductor recomputed or copied it for each
@@ -424,13 +407,7 @@ def input_embedding_kernel(boards_ptr, rows_ptr, embed_ptr, position_ptr, table_
     for feature in range(FEATURES):
         row = tl.load(rows_ptr + (board * SQUARES + place) * FEATURES + feature, mask=square_ok, other=0)
         features += tl.load(table_ptr + row[:, None] * D + d[None, :], mask=square_ok[:, None] & d_ok[None, :], other=0.0).to(tl.float32)
-    code = tl.load(boards_ptr + token, mask=token_ok, other=0)
-    mask = token_ok[:, None] & d_ok[None, :]
-    total = tl.load(embed_ptr + code[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
-    total += tl.load(position_ptr + place[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
-    #the features' sum in the table's precision, as SquareFeatures gives it
-    total += features.to(out_ptr.dtype.element_ty).to(tl.float32)
-    tl.store(out_ptr + token[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=mask)
+    store_embedding(boards_ptr, embed_ptr, position_ptr, out_ptr, features, token, place, d, D, token_ok, d_ok)
 
 
 #boards B x T, rows B x 64 x features (each square's rows in the feature table): B x T x D
@@ -451,8 +428,7 @@ def _(boards, rows, embed, position, table):
     return table.new_empty(*boards.shape, table.shape[1])
 
 
-#the gpus the board embedding (board_embedding_kernel) and the fused heads (heads) were timed on, an RTX 5070 Ti and a
-#5090 (sm_120, 70 and 170 multiprocessors): other gpus keep the kernels before them until timed
+#the gpus (sm_120) that take board_embedding_kernel and the fused heads (heads); others keep input_embedding_kernel and head_weights' matmuls
 FUSED_ENDS_CAPABILITIES = {(12, 0)}
 
 
@@ -460,8 +436,7 @@ def fused_ends(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.get_device_capability(device) in FUSED_ENDS_CAPABILITIES
 
 
-#tokens and columns a program of board_embedding_kernel takes, by the batch's tokens: more programs for one or two boards
-#(the fastest of 2-16 tokens and 128-1024 columns on an RTX 5070 Ti and 5090); whole rows in one program were slower
+#tokens and columns a program of board_embedding_kernel takes, by the batch's tokens: smaller for one or two boards, for more programs
 def embedding_block(tokens: int) -> tuple[int, int]:
     return (4, 128) if tokens < 4 * TOKENS_PER_BOARD else (8, 256)
 
@@ -473,7 +448,6 @@ def piece_offset_row(codes, squares, place, CODE: tl.constexpr, NO_PIECE: tl.con
     return tl.where(piece < 64, (place // 8 - piece // 8 + 7) * 15 + place % 8 - piece % 8 + 7, NO_PIECE)
 
 
-#a direction's column of tokens x 8
 @triton.jit
 def direction_column(values, directions, DIRECTION: tl.constexpr):
     return tl.sum(tl.where(directions[None, :] == DIRECTION, values, 0), 1)
@@ -492,9 +466,8 @@ def feature_row(table_ptr, offsets_ptr, row, FEATURE: tl.constexpr, d, D, mask):
     return tl.load(table_ptr + (row + tl.load(offsets_ptr + FEATURE))[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
 
 
-#input_embedding_kernel finding each square's 23 feature rows itself, as SquareFeatures.indices does (a change to it must
-#be made here too), from rays (each square's squares out along the 8 directions, nearest first, past the edge 64) and
-#jumps (its knight jumps)
+#input_embedding_kernel finding each square's 23 feature rows itself, as SquareFeatures.indices does (a change to it must be made here too), from
+#rays (each square's squares out along the 8 directions, nearest first, past the edge 64) and jumps (its knight jumps)
 @triton.jit
 def board_embedding_kernel(boards_ptr, rays_ptr, jumps_ptr, offsets_ptr, embed_ptr, position_ptr, table_ptr, out_ptr, tokens, D, T: tl.constexpr,
                            PAWN: tl.constexpr, KNIGHT: tl.constexpr, QUEEN: tl.constexpr, KING: tl.constexpr, THEIRS: tl.constexpr,
@@ -535,14 +508,7 @@ def board_embedding_kernel(boards_ptr, rays_ptr, jumps_ptr, offsets_ptr, embed_p
     features += feature_row(table_ptr, offsets_ptr, knights, 20, d, D, mask)
     features += feature_row(table_ptr, offsets_ptr, direction_column(pawns, directions, 0), 21, d, D, mask)
     features += feature_row(table_ptr, offsets_ptr, direction_column(pawns, directions, 1), 22, d, D, mask)
-
-    code = tl.load(boards_ptr + token, mask=token_ok, other=0)
-    mask = token_ok[:, None] & d_ok[None, :]
-    total = tl.load(embed_ptr + code[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
-    total += tl.load(position_ptr + place[:, None] * D + d[None, :], mask=mask, other=0.0).to(tl.float32)
-    #the features' sum in the table's precision, as SquareFeatures gives it
-    total += features.to(out_ptr.dtype.element_ty).to(tl.float32)
-    tl.store(out_ptr + token[:, None] * D + d[None, :], total.to(out_ptr.dtype.element_ty), mask=mask)
+    store_embedding(boards_ptr, embed_ptr, position_ptr, out_ptr, features, token, place, d, D, token_ok, d_ok)
 
 
 #boards B x T: B x T x D. rays 64 x 8 x 8 and jumps 64 x 8 (board_embedding_kernel), offsets the features' first rows
@@ -566,8 +532,6 @@ def _(boards, rays, jumps, offsets, embed, position, table):
     return table.new_empty(*boards.shape, table.shape[1])
 
 
-#ChessTransformer's input embedding (embed, position_embed and the square features) by board_embedding_kernel, or on gpus
-#without fused_ends by input_embedding_kernel on SquareFeatures.indices' rows
 class InputEmbedding(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
@@ -585,30 +549,26 @@ class InputEmbedding(nn.Module):
         return input_embedding(board_state, rows, self.embed.weight, self.position_embed, self.features.table)
 
 
-#the heads after the last block in three kernels, from its stream to the engine's answer rows (a board's move logits,
-#then its expected score). With x a row of the stream, r its 1 / rms and g the final norm's gain, the normed row is
-#y = r g x: the heads fold g into their weights and r into their epilogues, and read the stream as it is
-#(fused_head_weights). Their fp32 matmuls are fp16 tensor core matmuls of numbers split in two (split), many times
-#faster than Triton's fp32 dot
+#the heads after the last block in three kernels, from its stream to the engine's answer rows (a board's move logits, then its expected score). With
+#x a row of the stream, r its 1 / rms and g the final norm's gain, the normed row is y = r g x: the heads fold g into their weights and r into their
+#epilogues, and read the stream as it is (fused_head_weights). Their fp32 matmuls are fp16 tensor core matmuls of numbers split in two (split)
 
-#the narrow matmul's columns: board_down_project's, then a square's terms (s and t, a move's terms of its from and to
-#square, and the 4 promotion logits), padded
+#the narrow matmul's columns: board_down_project's, then a square's terms (s and t, a move's terms of its from and to square, and the 4 promotion
+#logits), padded
 NARROW_COLUMNS = 32
 DOWN_COLUMNS = 16
 #where the promotions' logits are among a square's terms, and where r is
 PROMOTION_TERM, R_TERM = 2, 6
 #per square, its terms and r, padded
 SQUARE_TERMS = 8
-#a number is split into its fp16 rounding and the rest times LO_SCALE, also fp16, which keeps the rest out of fp16's
-#subnormals: their products are exact in fp32, and the products of two rests are below fp32's rounding
+#a number is split into its fp16 rounding and the rest times LO_SCALE, also fp16, which keeps the rest out of fp16's subnormals: their products
+#are exact in fp32, and the products of two rests are below fp32's rounding
 LO_SCALE = 2048.0
 #the metadata rows the narrow matmul takes after the squares, at least TOKENS_PER_BOARD - 64
 META_ROWS = 16
 #the stream's columns head_matmul_kernel reads at a time
 HEAD_DEPTH = 64
-#moves a program of head_answer_kernel writes
 MOVE_BLOCK = 256
-#the eval head's hidden units a program of head_answer_kernel takes
 VALUE_UNITS = 16
 
 
@@ -625,8 +585,7 @@ def split(x, LO_SCALE: tl.constexpr):
     return hi, ((x - hi.to(tl.float32)) * LO_SCALE).to(tl.float16)
 
 
-#A_COLUMNS of a = r x A on a board's squares (r from the squares' sums of squares, as they are read), and their part of
-#a . x for every pair of squares
+#A_COLUMNS of a = r x A on a board's squares (r from the squares' sums of squares, as they are read), and their part of a . x for every pair of squares
 @triton.jit
 def head_a_tile(board_ptr, a_ptr, partials_ptr, tile, D, eps, A_COLUMNS: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
     squares = tl.arange(0, 64)
@@ -680,7 +639,6 @@ def head_board_down(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, do
     tl.store(down_ptr + lo_offset + offsets, lo, mask=(rows < T)[:, None])
 
 
-#a board's square terms and r
 @triton.jit
 def head_square_terms(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, terms_ptr, D, eps, T: tl.constexpr, NARROW: tl.constexpr,
                       DOWN: tl.constexpr, TERMS: tl.constexpr, R_TERM: tl.constexpr, DEPTH: tl.constexpr, LO_SCALE: tl.constexpr):
@@ -691,9 +649,8 @@ def head_square_terms(board_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, 
     tl.store(terms_ptr + squares * TERMS + R_TERM, r)
 
 
-#program (tile, board): every tile but the last three takes a's columns head_a_tile does (partials, summed by
-#head_answer_kernel), the last three the narrow matmul: board_down_project's output on the squares, then on the
-#metadata tokens, then the square terms
+#program (tile, board): every tile but the last three takes a's columns head_a_tile does (partials, summed by head_answer_kernel), the last three
+#the narrow matmul: board_down_project's output on the squares, then on the metadata tokens, then the square terms
 @triton.jit
 def head_matmul_kernel(x_ptr, a_ptr, narrow_hi_ptr, narrow_lo_ptr, narrow_bias_ptr, partials_ptr, squares_ptr, board_down_ptr, B, D, eps,
                        T: tl.constexpr, A_COLUMNS: tl.constexpr, DEPTH: tl.constexpr, NARROW: tl.constexpr, DOWN: tl.constexpr,
@@ -733,8 +690,7 @@ def head_moves(partials_ptr, terms_ptr, moves_ptr, rows_ptr, first, A_TILES: tl.
     tl.store(rows_ptr + move, logit, mask=move_ok)
 
 
-#UNITS of the eval head's hidden layer for BOARDS boards (its inputs, board_down, and weights split: each hi then lo), and
-#their part of its output layer
+#UNITS of the eval head's hidden layer for BOARDS boards (its inputs, board_down, and weights split: each hi then lo), and their part of its output layer
 @triton.jit
 def head_value_tile(board_down_ptr, hidden_ptr, hidden_bias_ptr, out_ptr, value_partials_ptr, unit_tile, board_tile, B, INPUTS: tl.constexpr,
                     HIDDEN: tl.constexpr, BINS: tl.constexpr, BLOCK_BINS: tl.constexpr, BOARDS: tl.constexpr, UNITS: tl.constexpr,
@@ -764,8 +720,8 @@ def head_value_tile(board_down_ptr, hidden_ptr, hidden_bias_ptr, out_ptr, value_
     tl.store(value_partials_ptr + (unit_tile * B + boards[:, None]) * BLOCK_BINS + bins[None, :], value, mask=board_ok[:, None])
 
 
-#programs 0 to boards * move programs - 1 each write MOVE_BLOCK moves of a board (head_moves), the rest each take a tile
-#of the eval head (head_value_tile: value_partials, summed by head_value_kernel)
+#programs 0 to boards * move programs - 1 each write MOVE_BLOCK moves of a board (head_moves), the rest each take a tile of the eval head
+#(head_value_tile: value_partials, summed by head_value_kernel)
 @triton.jit
 def head_answer_kernel(partials_ptr, squares_ptr, moves_ptr, board_down_ptr, hidden_ptr, hidden_bias_ptr, out_ptr, value_partials_ptr, rows_ptr, B,
                        A_TILES: tl.constexpr, MOVES: tl.constexpr, MOVE_BLOCK: tl.constexpr, MOVE_PROGRAMS: tl.constexpr, TERMS: tl.constexpr,
@@ -784,8 +740,8 @@ def head_answer_kernel(partials_ptr, squares_ptr, moves_ptr, board_down_ptr, hid
                         HIDDEN, BINS, BLOCK_BINS, BOARDS, UNITS, DEPTH, LO_SCALE)
 
 
-#a board's expected score from the eval head's output (value_partials summed, then its bias): the bins' softmax times
-#their centres, or one bin's sigmoid (model.expected_score)
+#a board's expected score from the eval head's output (value_partials summed, then its bias): the bins' softmax times their centres, or one bin's
+#sigmoid (model.expected_score)
 @triton.jit
 def head_value_kernel(value_partials_ptr, out_bias_ptr, centres_ptr, rows_ptr, B, UNIT_TILES: tl.constexpr, BLOCK_TILES: tl.constexpr,
                       MOVES: tl.constexpr, BINS: tl.constexpr, BLOCK_BINS: tl.constexpr, PDL: tl.constexpr):
@@ -805,8 +761,7 @@ def head_value_kernel(value_partials_ptr, out_bias_ptr, centres_ptr, rows_ptr, B
     tl.store(rows_ptr + b * (MOVES + 1) + MOVES, score)
 
 
-#a's columns a program of head_matmul_kernel takes: fewer for fewer boards, so that a small batch runs on more
-#multiprocessors (the fastest of 32-128 on an RTX 5090 and 5070 Ti)
+#a's columns a program of head_matmul_kernel takes: fewer for fewer boards, so that a small batch runs on more multiprocessors
 def head_a_columns(boards: int, d_model: int) -> int:
     columns = 32 if boards <= 4 else 64
     while d_model % columns:
@@ -814,13 +769,13 @@ def head_a_columns(boards: int, d_model: int) -> int:
     return columns
 
 
-#the eval head's inputs a program of head_answer_kernel reads at a time for this many boards (the fastest of 32-128)
+#the eval head's inputs a program of head_answer_kernel reads at a time for this many boards
 def value_depth(boards: int) -> int:
     return 32 if boards >= 64 else 128
 
 
-#an opaque op for torch.compile, as linear. The stream B x T x d (fp16, or rounded to it) in, the answer rows out;
-#hidden and out are the eval head's two layers' weights split (2 x out_features x in_features)
+#an opaque op, as linear. The stream B x T x d (fp16, or rounded to it) in, the answer rows out; hidden and out are the eval head's two layers'
+#weights split (2 x out_features x in_features)
 @torch.library.custom_op("chess::heads", mutates_args=())
 def heads(stream: torch.Tensor, a_weight: torch.Tensor, narrow_hi: torch.Tensor, narrow_lo: torch.Tensor, narrow_bias: torch.Tensor,
           moves: torch.Tensor, hidden: torch.Tensor, hidden_bias: torch.Tensor, out: torch.Tensor, out_bias: torch.Tensor, centres: torch.Tensor,
@@ -860,16 +815,14 @@ def _(stream, a_weight, narrow_hi, narrow_lo, narrow_bias, moves, hidden, hidden
     return stream.new_empty(stream.shape[0], moves.shape[1] + 1, dtype=torch.float32)
 
 
-#a weight as split gives it, hi then lo
 def split_weight(weight: torch.Tensor) -> torch.Tensor:
     hi = weight.half()
     return torch.stack([hi, ((weight.double() - hi.double()) * LO_SCALE).half()])
 
 
-#the fused heads' weights: logits[f, t] = (W_f y_f + b_f) . (W_t y_t + b_t) / sqrt(d) = r_f r_t x_f A x_t + t_t + s_f
-#for the normed rows y = r g x, A = diag(g) W_f^T W_t diag(g) / sqrt(d) in fp16. The narrow weights (d x NARROW_COLUMNS,
-#split) give board_down_project's output, s_f = y_f . W_f^T b_t / sqrt(d) + b_f . b_t / sqrt(d), t_t = y_t . W_t^T b_f
-#/ sqrt(d) and the promotion logits
+#the fused heads' weights: logits[f, t] = (W_f y_f + b_f) . (W_t y_t + b_t) / sqrt(d) = r_f r_t x_f A x_t + t_t + s_f for the normed rows y = r g x,
+#A = diag(g) W_f^T W_t diag(g) / sqrt(d) in fp16. The narrow weights (d x NARROW_COLUMNS, split) give board_down_project's output,
+#s_f = y_f . W_f^T b_t / sqrt(d) + b_f . b_t / sqrt(d), t_t = y_t . W_t^T b_f / sqrt(d) and the promotion logits
 def fused_head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     with torch.no_grad():
         gain = model.ln.weight.double()
@@ -907,9 +860,8 @@ def head_weights(model: ChessTransformer) -> tuple[torch.Tensor, torch.Tensor, t
                 narrow_bias.float())
 
 
-#ChessTransformer.forward with FusedBlocks, for inference: a change to it must be made here too. On the gpus of
-#fused_ends the heads are their kernels (heads), which give the answer rows rather than the model's logits and value
-#logits (inference.answer_rows takes either); on others head_weights' matmuls
+#ChessTransformer.forward with FusedBlocks, for inference: a change to it must be made here too. On the gpus of fused_ends the heads are the op
+#heads, which gives the answer rows rather than the model's logits and value logits (inference.answer_rows takes either)
 class FusedTransformer(nn.Module):
     def __init__(self, model: ChessTransformer):
         super().__init__()
@@ -960,7 +912,6 @@ class FusedTransformer(nn.Module):
             compressed_board = self.board_down_activation(narrow[..., self.down_columns]).reshape(board_state.shape[0], -1)
             return combined_logits, self.eval_head(compressed_board)
 
-    #the fused heads on the last block's stream: the answer rows
     def answers(self, embed_state: torch.Tensor) -> torch.Tensor:
         return heads(embed_state, self.a_weight, self.narrow[0], self.narrow[1], self.narrow_bias, self.moves, self.hidden, self.hidden_bias, self.out,
                      self.out_bias, self.centres, self.eps)

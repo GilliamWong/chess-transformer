@@ -1,8 +1,7 @@
 #the int8 matmuls of small batches (CONFIGS' rows: 1 and 2 boards) as CUDA kernels: compiled once per process by NVRTC
-#(the copy torch ships) and launched through the CUDA driver on torch's stream, so inside its cuda graphs too. A CTA
-#splits K over its warps and adds their int32 sums in shared memory (integer atomics: exact in any order), then runs
-#int8_linear_kernel's epilogue with the same fp32 operations: the answers are int8_linear's bits. Used only on the gpus
-#CONFIGS was timed on; int8_linear's Triton kernel does the rest, and everything when the kernels do not compile
+#(the copy torch ships) and launched through the CUDA driver on torch's stream, so inside its cuda graphs too. The int32
+#sums are exact in any order (integer atomics) and the epilogue repeats int8_linear_kernel's fp32 operations: the answers
+#are int8_linear's bits. Only on the gpus in CONFIGS; int8_linear's Triton kernel does the rest, and all when these do not compile
 import ctypes
 import sys
 import warnings
@@ -57,7 +56,6 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
                 int col = min(n0 + nw * NT * 8 + j * 8 + g, N - 1);
                 wv[c][h][j] = __ldg(reinterpret_cast<const uint4*>(w + (size_t)(h * N + col) * K + k0 + c * 64));
             }
-    //each thread's groups of 4 outputs, their weight scales and bias
     int rows_[ROUNDS], cols_[ROUNDS];
     bool valid[ROUNDS];
     float4 ws[ROUNDS][G];
@@ -185,9 +183,7 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
 }
 """
 
-#(MT, NT, WN, WK, CK) by (compute capability, multiprocessors) and kind, by the most rows each takes: the fastest of a
-#sweep at 70 to 560 rows on an RTX 5070 Ti (70) and an RTX 5090 (170), kept where it beat int8_linear's best Triton
-#tile (16 to 128 rows) in the network too
+#(MT, NT, WN, WK, CK) by (compute capability, multiprocessors: 70 RTX 5070 Ti, 170 RTX 5090) and kind, by the most rows each takes
 CONFIGS = {(12, 0, 70): {"projection": [(70, (5, 4, 1, 12, 1))], "gate_up": [(70, (5, 1, 1, 12, 1))], "down": [(70, (3, 4, 1, 8, 2))]},
            (12, 0, 170): {"projection": [(70, (3, 4, 1, 12, 1)), (140, (3, 4, 1, 12, 1))],
                           "gate_up": [(70, (3, 2, 1, 12, 1)), (140, (3, 2, 2, 6, 2))],
@@ -266,17 +262,17 @@ class Kernels:
         self.driver.cuLaunchKernelEx.argtypes = [ctypes.POINTER(LaunchConfig), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
         wanted = sorted({(config, EPILOGUES[epilogue]) for kind, table in configs.items() for _, config in table
                          for epilogue in (["down", "mixing down"] if kind == "down" else [kind])})
-        names = [kernel_name(config, epilogue) for config, epilogue in wanted]
-        cubin, lowered = compile_cubin(SOURCE, names, torch.cuda.get_device_capability(device))
+        names = {key: kernel_name(*key) for key in wanted}
+        cubin, lowered = compile_cubin(SOURCE, list(names.values()), torch.cuda.get_device_capability(device))
         with torch.cuda.device(device):
             torch.empty(0, device=device)
             self.module = ctypes.c_void_p()
             self.check(self.driver.cuModuleLoadData(ctypes.byref(self.module), cubin))
         self.functions = {}
-        for config, epilogue in wanted:
+        for key, name in names.items():
             function = ctypes.c_void_p()
-            self.check(self.driver.cuModuleGetFunction(ctypes.byref(function), self.module, lowered[kernel_name(config, epilogue)].encode()))
-            self.functions[config, epilogue] = function
+            self.check(self.driver.cuModuleGetFunction(ctypes.byref(function), self.module, lowered[name].encode()))
+            self.functions[key] = function
 
     def check(self, result: int) -> None:
         if result != 0:
@@ -318,7 +314,9 @@ def kernels(device: torch.device) -> Kernels | None:
 #the kernels and config that take a kind's matmul of M rows and depth K on this gpu, or None (Triton's then)
 def config_for(device: torch.device, kind: str, M: int, K: int) -> tuple[Kernels, tuple] | None:
     found = kernels(device) if ENABLED and device.type == "cuda" else None
-    config = next((config for largest, config in found.configs.get(kind, ()) if M <= largest), None) if found is not None else None
+    if found is None:
+        return None
+    config = next((config for largest, config in found.configs.get(kind, ()) if M <= largest), None)
     #a config splits K exactly
     return (found, config) if config is not None and K == config[3] * config[4] * 64 else None
 

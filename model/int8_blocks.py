@@ -1,4 +1,4 @@
-#the engine's blocks with their matmuls in int8 but combine_heads: weights scaled per output channel, inputs per token
+#the engine's int8 blocks: weights scaled per output channel, inputs per token, combine_heads left in fp16
 import math
 
 import torch
@@ -14,14 +14,9 @@ from model.int8_cuda import kernels, small_int8_linear, takes_rows
 
 #the mlp's hidden is rotated in blocks of this many to spread its outlier channels, down's weights to match (H H^T = 32 I)
 HADAMARD_BLOCK = 32
-#the down matmul reads its inputs (the mlp's hidden width, padded with zeros) BLOCK_K at a time
+#down's input width is the mlp's hidden zero-padded to a multiple of this, so every BLOCK_K divides it
 DOWN_INPUT_MULTIPLE = 128
-#int8 matmul tiles (rows, columns, depth, warps, stages[, registers a thread may use]) by compute capability and matmul,
-#as fused_blocks.tile_for lists, within 99 KB of shared memory; a tile changes only the speed (the int32 sums are exact).
-#sm_120's were timed in the engine's network on an RTX 5070 Ti and an RTX 5090, one batch and two at once: below 16 rows
-#a multiprocessor the narrower tiles fill more of them, 32 rows to 2 a multiprocessor, and below one (a 5090's one or
-#two boards) down's 16 columns. The others' are the fastest at 32 to 128 boards on an A100, A40 and L40S. Only sm_120's
-#down is capped (timed there): two blocks share a multiprocessor
+#int8 matmul tiles (rows, columns, depth, warps, stages[, max registers]) by compute capability and matmul, for tile_for; within 99 KB of shared memory
 INT8_TILES = {(12, 0): {"projection": [(2, (32, 64, 64, 4, 4)), (4, (64, 64, 64, 4, 4)), (math.inf, (128, 128, 64, 8, 3))],
                         "gate_up": [(2, (32, 64, 64, 4, 4)), (4, (64, 32, 64, 4, 4)), (8, (128, 32, 64, 4, 3)),
                                     (math.inf, (128, 64, 64, 4, 2))],
@@ -33,23 +28,19 @@ INT8_TILES = {(12, 0): {"projection": [(2, (32, 64, 64, 4, 4)), (4, (64, 64, 64,
                        "down": [(math.inf, (64, 128, 128, 4, 3))]},
               (8, 0): {"projection": [(math.inf, (128, 64, 128, 4, 3))], "gate_up": [(math.inf, (128, 32, 64, 4, 3))],
                        "down": [(math.inf, (128, 64, 128, 4, 3))]}}
-#the rows a program of norm_quant_kernel takes and its warps
 NORM_ROWS, NORM_WARPS = 1, 2
-#the rows a program of rotate_quant_kernel takes by compute capability, [(the most rows a multiprocessor's share may be,
-#rows), ...]: fewer at a few boards on sm_120 (timed on an RTX 5070 Ti and 5090), UNTIMED_ROTATE_ROWS on other gpus.
-#Any rows give the same bits
+#rotate_quant_kernel's rows a program by compute capability: [(the most rows a multiprocessor's share may be, rows), ...]
 ROTATE_ROWS = {(12, 0): [(4, 2), (math.inf, 8)]}
 UNTIMED_ROTATE_ROWS = 8
 
 
-#a matmul's tile for M rows on the gpu, by its compute capability (one not timed takes sm_120's for any rows)
+#a gpu not in INT8_TILES takes sm_120's last tile for any rows
 def int8_tile(device: torch.device, matmul: str, M: int) -> tuple[int, ...]:
     capability = torch.cuda.get_device_capability(device)
     tiles = INT8_TILES[capability][matmul] if capability in INT8_TILES else INT8_TILES[(12, 0)][matmul][-1:]
     return tile_for(tiles, M, torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-#rotate_quant_kernel's rows a program for M rows on the gpu
 def rotate_rows(device: torch.device, M: int) -> int:
     shares = ROTATE_ROWS.get(torch.cuda.get_device_capability(device))
     if shares is None:
@@ -66,7 +57,6 @@ def hadamard(size: int) -> torch.Tensor:
     return matrix
 
 
-#the int8 inputs' width for the down matmul
 def down_inputs(hidden: int) -> int:
     return triton.cdiv(hidden, DOWN_INPUT_MULTIPLE) * DOWN_INPUT_MULTIPLE
 
@@ -110,7 +100,6 @@ def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residua
                     HAS_RESIDUAL, GATED, MIX)
 
 
-#int8_linear with a tile of INT8_TILES'
 def launch_int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias: torch.Tensor | None,
                        residual: torch.Tensor | None, gated: bool, original: torch.Tensor | None, residual_scale: torch.Tensor | None,
                        input_scale: torch.Tensor | None, tile: tuple[int, ...]) -> torch.Tensor:
@@ -135,10 +124,7 @@ def launch_int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Ten
     return out
 
 
-#an opaque op for torch.compile, as fused_blocks.linear; gives fp16. matmul names its INT8_TILES (projection, gate_up
-#or down). With original (the input embedding) and the next block's residual_scale and input_scale it gives the next
-#block's input (linear_epilogue). A small batch on a gpu int8_cuda was timed on takes its CUDA kernel instead (the same
-#bits)
+#opaque to torch.compile, gives fp16; matmul is projection, gate_up or down; original, residual_scale and input_scale make it give the next block's input
 @torch.library.custom_op("chess::int8_linear", mutates_args=())
 def int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias: torch.Tensor | None,
                 residual: torch.Tensor | None, gated: bool, matmul: str, original: torch.Tensor | None = None,
@@ -154,8 +140,7 @@ def _(x, x_scale, weight, weight_scale, bias, residual, gated, matmul, original=
     return x.new_empty(*x.shape[:-1], weight.shape[0] // 2 if gated else weight.shape[0], dtype=torch.float16)
 
 
-#dependent_launch_wait, then with EARLY the next kernel may launch: a small-batch CUDA matmul (int8_cuda) reads its
-#weights before its own wait, so it loads them while this kernel runs
+#dependent_launch_wait, then with EARLY the next kernel may launch: int8_cuda's matmul loads its weights before its own wait
 @triton.jit
 def wait_then_let_launch(PDL: tl.constexpr, EARLY: tl.constexpr):
     dependent_launch_wait(PDL)
@@ -192,7 +177,6 @@ def launch_norm_quant(x, original, residual_scale, input_scale, gain, mixed, eps
     q = torch.empty(x.shape, device=x.device, dtype=torch.int8)
     scale = torch.empty(x.shape[:-1], device=x.device, dtype=torch.float32)
     mix = original is not None
-    #the projection or gate_up after it
     early = takes_rows(x.device, ("projection", "gate_up"), M, D)
     norm_quant_kernel[(triton.cdiv(M, NORM_ROWS),)](x, original if mix else x, residual_scale if mix else gain, input_scale if mix else gain, gain,
                                                     mixed if mix else x, q, scale, M, D, eps, MIX=mix, ROWS=NORM_ROWS,
@@ -210,7 +194,6 @@ def _(x, gain, eps):
     return x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[:-1], dtype=torch.float32)
 
 
-#the block's input mix, and its norm_quant
 @torch.library.custom_op("chess::mix_norm_quant", mutates_args=())
 def mix_norm_quant(x: torch.Tensor, original: torch.Tensor, residual_scale: torch.Tensor, input_scale: torch.Tensor, gain: torch.Tensor,
                    eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -280,8 +263,7 @@ class Int8Block(nn.Module):
             self.register_buffer(name, integers.to(device).contiguous())
             self.register_buffer(f"{name}_scale", (scale * output_scale if name == "down" else scale).to(device, torch.float32).contiguous())
         self.register_buffer("hadamard_signs", hadamard(HADAMARD_BLOCK).to(device, torch.float16))
-        #set by link_input_mixes: the next block's (residual_scale, input_scale) when down mixes its input, and whether this
-        #block's input comes mixed
+        #set by link_input_mixes: the next block's scales when down mixes its input, and whether this block's input comes mixed
         self.next_scales: tuple[nn.Parameter, nn.Parameter] | None = None
         self.input_mixed = False
 
@@ -302,8 +284,8 @@ class Int8Block(nn.Module):
         return int8_linear(rotated, scale, self.down, self.down_scale, None, x, False, "down", original_board_embed, *self.next_scales)
 
 
-#the fused model (FusedTransformer) with the blocks of the layers in weights swapped for Int8Blocks; the small-batch
-#CUDA kernels compiled now, not while a cuda graph records
+#the fused model with the blocks of the layers in weights swapped for Int8Blocks; the small-batch CUDA kernels compile now,
+#not while a cuda graph records
 def quantize_blocks(model: nn.Module, weights: dict[int, dict], output_scale: float) -> nn.Module:
     blocks = [Int8Block(block, weights[layer], output_scale) if layer in weights else block for layer, block in enumerate(model.encoder)]
     link_input_mixes(blocks)

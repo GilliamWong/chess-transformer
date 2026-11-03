@@ -1,32 +1,29 @@
-#a checkpoint holds the weights and the settings the model was built with, so any size loads back
 import json
 import math
 from pathlib import Path
 import torch
 from model.model import ChessTransformer
 
-#no code lives here: pgns, training sets, checkpoints, runs, engines
 ARTIFACTS_DIR = Path(__file__).resolve().parent.parent / "artifacts"
-#one folder per run: tensorboard logs, settings.json, model.pt (the best checkpoint) and final.pt
+#one folder per run: settings.json, model.pt (the best checkpoint), final.pt, tensorboard logs
 RUNS_DIR = ARTIFACTS_DIR / "runs"
 
-#settings removed in the 2026-09-23 cleanup; every checkpoint saved before it names at least dropout
 PRE_CLEANUP_SETTINGS = ("history", "future", "dropout", "swiglu", "value_target")
 
-#the mlp's hidden width in checkpoints saved before mlp_hidden was a setting (2026-09-25): 8/3 of d_model or mlp_ratio
-#times it, to a multiple of 8
+#the mlp width of checkpoints from before mlp_hidden was a setting; rounds differently from mlp_hidden_width
 def legacy_mlp_hidden(d_model: int, mlp_ratio: float | None) -> int:
     if mlp_ratio is None:
         return 8 * math.ceil(d_model / 3)
     return max(8, 8 * round(mlp_ratio * d_model / 8))
 
-#the run that finished last. A run still training is skipped: its model.pt may be half written
+#a run still training is skipped, its model.pt may be half written
 def latest_checkpoint() -> Path:
     finished = {}
     for settings_path in RUNS_DIR.glob("*/settings.json"):
+        model_path = settings_path.with_name("model.pt")
         finished_at = json.loads(settings_path.read_text()).get("finished_at")
-        if finished_at is not None and (settings_path.parent / "model.pt").exists():
-            finished[finished_at] = settings_path.parent / "model.pt"
+        if finished_at is not None and model_path.exists():
+            finished[finished_at] = model_path
     if not finished:
         raise FileNotFoundError(f"no finished run with a model.pt in {RUNS_DIR}, train a model with train.py first")
     return finished[max(finished)]
@@ -34,9 +31,8 @@ def latest_checkpoint() -> Path:
 def save_checkpoint(model: ChessTransformer, model_settings: dict, checkpoint_path: Path) -> None:
     torch.save({"model_settings": model_settings, "state_dict": model.state_dict()}, checkpoint_path)
 
-#the model (on device, still in training mode) and its settings
+#the model on device, in training mode, and its settings
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[ChessTransformer, dict]:
-    #map_location so a gpu checkpoint also loads without one
     checkpoint = torch.load(checkpoint_path, map_location=device)
     if "model_settings" not in checkpoint:
         raise ValueError(f"{checkpoint_path} is bare weights without model settings, it was saved before checkpoints recorded them")
@@ -47,19 +43,17 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[ChessT
         raise ValueError(f"{checkpoint_path} predates the 2026-09-23 cleanup (its settings name {', '.join(old_settings)}), the model "
                          "here cannot load it. Load it from a checkout of tag pre-cleanup-2026-09-23, for example "
                          "git worktree add ../chess-transformer-pre-cleanup pre-cleanup-2026-09-23")
-    #the template embedding was removed on 2026-09-24; checkpoints before that name it, 0 in all but two d128 runs
     template_maps = model_settings.pop("template_maps", 0)
     if template_maps:
         raise ValueError(f"{checkpoint_path} has a template embedding ({template_maps} template maps), which the model here no longer has. "
                          "Load it from a checkout of commit 1a976d9, for example git worktree add ../chess-transformer-template-maps 1a976d9")
-    #before 2026-09-25 the eval head was one logit of the expected score
+    #older checkpoints have a one-logit eval head
     model_settings.setdefault("value_bins", 1)
     if "mlp_hidden" not in model_settings:
         model_settings["mlp_hidden"] = legacy_mlp_hidden(model_settings["d_model"], model_settings.pop("mlp_ratio", None))
-    #the input skip and RMSNorm were settings on 2026-10-07 before both became the model; that day's runs name them
+    #the runs of 2026-10-07, when these two were settings, name them
     for name in ("input_skip", "rms_norm"):
         model_settings.pop(name, None)
-    #LayerNorm (with a bias) and no input skip until then
     state_dict = checkpoint["state_dict"]
     if "ln.bias" in state_dict or "encoder.0.residual_scale" not in state_dict:
         raise ValueError(f"{checkpoint_path} has LayerNorms and no input skip, from before 2026-10-07; the model here has RMSNorms and the skip. "
@@ -69,8 +63,7 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[ChessT
 
     return model.to(device), model_settings
 
-#a checkpoint to train on from: its size and weights, but with value_bins eval head bins. With other bins than the
-#checkpoint's, the eval head's last layer starts afresh and everything else carries over
+#the checkpoint's size and weights to train on, with value_bins eval head bins: other bins renew only the head's last layer
 def warm_start(checkpoint_path: Path, device: torch.device, value_bins: int) -> tuple[ChessTransformer, dict]:
     model, model_settings = load_checkpoint(checkpoint_path, device)
     if value_bins == model_settings["value_bins"]:
