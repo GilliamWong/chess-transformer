@@ -1,0 +1,12 @@
+[
+  {
+    "name": "ChessTransformer",
+    "command": "./linux/engine.sh",
+    "workingDirectory": "chess-transformer",
+    "protocol": "uci",
+    "options": [
+      {"name": "SyzygyPath", "value": "/path/to/syzygy"},
+      {"name": "RamLimitMb", "value": 150000}
+    ]
+  }
+]
