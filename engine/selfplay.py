@@ -1,6 +1,4 @@
-#self play for expert iteration: every position is saved with what mcts found there, as a training set for train.py.
-#   python -m engine.selfplay artifacts/runs/rl_start_d128_4min/model.pt --name selfplay_r1 --positions 1_000_000 --tablebase
-#   python -m training.train --init-checkpoint artifacts/runs/rl_start_d128_4min/model.pt --training-set selfplay_r1 --mix-set full_sf8_30M_mix
+#self play for expert iteration: every position is saved with what mcts found there, as a training set for train.py
 #the games run in rust (selfplay_rs/): mirror any change to mcts.py's search or the rules there, tests/test_selfplay_rs.py
 #holds it to the python reference in tests/reference_selfplay.py
 from __future__ import annotations
@@ -20,7 +18,7 @@ import sys
 import time
 import traceback
 try:
-    import msvcrt #single key presses, for + and -
+    import msvcrt
 except ImportError:
     msvcrt = None
 import chess
@@ -30,28 +28,27 @@ from engine import mcts
 import selfplay_rs
 from model.encoding import MOVE_IDS_BY_SQUARES, NO_MOVE, NUM_MOVE_IDS, TOKENS_PER_BOARD
 from engine.tablebase import TABLEBASE_PIECES, open_tablebase, tablebase_path
-#every worker imports this file, so nothing at the top may import torch (data.py, model.checkpoint and inference.py do)
+#workers import this file, so nothing at the top may import torch (data.py, model.checkpoint, inference.py do)
 
-SIMULATIONS = 64 #+390 elo over the policy alone (artifacts/reports/mcts_ladder_2026-09-23.md)
+SIMULATIONS = 64
 TOP_MOVES = 8
 SAMPLED_PLIES = 30
-#the move played keeps its subtree: the same target quality for 38 new simulations a move instead of 64
+#the move played keeps its subtree as the next root
 TREE_REUSE = True
-MAX_PLIES = 600 #the fifty move rule ends nearly every game long before
-VAL_EVERY = 50 #every 50th game goes to val
-#rust workers of GAMES_PER_PROCESS games each: with the d128, 2 already keep the gpu busy (~140k evaluations a second)
+MAX_PLIES = 600
+VAL_EVERY = 50
 PROCESSES = 2
 MAX_PROCESSES = 8
 GAMES_PER_PROCESS = 256
 LOG_EVERY_GAMES = 50
 SEED = 42
-#the network's answers kept by position for transpositions (selfplay_rs' Cache, one a process), about 200 bytes each: a
-#third of a d512 search's evaluations repeat a position, and self play's games share their openings
+#positions whose network answers each process's cache keeps (selfplay_rs' Cache), about 200 bytes each
 CACHE_POSITIONS = 500_000
-#a round's simulations for each leaf it sends to the network: those the cache or the game's end answer at once do not
-#wait for it. One leaf a round is still mcts.py's search, in fewer rounds
+#a round's simulations for each leaf it sends to the network: those the cache or a game's end answer at once do not wait for it
 SIMULATIONS_PER_LEAF = 3
-RECORD_ATTEMPTS = 20 #about 10 seconds of retrying the record's move
+RECORD_ATTEMPTS = 20
+#the move logits, then the expected score
+ANSWER_WIDTH = NUM_MOVE_IDS + 1
 
 
 #every position before a move with what the search found there, and the result from white's side
@@ -65,7 +62,6 @@ class Game:
     white_to_move: np.ndarray
     white_score: float
 
-    #the result for the side to move at every position
     def outcomes(self) -> np.ndarray:
         return np.where(self.white_to_move, self.white_score, 1 - self.white_score).astype(np.float32)
 
@@ -77,15 +73,14 @@ def move_id_table() -> np.ndarray:
         table[from_square, to_square, promotion or 0] = move_id
     return table
 
-#mcts.py's constants are read at call time, so a test can change them. tablebase_pieces: the tables' positions of up to
-#that many pieces (engine.tablebase.TABLE_SETS), from syzygy_path's folders rather than the downloaded ones if it is given
+#mcts.py's constants are read at call time, so a test can change them. tablebase_pieces: the tables of up to that many
+#pieces (engine.tablebase.TABLE_SETS), from syzygy_path's folders rather than the downloaded ones if it is given
 def rust_search_settings(use_tablebase: bool, tablebase_pieces: int = TABLEBASE_PIECES, syzygy_path: str | None = None) -> dict:
     return dict(move_id_table=move_id_table().ravel().tolist(), answer_width=ANSWER_WIDTH, c_puct=mcts.C_PUCT, c_puct_factor=mcts.C_PUCT_FACTOR,
                 c_puct_base=mcts.C_PUCT_BASE, fpu_reduction=mcts.FPU_REDUCTION, draw=mcts.DRAW, repetitions_for_a_draw=mcts.REPETITIONS_FOR_A_DRAW,
                 tablebase_folder=(syzygy_path or tablebase_path(tablebase_pieces)) if use_tablebase else None, tablebase_pieces=tablebase_pieces)
 
-#up to `size` games at once in rust, one simulation of each per round. network takes the leaves' boards and gives back
-#ANSWER_WIDTH numbers for each, as the inference process does
+#up to `size` games at once in rust. network takes the leaves' boards and gives back ANSWER_WIDTH numbers for each
 class RustSelfPlayBatch:
     def __init__(self, network: Callable[[np.ndarray], np.ndarray], simulations: int, numbers: Iterator[int], size: int, seed: int,
                  board: chess.Board, sampled_plies: int, max_plies: int, tree_reuse: bool, use_tablebase: bool):
@@ -102,9 +97,6 @@ class RustSelfPlayBatch:
         for number in self.numbers:
             if self.games.start_game(number):
                 return
-
-    def playing(self) -> bool:
-        return self.games.playing()
 
     #one round, returning the games it finished
     def step(self) -> list[Game]:
@@ -123,7 +115,7 @@ def play_games_in_rust(network: Callable[[np.ndarray], np.ndarray], simulations:
                        tree_reuse: bool = TREE_REUSE, use_tablebase: bool = False) -> Iterator[Game]:
     batch = RustSelfPlayBatch(network, simulations, iter(numbers), size, seed, board if board is not None else chess.Board(), sampled_plies,
                               max_plies, tree_reuse, use_tablebase)
-    while batch.playing():
+    while batch.games.playing():
         yield from batch.step()
 
 
@@ -149,7 +141,7 @@ class SelfPlaySet:
         elif records:
             raise ValueError(f"the files of {name} are shorter than its records say")
         else:
-            if list(folder.glob(f"{name}_*")):
+            if any(folder.glob(f"{name}_*")):
                 raise FileExistsError(f"{name} already has files in {folder} but no {self.record_path.name}, give another --name")
             self.record = {"settings": settings, "games": 0, "next_game": 0, "positions": {"train": 0, "val": 0},
                            "white_scores": {"1.0": 0, "0.5": 0, "0.0": 0}, "seconds": 0.0}
@@ -209,9 +201,6 @@ class SelfPlaySet:
                 time.sleep(0.05 * (attempt + 1))
         return False
 
-
-#the move logits, then the expected score
-ANSWER_WIDTH = NUM_MOVE_IDS + 1
 
 #a worker's place at the inference process: shared memory for its boards (a byte a token) and answers, and a pipe.
 #made by the main process, so a worker added later finds it ready
@@ -276,7 +265,6 @@ class Workers:
         self.context = context
         self.results = context.Queue()
         self.next_number = context.Value("q", first_number)
-        self.games_per_process = games_per_process
         self.worker_arguments = worker_arguments
         self.slots = [Slot(games_per_process) for _ in range(MAX_PROCESSES)]
         self.free_slots = list(range(MAX_PROCESSES))
@@ -317,9 +305,6 @@ class Workers:
     #the ones still starting new games
     def playing(self) -> list[int]:
         return [worker_id for worker_id in self.processes if worker_id not in self.done and not self.stops[worker_id].is_set()]
-
-    def can_start(self) -> bool:
-        return bool(self.free_slots)
 
     #the newest one finishes its games and goes
     def stop_one(self) -> None:
@@ -433,7 +418,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
     try:
         while not (finishing and workers.all_done()):
             for key in pressed_keys():
-                if key == "+" and not finishing and workers.can_start():
+                if key == "+" and not finishing and workers.free_slots:
                     workers.start()
                     tqdm.write(f"{len(workers.playing())} processes")
                 elif key == "-" and not finishing and len(workers.playing()) > 1:

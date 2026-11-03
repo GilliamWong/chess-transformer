@@ -1,6 +1,5 @@
 #monte carlo tree search over the model: the policy gives the priors, the eval head scores the leaves.
-#scores are expected scores, 0 lost to 1 won. Watch one search:
-#   python -m engine.mcts artifacts/runs/rl_start_d128_4min/model.pt --fen "<fen>" --simulations 800 --cpu
+#scores are expected scores, 0 lost to 1 won
 from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
@@ -13,37 +12,33 @@ import chess.syzygy
 import numpy as np
 from model.encoding import encode_board, encode_move_to_id
 from engine.tablebase import covers, open_tablebase, ranked_moves, wdl_score
-#self play's workers import this file for its constants and must not import torch
+#self play's workers import this file and must not import torch
 if TYPE_CHECKING:
     import torch
     from torch import nn
 
 SIMULATIONS = 200
 DRAW = 0.5
-#the board has no history, so only the search can see a repetition coming
 REPETITIONS_FOR_A_DRAW = 3
 #lc0's defaults, halved where they scale a score: its scores run from -1 to 1, ours from 0 to 1
 C_PUCT = 1.745 / 2
 C_PUCT_FACTOR = 3.894 / 2
 C_PUCT_BASE = 38739
 FPU_REDUCTION = 0.33 / 2
-#alphazero's dirichlet noise for chess, mixed into the root's priors in self play
 ROOT_NOISE_ALPHA = 0.3
 ROOT_NOISE_SHARE = 0.25
 
-#set by main (--tablebase): game_result then scores the positions the tables cover
+#when set (main --tablebase), game_result scores the positions the tables cover
 tablebase: chess.syzygy.Tablebase | None = None
 
 
-#slots: a search makes thousands of nodes
 @dataclass(slots=True)
 class Node:
     prior: float
     visit_count: int = 0
     #for the side that played the move into this node
     value_sum: float = 0.0
-    #empty until expanded
-    children: dict[chess.Move, "Node"] = field(default_factory=dict)
+    children: dict[chess.Move, Node] = field(default_factory=dict)
 
 
 #the priors of the legal moves and the score of the side to move
@@ -55,7 +50,7 @@ def evaluate_many(model: nn.Module, boards: list[chess.Board], device: torch.dev
     from model.model import expected_score
     legal_moves = [list(board.legal_moves) for board in boards]
     for board, moves in zip(boards, legal_moves):
-        if len(moves) == 0:
+        if not moves:
             raise ValueError(f"the game is over here, game_result scores it: {board.fen()}")
 
     encoded = torch.tensor([encode_board(board) for board in boards], dtype=torch.long, device=device)
@@ -66,7 +61,6 @@ def evaluate_many(model: nn.Module, boards: list[chess.Board], device: torch.dev
 
     evaluations = []
     for board, moves, logits, value in zip(boards, legal_moves, move_logits, values):
-        #softmax over the legal moves alone
         legal_logits = logits[[encode_move_to_id(move, board.turn) for move in moves]]
         weights = np.exp(legal_logits - legal_logits.max())
         evaluations.append((dict(zip(moves, (weights / weights.sum()).tolist())), value))
@@ -88,21 +82,16 @@ def game_result(board: chess.Board) -> float | None:
 def select_child(node: Node) -> tuple[chess.Move, Node]:
     c_puct = C_PUCT + C_PUCT_FACTOR * math.log((node.visit_count + C_PUCT_BASE) / C_PUCT_BASE)
     #at least 1, so the first pick follows the priors
-    children_visits = max(node.visit_count - 1, 1)
+    sqrt_children_visits = math.sqrt(max(node.visit_count - 1, 1))
     visited_policy = sum(child.prior for child in node.children.values() if child.visit_count > 0)
     first_play_urgency = (1 - node.value_sum / node.visit_count) - FPU_REDUCTION * math.sqrt(visited_policy)
-    sqrt_children_visits = math.sqrt(children_visits)
 
-    #keeps the first child with the highest score, as max() would; this loop is the search's hot spot
+    #the first child with the highest score wins ties, as max() would; this loop is the search's hot spot
     best_move, best_child, best_U = None, None, -math.inf
     for move, child in node.children.items():
-        P = child.prior
         N = child.visit_count
-        if N > 0:
-            Q = child.value_sum / N
-        else:
-            Q = first_play_urgency
-        U = Q + (c_puct * P * (sqrt_children_visits / (1 + N)))
+        Q = child.value_sum / N if N > 0 else first_play_urgency
+        U = Q + c_puct * child.prior * (sqrt_children_visits / (1 + N))
         if U > best_U:
             best_move, best_child, best_U = move, child, U
     return best_move, best_child
@@ -119,15 +108,6 @@ def backup(path: list[Node], value: float) -> None:
         node.visit_count += 1
         node.value_sum += score
         score = 1 - score
-
-#board is a copy at the root position
-def run_simulation(root: Node, board: chess.Board, model: nn.Module, device: torch.device) -> None:
-    leaf = descend(root, board)
-    if leaf.value is None:
-        priors, value = evaluate(model, board, device)
-        finish(leaf, priors, value)
-    else:
-        finish(leaf, None, leaf.value)
 
 #value is None when the network has to evaluate the leaf
 @dataclass
@@ -169,7 +149,13 @@ def search(model: nn.Module, board: chess.Board, device: torch.device, simulatio
     root = Node(prior=1.0)
     for simulation in range(simulations):
         #copied with the move stack, which is how game_result sees repetitions
-        run_simulation(root, board.copy(), model, device)
+        leaf_board = board.copy()
+        leaf = descend(root, leaf_board)
+        if leaf.value is None:
+            priors, value = evaluate(model, leaf_board, device)
+            finish(leaf, priors, value)
+        else:
+            finish(leaf, None, leaf.value)
         #the first simulation expanded the root, and no child has been chosen yet
         if simulation == 0 and root_noise is not None:
             add_root_noise(root, root_noise)
@@ -202,9 +188,9 @@ def principal_variation(root: Node) -> list[chess.Move]:
     return line
 
 
-def print_search(root: Node, board: chess.Board, top: int = 10) -> None:
+def print_search(root: Node, board: chess.Board) -> None:
     print(f"{'move':<8}{'prior':>8}{'visits':>8}{'score':>8}")
-    for move, child in sorted(root.children.items(), key=lambda item: item[1].visit_count, reverse=True)[:top]:
+    for move, child in sorted(root.children.items(), key=lambda item: item[1].visit_count, reverse=True)[:10]:
         score = f"{child.value_sum / child.visit_count:.3f}" if child.visit_count > 0 else "-"
         print(f"{board.san(move):<8}{child.prior:>8.1%}{child.visit_count:>8}{score:>8}")
 
@@ -220,8 +206,8 @@ def main(checkpoint_path: Path, fen: str, simulations: int, device: torch.device
 
     #also warms the model up, so its setup is not timed with the search
     priors, value = evaluate(model, board, device)
-    favourite = max(priors, key=lambda move: priors[move])
-    side = "white" if board.turn == chess.WHITE else "black"
+    favourite = max(priors, key=priors.get)
+    side = chess.COLOR_NAMES[board.turn]
     print(f"network alone: score {value:.3f} for {side}, favourite move {board.san(favourite)} ({priors[favourite]:.1%})")
 
     if tablebase is not None and covers(board):

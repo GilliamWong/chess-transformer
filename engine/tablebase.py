@@ -1,8 +1,4 @@
-#syzygy endgame tables for positions without castling rights: the result under perfect play (wdl, .rtbw) and the plies
-#to the next capture or pawn move (dtz, .rtbz). python -m engine.tablebase downloads those of up to 5 pieces into
-#artifacts/engines/syzygy, about 1 GB; --pieces 6 adds the 6 piece tables in artifacts/engines/syzygy6, 73 GB of wdl
-#and 87 GB of dtz (lichess sends ~3 MB/s a connection: ~7 h over 2), or with --wdl-only their wdl half alone. The 7
-#piece tables (~17 TB, a tournament box's) are not downloaded here: a SyzygyPath or artifacts/engines/syzygy7 holds them
+#syzygy tables: wdl (.rtbw) is the result under perfect play, dtz (.rtbz) the plies to the next capture or pawn move
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -18,49 +14,42 @@ from tqdm import tqdm
 #not from data.ARTIFACTS_DIR: data imports torch, and labelling workers import this file
 SYZYGY_DIR = Path(__file__).parent.parent / "artifacts" / "engines" / "syzygy"
 LICHESS_TABLES = "https://tablebase.lichess.ovh/tables/standard/"
-#the tables used unless more pieces are asked for; ranked_moves needs their dtz tables
+#ranked_moves needs the dtz tables of this many pieces
 TABLEBASE_PIECES = 5
 CONNECTIONS = 2
 CHUNK_BYTES = 1 << 20
-#a table's download is tried this many times, this long apart; a connection that sends nothing this long has failed
 TRIES = 5
 RETRY_SECONDS = 30
 TIMEOUT_SECONDS = 60
 
 
-#the tables in one pair of lichess folders, <lichess_name>-wdl and <lichess_name>-dtz, and the folder they go into
+#the tables of positions of up to `pieces` pieces: lichess' <lichess_name>-wdl and -dtz folders, saved in `folder`
 @dataclass(frozen=True)
 class TableSet:
-    pieces: int #the most pieces of the positions they cover
+    pieces: int
     folder: Path
     lichess_name: str
     tables_per_half: int
 
-    #the tables of one half in the folder, "rtbw" (wdl) or "rtbz" (dtz)
     def count(self, extension: str) -> int:
         return len(list(self.folder.glob(f"*.{extension}")))
 
-#a size's tables probe the smaller sizes' too (the positions after a capture). Lichess keeps the 7 piece tables in
-#subfolders by material, not as one -wdl and -dtz pair
+#a size's tables probe the smaller sizes' too (the positions after a capture); lichess has the 7 piece ones in subfolders by material
 TABLE_SETS = (TableSet(5, SYZYGY_DIR, "3-4-5", 145), TableSet(6, SYZYGY_DIR.with_name("syzygy6"), "6", 365),
               TableSet(7, SYZYGY_DIR.with_name("syzygy7"), "7", 1001))
-#the most pieces of any set, and SyzygyProbeLimit's default: a SyzygyPath gives the most it holds up to it
 MOST_PIECES = max(table_set.pieces for table_set in TABLE_SETS)
 
-#the sets that cover positions of up to `pieces` pieces
 def table_sets(pieces: int) -> list[TableSet]:
     if pieces not in {table_set.pieces for table_set in TABLE_SETS}:
         raise ValueError(f"there are tables of up to {', '.join(str(table_set.pieces) for table_set in TABLE_SETS)} pieces, not {pieces}")
     return [table_set for table_set in TABLE_SETS if table_set.pieces <= pieces]
 
-#the folders of the tables up to `pieces`, as a SyzygyPath (os.pathsep between them), for rules.rs Tables
+#the folders of table_sets(pieces) as a SyzygyPath, for rules.rs Tables
 def tablebase_path(pieces: int) -> str:
     return os.pathsep.join(str(table_set.folder) for table_set in table_sets(pieces))
 
 
-#one table into its .part file, which is renamed once whole so that an unfinished download is not taken for a table. A
-#connection that fails or ends short (lichess drops some) is tried again from where it stopped, TRIES times in all.
-#Stops between chunks once stopping is set
+#into name.part, renamed once whole so that an unfinished download is not taken for a table
 def download_table(folder: Path, url: str, name: str, size: int, progress: tqdm, stopping: threading.Event) -> None:
     path = folder / name
     partial = path.with_name(name + ".part")
@@ -78,7 +67,7 @@ def download_table(folder: Path, url: str, name: str, size: int, progress: tqdm,
     if not stopping.is_set():
         partial.replace(path)
 
-#the bytes the .part does not have yet, appended to it; raises unless it then has the table's size
+#the bytes the .part does not have yet, appended to it; raises unless it then has the table's size (lichess drops some connections)
 def download_rest(url: str, partial: Path, size: int, progress: tqdm, stopping: threading.Event) -> None:
     have = partial.stat().st_size if partial.exists() else 0
     if have > size:
@@ -96,8 +85,7 @@ def download_rest(url: str, partial: Path, size: int, progress: tqdm, stopping: 
     if partial.stat().st_size != size:
         raise IOError(f"{partial.name} has {partial.stat().st_size:,} of {size:,} bytes")
 
-#the set's tables that are not in its folder yet, the wdl half first (the search needs only those), each checked against
-#the size lichess lists. Run again to resume
+#the tables not in the folder yet, wdl first (the search needs only those), each checked against the size lichess lists; run again to resume
 def download(table_set: TableSet, connections: int = CONNECTIONS, dtz: bool = True) -> None:
     if table_set.pieces == 7:
         raise ValueError(f"the 7 piece tables are ~17 TB: put them in {table_set.folder} or give the engine a SyzygyPath")
@@ -124,14 +112,11 @@ def download(table_set: TableSet, connections: int = CONNECTIONS, dtz: bool = Tr
             pool.shutdown(cancel_futures=True)
 
 
-#tables of up to `pieces` pieces, `whole` of each half, can be opened: all the wdl tables are there, and all the dtz
-#tables or, above TABLEBASE_PIECES, none
+#all the wdl tables, and all the dtz tables or, above TABLEBASE_PIECES, none
 def usable(wdl: int, dtz: int, whole: int, pieces: int) -> bool:
     return wdl == whole and (dtz == whole or dtz == 0 and pieces > TABLEBASE_PIECES)
 
-#the tables of positions of up to `pieces` pieces. Each size needs all its wdl tables, and up to TABLEBASE_PIECES all
-#its dtz tables; a bigger size's dtz tables may be left out as a whole (the 6 piece wdl tables fit a pod's 80 GB disk,
-#with their dtz tables they don't), and ranked_pieces tells which sizes ranked_moves can rank
+#a bigger size's dtz tables may be left out as a whole: its positions are then searched, not ranked (see ranked_pieces)
 def open_tablebase(pieces: int = TABLEBASE_PIECES) -> chess.syzygy.Tablebase:
     tablebase = chess.syzygy.Tablebase()
     for table_set in table_sets(pieces):
@@ -142,9 +127,7 @@ def open_tablebase(pieces: int = TABLEBASE_PIECES) -> chess.syzygy.Tablebase:
         tablebase.add_directory(str(table_set.folder))
     return tablebase
 
-#the tables in the folders of a SyzygyPath (os.pathsep between them, as uci's SyzygyPath option gives them), each size
-#up to `pieces` checked by the tables' names as open_tablebase checks a downloaded set; and the most pieces of a
-#position ranked_moves can rank with them
+#open_tablebase for the folders of a SyzygyPath (uci's option), checked by the tables' names; and the most pieces ranked_moves can rank with them
 def open_tablebase_path(path: str, pieces: int) -> tuple[chess.syzygy.Tablebase, int]:
     folders = path_folders(path)
     found = found_tables(folders)
@@ -159,8 +142,7 @@ def open_tablebase_path(path: str, pieces: int) -> tuple[chess.syzygy.Tablebase,
         tablebase.add_directory(folder)
     return tablebase, ranked
 
-#the most pieces, up to `limit`, whose tables the folders of `path` hold as open_tablebase_path asks, as stockfish takes
-#the tables it finds up to its SyzygyProbeLimit; 2 if not even the 3 piece ones are all there
+#the most pieces, up to `limit`, whose tables the folders of `path` hold as open_tablebase_path asks, as stockfish does; 2 if not even the 3 piece ones
 def complete_pieces(path: str, limit: int) -> int:
     found = found_tables(path_folders(path))
     pieces = 2
@@ -171,7 +153,6 @@ def complete_pieces(path: str, limit: int) -> int:
 def path_folders(path: str) -> list[str]:
     return [folder for folder in path.split(os.pathsep) if folder]
 
-#the tables' names in the folders, by half ("rtbw", "rtbz")
 def found_tables(folders: list[str]) -> dict[str, set[str]]:
     return {extension: {name[:-len(extension) - 1] for folder in folders for name in os.listdir(folder) if name.endswith("." + extension)}
             for extension in ("rtbw", "rtbz")}
@@ -181,8 +162,7 @@ def size_counts(found: dict[str, set[str]], size: int) -> tuple[int, int, int]:
     names = {name for name in chess.syzygy.tablenames(piece_count=size) if len(name) == size + 1}
     return len(names & found["rtbw"]), len(names & found["rtbz"]), len(names)
 
-#the most pieces of a position ranked_moves can rank with open_tablebase(pieces): those of the sizes whose dtz tables are
-#there (open_tablebase makes sure of those up to TABLEBASE_PIECES)
+#the most pieces of a position ranked_moves can rank with open_tablebase(pieces): the sizes with dtz tables
 def ranked_pieces(pieces: int) -> int:
     return max(table_set.pieces for table_set in table_sets(pieces) if table_set.count("rtbz") > 0)
 
@@ -217,15 +197,15 @@ def ranked_moves(tablebase: chess.syzygy.Tablebase, board: chess.Board, preferre
         board.push(move)
         #the tables answer for the opponent, hence the minus
         if board.is_checkmate():
-            moves.append(TablebaseMove(move, 2, 0))
+            wdl, plies = 2, 0
         elif zeroing:
-            moves.append(TablebaseMove(move, -tablebase.probe_wdl(board), 1))
+            wdl, plies = -tablebase.probe_wdl(board), 1
         else:
             wdl, plies = -tablebase.probe_wdl(board), abs(tablebase.probe_dtz(board)) + 1
             #the probe counts the 50-move rule from the next position, but this move used one ply of it
             if abs(wdl) == 2 and plies > 100:
                 wdl //= 2
-            moves.append(TablebaseMove(move, wdl, plies))
+        moves.append(TablebaseMove(move, wdl, plies))
         board.pop()
 
     return sorted(moves, key=TablebaseMove.rank)

@@ -1,9 +1,5 @@
-#the model as a uci engine, for cutechess-cli matches, tournament managers and the cute chess gui: uci, isready,
-#setoption (Options), ucinewgame, position, go, stop, ponderhit and quit, read on a thread of their own (Commands) so
-#that stop, isready and quit reach a running search. The search (--select mcts) keeps to go's movetime, nodes and
-#wtime/btime; a go without them runs --simulations, go infinite too (cutechess sends it for tc=inf) unless
-#--infinite-until-stop. go ponder searches until ponderhit, then as the go asks; its searchmoves, depth and mate are
-#ignored. The other selections ignore the clock
+#the model as a uci engine; commands are read on a thread of their own so that stop, isready and quit reach a running search
+#--select mcts keeps to go's movetime, nodes, wtime/btime and ponder (searchmoves, depth and mate are ignored); the other selections ignore the clock
 #   python -m engine.uci [model.pt | random] [--select mcts --gpu]
 import argparse
 from collections.abc import Iterable
@@ -32,63 +28,60 @@ from engine.tablebase import MOST_PIECES, TABLE_SETS, TABLEBASE_PIECES, complete
 ENGINE_NAME = "Fry"
 REPOSITORY = Path(__file__).resolve().parent.parent
 
-#one board takes a few ms on the cpu, less than starting cuda; one thread so parallel games don't fight over cores
+#one board takes a few ms on the cpu, less than starting cuda
 DEVICE = torch.device("cpu")
-#the time between the search's end and the gui reading bestmove, kept off go's time (uci option MoveOverhead)
+#kept off go's time for the gui to read bestmove (uci option MoveOverhead)
 MOVE_OVERHEAD_SECONDS = 0.02
-#uci's id name version: pyproject.toml's, with the commit when the engine runs from a git checkout. git gets no stdin:
-#given the gui's pipe it waits on it
+
 def engine_version() -> str:
     version = re.search(r'^version = "([^"]+)"', (REPOSITORY / "pyproject.toml").read_text(), re.MULTILINE).group(1)
     try:
+        #git gets no stdin: given the gui's pipe it waits on it
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPOSITORY, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                                 timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         commit = ""
     return f"{version}-{commit}" if commit else version
 
-#--gpus and the GPUs option: "all" for every cuda device, else devices by number ("0,1,2")
+#"all" for every cuda device, else devices by number ("0,1,2")
 def parse_gpus(text: str) -> list[int]:
     if text == "all":
-        if not torch.cuda.device_count():
+        count = torch.cuda.device_count()
+        if not count:
             raise ValueError("there is no cuda device")
-        return list(range(torch.cuda.device_count()))
+        return list(range(count))
     devices = [int(device) for device in text.split(",")]
     if min(devices) < 0 or len(set(devices)) < len(devices):
         raise ValueError(f"{text} is not a list of different cuda devices")
     return devices
 
-#parse_gpus for argparse, which shows an ArgumentTypeError's message but not a ValueError's
+#argparse shows an ArgumentTypeError's message but not a ValueError's
 def gpus_argument(text: str) -> list[int]:
     try:
         return parse_gpus(text)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
 
-#go's arguments that take a number
-GO_NUMBERS =("wtime", "btime", "winc", "binc", "movestogo", "movetime", "nodes", "depth", "mate")
-#with wtime/btime and no movestogo, the time left is planned over the moves the game still has, this many a man above
-#the two kings: the plan follows the material rather than a move number
+GO_NUMBERS = ("wtime", "btime", "winc", "binc", "movestogo", "movetime", "nodes", "depth", "mate")
+#with wtime/btime and no movestogo, the game is planned to last this many moves a man above the two kings
 MOVES_PER_MAN = 1.5
 #the fewest moves the time left is shared over, so the last of it goes gradually
 LEAST_MOVES_LEFT = 10
-#a move's weight in the plan by the men on the board, kings included, as (fewest, most, weight): the middlegame gets more
+#a move's weight by the men on the board, kings included: (fewest, most, weight)
 PHASE_WEIGHTS = ((26, 32, 0.85), (16, 25, 1.25), (10, 15, 1.0), (3, 9, 0.8))
 #kept back from the time left, for a search that runs over
 RESERVE_SECONDS = 1.0
-#a move gets at most this part of the time left, and never the reserve: no cap, as in lc0
+#the most of the time left one move gets, 1.0 for no cap as in lc0
 MOST_OF_THE_TIME_LEFT = 1.0
-#a search whose score falls below the last one's may run on (engine_search.py FALL_START_CP) by up to this many of its
-#move's shares, never past this part of the time left
+#a search whose score falls may run on by up to MOST_EXTENSION shares, never past MOST_OF_THE_TIME_LEFT_EXTENDED of the time left
 MOST_EXTENSION = 2.0
 MOST_OF_THE_TIME_LEFT_EXTENDED = 1 / 3
-#lc0's legacy time manager gives a game's first search on the clock 1 + its first move bonus (lc0's 1.8) + its book ply
-#bonus (0.25) x the plies before it, at most MOST_BOOK_PLIES, times its share: it starts without a kept tree. 0 for none
+#lc0's bonus for a game's first search on the clock: its share x (1 + FIRST_MOVE_BONUS + BOOK_PLY_BONUS x ply, ply at most MOST_BOOK_PLIES)
 FIRST_MOVE_BONUS = 0.0
 BOOK_PLY_BONUS = 0.0
 MOST_BOOK_PLIES = 12
 
-#go's numbers (GO_NUMBERS) by name, and those that are not whole numbers ("name value"), which are left out
+#go's whole-number arguments by name, and the ones with another value ("name value"), which are left out
 def go_numbers(arguments: list[str]) -> tuple[dict[str, int], list[str]]:
     numbers, bad = {}, []
     for key, value in zip(arguments, arguments[1:]):
@@ -102,7 +95,7 @@ def go_numbers(arguments: list[str]) -> tuple[dict[str, int], list[str]]:
 def phase_weight(men: int) -> float:
     return next((weight for fewest, most, weight in PHASE_WEIGHTS if fewest <= men <= most), 1.0)
 
-#print writes the line and its newline apart, and the reader thread answers isready while a search sends its lines
+#print writes a line and its newline apart, and the reader thread sends readyok during a search
 SENDING = threading.Lock()
 
 def send(line: str) -> None:
@@ -110,8 +103,7 @@ def send(line: str) -> None:
     with SENDING:
         print(line, flush=True)
 
-#shakmaty's (the rust search's) check of a fen that python-chess's status leaves out: a side's pawns and its pieces
-#beyond the start's (a bishop of each colour) are at most 8
+#shakmaty's (the rust search's) limit that python-chess's status leaves out: a side's pawns plus its pieces beyond the start's are at most 8
 def standard_material(board: chess.Board, color: chess.Color) -> bool:
     ours = board.occupied_co[color]
     at_the_start = ((board.queens, 1), (board.rooks, 2), (board.knights, 2), (board.bishops & chess.BB_LIGHT_SQUARES, 1),
@@ -119,20 +111,16 @@ def standard_material(board: chess.Board, color: chess.Color) -> bool:
     promoted = sum(max(0, chess.popcount(pieces & ours) - start) for pieces, start in at_the_start)
     return chess.popcount(board.pawns & ours) + promoted <= 8
 
-#"startpos moves e2e4 e7e5" or "fen <6 fen fields> moves ..."; a ValueError for one the search could not start from: a
-#bad fen, a board the rust search refuses (its castling rights and en passant square python-chess cleans in fen()),
-#an illegal or a null move
+#"startpos moves e2e4 e7e5" or "fen <6 fen fields> moves ..."; a ValueError for a position the search could not start from
 def parse_position(arguments: list[str]) -> chess.Board:
-    if "moves" in arguments:
-        moves_index = arguments.index("moves")
-        setup, moves = arguments[:moves_index], arguments[moves_index + 1:]
-    else:
-        setup, moves = arguments, []
+    moves_index = arguments.index("moves") if "moves" in arguments else len(arguments)
+    setup, moves = arguments[:moves_index], arguments[moves_index + 1:]
 
     if setup[:1] == ["startpos"]:
         board = chess.Board()
     elif setup[:1] == ["fen"]:
         board = chess.Board(" ".join(setup[1:]))
+        #python-chess cleans bad castling rights and en passant squares in fen(), which is what the rust search gets
         refused = board.status() & ~(chess.STATUS_BAD_CASTLING_RIGHTS | chess.STATUS_INVALID_EP_SQUARE)
         if refused or not all(standard_material(board, color) for color in chess.COLORS):
             raise ValueError(f"not a position the search can play: {board.fen()}")
@@ -147,19 +135,13 @@ def parse_position(arguments: list[str]) -> chess.Board:
 
     return board
 
-def choose_random_move(board: chess.Board) -> chess.Move:
-    return random.choice(list(board.legal_moves))
-
 #depth is the length of the expected line; cutechess keeps score, depth and time in the pgn
 def info_line(report: SearchReport, seconds: float) -> str:
     return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {round(report.simulations / max(seconds, 1e-3))} "
             f"score cp {score_to_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
 
-#go's limits for the search, and on a clock (wtime/btime) the time a move gets: its weighted share of the time left (less
-#the reserve and the bank) over the moves still to play, plus the increment, plus the bank: the time earlier searches
-#were given and did not use (smart pruning stops some early), as lc0's legacy time manager spends it. A search whose
-#score falls may run on (extension), and the game's first search may get a bonus. The arguments are the constants
-#above of the same names, for tools/play/variant_match.py to tune. A new game needs a new Clock
+#go's limits and, on a clock (wtime/btime), a move's time: its weighted share of the time left over the moves still to play, plus the
+#increment and the bank (what earlier searches were given and did not use), as lc0's legacy time manager. A new game needs a new Clock
 class Clock:
     def __init__(self, moves_per_man: float = MOVES_PER_MAN, least_moves_left: int = LEAST_MOVES_LEFT, reserve_seconds: float = RESERVE_SECONDS,
                  most_of_the_time_left: float = MOST_OF_THE_TIME_LEFT, first_move_bonus: float = FIRST_MOVE_BONUS,
@@ -168,12 +150,12 @@ class Clock:
         self.reserve_seconds, self.most_of_the_time_left = reserve_seconds, most_of_the_time_left
         self.first_move_bonus, self.book_ply_bonus = first_move_bonus, book_ply_bonus
         self.move_overhead_seconds = move_overhead_seconds
-        self.first_search = True #the game's first search on the clock is still to come
-        self.saved = 0.0 #the seconds earlier searches were given and did not use
+        self.first_search = True
+        self.saved = 0.0 #the bank, in seconds
         self.allotted: float | None = None #the seconds the search on the clock was given
         self.share = 0.0 #its move's share of the time left
         self.last_score: int | None = None #the last search's score, centipawns for us
-        #(the last search's score, the seconds this search may add if its score falls below it), None off the clock
+        #(last_score, the seconds this search may add if its score falls below it), None off the clock
         self.extension: tuple[int, float] | None = None
 
     #(simulations, seconds) for a search of `board`, each None when go does not set it; a go with neither runs `simulations`
@@ -193,13 +175,12 @@ class Clock:
                                                             chess.popcount(board.occupied), bonus)
             if self.last_score is not None:
                 self.extension = (self.last_score, self.extra_seconds(seconds_left))
-        #go nodes 0 plays at once, the root's one simulation (or a kept tree's move), as lc0 answers at once
-        nodes = None if "nodes" not in numbers else max(1, numbers["nodes"])
+        #go nodes 0 plays at once on the root's one simulation, as lc0 does
+        nodes = max(1, numbers["nodes"]) if "nodes" in numbers else None
         if nodes is None and seconds is None:
             nodes = simulations
         return nodes, seconds
 
-    #bonus multiplies the move's share, as lc0's first move bonus does before it adds the bank: the time left pays for it
     def seconds_for_move(self, time_left: float, increment: float, moves_to_go: int | None, men: int, bonus: float = 1.0) -> float:
         spare = max(0.0, time_left - self.reserve_seconds)
         self.saved = min(self.saved, spare)
@@ -213,26 +194,23 @@ class Clock:
         self.saved -= max(0.0, seconds - own)
         return seconds
 
-    #the seconds a search whose score falls may add: MOST_EXTENSION shares, never past MOST_OF_THE_TIME_LEFT_EXTENDED of
-    #the time left
     def extra_seconds(self, time_left: float) -> float:
         return max(0.0, min(MOST_EXTENSION * self.share, (time_left - self.reserve_seconds) * MOST_OF_THE_TIME_LEFT_EXTENDED - (self.allotted or 0.0)))
 
-    #after a search, the seconds it took and its score (centipawns for us); what it did not use goes to the bank
+    #after a search: the seconds it took and its score (centipawns for us)
     def searched(self, seconds: float, score: int) -> None:
         if self.allotted:
             self.saved = max(0.0, self.saved + self.allotted - seconds)
         self.last_score = score
 
-#after bestmove is sent: the search's tree carried on to the game after the move, off the engine's clock, on a thread of
-#its own (EngineSearch.advance); the next position need not follow it
+#carries the search's tree on to the game after the move, off the engine's clock, on a thread of EngineSearch's own
 def advance_after(player, board: chess.Board, move: chess.Move) -> None:
     if isinstance(player, EngineSearch):
         played = board.copy()
         played.push(move)
         player.advance(played)
 
-#a file per process, so engines playing side by side never share one. evaluate_elo writes them into the pgn
+#a file per process, so engines playing side by side never share one
 def log_search(log_folder: Path, board: chess.Board, move: chess.Move, report: SearchReport) -> None:
     record = {
         "fen": board.fen(), "move": move.uci(), "score": report.score, "simulations": report.simulations,
@@ -242,35 +220,23 @@ def log_search(log_folder: Path, board: chess.Board, move: chess.Move, report: S
     with open(log_folder / f"{os.getpid()}.jsonl", "a") as log:
         log.write(json.dumps(record) + "\n")
 
-#boards stay on DEVICE either way: CudaGraphModel takes them from the cpu
-def load_engine_model(checkpoint_path: Path, gpu: bool) -> nn.Module:
-    if gpu:
-        return CudaGraphModel(load_model(checkpoint_path, torch.device("cuda")))
-    return load_model(checkpoint_path, DEVICE)
-
-#the search for --select mcts: on the gpu `leaves` leaves a round, the network in `precision` (int8 with fp16_blocks), on
-#each of the cuda devices `gpus` if given (a thread driving each); on the cpu one, which is mcts.py's search. options are
-#EngineSearch's keyword arguments (smart pruning, the tables' pieces, changes to the search's settings). On several gpus
-#the networks wait for the gpu asleep (inference.GraphedBatches' blocking_wait), where each thread would spin a core
-def load_engine_search(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, options: dict, precision: str,
-                       fp16_blocks: int, gpus: list[int] | None = None) -> EngineSearch:
-    if gpu:
-        network = engine_network(checkpoint_path, leaves, precision, fp16_blocks) if gpus is None else (
-            engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, len(gpus) > 1))
-        return EngineSearch(network, leaves, use_tablebase=tablebase, **options)
-    return EngineSearch(cpu_batches(load_model(checkpoint_path, DEVICE)), 1, use_tablebase=tablebase, **options)
-
-#what picks the moves: the search for --select mcts, else the model
+#the search for --select mcts, else the model. The search gathers `leaves` a round on the gpu (the network in `precision`) on each of `gpus`,
+#a thread driving each, and is mcts.py's on the cpu; search_options are EngineSearch's keyword arguments
 def load_player(checkpoint_path: Path, selection: str, gpu: bool, leaves: int, tablebase: bool, search_options: dict,
                 precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> nn.Module | EngineSearch:
-    if selection == "mcts":
-        return load_engine_search(checkpoint_path, gpu, leaves, tablebase, search_options, precision, fp16_blocks, gpus)
-    return load_engine_model(checkpoint_path, gpu)
+    if selection != "mcts":
+        #boards stay on DEVICE either way: CudaGraphModel takes them from the cpu
+        return CudaGraphModel(load_model(checkpoint_path, torch.device("cuda"))) if gpu else load_model(checkpoint_path, DEVICE)
+    if not gpu:
+        return EngineSearch(cpu_batches(load_model(checkpoint_path, DEVICE)), 1, use_tablebase=tablebase, **search_options)
+    #on several gpus the networks wait asleep (inference.GraphedBatches' blocking_wait) where each thread would spin a core
+    network = engine_network(checkpoint_path, leaves, precision, fp16_blocks) if gpus is None else (
+        engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, len(gpus) > 1))
+    return EngineSearch(network, leaves, use_tablebase=tablebase, **search_options)
 
 
-#a go as the reader saw it: its arguments and when it came (the gui times the move from then). stop is set at stop or
-#quit, or at the end of the input for a go that waits for a stop: go infinite with --infinite-until-stop (until_stop)
-#and go ponder, which searches until pondered is set (stop or ponderhit, whose time is kept)
+#a go as the reader saw it: its arguments and when it came (the gui times the move from then). stop is set by stop or quit, and at the end
+#of the input for a go that waits for a stop (until_stop, ponder); pondered by stop or ponderhit, whose time is kept
 class Go:
     def __init__(self, arguments: list[str], received: float, until_stop: bool):
         self.arguments, self.received, self.until_stop = arguments, received, until_stop
@@ -287,11 +253,8 @@ class Go:
             self.ponderhit = received
             self.pondered.set()
 
-#stdin read on a thread of its own, so that stop, isready and quit reach the engine while it searches. The main thread
-#takes the other commands in order (next; None once the input ends) and keeps every search's state. While the command
-#queued last is a go the main thread has not finished, the reader answers isready itself (UCI: at once, the search
-#going on); stop and quit end the unfinished gos, ponderhit ends their pondering, and the end of the input the gos that
-#wait for a stop
+#stdin read on a thread of its own, so that stop, isready and quit reach the engine while it searches. The main thread takes the other
+#commands in order (next) and keeps every search's state. While the command queued last is an unfinished go, the reader answers isready itself
 class Commands:
     def __init__(self, lines: Iterable[str], infinite_until_stop: bool):
         self.infinite_until_stop = infinite_until_stop
@@ -338,23 +301,18 @@ class Commands:
     def next(self) -> tuple[str, list[str], Go | None] | None:
         return self.queued.get()
 
-    #the main thread is done with the go, its bestmove sent
     def finished(self, go: Go) -> None:
         with self.lock:
             self.unfinished.remove(go)
 
-#setoption's whole number options, (lowest, highest): the tables' most pieces, MoveOverhead in ms, RamLimitMb in MB,
-#Leaves a round on each gpu (--leaves)
+#setoption's whole number options, (lowest, highest); MoveOverhead is in ms, RamLimitMb in MB
 SPIN_OPTIONS = {"SyzygyProbeLimit": (min(table_set.pieces for table_set in TABLE_SETS), max(table_set.pieces for table_set in TABLE_SETS)),
                 "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000), "AdvanceThreads": (0, 256),
                 "Leaves": (1, 1024)}
-#setoption's decimal options, strings as lc0's (uci has no decimal type), (lowest, highest): SmartPruningFactor 0 for
-#none (--no-smart-pruning), the bonuses --first-move-bonus's and --book-ply-bonus's
+#setoption's decimal options, strings as lc0's (uci has no decimal type), (lowest, highest); SmartPruningFactor 0 is no smart pruning
 DECIMAL_OPTIONS = {"SmartPruningFactor": (0.0, 100.0), "FirstMoveBonus": (0.0, 100.0), "BookPlyBonus": (0.0, 100.0)}
-#the options only the search on the gpu has
 GPU_OPTIONS = ("GPUs", "Leaves", "SmartPruningFactor")
-#the options the search is built with (at isready or the first go): set later, they take effect when the engine
-#restarts, not at a new game (Searches takes them when it is made)
+#built into the search at isready or the first go: set later, they take effect when the engine restarts
 BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb", "AdvanceThreads", "GPUs", "Leaves", "SearchSettings",
                  "SmartPruningFactor")
 
@@ -363,15 +321,8 @@ def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
     value_at = arguments.index("value") if "value" in arguments else len(arguments)
     return " ".join(arguments[1:value_at]), " ".join(arguments[value_at + 1:])
 
-#the search's uci options, the command line's choices their defaults. SyzygyPath: folders of syzygy tables, os.pathsep
-#between them, or <empty> for the command line's (--tablebase, else none); SyzygyProbeLimit: their most pieces, as
-#stockfish's: a SyzygyPath gives the most it holds up to it (MOST_PIECES by default), --tablebase's take --tablebase-pieces;
-#CachePositions: the network's answers the search keeps (engine_search.CACHE_POSITIONS); RamLimitMb: the MB (10^6
-#bytes) the search's tree may take, 0 for no limit (Searches' memory_limit_mb, without the cache or a kept tree's copy);
-#AdvanceThreads: the threads the kept tree is carried on to the next move on, 0 for none (engine_search.ADVANCE_THREADS). On the gpu
-#GPUs: "all" or cuda devices by number (--gpus), <empty> for the command line's; Leaves (--leaves); SmartPruningFactor
-#(--smart-pruning-factor). SearchSettings: changes to the search's settings over --search-settings', the same "name=value,...".
-#FirstMoveBonus and BookPlyBonus: the clock's (--first-move-bonus, --book-ply-bonus), for each game's first search
+#the search's uci options, the command line's choices their defaults (<empty> goes back to the command line's). SyzygyPath: folders of
+#tables, os.pathsep between them. SearchSettings: --search-settings' "name=value,..." as changes over the command line's
 class Options:
     def __init__(self, tablebase: bool, tablebase_pieces: int, gpu: bool = False, gpus: list[int] | None = None, leaves: int = LEAVES,
                  search_options: dict | None = None, clock_options: dict | None = None):
@@ -379,25 +330,23 @@ class Options:
         self.tablebase, self.default_pieces = tablebase, tablebase_pieces
         self.syzygy_path: str | None = None #None for the command line's tables
         self.tablebase_pieces = tablebase_pieces
-        self.probe_limit: int | None = None #SyzygyProbeLimit's, None for its default
+        self.probe_limit: int | None = None #None for SyzygyProbeLimit's default
         self.move_overhead_seconds = MOVE_OVERHEAD_SECONDS
         self.cache_positions = CACHE_POSITIONS
         self.ram_limit_mb = 0
         self.advance_threads = ADVANCE_THREADS
         self.gpu, self.command_line_gpus, self.gpus, self.leaves = gpu, gpus, gpus, leaves
         self.command_line_settings = search_options.get("settings", {})
-        self.settings: dict | None = None #SearchSettings' changes, None for the command line's alone
+        self.settings: dict | None = None #None for the command line's alone
         self.command_line_factor = search_options.get("smart_pruning_factor", SMART_PRUNING_FACTOR) if search_options.get("smart_pruning", True) else 0.0
         self.smart_pruning_factor: float | None = None #None for the command line's
         self.first_move_bonus = clock_options.get("first_move_bonus", FIRST_MOVE_BONUS)
         self.book_ply_bonus = clock_options.get("book_ply_bonus", BOOK_PLY_BONUS)
 
-    #this engine's options: the gpu's only with --gpu
     def names(self) -> list[str]:
         names = ["SyzygyPath", *SPIN_OPTIONS, "GPUs", *DECIMAL_OPTIONS, "SearchSettings"]
         return [name for name in names if self.gpu or name not in GPU_OPTIONS]
 
-    #the uci reply's lines
     def lines(self) -> list[str]:
         defaults = {"SyzygyProbeLimit": MOST_PIECES, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": CACHE_POSITIONS,
                     "RamLimitMb": 0, "AdvanceThreads": ADVANCE_THREADS, "Leaves": self.leaves, "SmartPruningFactor": self.command_line_factor,
@@ -414,11 +363,11 @@ class Options:
                 lines.append(f"option name {name} type string default {defaults.get(name, '<empty>')}")
         return lines
 
-    #a setoption once the search is built or not: what to tell the gui (an info string), None if nothing. A value the
-    #search could not take (tables that are not all there, a number out of range) leaves the option as it was
+    #applies a setoption: what to tell the gui (an info string), None if nothing. A value the search could not take leaves the option as it was
     def set(self, name: str, value: str, built: bool) -> str | None:
-        name = next((known for known in self.names() if known.lower() == name.lower()), name)
-        if name not in self.names():
+        names = self.names()
+        name = next((known for known in names if known.lower() == name.lower()), name)
+        if name not in names:
             return f"no option {name}"
         if built and name in BUILD_OPTIONS:
             return f"{name} takes effect when the engine restarts: the search is built"
@@ -458,7 +407,6 @@ class Options:
             self.advance_threads = number
         return None
 
-    #GPUs: the devices must be there, and several need more than a leaf a round
     def set_gpus(self, value: str) -> str | None:
         if value == "<empty>":
             gpus = self.command_line_gpus
@@ -474,7 +422,6 @@ class Options:
         self.gpus = gpus
         return None
 
-    #a decimal option, in its range
     def set_decimal(self, name: str, value: str) -> str | None:
         lowest, highest = DECIMAL_OPTIONS[name]
         try:
@@ -491,9 +438,8 @@ class Options:
             self.book_ply_bonus = number
         return None
 
-    #the tables of `path` (None for the command line's) up to `limit` (None for SyzygyProbeLimit's default), if the search
-    #can open them: a SyzygyPath gives the most pieces it holds up to the limit, at least TABLEBASE_PIECES'; the command
-    #line's take the limit or --tablebase-pieces. What to tell the gui, None if nothing
+    #the tables of `path` (None for the command line's) up to `limit` (None for the default). A SyzygyPath gives the most pieces it holds up to
+    #the limit, at least TABLEBASE_PIECES; the command line's take the limit or --tablebase-pieces. What to tell the gui, None if nothing
     def set_tables(self, path: str | None, limit: int | None) -> str | None:
         if path is None:
             pieces = self.default_pieces if limit is None else limit
@@ -520,7 +466,7 @@ class Options:
             return f"{error}: the tables stay as they were"
         return None
 
-    #load_player's tablebase and the search options these set
+    #load_player's tablebase and search options
     def search(self) -> tuple[bool, dict]:
         options = {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": self.cache_positions,
                    "memory_limit_mb": self.ram_limit_mb, "advance_threads": self.advance_threads}
@@ -532,7 +478,7 @@ class Options:
             options.update(smart_pruning=True, smart_pruning_factor=self.smart_pruning_factor)
         return self.tablebase or self.syzygy_path is not None, options
 
-    #Clock's keyword arguments these set
+    #Clock's keyword arguments
     def clock(self) -> dict:
         return {"first_move_bonus": self.first_move_bonus, "book_ply_bonus": self.book_ply_bonus, "move_overhead_seconds": self.move_overhead_seconds}
 
@@ -542,10 +488,9 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
          gpu: bool = False, leaves: int = LEAVES, tablebase: bool = False, search_log: Path | None = None, search_options: dict | None = None,
          precision: str = ENGINE_PRECISION, fp16_blocks: int = ENGINE_FP16_BLOCKS, clock_options: dict | None = None,
          infinite_until_stop: bool = False, gpus: list[int] | None = None):
-    torch.set_num_threads(1)
+    torch.set_num_threads(1) #so that parallel games don't fight over cores
     search_options = search_options or {}
     clock_options = clock_options or {}
-    #the options are the search's
     searching = selection == "mcts" and not random_mover
     options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES), gpu, gpus, leaves, search_options, clock_options)
     player = None
@@ -558,12 +503,10 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
         return load_player(checkpoint_path, selection, gpu, options.leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
                            options.gpus)
 
-    #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by
-    #itself (a proven or only move), as UCI asks; a go ponder searches the opponent's time until ponderhit, then on as
-    #the go asks (the tree kept) with its time from the ponderhit, or until stop, for a move the gui throws away
+    #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by itself, as UCI asks. A go
+    #ponder searches until ponderhit, then on as the go asks (the tree kept) with its time from the ponderhit; on stop its move is thrown away
     def move_for(go: Go) -> chess.Move | None:
         nonlocal player
-        #timed from when the go came, as the gui times it
         started = go.received
         if not any(board.legal_moves):
             send("info string the game is over, there is no move to play")
@@ -577,7 +520,7 @@ def main(checkpoint_path: Path | None = None, random_mover: bool = False, select
                 return pondered.line[0] if pondered else next(iter(board.legal_moves))
             started = go.ponderhit
         if random_mover:
-            move = choose_random_move(board)
+            move = random.choice(list(board.legal_moves))
         elif searching:
             for number in go_numbers(go.arguments)[1]:
                 send(f"info string go's {number} is not a whole number: left out")

@@ -1,5 +1,4 @@
-#the int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022) and cached, without
-#the blocks kept in fp16 for their int8 error (block_errors)
+#int8 weights of model/int8_blocks.py, rounded once per checkpoint by GPTQ (Frantar et al. 2022) and cached
 #   python -m engine.quantization <model.pt>    computes them ahead of a match
 import argparse
 import hashlib
@@ -19,25 +18,25 @@ from model.fused_blocks import link_input_mixes
 from model.int8_blocks import DOWN_INPUT_MULTIPLE, HADAMARD_BLOCK, Int8Block, down_inputs, hadamard
 from model.model import ChessTransformer
 
-#carlsen's games: the matches' openings, the tests' positions and the int8 network's calibration
+Int8Weights = dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]
+
 CARLSEN_PGN = Path(__file__).resolve().parent / "Carlsen.pgn"
-#in the home folder, not the checkpoint's: that may be read-only, and hyak's nodes share their home folders
+#not the checkpoint's folder: that may be read-only
 CACHE = Path.home() / ".cache" / "chess_transformer" / "int8"
-#the rounding code's version, changed with it: it and the settings below name the cached file with the checkpoint
+#bumped with the rounding code: it and the settings below name the cached file
 VERSION = 1
-#every CALIBRATION_STEP plies of Carlsen's games from CALIBRATION_FIRST_GAME, after the tests' and the benchmarks' games
+#every CALIBRATION_STEP plies of the games from CALIBRATION_FIRST_GAME on; the games before are the tests' and benchmarks'
 CALIBRATION_POSITIONS = 1024
 CALIBRATION_FIRST_GAME = 1000
 CALIBRATION_STEP = 9
-#GPTQ's dampening of the Hessian, a share of its mean diagonal, and the columns it rounds before passing on their error
+#share of the Hessian's mean diagonal added to its diagonal; columns rounded before their error is passed on
 DAMPENING = 0.01
 GPTQ_COLUMNS = 128
-#the last layer stays fp16: its down matmul alone costs the policy as much as all the others'
+#the last layer's down matmul alone costs the policy as much as all the others'
 FP16_LAST_LAYERS = 1
 INT8_MAX = 127
-#block_errors' version, changed with it: it and the count name the file of the weights without the blocks kept in fp16
+#bumped with block_errors: it and the count name the file of the weights without the blocks kept in fp16
 CHOICE_VERSION = 1
-#boards a forward of block_errors takes
 ERROR_BATCH = 256
 
 
@@ -59,19 +58,20 @@ def calibration_positions() -> list[chess.Board]:
     return boards
 
 
-def calibration_boards() -> torch.Tensor:
-    return torch.from_numpy(np.array([encode_board(board) for board in calibration_positions()])).long()
+def encode_positions(positions: list[chess.Board]) -> torch.Tensor:
+    return torch.from_numpy(np.array([encode_board(board) for board in positions])).long()
 
 
-#(int8, scale a row) of the weight (N x K) by GPTQ on its inputs' Hessian: each column's error spread over the later ones
+#(int8 weight, scale a row) of an N x K weight: each column's error is spread over the later ones through the Hessian
 def gptq(weight: torch.Tensor, hessian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     #fp64: machines summing in other orders round every weight alike
     weight, hessian = weight.double().clone(), hessian.double().clone()
+    diagonal = hessian.diagonal()
     #inputs that are always zero (the down matmul's padding) have no curvature: their weights are left at zero
-    dead = torch.diag(hessian) == 0
-    hessian[dead, dead] = 1
+    dead = diagonal == 0
+    diagonal[dead] = 1
     weight[:, dead] = 0
-    hessian += DAMPENING * torch.diag(hessian).mean() * torch.eye(len(hessian), device=hessian.device, dtype=hessian.dtype)
+    diagonal += DAMPENING * diagonal.mean()
     #the inverse's upper Cholesky factor: its row i spreads column i's error over the columns after it
     inverse = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(hessian)), upper=True)
     scale = weight.abs().amax(dim=1).clamp(min=1e-20) / INT8_MAX
@@ -84,12 +84,12 @@ def gptq(weight: torch.Tensor, hessian: torch.Tensor) -> tuple[torch.Tensor, tor
             rounded = (columns[:, i] / scale).round().clamp(-INT8_MAX, INT8_MAX)
             integers[:, first + i] = rounded
             errors[:, i] = (columns[:, i] - rounded * scale) / block_inverse[i, i]
-            columns[:, i:] -= errors[:, i, None] * block_inverse[i, i:][None, :]
+            columns[:, i:] -= errors[:, i, None] * block_inverse[i, i:]
         weight[:, last:] -= errors @ inverse[first:last, last:]
     return integers.to(torch.int8), scale.float()
 
 
-#each block's matmul inputs' x^T x summed over the calibration boards, in fp64: (projection, gate_up, down) per block
+#per block, the sum over the boards of x^T x for the inputs x of its projection, gate_up and down matmuls
 @torch.no_grad()
 def input_hessians(model: ChessTransformer, boards: torch.Tensor, batch: int = 128) -> list[dict[str, torch.Tensor]]:
     hessians = [{} for _ in model.encoder]
@@ -110,31 +110,32 @@ def input_hessians(model: ChessTransformer, boards: torch.Tensor, batch: int = 1
 
 
 #{layer: {name: (int8 N x K, scale a row)}} of all but the last FP16_LAST_LAYERS blocks, laid out as Int8Block reads them:
-#projection Q|K|V|template mix, gate_up the gate's rows then up's, down padded to down_inputs and rotated
+#projection is Q|K|V|template mix, gate_up the gate's rows then up's, down padded to down_inputs and rotated
 @torch.no_grad()
-def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+def compute_int8_weights(model: ChessTransformer, boards: torch.Tensor) -> Int8Weights:
     hessians = input_hessians(model, boards)
     weights = {}
-    for layer, (block, sums) in enumerate(list(zip(model.encoder, hessians))[:len(hessians) - FP16_LAST_LAYERS]):
-        projection = torch.cat([layer_.weight for layer_ in (block.Q, block.K, block.V, block.template_mix)])
+    for layer in range(len(hessians) - FP16_LAST_LAYERS):
+        block, sums = model.encoder[layer], hessians[layer]
+        projection = torch.cat([matmul.weight for matmul in (block.Q, block.K, block.V, block.template_mix)])
         gate_up = torch.cat([block.mlp.gate_projection.weight, block.mlp.up_projection.weight])
         hidden = block.mlp.down_projection.weight.shape[1]
         width = down_inputs(hidden)
+        padding = width - hidden
         rotation = torch.block_diag(*[hadamard(HADAMARD_BLOCK)] * (width // HADAMARD_BLOCK)).to(sums["down"])
-        padded = torch.zeros(width, width, device=rotation.device, dtype=rotation.dtype)
-        padded[:hidden, :hidden] = sums["down"]
-        down = torch.nn.functional.pad(block.mlp.down_projection.weight, (0, width - hidden)) @ rotation / HADAMARD_BLOCK
+        padded = nn.functional.pad(sums["down"], (0, padding, 0, padding))
+        down = nn.functional.pad(block.mlp.down_projection.weight, (0, padding)) @ rotation / HADAMARD_BLOCK
         weights[layer] = {"projection": gptq(projection, sums["projection"]), "gate_up": gptq(gate_up, sums["gate_up"]),
                           "down": gptq(down, rotation.t() @ padded @ rotation)}
     return weights
 
 
-#each int8 block's error (the layers of weights): the policy's total variation over the legal moves from the fp16 model's
+#per layer of weights, the total variation of the policy over the legal moves between the fp16 model and the fp16 model
 #with only that block in int8, mean over the calibration boards
 @torch.no_grad()
-def block_errors(checkpoint_path: Path, weights: dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]) -> dict[int, float]:
+def block_errors(checkpoint_path: Path, weights: Int8Weights) -> dict[int, float]:
     positions = calibration_positions()
-    boards = torch.from_numpy(np.array([encode_board(board) for board in positions])).long().cuda()
+    boards = encode_positions(positions).cuda()
     legal = torch.zeros(len(positions), NUM_MOVE_IDS, dtype=torch.bool)
     for row, board in enumerate(positions):
         legal[row, [encode_move_to_id(move, board.turn) for move in board.legal_moves]] = True
@@ -159,8 +160,8 @@ def block_errors(checkpoint_path: Path, weights: dict[int, dict[str, tuple[torch
     return errors
 
 
-#the checkpoint's int8 weights' file in CACHE, named by the checkpoint file's content and everything else that rounds
-#them, and by the blocks kept in fp16 besides the last: without any, the name weights had before they could be kept
+#named by the checkpoint file's content, everything else that rounds, and the count of blocks kept in fp16; with none
+#kept it is the name weights had before blocks could be kept
 def cached_weights_path(checkpoint_path: Path, fp16_blocks: int) -> Path:
     with open(checkpoint_path, "rb") as checkpoint:
         digest = hashlib.file_digest(checkpoint, "sha256").hexdigest()
@@ -171,9 +172,9 @@ def cached_weights_path(checkpoint_path: Path, fp16_blocks: int) -> Path:
     return CACHE / f"{digest}_{hashlib.sha256(repr(rounding).encode()).hexdigest()[:16]}.pt"
 
 
-#the checkpoint's int8 weights on the cpu, from CACHE or computed on the gpu and cached: compute_int8_weights' without
-#the fp16_blocks blocks of the largest block_errors
-def int8_weights(checkpoint_path: Path, fp16_blocks: int) -> dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+#the checkpoint's int8 weights on the cpu, from CACHE or computed on the gpu and cached, without the fp16_blocks blocks
+#of the largest block_errors
+def int8_weights(checkpoint_path: Path, fp16_blocks: int) -> Int8Weights:
     if fp16_blocks < 0:
         raise ValueError(f"a count of blocks to keep in fp16, not {fp16_blocks}")
     path = cached_weights_path(checkpoint_path, fp16_blocks)
@@ -188,11 +189,11 @@ def int8_weights(checkpoint_path: Path, fp16_blocks: int) -> dict[int, dict[str,
         #fp64 but the heads, whose inputs the model casts to fp32
         model = load_model(checkpoint_path, torch.device("cuda")).half_except_heads(torch.float64)
         weights = {layer: {name: tuple(tensor.cpu() for tensor in pair) for name, pair in matmuls.items()}
-                   for layer, matmuls in compute_int8_weights(model, calibration_boards()).items()}
+                   for layer, matmuls in compute_int8_weights(model, encode_positions(calibration_positions())).items()}
         del model
         torch.cuda.empty_cache()
     CACHE.mkdir(parents=True, exist_ok=True)
-    #written whole under another name first: engines starting together each compute the same weights
+    #written under another name first: engines starting together compute the same weights
     partial = path.with_name(f"{path.name}.{os.getpid()}.partial")
     torch.save(weights, partial)
     os.replace(partial, path)

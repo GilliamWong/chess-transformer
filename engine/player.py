@@ -18,32 +18,23 @@ from engine.tablebase import covers, ranked_moves, wdl_score
 SELECTIONS = ("argmax", "sample", "avoid-repetition", "mcts")
 TEMPERATURE = 0.5
 SAMPLE_PLIES = 1000 #the whole game
-#avoid-repetition needs both: the d640 bot lost lichess game dwCvJZkh avoiding a repetition in a drawn rook
-#ending it rated a sliver ahead, with a move the policy gave 1.9% that hung the rook
 AHEAD_SCORE = 0.6
 ALTERNATIVE_SHARE = 0.1
 SIMULATIONS = 200
 ROOT_MOVES_REPORTED = 3
 MAX_REPORTED_SCORE = 0.9999 #about 25 pawns
 
-#the model in eval mode, at the size its checkpoint says
 def load_model(checkpoint_path: Path, device: torch.device) -> ChessTransformer:
     model, _ = load_checkpoint(checkpoint_path, device)
-    model.eval()
+    return model.eval()
 
-    return model
-
-#cublas keeps a workspace for each stream it runs on, made at its first matmul there: made while a graph records, it
-#is in that graph's pool, and calls and graphs after on the stream used it past the graph's end (cuda error 700).
-#Cleared around each recording (as inductor's cuda graph trees do), a graph records a workspace of its own in its pool
+#a workspace cublas makes while a graph records lands in that graph's pool and breaks later calls (cuda error 700)
 def clear_cublas_workspaces() -> None:
     #a private torch function, absent from some versions
     clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
     if clear is not None:
         clear()
 
-#one board at a time on the gpu as a replayed cuda graph: 1,700 simulations a second on the d128 against 440 on a cpu
-#thread, but processes sharing the gpu get only about 2,400 between them, so many games at once are faster on the cpu
 class CudaGraphModel(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()
@@ -82,7 +73,7 @@ class SearchReport:
 
 #mcts.py's search, or the tablebase's move where the tables know the position (search refuses those)
 def search_move(model: nn.Module, board: chess.Board, device: torch.device, simulations: int) -> tuple[chess.Move, SearchReport]:
-    #imported here because mcts.py imports this file
+    #mcts.py imports this file
     from engine import mcts
     if mcts.tablebase is not None and covers(board):
         best = ranked_moves(mcts.tablebase, board)[0]
@@ -96,7 +87,7 @@ def search_move(model: nn.Module, board: chess.Board, device: torch.device, simu
     by_visits = sorted(root.children.items(), key=lambda item: item[1].visit_count, reverse=True)[:ROOT_MOVES_REPORTED]
     return line[0], SearchReport(score, line, simulations, [(move, child.visit_count) for move, child in by_visits])
 
-#the inverse of data.py's centipawn curve, capped since a sure win is infinitely many centipawns
+#the inverse of the training curve, capped since a sure win is infinitely many centipawns
 def score_to_centipawns(score: float) -> int:
     score = min(max(score, 1 - MAX_REPORTED_SCORE), MAX_REPORTED_SCORE)
     return round(math.log(score / (1 - score)) / EXPECTED_SCORE_PER_CENTIPAWN)
@@ -104,39 +95,35 @@ def score_to_centipawns(score: float) -> int:
 def choose_move(model: nn.Module, board: chess.Board, device: torch.device, selection: str = "argmax",
                 temperature: float = TEMPERATURE, sample_plies: int = SAMPLE_PLIES, simulations: int = SIMULATIONS) -> chess.Move:
     legal_move_ids = [encode_move_to_id(move, board.turn) for move in board.legal_moves]
-    if len(legal_move_ids) == 0:
+    if not legal_move_ids:
         raise ValueError(f"no legal moves, the game is over: {board.fen()}")
 
     if selection == "mcts":
         return search_move(model, board, device, simulations)[0]
 
     boards = torch.tensor(encode_board(board), dtype=torch.long, device=device).unsqueeze(0)
-
     with torch.no_grad():
         move_logits, value_logits = model(boards)
-    logits = move_logits[0]
 
-    #illegal moves at -inf
     masked_logits = torch.full((NUM_MOVE_IDS,), float("-inf"), device=device)
-    masked_logits[legal_move_ids] = logits[legal_move_ids]
+    masked_logits[legal_move_ids] = move_logits[0][legal_move_ids]
 
     if selection == "sample" and board.ply() < sample_plies:
         probabilities = torch.softmax(masked_logits[legal_move_ids] / temperature, dim=0).tolist()
         #python's random, not torch's: torch seeds every process the same, so every game would repeat
         return decode_id_to_move(random.choices(legal_move_ids, probabilities)[0], board.turn)
 
-    if selection == "avoid-repetition":
-        #moves are tried best first, stopping at the first below ALTERNATIVE_SHARE of the best
-        if expected_score(value_logits)[0].item() >= AHEAD_SCORE:
-            probabilities = torch.softmax(masked_logits, dim=0)
-            for move_id in masked_logits.argsort(descending=True)[:len(legal_move_ids)].tolist():
-                if probabilities[move_id] < ALTERNATIVE_SHARE * probabilities.max():
-                    break
-                move = decode_id_to_move(move_id, board.turn)
-                board.push(move)
-                repeats = board.is_repetition(2)
-                board.pop()
-                if not repeats:
-                    return move
+    if selection == "avoid-repetition" and expected_score(value_logits)[0].item() >= AHEAD_SCORE:
+        probabilities = torch.softmax(masked_logits, dim=0)
+        cutoff = ALTERNATIVE_SHARE * probabilities.max()
+        for move_id in masked_logits.argsort(descending=True)[:len(legal_move_ids)].tolist():
+            if probabilities[move_id] < cutoff:
+                break
+            move = decode_id_to_move(move_id, board.turn)
+            board.push(move)
+            repeats = board.is_repetition(2)
+            board.pop()
+            if not repeats:
+                return move
 
-    return decode_id_to_move(int(masked_logits.argmax().item()), board.turn)
+    return decode_id_to_move(masked_logits.argmax().item(), board.turn)
