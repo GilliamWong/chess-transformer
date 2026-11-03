@@ -13,10 +13,9 @@ from torch import nn
 from training import data
 from engine import selfplay
 from training.data import SelfPlayDataset, load_training_set
-from model.encoding import NUM_MOVE_IDS
+from model.encoding import NO_MOVE, NUM_MOVE_IDS
 from engine.inference import cpu_batches, serve
 from engine.selfplay import TOP_MOVES, Game, RemoteNetwork, SelfPlaySet, Slot, play_games_in_rust, slot_arrays
-from tools.label_with_stockfish import NO_MOVE
 
 SETTINGS = {"simulations": 16}
 

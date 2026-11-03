@@ -1,8 +1,8 @@
 import chess.pgn
 import pytest
 
-from tools.play.evaluate_elo import CARLSEN_PGN
-from tools.tablebase import open_tablebase
+from training.data import CARLSEN_PGN
+from engine.tablebase import open_tablebase
 
 NUM_PGN_GAMES_TO_REPLAY = 5
 

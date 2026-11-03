@@ -27,7 +27,7 @@ uv run python -m training.train --note "final layer norm"    the same, with a no
 uv run python -m training.train --minutes 30                 a longer run
 uv run python -m training.train --positions 10_000_000       a budget in positions instead (about 3 minutes per 10M on an RTX 5070 Ti)
 uv run python -m training.train --d-model 256 --layers 8 --heads 8 --lr 3e-3    see --help for every flag
-uv run python -m tools.compare_runs                          every finished run, grouped by budget, best first
+uv run python -m training.compare_runs                          every finished run, grouped by budget, best first
 ```
 
 Training starts TensorBoard at localhost:6006 (`--no-tensorboard` skips it). Runs with the same budget are comparable:
@@ -53,7 +53,7 @@ narrow gaussian around the score), read out as its mean; `--value-bins 1` is the
 ```
 uv run python -m tools.label_with_stockfish        label the first games of a set (stoppable, carries on)
 uv run python -m tools.label_blunders label <boards.bin> <folder>    blunder labels, then `merge` into the set
-uv run python -m tools.tablebase                    download the 3-5 piece Syzygy tables (about 1 GB)
+uv run python -m engine.tablebase                    download the 3-5 piece Syzygy tables (about 1 GB)
 uv run python -m tools.label_with_tablebase         a copy of a set with tablebase labels for positions of <= 5 pieces
 uv run python -m tools.evaluate_checkpoint <model.pt> --training-set <set>    a checkpoint on another set's val
 ```
@@ -296,9 +296,9 @@ uv run pytest
 | Path | What it is |
 |---|---|
 | `model/` | The architecture: `encoding.py` (boards to 70 tokens, moves to one of 1,968 ids, and back), `model.py` (the transformer: board tokens in, move logits and an eval out) and `fused_blocks.py` (the same blocks as Triton kernels for the engine's GPU inference; a change to `model.py`'s blocks goes here too) |
-| `training/` | `train.py` (the single-GPU training loop), `train_ddp.py` (the DDP trainer), `muon.py` (torch's Muon with each shape's matrices orthogonalised in batched matmuls, shared out between DDP ranks) and `data.py` (training sets as datasets and loaders) |
-| `engine/` | Playing chess: `mcts.py` (Monte Carlo tree search over the model), `player.py` (move selection and model loading), `engine_search.py` and `uci.py` (the UCI engine and its batched search), `selfplay.py` and `inference.py` (self-play's worker processes and GPU inference process), and `selfplay_rs/` (the search and self-play games in Rust) |
-| `tools/` | Checkpoints, run comparison, labelling, puzzles, attention probes and maps (`plot_attention.py`, like `plot_templates.py`), the scaling grid's and attention report's figures, and `play/` (matches against other engines, match analysis, the Elo log) |
-| `artifacts/` | Data, checkpoints, runs, engines, results and reports. Code here is only the scripts and source snapshots an experiment or audit ran with, kept beside its results. Dated folders hold one experiment each, `plots/` the attention, template and embedding pictures, `reports/` the write-ups that span several, `patches/` code for experiments that were not merged, and `elo_results.jsonl` the match log. Only small files are in git, among them `pgn_data/Carlsen.pgn` (match openings and test games), `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget), `reports/selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish), `attention_lookups_20260927/` (weight decay for long runs, the block-1 attention collapse, and what every head looks up, with charts) and `mlp_layers_20261001/` (what each MLP layer does, and what dropping some costs in quality and buys in speed) |
-| `tests/` | `uv run pytest` |
+| `training/` | `train.py` (the single-GPU training loop), `train_ddp.py` (the DDP trainer), `muon.py` (torch's Muon with each shape's matrices orthogonalised in batched matmuls, shared out between DDP ranks), `data.py` (training sets as datasets and loaders), `budget.py` (a run's time budget), `compare_runs.py` (every run compared, and the progress page) and `tensorboard_server.py` |
+| `engine/` | Playing chess: `mcts.py` (Monte Carlo tree search over the model), `player.py` (move selection and model loading), `engine_search.py` and `uci.py` (the UCI engine and its batched search), `selfplay.py` and `inference.py` (self-play's worker processes and GPU inference process), `selfplay_rs/` (the search and self-play games in Rust), `checkpoint.py` (saving and loading checkpoints), `tablebase.py` (the Syzygy tables: download and probes) and `Carlsen.pgn` (match openings, test games and the int8 calibration positions) |
+| `tools/` | Not in git, local only. Labelling, puzzles, attention probes and maps (`plot_attention.py`, like `plot_templates.py`), the scaling grid's and attention report's figures, and `play/` (matches against other engines, match analysis, the Elo log) |
+| `artifacts/` | Data, checkpoints, runs, engines, results and reports. Code here is only the scripts and source snapshots an experiment or audit ran with, kept beside its results. Dated folders hold one experiment each, `plots/` the attention, template and embedding pictures, `reports/` the write-ups that span several, `patches/` code for experiments that were not merged, and `elo_results.jsonl` the match log. Not in git, local only. Among the write-ups are `scaling_grid_20260925/` (how val loss scales with model size and positions, with the size to pick for a compute budget), `reports/selfplay_and_leela_2026-09-26.md` (the d512, its self-play and fine-tunes, and how its moves compare with Leela's and with deeper Stockfish), `attention_lookups_20260927/` (weight decay for long runs, the block-1 attention collapse, and what every head looks up, with charts) and `mlp_layers_20261001/` (what each MLP layer does, and what dropping some costs in quality and buys in speed) |
+| `tests/` | `uv run pytest` (with `tools/tests/` where `tools/` is there) |
 | `notes.txt` | Running notes: ideas to try and small experiments' results |

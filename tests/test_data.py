@@ -5,8 +5,7 @@ from torch.utils.data import DataLoader
 
 from training import data
 from training.data import BLUNDER_THRESHOLD, EXPECTED_SCORE_PER_CENTIPAWN, ChessGamesDataset, MixedLoader, SelfPlayDataset, datasets_to_dataloaders, load_training_set
-from model.encoding import TOKENS_PER_BOARD
-from tools.label_with_stockfish import NO_EVAL, NO_MOVE
+from model.encoding import NO_EVAL, NO_MOVE, TOKENS_PER_BOARD
 
 EVAL = 120  #stockfish's score of every position the tests write, in centipawns
 TEMPERATURE = 0.02

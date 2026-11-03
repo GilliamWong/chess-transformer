@@ -5,7 +5,7 @@ import torch
 
 from training.muon import BatchedMuon
 from training.train import WEIGHT_DECAY, MasterWeights, blunder_loss, compile_muon_step, make_optimizers, policy_loss, value_loss
-from tools.label_with_stockfish import NO_MOVE
+from model.encoding import NO_MOVE
 from model.model import ChessTransformer
 
 CPU = torch.device("cpu")

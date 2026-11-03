@@ -10,46 +10,19 @@ import torch
 
 from engine import mcts
 import selfplay_rs
-from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
+from model.encoding import TOKENS_PER_BOARD
 from fake_models import UniformModel
 from engine.inference import cpu_batches
 from reference_selfplay import final_result
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
-from tools.label_with_stockfish import NO_EVAL, NO_MOVE
-from tools.label_with_tablebase import TABLEBASE_WIN_EVAL, label_position
 from engine.engine_search import EngineSearch
 from engine.player import choose_move
-from tools.tablebase import TABLE_SETS, TableSet, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces
+from engine.tablebase import TABLE_SETS, TableSet, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces
 
 CPU = torch.device("cpu")
-TOP_MOVES = 4
 #white takes the rook (Qxd5+), which wins: from 7 pieces, 6 (a 6 piece table's) and 6 pieces, 5
 SEVEN_PIECES = "6k1/1p5p/8/3r4/8/8/P7/3Q2K1 w - - 0 1"
 SIX_PIECES = "6k1/7p/8/3r4/8/8/P7/3Q2K1 w - - 0 1"
-
-
-#nearly every rook move keeps the win, but a mate is the fastest progress, so it is the whole target
-def test_a_mate_in_one_is_the_only_target(tablebase):
-    board = chess.Board("k7/8/1K6/8/8/8/8/7R w - - 0 1")
-
-    moves, evals, _ = label_position(tablebase, board, [], TOP_MOVES)
-
-    assert moves == [encode_move_to_id(chess.Move.from_uci("h1h8"), chess.WHITE)] + [NO_MOVE] * 3
-    assert evals == [TABLEBASE_WIN_EVAL] + [NO_EVAL] * 3
-
-
-#a drawn rook ending: the move that hangs the rook leaves the target, and stockfish's drawing move comes first
-def test_a_move_that_gives_the_draw_away_leaves_the_target(tablebase):
-    board = chess.Board("6k1/5r2/8/8/8/8/1R6/2K5 w - - 0 1")
-    hangs_the_rook, draws = chess.Move.from_uci("b2f2"), chess.Move.from_uci("b2b3")
-    assert tablebase.probe_wdl(board) == 0
-
-    moves, evals, stockfish_wdls = label_position(tablebase, board, [hangs_the_rook, draws], TOP_MOVES)
-
-    assert moves[0] == encode_move_to_id(draws, chess.WHITE)
-    assert encode_move_to_id(hangs_the_rook, chess.WHITE) not in moves
-    assert evals == [0] * TOP_MOVES
-    assert stockfish_wdls == [-2, 0]
 
 
 #a quiet move whose win needs 101 plies to the next capture or pawn move is a cursed win, as the root probe says
@@ -59,16 +32,6 @@ def test_the_best_move_keeps_the_roots_result_at_the_50_move_edge(tablebase, fen
     assert tablebase.probe_wdl(board) == 1
 
     assert ranked_moves(tablebase, board)[0].wdl == 1
-
-
-#black's moves are labelled mirrored, and a lost position gets a lost value target
-def test_a_lost_position_for_black(tablebase):
-    board = chess.Board("k7/8/1K6/8/8/8/8/7R b - - 0 1")
-
-    moves, evals, _ = label_position(tablebase, board, [], TOP_MOVES)
-
-    assert moves == [encode_move_to_id(chess.Move.from_uci("a8b8"), chess.BLACK)] + [NO_MOVE] * 3
-    assert evals == [-TABLEBASE_WIN_EVAL] + [NO_EVAL] * 3
 
 
 #6 pieces at the root; taking the rook leaves 5 and a won position, which only the tables can tell the search
@@ -118,7 +81,7 @@ def fake_table_sets(folder: Path, monkeypatch, tables: dict[int, tuple[int, int]
         wdl, dtz = tables[table_set.pieces]
         for name in [f"fake{index}.rtbw" for index in range(wdl)] + [f"fake{index}.rtbz" for index in range(dtz)]:
             (table_set.folder / name).touch()
-    monkeypatch.setattr("tools.tablebase.TABLE_SETS", table_sets)
+    monkeypatch.setattr("engine.tablebase.TABLE_SETS", table_sets)
     return table_sets
 
 #every wdl table must be there, and every dtz table up to 5 pieces; the 6 piece dtz tables may be left out as a whole
@@ -270,7 +233,7 @@ def wdl_only_table_sets(tablebase6, tmp_path_factory):
 #tables call a win; from 7 pieces its search sees that win in the 6 pieces after the capture
 @pytest.mark.parametrize("fen", [SIX_PIECES, SEVEN_PIECES])
 def test_the_engine_searches_6_pieces_without_their_dtz_tables(wdl_only_table_sets, monkeypatch, fen):
-    monkeypatch.setattr("tools.tablebase.TABLE_SETS", wdl_only_table_sets)
+    monkeypatch.setattr("engine.tablebase.TABLE_SETS", wdl_only_table_sets)
 
     report = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True, tablebase_pieces=6).search(chess.Board(fen), 400)
 

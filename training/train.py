@@ -18,11 +18,11 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from tools.budget import Budget
-from tools.checkpoint import RUNS_DIR, load_checkpoint, save_checkpoint
-from tools.compare_runs import write_progress_page
-from tools.label_with_stockfish import NO_MOVE
-from tools.tensorboard_server import start_tensorboard
+from training.budget import Budget
+from engine.checkpoint import RUNS_DIR, load_checkpoint, save_checkpoint
+from training.compare_runs import write_progress_page
+from model.encoding import NO_MOVE
+from training.tensorboard_server import start_tensorboard
 from model.model import ChessTransformer, expected_score, mlp_hidden_width, value_bin_edges
 
 #the model, each of these has a command line flag (python -m training.train --help)

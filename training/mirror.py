@@ -10,6 +10,7 @@ from model.encoding import (
     CASTLING_TOKEN_OFFSET,
     EN_PASSANT_INDEX,
     EN_PASSANT_TOKEN_OFFSET,
+    NO_MOVE,
     NUM_MOVE_IDS,
     NUM_SQUARES,
     TOKENS_PER_BOARD,
@@ -17,7 +18,6 @@ from model.encoding import (
     decode_id_to_move,
     encode_move_to_id,
 )
-from tools.label_with_stockfish import NO_MOVE
 
 #left-right mirror augmentation (files a <-> h; encoding.mirror_move flips ranks, for black). Castling is the one rule
 #that is not symmetric, so only positions without a castling right for either side are mirrored. A mirror keeps every

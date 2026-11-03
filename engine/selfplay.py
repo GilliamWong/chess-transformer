@@ -28,10 +28,9 @@ import numpy as np
 from tqdm import tqdm
 from engine import mcts
 import selfplay_rs
-from model.encoding import MOVE_IDS_BY_SQUARES, NUM_MOVE_IDS, TOKENS_PER_BOARD
-from tools.label_with_stockfish import NO_MOVE
-from tools.tablebase import TABLEBASE_PIECES, open_tablebase, tablebase_path
-#every worker imports this file, so nothing at the top may import torch (data.py, tools.checkpoint and inference.py do)
+from model.encoding import MOVE_IDS_BY_SQUARES, NO_MOVE, NUM_MOVE_IDS, TOKENS_PER_BOARD
+from engine.tablebase import TABLEBASE_PIECES, open_tablebase, tablebase_path
+#every worker imports this file, so nothing at the top may import torch (data.py, engine.checkpoint and inference.py do)
 
 SIMULATIONS = 64 #+390 elo over the policy alone (artifacts/reports/mcts_ladder_2026-09-23.md)
 TOP_MOVES = 8
@@ -79,7 +78,7 @@ def move_id_table() -> np.ndarray:
     return table
 
 #mcts.py's constants are read at call time, so a test can change them. tablebase_pieces: the tables' positions of up to
-#that many pieces (tools.tablebase.TABLE_SETS), from syzygy_path's folders rather than the downloaded ones if it is given
+#that many pieces (engine.tablebase.TABLE_SETS), from syzygy_path's folders rather than the downloaded ones if it is given
 def rust_search_settings(use_tablebase: bool, tablebase_pieces: int = TABLEBASE_PIECES, syzygy_path: str | None = None) -> dict:
     return dict(move_id_table=move_id_table().ravel().tolist(), answer_width=ANSWER_WIDTH, c_puct=mcts.C_PUCT, c_puct_factor=mcts.C_PUCT_FACTOR,
                 c_puct_base=mcts.C_PUCT_BASE, fpu_reduction=mcts.FPU_REDUCTION, draw=mcts.DRAW, repetitions_for_a_draw=mcts.REPETITIONS_FOR_A_DRAW,
@@ -380,7 +379,7 @@ def set_priority(priority_class: int) -> None:
 def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use_tablebase: bool, processes: int, games_per_process: int, seed: int,
          tree_reuse: bool, compile_model: bool, precision: str) -> None:
     from training.data import PROCESSED_DATA_DIR
-    from tools.checkpoint import RUNS_DIR
+    from engine.checkpoint import RUNS_DIR
     if simulations < 2:
         raise ValueError("a search of fewer than 2 simulations visits no move, so there would be no visit shares to learn")
     settings = {"checkpoint": str(checkpoint_path), "simulations": simulations, "top_moves": TOP_MOVES, "sampled_plies": SAMPLED_PLIES,
@@ -499,7 +498,7 @@ def main(checkpoint_path: Path, name: str, positions: int, simulations: int, use
 
 
 if __name__ == "__main__":
-    from tools.checkpoint import latest_checkpoint
+    from engine.checkpoint import latest_checkpoint
     parser = argparse.ArgumentParser(description="the model plays itself with mcts.py's search, and every position is saved as a training set")
     parser.add_argument("checkpoint", nargs="?", type=Path, help="a model.pt, default the run that finished last")
     parser.add_argument("--name", required=True, help="the training set that is made in processed_data/")

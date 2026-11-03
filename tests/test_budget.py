@@ -1,7 +1,7 @@
 import pytest
 
-from tools import budget as budget_module
-from tools.budget import Budget
+from training import budget as budget_module
+from training.budget import Budget
 
 
 #a clock the test moves by hand: clock.now += seconds

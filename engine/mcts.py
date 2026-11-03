@@ -12,7 +12,7 @@ import chess
 import chess.syzygy
 import numpy as np
 from model.encoding import encode_board, encode_move_to_id
-from tools.tablebase import covers, open_tablebase, ranked_moves, wdl_score
+from engine.tablebase import covers, open_tablebase, ranked_moves, wdl_score
 #self play's workers import this file for its constants and must not import torch
 if TYPE_CHECKING:
     import torch
@@ -238,13 +238,13 @@ def main(checkpoint_path: Path, fen: str, simulations: int, device: torch.device
 
 if __name__ == "__main__":
     import torch
-    from tools.checkpoint import latest_checkpoint
+    from engine.checkpoint import latest_checkpoint
     parser = argparse.ArgumentParser(description="one search from a position, to watch what it does")
     parser.add_argument("checkpoint", nargs="?", type=Path, help="a model.pt, default the run that finished last")
     parser.add_argument("--fen", default=chess.STARTING_FEN, help="the position to search, default the start")
     parser.add_argument("--simulations", type=int, default=SIMULATIONS, help="default %(default)s")
     parser.add_argument("--cpu", action="store_true", help="leave the gpu alone, for when a training run is using it")
-    parser.add_argument("--tablebase", action="store_true", help="score positions of at most 5 pieces from the syzygy tables (python -m tools.tablebase)")
+    parser.add_argument("--tablebase", action="store_true", help="score positions of at most 5 pieces from the syzygy tables (python -m engine.tablebase)")
     arguments = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() and not arguments.cpu else "cpu")

@@ -1,6 +1,5 @@
 from pathlib import Path
-from model.encoding import TOKENS_PER_BOARD
-from tools.label_with_stockfish import NO_MOVE
+from model.encoding import NO_MOVE, TOKENS_PER_BOARD
 from training.mirror import MirrorRows, draw_mirrors, mirror_moves, read_boards
 from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, Sampler, SequentialSampler
 import numpy as np
@@ -13,7 +12,7 @@ ARTIFACTS_DIR = Path(__file__).resolve().parent.parent / "artifacts"
 #training sets as raw arrays on disk, see processed_data/scripts_used/ for how they were made
 PROCESSED_DATA_DIR = ARTIFACTS_DIR / "processed_data"
 #carlsen's games: the matches' openings, the tests' positions and the int8 network's calibration
-CARLSEN_PGN = ARTIFACTS_DIR / "pgn_data" / "Carlsen.pgn"
+CARLSEN_PGN = Path(__file__).resolve().parent.parent / "engine" / "Carlsen.pgn"
 
 #centipawns to expected score (0 lost, 1 won): sigmoid(EXPECTED_SCORE_PER_CENTIPAWN * centipawns), lichess's fit
 EXPECTED_SCORE_PER_CENTIPAWN = 0.00368208

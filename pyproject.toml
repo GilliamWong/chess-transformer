@@ -37,4 +37,4 @@ explicit = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests"]
+testpaths = ["tests", "tools/tests"] #tools/ is local only, so a clone has just tests/

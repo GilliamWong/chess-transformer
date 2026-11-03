@@ -28,8 +28,8 @@ from fake_models import BoardModel, CountingNetwork, UniformModel
 from engine.inference import GraphedBatches, ImmediateBatches, cpu_batches, small_graph_sizes
 from model.model import ChessTransformer
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
-from tools.checkpoint import save_checkpoint
-from tools.tablebase import SYZYGY_DIR
+from engine.checkpoint import save_checkpoint
+from engine.tablebase import SYZYGY_DIR
 from engine import engine_search
 from engine.engine_search import EngineSearch, engine_search_settings, parse_changes
 from engine.player import SearchReport

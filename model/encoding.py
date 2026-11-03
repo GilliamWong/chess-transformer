@@ -61,6 +61,10 @@ def _build_all_possible_moves() -> tuple[chess.Move, ...]:
 ALL_POSSIBLE_MOVES = _build_all_possible_moves()
 NUM_MOVE_IDS = len(ALL_POSSIBLE_MOVES) #1968
 
+#a label slot without a move or eval (the eval as the fishtest set's)
+NO_EVAL = -32768
+NO_MOVE = -1 #also marks a position not labelled yet
+
 def _build_move_dict() -> dict[chess.Move, int]:
     output = {}
     for move_id, move in enumerate(ALL_POSSIBLE_MOVES):

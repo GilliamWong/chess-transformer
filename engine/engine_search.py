@@ -22,7 +22,7 @@ from engine.inference import ExactSizeCompiled, GraphedBatches, chunk_positions,
 from engine.player import MAX_REPORTED_SCORE, ROOT_MOVES_REPORTED, SearchReport, score_to_centipawns
 from engine.cuda_runtime import cuda_runtime
 from training.data import EXPECTED_SCORE_PER_CENTIPAWN
-from tools.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
+from engine.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
 
 #leaves a round (lc0's minibatch), and its descents that may end on a leaf already waiting before it stops gathering.
 #With the d512 at 1 s a move 64 leaves do 17.3k simulations/s without the cache (128 16.8k, 32 14.8k). Against one leaf

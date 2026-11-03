@@ -15,7 +15,7 @@ from model.model import ChessTransformer, expected_score
 from engine import quantization
 from engine.quantization import gptq
 from tests.test_model import mix_in_the_input
-from tools.checkpoint import save_checkpoint
+from engine.checkpoint import save_checkpoint
 
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 

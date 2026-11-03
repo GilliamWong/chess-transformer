@@ -42,7 +42,7 @@ def test_the_decay_fraction_moves_where_the_decay_starts(schedule):
 
 def test_a_resumed_run_with_a_larger_budget_holds_until_its_new_decay():
     #the d768 continuation: the step a pre-decay state was saved at, in a run twice as long, is still at the peak
-    from tools.budget import Budget
+    from training.budget import Budget
     from training.train_ddp import make_scheduler
     import torch
 

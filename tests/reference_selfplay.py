@@ -6,10 +6,9 @@ import numpy as np
 import torch
 from torch import nn
 from engine import mcts
-from model.encoding import TOKENS_PER_BOARD, encode_board, encode_move_to_id
+from model.encoding import NO_MOVE, TOKENS_PER_BOARD, encode_board, encode_move_to_id
 from engine.selfplay import MAX_PLIES, SAMPLED_PLIES, SEED, TOP_MOVES, TREE_REUSE, Game
-from tools.label_with_stockfish import NO_MOVE
-from tools.tablebase import covers, wdl_score
+from engine.tablebase import covers, wdl_score
 
 
 #white's result if the game is over, None while it goes on

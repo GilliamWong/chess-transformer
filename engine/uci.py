@@ -19,13 +19,13 @@ import chess
 import torch
 from torch import nn
 from engine.inference import cpu_batches
-from tools.checkpoint import latest_checkpoint
+from engine.checkpoint import latest_checkpoint
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GROW_LEAVES, LEAVES, PRECISIONS,
                                   SMART_PRUNING_FACTOR, SMART_PRUNING_WAIT, VISITS_PER_LEAF_OUT, EngineSearch, engine_network, engine_networks,
                                   engine_search_settings, parse_changes)
 from engine.player import (SAMPLE_PLIES, SELECTIONS, SIMULATIONS, TEMPERATURE, CudaGraphModel, SearchReport, choose_move,
                                load_model, score_to_centipawns)
-from tools.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
+from engine.tablebase import TABLE_SETS, TABLEBASE_PIECES, open_tablebase, open_tablebase_path
 
 ENGINE_NAME = "ChessTransformer"
 
@@ -529,7 +529,7 @@ if __name__ == "__main__":
                              f"(engine/quantization.py), default {ENGINE_FP16_BLOCKS}; 0 for every other block in int8")
     parser.add_argument("--tablebase", action="store_true", help="for --select mcts: positions of at most --tablebase-pieces pieces from the syzygy tables")
     parser.add_argument("--tablebase-pieces", type=int, choices=[table_set.pieces for table_set in TABLE_SETS], default=TABLEBASE_PIECES,
-                        help="for --tablebase: the most pieces, default %(default)s; 6 needs python -m tools.tablebase --pieces 6, and without "
+                        help="for --tablebase: the most pieces, default %(default)s; 6 needs python -m engine.tablebase --pieces 6, and without "
                              "the 6 piece dtz tables searches those positions rather than playing the tables' move")
     parser.add_argument("--search-log", type=Path, help="for --select mcts: a folder to add every search to, as <process id>.jsonl")
     parser.add_argument("--grow-leaves", type=int, default=GROW_LEAVES,

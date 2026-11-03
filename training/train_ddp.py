@@ -23,10 +23,10 @@ from training import train as single
 from training.data import concatenate_batches
 from training.mirror import draw_mirrors
 from model.model import ChessTransformer, mlp_hidden_width
-from tools.budget import Budget
-from tools.checkpoint import RUNS_DIR, save_checkpoint, warm_start
-from tools.compare_runs import write_progress_page
-from tools.tensorboard_server import start_tensorboard
+from training.budget import Budget
+from engine.checkpoint import RUNS_DIR, save_checkpoint, warm_start
+from training.compare_runs import write_progress_page
+from training.tensorboard_server import start_tensorboard
 
 #steps between two looks at rank zero's clock under a budget of minutes (see step_budget)
 CLOCK_EVERY = 20

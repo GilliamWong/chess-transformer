@@ -22,8 +22,8 @@ from model.encoding import BLACK_QUEENSIDE_INDEX, BOARD_VOCAB_SIZE, CASTLING_TOK
 from model.model import ChessTransformer
 from training import train_ddp
 from training.muon import BatchedMuon
-from tools.budget import Budget
-from tools.checkpoint import load_checkpoint
+from training.budget import Budget
+from engine.checkpoint import load_checkpoint
 
 
 #random boards as the data holds them: a piece code on every square (the square features index by it), any token after
@@ -102,7 +102,7 @@ def check_shared_clock(rank):
     optimizer = torch.optim.SGD([nn.Parameter(torch.ones(1))], lr=0.1)
     scheduler = train_ddp.make_scheduler(optimizer, budget, "cosine")
     now = [100.0 + 1000 * rank]
-    with patch("tools.budget.time.perf_counter", side_effect=lambda: now[0]), patch.object(train_ddp, "CLOCK_EVERY", 2):
+    with patch("training.budget.time.perf_counter", side_effect=lambda: now[0]), patch.object(train_ddp, "CLOCK_EVERY", 2):
         for step, expected_seconds in enumerate((0, 30, 30, 90), start=1):
             now[0] += 30 if rank == 0 else 300  #the other ranks have deliberately different clocks
             optimizer.step()
@@ -165,7 +165,7 @@ def distributed_worker(rank, folder, world_size):
         #the real entry point, with only the folders and the warmup/eval intervals made small
         data.PROCESSED_DATA_DIR = folder
         train_ddp.RUNS_DIR = folder / "runs"
-        import tools.compare_runs as reports
+        import training.compare_runs as reports
         reports.RUNS_DIR = train_ddp.RUNS_DIR
         reports.PROGRESS_PAGE = folder / "progress.html"
         single.BATCH_SIZE = 8  #10 validation rows includes an incomplete final batch
@@ -219,7 +219,7 @@ def resume_worker(rank, folder, world_size, mix, mirror):
     try:
         data.PROCESSED_DATA_DIR = folder
         train_ddp.RUNS_DIR = folder / "runs"
-        import tools.compare_runs as reports
+        import training.compare_runs as reports
         reports.RUNS_DIR = train_ddp.RUNS_DIR
         reports.PROGRESS_PAGE = folder / "progress.html"
         single.BATCH_SIZE, single.EVAL_BATCHES = 8, 1
@@ -295,7 +295,7 @@ def micro_batch_worker(rank, folder, world_size):
     try:
         data.PROCESSED_DATA_DIR = folder
         train_ddp.RUNS_DIR = folder / "runs"
-        import tools.compare_runs as reports
+        import training.compare_runs as reports
         reports.RUNS_DIR = train_ddp.RUNS_DIR
         reports.PROGRESS_PAGE = folder / "progress.html"
         single.BATCH_SIZE, single.EVAL_BATCHES = 8, 1

@@ -234,14 +234,14 @@ pub fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
     1 + since_zeroing.iter().filter(|&key| key == current).count()
 }
 
-//the syzygy tables (tools.tablebase), memory mapped: a probe's few small reads would each be a system call
+//the syzygy tables (engine.tablebase), memory mapped: a probe's few small reads would each be a system call
 pub struct Tables {
     tablebase: Tablebase<Chess>,
     pieces: usize,
 }
 
 impl Tables {
-    //folders as a SyzygyPath (tools.tablebase.tablebase_path): ';' between them on windows, ':' elsewhere
+    //folders as a SyzygyPath (engine.tablebase.tablebase_path): ';' between them on windows, ':' elsewhere
     pub fn open(folders: &str, pieces: usize) -> std::io::Result<Tables> {
         //SAFETY: the files stay unchanged while mapped; a failed page read ends the process rather than erroring
         let mut tablebase = unsafe { Tablebase::with_mmap_filesystem() };
@@ -251,12 +251,12 @@ impl Tables {
         Ok(Tables { tablebase, pieces })
     }
 
-    //tools.tablebase.covers
+    //engine.tablebase.covers
     pub fn covers(&self, board: &Chess) -> bool {
         board.board().occupied().count() <= self.pieces && board.castles().castling_rights().is_empty()
     }
 
-    //tools.tablebase.wdl_score with a draw scored `draw`: a win or loss the fifty move rule turns into a draw is a draw
+    //engine.tablebase.wdl_score with a draw scored `draw`: a win or loss the fifty move rule turns into a draw is a draw
     fn score(&self, board: &Chess, draw: f64) -> Result<f64, SyzygyError> {
         Ok(match self.tablebase.probe_wdl_after_zeroing(board)? {
             Wdl::Win => 1.0,
