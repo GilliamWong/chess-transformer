@@ -454,10 +454,11 @@ impl SharedTree {
         match parent.children() {
             Children::Solid(first) => {
                 for (index, (prior, slot)) in priors.iter().zip(self.links.solid_slots(first, edges.len())).enumerate() {
-                    if let Some(u) = value(prior, slot.child(), slot.visits())
+                    if let Some((u, child)) = value(prior, slot.child(), slot.visits())
                         && u > best_u
                     {
                         (best, best_u, best_link) = (index, u, first + index as u32);
+                        self.prefetch_children(child);
                     }
                 }
             }
@@ -476,10 +477,11 @@ impl SharedTree {
                     } else {
                         (NO_LINK, value(prior, NO_NODE, &unvisited))
                     };
-                    if let Some(u) = found
+                    if let Some((u, child)) = found
                         && u > best_u
                     {
                         (best, best_u, best_link) = (index, u, link);
+                        self.prefetch_children(child);
                     }
                 }
             }
@@ -487,13 +489,32 @@ impl SharedTree {
         (edges.start + best, best_link)
     }
 
-    //select_edge's value of a move; None for a proven loss, never chosen
+    //the lines a descent through the move's `child` reads first, asked for while the node's other moves are scored
     #[inline(always)]
-    fn move_value(&self, scan: &Scan, repeats: Option<&Repeats>, prior: &AtomicU32, child: u32, own_visits: &AtomicU32) -> Option<f64> {
+    fn prefetch_children(&self, child: Option<&Node>) {
+        if let Some(child) = child {
+            let edges = child.edges();
+            if !edges.is_empty() {
+                self.edges.prefetch(edges.start);
+                self.links.prefetch(child.children());
+            }
+        }
+    }
+
+    //select_edge's value of a move with its node; None for a proven loss, never chosen
+    #[inline(always)]
+    fn move_value(
+        &self,
+        scan: &Scan,
+        repeats: Option<&Repeats>,
+        prior: &AtomicU32,
+        child: u32,
+        own_visits: &AtomicU32,
+    ) -> Option<(f64, Option<&Node>)> {
         let prior = f64::from(f32::from_bits(prior.load(Ordering::Relaxed)));
         if child == NO_NODE {
             //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
-            return Some(scan.first_play_urgency + (scan.c_puct * prior * scan.sqrt_children_visits));
+            return Some((scan.first_play_urgency + (scan.c_puct * prior * scan.sqrt_children_visits), None));
         }
         let child = self.nodes.get(child as usize);
         if child.proves_a_loss() {
@@ -509,7 +530,7 @@ impl SharedTree {
         };
         //with transpositions a move's own visits, its node's mean (every path's)
         let own = if scan.transpositions { own_visits.load(Ordering::Acquire) } else { visits };
-        Some(q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + own + in_flight))))
+        Some((q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + own + in_flight))), Some(child)))
     }
 
     //plays the moves of the path (edges) that `board` has not seen yet: a descent plays them only where it needs the position

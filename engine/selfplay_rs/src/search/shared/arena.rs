@@ -285,6 +285,17 @@ impl<T> Table<T> {
         unsafe { std::slice::from_raw_parts(self.chunk_of(index).add(offset), len) }
     }
 
+    //a hint to the cpu that element `index` is read soon; it reads nothing the program sees, a chunk not made included
+    fn prefetch(&self, index: usize) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let chunk = self.chunks[index >> self.bits].load(Ordering::Relaxed);
+            // SAFETY: sse is part of x86_64, and a prefetch of an address that is none is no read
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(chunk.wrapping_add(index & ((1 << self.bits) - 1)).cast()) };
+        }
+    }
+
     fn ensure_chunk(&self, index: usize, make: impl FnOnce() -> Box<[T]>) {
         let slot = &self.chunks[index >> self.bits];
         if !slot.load(Ordering::Acquire).is_null() {
@@ -703,6 +714,15 @@ impl Links {
         self.slots.get((link & !SOLID) as usize)
     }
 
+    //a hint that a node's first link or slot is read soon
+    pub fn prefetch(&self, children: Children) {
+        match children {
+            Children::List(head) if head != NO_LINK => self.table.prefetch(head as usize),
+            Children::List(_) => {}
+            Children::Solid(first) => self.slots.prefetch((first & !SOLID) as usize),
+        }
+    }
+
     pub fn solid_slots(&self, first: u32, moves: usize) -> &[Slot] {
         if moves == 0 { &[] } else { self.slots.slice((first & !SOLID) as usize, moves) }
     }
@@ -929,6 +949,11 @@ impl Edges {
     //a dead node's `count` edges from `first`, given back
     pub fn free(&self, first: usize, count: usize) {
         self.runs.freed.give(first, count);
+    }
+
+    //a hint that the priors from edge `first` are read soon
+    pub fn prefetch(&self, first: usize) {
+        self.priors.prefetch(first);
     }
 
     pub fn priors(&self, edges: Range<usize>) -> &[AtomicU32] {
