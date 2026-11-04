@@ -473,7 +473,6 @@ if __name__ == "__main__":
     parser.add_argument("--games-per-process", type=int, default=GAMES_PER_PROCESS, help="games each process plays at once. Default %(default)s")
     parser.add_argument("--no-tree-reuse", action="store_true", help="start every search from a new root")
     parser.add_argument("--no-compile", action="store_true", help="skip torch.compile in the inference process")
-    parser.add_argument("--precision", choices=["fp16"], default="fp16", help="of the network in the inference process; fp16 is the only one")
     parser.add_argument("--seed", type=int, default=SEED, help="default %(default)s")
     arguments = parser.parse_args()
 

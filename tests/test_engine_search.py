@@ -734,7 +734,6 @@ def test_a_clocks_plan_and_cap_can_be_set():
     board = chess.Board()
     arguments = "wtime 60000 btime 60000 winc 600 binc 600".split()
     assert Clock(moves_per_man=1.0).limits(arguments, board, 800)[1] > 1.25 * Clock().limits(arguments, board, 800)[1]
-    assert Clock(most_of_the_time_left=0.01).limits(arguments, board, 800)[1] == pytest.approx((60 - MOVE_OVERHEAD_SECONDS) * 0.01)
     #late in the game the least moves left and the reserve decide the share
     board = board_with_men(4)
     arguments = "wtime 10000 btime 10000 winc 600 binc 600".split()
@@ -791,7 +790,6 @@ def test_the_first_search_bonus_keeps_to_the_reserve_and_the_time_left():
     assert Clock().limits(arguments, board, 800)[1] < 1.1
     assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(3 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS)
     assert Clock(reserve_seconds=0.0, **LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(3 - MOVE_OVERHEAD_SECONDS)
-    assert Clock(most_of_the_time_left=0.25, **LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx((3 - MOVE_OVERHEAD_SECONDS) / 4)
 
 def test_a_falling_score_runs_the_search_on():
     search = EngineSearch(cpu_batches(UniformModel()), 16)
@@ -897,7 +895,7 @@ def test_a_decided_proven_or_only_move_search_stops_at_the_first_answers(monkeyp
     assert search.searches.stopped_at == stopped_at
 
 def engine_command(model_path: Path | str, *options: str) -> list[str]:
-    return [sys.executable, "-m", "engine.uci", str(model_path), "--select", "mcts", *options]
+    return [sys.executable, "-m", "engine.uci", str(model_path), *options]
 
 def run_engine(model_path: Path | str, *options: str) -> subprocess.CompletedProcess:
     return subprocess.run(engine_command(model_path, *options), cwd=REPOSITORY, capture_output=True, text=True, input="")
@@ -922,7 +920,7 @@ def fake_engine_network(built: list | None = None):
     return engine_network
 
 def run_uci_main(monkeypatch, *options: str, stdin: str = "isready\nquit\n") -> None:
-    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--select", "mcts", "--gpu", *options])
+    monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--gpu", *options])
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
     runpy.run_module("engine.uci", run_name="__main__")
 
@@ -1343,31 +1341,13 @@ def test_go_infinite_runs_the_simulations_by_default(monkeypatch):
     assert gui.sent_at("bestmove", seconds=10) is not None and gui.last_info("nodes") == 300
     gui.close()
 
-#at stop it answers at once, a move the gui throws away, and the clock never hears of it
-def test_go_ponder_searches_until_ponderhit(monkeypatch):
-    limits = []
-    class Recorded(EngineSearch):
-        def search(self, board, simulations=None, seconds=None, extension=None, stop=None, info=None):
-            limits.append((simulations, seconds))
-            return super().search(board, simulations, seconds, extension, stop, info)
-    gui = Gui(monkeypatch, lambda: Recorded(cpu_batches(BoardModel()), 16))
-    board = chess.Board()
-    board.push_uci("e2e4")
-    gui.tell("position startpos moves e2e4")
-    go = "go ponder wtime 10000 btime 10000"
-    gui.tell(go)
-    time.sleep(0.5)
-    assert gui.sent_at("bestmove") is None
-    hit = gui.tell("ponderhit")
-    answered = gui.sent_at("bestmove", seconds=3)
-    assert answered is not None and gui.last_info("time") < (answered - hit) * 1000 + 50
-    assert limits == [(None, None), (None, pytest.approx(Clock().limits(go.split()[1:], board, 200)[1]))]
+#the engine declares no Ponder option; a go ponder from a gui that sends one anyway is searched as a go on the clock, and ponderhit is ignored
+def test_go_ponder_is_an_ordinary_go(monkeypatch):
+    searches, sent, _ = run_uci(monkeypatch, ["position startpos", "go ponder wtime 10000 btime 10000", "ponderhit", "go ponder movetime 500", "quit"])
 
-    gui.tell(go)
-    time.sleep(0.3)
-    stopped = gui.tell("stop")
-    assert gui.sent_at("bestmove", since=stopped, seconds=2) is not None and len(limits) == 3
-    gui.close()
+    assert [(nodes, seconds) for _, nodes, seconds, _ in searches] == [(None, pytest.approx(Clock().limits("wtime 10000".split(), chess.Board(), 800)[1])),
+                                                                         (None, pytest.approx(0.5 - MOVE_OVERHEAD_SECONDS))]
+    assert len([line for line in sent if line.startswith("bestmove")]) == 2
 
 #MoveOverhead reaches the next go's time; an option set once the search is built, or to a value it could not take, stays as it was and the gui is told why
 def test_the_options_reach_the_search(monkeypatch):

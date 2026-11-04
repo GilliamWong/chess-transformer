@@ -58,7 +58,6 @@ LEAST_MOVES_LEFT = 10
 #a move's weight by the men on the board, kings included: (fewest, most, weight)
 PHASE_WEIGHTS = ((26, 32, 0.85), (16, 25, 1.25), (10, 15, 1.0), (3, 9, 0.8))
 RESERVE_SECONDS = 1.0
-MOST_OF_THE_TIME_LEFT = 1.0
 #a search whose score falls may run on by up to MOST_EXTENSION shares (Clock.share), never past MOST_OF_THE_TIME_LEFT_EXTENDED of the time left
 MOST_EXTENSION = 2.0
 MOST_OF_THE_TIME_LEFT_EXTENDED = 1 / 3
@@ -126,10 +125,9 @@ def info_line(report: SearchReport, seconds: float) -> str:
 #a new game needs a new Clock
 class Clock:
     def __init__(self, moves_per_man: float = MOVES_PER_MAN, least_moves_left: int = LEAST_MOVES_LEFT, reserve_seconds: float = RESERVE_SECONDS,
-                 most_of_the_time_left: float = MOST_OF_THE_TIME_LEFT, first_move_bonus: float = FIRST_MOVE_BONUS,
-                 book_ply_bonus: float = BOOK_PLY_BONUS, move_overhead_seconds: float = MOVE_OVERHEAD_SECONDS):
-        self.moves_per_man, self.least_moves_left = moves_per_man, least_moves_left
-        self.reserve_seconds, self.most_of_the_time_left = reserve_seconds, most_of_the_time_left
+                 first_move_bonus: float = FIRST_MOVE_BONUS, book_ply_bonus: float = BOOK_PLY_BONUS,
+                 move_overhead_seconds: float = MOVE_OVERHEAD_SECONDS):
+        self.moves_per_man, self.least_moves_left, self.reserve_seconds = moves_per_man, least_moves_left, reserve_seconds
         self.first_move_bonus, self.book_ply_bonus = first_move_bonus, book_ply_bonus
         self.move_overhead_seconds = move_overhead_seconds
         self.first_search = True
@@ -171,7 +169,7 @@ class Clock:
         weighted_left = moves_to_go or max(self.least_moves_left * weight, sum(self.moves_per_man * phase_weight(k) for k in range(3, men + 1)))
         share = self.share = (spare - self.saved) * weight / weighted_left + increment
         own = share * bonus
-        seconds = max(0.0, min(own + self.saved, spare, time_left * self.most_of_the_time_left))
+        seconds = max(0.0, min(own + self.saved, spare))
         #the bank pays for what the move gets beyond its share and bonus
         self.saved -= max(0.0, seconds - own)
         return seconds
@@ -202,22 +200,11 @@ def load_player(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, 
 
 
 #a go as the reader saw it, received when it came (the gui times the move from then). stop is set by stop, quit and the input's end (for a go
-#that waits for a stop: until_stop, ponder); pondered by stop or ponderhit, whose time is kept
+#that waits for a stop: until_stop)
 class Go:
     def __init__(self, arguments: list[str], received: float, until_stop: bool):
         self.arguments, self.received, self.until_stop = arguments, received, until_stop
-        self.ponder = "ponder" in arguments
-        self.stop, self.pondered = threading.Event(), threading.Event()
-        self.ponderhit: float | None = None
-
-    def end(self) -> None:
-        self.stop.set()
-        self.pondered.set()
-
-    def hit(self, received: float) -> None:
-        if self.ponder and not self.pondered.is_set():
-            self.ponderhit = received
-            self.pondered.set()
+        self.stop = threading.Event()
 
 #stdin is read on a thread of its own, so that stop, isready and quit reach the engine while it searches; the main thread takes the other
 #commands in order (next). While the command queued last is an unfinished go, the reader answers isready itself
@@ -237,8 +224,8 @@ class Commands:
         finally:
             with self.lock:
                 for go in self.unfinished:
-                    if go.until_stop or go.ponder:
-                        go.end()
+                    if go.until_stop:
+                        go.stop.set()
             self.queued.put(None)
 
     def receive(self, words: list[str], received: float) -> None:
@@ -250,17 +237,14 @@ class Commands:
                 send("readyok")
             elif command == "stop":
                 for go in self.unfinished:
-                    go.end()
-            elif command == "ponderhit":
-                for go in self.unfinished:
-                    go.hit(received)
+                    go.stop.set()
             else:
                 self.last_go = Go(arguments, received, self.infinite_until_stop and "infinite" in arguments) if command == "go" else None
                 if self.last_go is not None:
                     self.unfinished.append(self.last_go)
                 if command == "quit":
                     for go in self.unfinished:
-                        go.end()
+                        go.stop.set()
                 self.queued.put((command, arguments, self.last_go))
 
     #(command, arguments, its Go for a go), None once the input has ended
@@ -459,7 +443,7 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
     options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES), gpu, gpus, leaves, search_options, clock_options)
     player = None
     board = chess.Board()
-    clock = Clock(**{**clock_options, **options.clock()})
+    clock = Clock(**options.clock())
     commands = Commands(sys.stdin, infinite_until_stop)
 
     def load() -> EngineSearch:
@@ -467,32 +451,24 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
         return load_player(checkpoint_path, gpu, options.leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
                            options.gpus)
 
-    #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by itself, as UCI asks. A go
-    #ponder searches until ponderhit, then on as the go asks (the tree kept) with its time from the ponderhit; on stop its move is thrown away
+    #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by itself, as UCI asks
     def move_for(go: Go) -> chess.Move | None:
         nonlocal player
-        started = go.received
         if not any(board.legal_moves):
             send("info string the game is over, there is no move to play")
             return None
         if player is None:
             player = load()
-        if go.ponder:
-            pondered = player.search(board, stop=go.pondered)
-            go.pondered.wait()
-            if go.ponderhit is None:
-                return pondered.line[0]
-            started = go.ponderhit
         for number in go_numbers(go.arguments)[1]:
             send(f"info string go's {number} is not a whole number: left out")
         nodes, seconds = clock.limits(go.arguments, board, simulations)
         if go.until_stop:
             nodes = seconds = None
-        running = lambda report: send(info_line(report, time.perf_counter() - started))
+        running = lambda report: send(info_line(report, time.perf_counter() - go.received))
         report = player.search(board, nodes, seconds, clock.extension, go.stop, running)
-        clock.searched(time.perf_counter() - started, score_to_centipawns(report.score))
+        clock.searched(time.perf_counter() - go.received, score_to_centipawns(report.score))
         move = report.line[0]
-        send(info_line(report, time.perf_counter() - started))
+        send(info_line(report, time.perf_counter() - go.received))
         if go.until_stop:
             go.stop.wait()
         return move
@@ -522,7 +498,7 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
 
         elif command == "ucinewgame":
             board = chess.Board()
-            clock = Clock(**{**clock_options, **options.clock()})
+            clock = Clock(**options.clock())
             if isinstance(player, EngineSearch):
                 player.new_game()
 
@@ -535,8 +511,7 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
         elif command == "go":
             move = move_for(go)
             send(f"bestmove {move.uci() if move is not None else '0000'}")
-            #not after a ponder miss, whose move is not played
-            if move is not None and not (go.ponder and go.ponderhit is None):
+            if move is not None:
                 advance_after(player, board, move)
             commands.finished(go)
 
@@ -549,8 +524,6 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="the model as a UCI engine")
     parser.add_argument("checkpoint", nargs="?", help="a model.pt; default the run that finished last")
-    parser.add_argument("--select", choices=["mcts"], default="mcts",
-                        help="accepted for the launch scripts (engine/linux/engine.sh passes it); mcts is the only way a move is picked")
     parser.add_argument("--simulations", type=int, default=SIMULATIONS,
                         help="the simulations of a go without movetime, nodes or wtime/btime, default %(default)s")
     parser.add_argument("--gpu", action="store_true", help="run the model on the gpu")
