@@ -54,6 +54,9 @@ pub const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + MOST_MOVES * EDGE_BYTES;
 
 const SOLID_BATCH: usize = 32;
 
+//the leaves a call has room for from the start: rounds are of a few dozen
+const LEAVES_AT_ONCE: usize = 64;
+
 //the nodes a descent short of room frees at a time
 const ASSIST_BATCH: usize = 64;
 
@@ -98,7 +101,9 @@ enum Arrival {
 
 struct Call {
     simulations: u32,
-    collisions: Vec<Vec<usize>>,
+    collisions: usize,
+    //the nodes of every collision's path, which are in flight until the call ends
+    collided: Vec<usize>,
     leaves: Vec<PendingLeaf>,
 }
 
@@ -851,8 +856,16 @@ impl SharedTree {
 
     //the network leaves of the round, in the order they were gathered in, for finish_leaf
     pub fn queue(&self, round: u64, leaves: Vec<PendingLeaf>) {
-        if !leaves.is_empty() {
-            self.pending.lock().expect("the pending leaves").entry(round).or_default().extend(leaves);
+        if leaves.is_empty() {
+            return;
+        }
+        let mut pending = self.pending.lock().expect("the pending leaves");
+        let queued = pending.entry(round).or_default();
+        //a round queued once is the caller's vector, not a copy of it
+        if queued.is_empty() {
+            *queued = leaves;
+        } else {
+            queued.extend(leaves);
         }
     }
 
@@ -873,11 +886,10 @@ impl SharedTree {
         boards: &mut Vec<u8>,
     ) -> Vec<PendingLeaf> {
         let mut hold = self.hold();
-        let mut call = Call { simulations: 0, collisions: Vec::new(), leaves: Vec::new() };
+        let leaves = Vec::with_capacity(LEAVES_AT_ONCE.min(round.leaves as usize));
+        let mut call = Call { simulations: 0, collisions: 0, collided: Vec::new(), leaves };
         self.gather_in(&mut hold, round, settings, tables, cache, boards, &mut call);
-        for path in &call.collisions {
-            self.take_off(path);
-        }
+        self.take_off(&call.collided);
         call.leaves
     }
 
@@ -942,11 +954,12 @@ impl SharedTree {
                 }
                 Arrival::Collision => {
                     give_back(false);
-                    if call.collisions.len() == round.collisions as usize {
+                    if call.collisions == round.collisions as usize {
                         self.take_off(&path);
                         break;
                     }
-                    call.collisions.push(path.clone());
+                    call.collisions += 1;
+                    call.collided.extend_from_slice(&path);
                     continue;
                 }
                 Arrival::Leaf => {}
