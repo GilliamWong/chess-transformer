@@ -69,7 +69,7 @@ def move_id_table() -> np.ndarray:
 
 def rust_search_settings(use_tablebase: bool, tablebase_pieces: int = TABLEBASE_PIECES, syzygy_path: str | None = None) -> dict:
     return dict(move_id_table=move_id_table().ravel().tolist(), answer_width=ANSWER_WIDTH, c_puct=mcts.C_PUCT, c_puct_factor=mcts.C_PUCT_FACTOR,
-                c_puct_base=mcts.C_PUCT_BASE, fpu_reduction=mcts.FPU_REDUCTION, draw=mcts.DRAW, repetitions_for_a_draw=mcts.REPETITIONS_FOR_A_DRAW,
+                c_puct_base=mcts.C_PUCT_BASE, fpu_reduction=mcts.FPU_REDUCTION, draw=mcts.DRAW,
                 tablebase_folder=(syzygy_path or tablebase_path(tablebase_pieces)) if use_tablebase else None, tablebase_pieces=tablebase_pieces)
 
 class RustSelfPlayBatch:

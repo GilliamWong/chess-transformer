@@ -950,7 +950,7 @@ impl SharedTree {
             let game_over = if node == self.root {
                 None
             } else {
-                match game_result(&board, &keys, &moves, settings.draw, settings.repetitions_for_a_draw, node_tables) {
+                match game_result(&board, &keys, &moves, settings.draw, node_tables) {
                     Ok(game_over) => game_over,
                     Err(error) => {
                         give_back(false);

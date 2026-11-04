@@ -97,7 +97,7 @@ impl SharedTree {
         }
         let legal_moves = board.legal_moves();
         let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
-        let over = game_result(&board, keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?;
+        let over = game_result(&board, keys, &legal_moves, settings.draw, node_tables)?;
         let (&leaf_key, path_keys) = keys[keys.len() - path.len()..].split_last().expect("the leaf's key");
         Ok(over.is_none() && !path_keys.contains(&leaf_key))
     }

@@ -170,7 +170,7 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, settin
         let over = if id == tree.root_index() {
             None
         } else {
-            game_result(board, keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, None).expect("no tables")
+            game_result(board, keys, &legal_moves, settings.draw, None).expect("no tables")
         };
         let (&leaf_key, path_keys) = keys[tree.keys.len() - 1..].split_last().expect("the root's key");
         let value = over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));

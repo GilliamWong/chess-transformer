@@ -110,7 +110,7 @@ impl SelfPlayGames {
     //simulations_per_round: simulations a game does between network calls, all but the last answered at once (cache or game end)
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, start_fen, start_moves, seed, simulations, sampled_plies, max_plies, tree_reuse,
-                        top_moves, no_move, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
+                        top_moves, no_move, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         root_noise_alpha, root_noise_share, tablebase_folder, tablebase_pieces, cache_positions, simulations_per_round))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -130,7 +130,6 @@ impl SelfPlayGames {
         c_puct_base: f64,
         fpu_reduction: f64,
         draw: f64,
-        repetitions_for_a_draw: usize,
         root_noise_alpha: f64,
         root_noise_share: f64,
         tablebase_folder: Option<&str>,
@@ -150,7 +149,6 @@ impl SelfPlayGames {
                     c_puct_base,
                     fpu_reduction,
                     draw,
-                    repetitions_for_a_draw,
                     value_sharpness: 1.0,
                     certainty: false,
                     transpositions: false,
@@ -293,7 +291,7 @@ impl SelfPlayGames {
         let tables = self.tables.as_ref();
         let search = &self.settings.search;
         let in_search =
-            game_result(&board, &keys, &legal_moves, search.draw, search.repetitions_for_a_draw, tables).map_err(tablebase_error)?;
+            game_result(&board, &keys, &legal_moves, search.draw, tables).map_err(tablebase_error)?;
         let over = final_result(&board, &keys, self.start_plies + moves.len(), self.settings.max_plies, tables).map_err(tablebase_error)?;
         Ok((PyBytes::new(py, &encoding), move_ids, in_search, over))
     }
@@ -736,7 +734,7 @@ impl Searches {
     //concurrent descents. gc_threads: with them, the threads that free the dead rest of a tree beside the search after a move; 0 frees
     //it all at the search's start
     #[new]
-    #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
+    #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
                         memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false))]
     #[allow(clippy::too_many_arguments)]
@@ -748,7 +746,6 @@ impl Searches {
         c_puct_base: f64,
         fpu_reduction: f64,
         draw: f64,
-        repetitions_for_a_draw: usize,
         tablebase_folder: Option<&str>,
         tablebase_pieces: usize,
         tree_reuse: bool,
@@ -773,7 +770,6 @@ impl Searches {
                 c_puct_base,
                 fpu_reduction,
                 draw,
-                repetitions_for_a_draw,
                 value_sharpness,
                 certainty,
                 transpositions,

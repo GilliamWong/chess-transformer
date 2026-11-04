@@ -1,6 +1,6 @@
 use shakmaty::uci::UciMove;
 use shakmaty::zobrist::Zobrist64;
-use shakmaty::{Bitboard, Board, CastlingSide, Chess, Color, EnPassantMode, File, Move, MoveList, Position, Role, Square};
+use shakmaty::{CastlingSide, Chess, Color, EnPassantMode, File, Move, MoveList, Position, Role, Square};
 use shakmaty_syzygy::filesystem::MmapFilesystem;
 use shakmaty_syzygy::{SyzygyError, Tablebase, Wdl};
 use std::sync::Arc;
@@ -199,26 +199,6 @@ fn promotion_order(promotion: Option<Role>) -> u32 {
     }
 }
 
-fn is_insufficient_material(board: &Board) -> bool {
-    has_insufficient_material(board, Color::White) && has_insufficient_material(board, Color::Black)
-}
-
-//Board.has_insufficient_material, line for line
-fn has_insufficient_material(board: &Board, color: Color) -> bool {
-    let ours = board.by_color(color);
-    if (ours & (board.pawns() | board.rooks() | board.queens())).any() {
-        return false;
-    }
-    if (ours & board.knights()).any() {
-        return ours.count() <= 2 && (board.by_color(!color) & !board.kings() & !board.queens()).is_empty();
-    }
-    if (ours & board.bishops()).any() {
-        let same_color = (board.bishops() & Bitboard::DARK_SQUARES).is_empty() || (board.bishops() & Bitboard::LIGHT_SQUARES).is_empty();
-        return same_color && board.pawns().is_empty() && board.knights().is_empty();
-    }
-    true
-}
-
 //the keys back to the last capture or pawn move, the last key (the position itself) included
 fn since_zeroing(keys: &[u64], halfmoves: u32) -> &[u64] {
     let earlier = keys.len() - 1;
@@ -267,14 +247,12 @@ pub fn game_result(
     keys: &[u64],
     legal_moves: &MoveList,
     draw: f64,
-    repetitions_for_a_draw: usize,
     tables: Option<&Tables>,
 ) -> Result<Option<f64>, SyzygyError> {
     if legal_moves.is_empty() {
         return Ok(Some(if board.is_check() { 0.0 } else { draw }));
     }
-    if is_insufficient_material(board.board()) || board.halfmoves() >= 100 || repetitions(keys, board.halfmoves()) >= repetitions_for_a_draw
-    {
+    if board.is_insufficient_material() || board.halfmoves() >= 100 || repetitions(keys, board.halfmoves()) >= THREEFOLD {
         return Ok(Some(draw));
     }
     if let Some(tables) = tables
@@ -303,7 +281,7 @@ pub fn final_result(
     let fifty_moves = halfmoves >= 100
         || (halfmoves >= 99
             && legal_moves.iter().any(|&chess_move| !chess_move.is_zeroing() && !after(board, chess_move).legal_moves().is_empty()));
-    if is_insufficient_material(board.board())
+    if board.is_insufficient_material()
         || fifty_moves
         || repetitions(keys, halfmoves) >= THREEFOLD
         || threefold_after_a_move(board, keys, &legal_moves)

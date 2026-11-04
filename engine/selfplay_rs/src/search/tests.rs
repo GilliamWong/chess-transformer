@@ -132,7 +132,7 @@ fn stale_leaves_by_positions(
         if node != 0 && tree.nodes[node].visit_count > 0 {
             let legal_moves = board.legal_moves();
             let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
-            let over = game_result(board, &tree.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)
+            let over = game_result(board, &tree.keys, &legal_moves, settings.draw, node_tables)
                 .expect("the tables");
             let (&leaf_key, path_keys) = tree.keys[tree.keys.len() - path.len()..].split_last().expect("the leaf's key");
             if over.is_none() && !path_keys.contains(&leaf_key) {
@@ -287,7 +287,6 @@ fn settings(certainty: bool) -> SearchSettings {
         c_puct_base: 38739.0,
         fpu_reduction: 0.33 / 2.0,
         draw: 0.5,
-        repetitions_for_a_draw: 3,
         value_sharpness: 3.0,
         certainty,
         transpositions: false,

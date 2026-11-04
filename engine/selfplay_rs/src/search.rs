@@ -16,7 +16,6 @@ pub struct SearchSettings {
     pub c_puct_base: f64,
     pub fpu_reduction: f64,
     pub draw: f64,
-    pub repetitions_for_a_draw: usize,
     pub value_sharpness: f64, //1 is mcts.py's search
     //proven results end descents; mcts.py has none
     pub certainty: bool,
@@ -883,7 +882,7 @@ impl Tree {
             let game_over = if node == self.root {
                 None
             } else {
-                game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?
+                game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables)?
             };
             //a repeat inside the search is a draw, but not a proven one: the game need not repeat (as in lc0)
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
@@ -1142,7 +1141,7 @@ impl Tree {
         }
         let legal_moves = board.legal_moves();
         let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
-        let over = game_result(&board, &self.keys, &legal_moves, settings.draw, settings.repetitions_for_a_draw, node_tables)?;
+        let over = game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables)?;
         let (&leaf_key, path_keys) = self.keys[self.keys.len() - path.len()..].split_last().expect("the leaf's key");
         Ok(over.is_none() && !path_keys.contains(&leaf_key))
     }
