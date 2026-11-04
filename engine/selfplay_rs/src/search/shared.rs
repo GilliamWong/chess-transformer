@@ -512,15 +512,24 @@ impl SharedTree {
         Some(q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + own + in_flight))))
     }
 
-    //the node and link of the parent's move `edge` (select_edge's link), made if the move has none yet; board is the node's
-    //position. Of two threads that make one, one node is kept and the other's stays unused. With transpositions it is the
-    //table's node of the position, made by one thread under the shard's lock
-    fn child_node(&self, parent: usize, edge: usize, link: u32, board: &Chess) -> (usize, u32) {
+    //plays the moves of the path (edges) that `board` has not seen yet: a descent plays them only where it needs the position
+    fn play_path(&self, board: &mut Chess, unplayed: &mut Vec<usize>) {
+        for edge in unplayed.drain(..) {
+            let chess_move = self.edges.chess_move(edge).to_move(board);
+            board.play_unchecked(chess_move);
+        }
+    }
+
+    //the node and link of the parent's move `edge` (select_edge's link), made if the move has none yet; the node's position is
+    //board with the path's moves `unplayed` played. Of two threads that make one, one node is kept and the other's stays
+    //unused. With transpositions it is the table's node of the position, made by one thread under the shard's lock
+    fn child_node(&self, parent: usize, edge: usize, link: u32, board: &mut Chess, unplayed: &mut Vec<usize>) -> (usize, u32) {
         //select_edge names no move when it chose none (every move a proven loss, the first taken): its node if it has one
         let link = if link == NO_LINK { self.link_of(self.nodes.get(parent), edge) } else { link };
         if link != NO_LINK && self.links.child(link) != NO_NODE {
             return (self.links.child(link) as usize, link);
         }
+        self.play_path(board, unplayed);
         let key = position_key(board);
         let made = match &self.graph {
             None => self.nodes.push(key),
@@ -652,11 +661,13 @@ impl SharedTree {
 
     //one simulation down to a leaf, every node on the way counted in flight; the path ends on the node it reached. With
     //transpositions `edges` gets the links of the moves between the path's nodes, and the descent may stop above a shared
-    //node (a repeat or a transposition visit, as Tree::gather's), that node the path's last but not counted in flight
+    //node (a repeat or a transposition visit, as Tree::gather's), that node the path's last but not counted in flight. The moves
+    //are not played on `board` but left in `unplayed`, for where the position is needed
     fn descend(
         &self,
         settings: &SearchSettings,
         board: &mut Chess,
+        unplayed: &mut Vec<usize>,
         keys: &mut Vec<u64>,
         path: &mut Vec<usize>,
         edges: &mut Vec<usize>,
@@ -667,11 +678,10 @@ impl SharedTree {
         loop {
             match self.arrive(node) {
                 Arrival::Inner => {
-                    let repeats = self.graph.as_ref().map(|_| Repeats::new(keys, path_start, board.halfmoves()));
+                    let repeats = self.graph.as_ref().map(|_| Repeats::new(keys, path_start, u32::from(self.nodes.get(node).halfmoves())));
                     let (edge, selected) = self.select_edge(node, settings, repeats.as_ref());
-                    let chess_move = self.edges.chess_move(edge).to_move(board);
-                    board.play_unchecked(chess_move);
-                    let (child, link) = self.child_node(node, edge, selected, board);
+                    unplayed.push(edge);
+                    let (child, link) = self.child_node(node, edge, selected, board, unplayed);
                     node = child;
                     path.push(node);
                     let child = self.nodes.get(node);
@@ -931,6 +941,7 @@ impl SharedTree {
         let root_keys = keys.len();
         let mut path = Vec::new();
         let mut edges = Vec::new();
+        let mut unplayed = Vec::new();
         let mut priors = Vec::new();
         let mut free_descents = self.free_descents(round.memory_limit);
         loop {
@@ -955,7 +966,8 @@ impl SharedTree {
             keys.truncate(root_keys);
             path.clear();
             edges.clear();
-            let arrival = self.descend(settings, &mut board, &mut keys, &mut path, &mut edges);
+            unplayed.clear();
+            let arrival = self.descend(settings, &mut board, &mut unplayed, &mut keys, &mut path, &mut edges);
             let give_back = || self.release(round.memory_limit, reserved);
             let node = *path.last().expect("the root at least");
             match arrival {
@@ -993,6 +1005,7 @@ impl SharedTree {
                 Arrival::Leaf => {}
             }
 
+            self.play_path(&mut board, &mut unplayed);
             let mut moves = board.legal_moves();
             let node_tables = tables.filter(|_| node != self.root && (!root_covered || board.halfmoves() == 0));
             //the root is searched whatever the rules say of it: Searches.start refuses only a mate or stalemate
