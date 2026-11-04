@@ -167,6 +167,56 @@ impl SharedTree {
         }
     }
 
+    //the same tree in the same arenas: every node, edge, link and slot alike, and the table's entries; for trees no thread works in
+    pub fn assert_same_arenas(&self, other: &SharedTree) {
+        assert_eq!((self.root, &self.keys, self.is_full()), (other.root, &other.keys, other.is_full()), "the root, game or fullness");
+        assert_eq!((self.arena_bytes(), self.in_use()), (other.arena_bytes(), other.in_use()), "the arenas");
+        let children = |node: &Node| match node.children() {
+            Children::List(head) => (false, head),
+            Children::Solid(first) => (true, first),
+        };
+        let numbers = |node: &Node| {
+            let proof = node.proof().map(|proof| (proof.outcome, proof.value.to_bits(), proof.plies));
+            let sums = (node.value_sum().to_bits(), node.visited_policy_sqrt().to_bits());
+            (node.counts(), sums, node.edges(), proof, node.key(), node.halfmoves(), node.references(), node.refreshes(), children(node))
+        };
+        for id in 0..self.nodes.len() {
+            let (node, other_node) = (self.nodes.get(id), other.nodes.get(id));
+            assert_eq!(numbers(node), numbers(other_node), "node {id}");
+            for edge in node.edges() {
+                assert_eq!(self.edges.chess_move(edge).bits(), other.edges.chess_move(edge).bits(), "edge {edge}'s move");
+                assert_eq!(self.edges.prior(edge).to_bits(), other.edges.prior(edge).to_bits(), "edge {edge}'s prior");
+            }
+            match node.children() {
+                Children::List(mut link) => {
+                    while link != NO_LINK {
+                        let (one, another) = (self.links.get(link), other.links.get(link));
+                        let numbers = |link: &Link| (link.child(), link.visits().load(Ordering::Relaxed), link.place(), link.next());
+                        assert_eq!(numbers(one), numbers(another), "link {link}");
+                        link = one.next();
+                    }
+                }
+                Children::Solid(first) => {
+                    let slots = |tree: &SharedTree| -> Vec<(u32, u32)> {
+                        let slots = tree.links.solid_slots(first, node.edges().len());
+                        slots.iter().map(|slot| (slot.child(), slot.visits().load(Ordering::Relaxed))).collect()
+                    };
+                    assert_eq!(slots(self), slots(other), "node {id}'s slots");
+                }
+            }
+        }
+        match (&self.graph, &other.graph) {
+            (None, None) => {}
+            (Some(graph), Some(other_graph)) => {
+                for (shard, other_shard) in graph.shards.iter().zip(other_graph.shards.iter()) {
+                    assert!(*shard.lock().expect("a table shard") == *other_shard.lock().expect("a table shard"), "a table shard");
+                }
+                assert_eq!(graph.entries.load(Ordering::Relaxed), other_graph.entries.load(Ordering::Relaxed), "the table's entries");
+            }
+            _ => panic!("one tree has transpositions and the other not"),
+        }
+    }
+
     //the part the root reaches as a tree numbered as Tree::compact numbers it (breadth first), whatever the arenas' order
     pub fn to_reachable_tree(&self) -> Tree {
         let order = self.reachable_ids();

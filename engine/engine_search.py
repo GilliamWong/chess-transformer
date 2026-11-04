@@ -271,7 +271,8 @@ class EngineSearch:
             best = ranked_moves(self.tablebase, board)[0]
             return SearchReport(wdl_score(best.wdl), [best.move], 0, [])
 
-        self.searches.start(GAME, board.root().fen(), [move.uci() for move in board.move_stack], UNLIMITED if simulations is None else simulations)
+        #the seconds let a kept tree's compaction (at the memory limit) give way to a short search
+        self.searches.start(GAME, board.root().fen(), [move.uci() for move in board.move_stack], UNLIMITED if simulations is None else simulations, seconds)
         deadline = started + seconds if seconds is not None else None
         run = SearchRun(simulations, deadline, extension if deadline is not None else None, board.legal_moves.count() == 1, stop, info,
                         started + INFO_SECONDS, self.searches.root_visits(GAME))

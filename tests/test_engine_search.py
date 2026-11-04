@@ -980,7 +980,7 @@ class ScriptedSearches:
         self.root, self.proven, self.lone = (visits, most, second), proven, lone
         self.finishes, self.stopped_at = 0, None
 
-    def start(self, game, fen, moves, simulations):
+    def start(self, game, fen, moves, simulations, seconds=None):
         pass
 
     def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None, legal_columns=False):

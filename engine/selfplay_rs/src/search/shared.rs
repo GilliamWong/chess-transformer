@@ -11,6 +11,7 @@
 
 mod arena;
 mod cache;
+mod compact;
 mod reclaim;
 mod reuse;
 #[cfg(test)]
@@ -196,13 +197,25 @@ impl SharedTree {
         let root_key = *keys.last().expect("the root's key");
         let nodes = Nodes::new();
         let root = nodes.push(root_key);
+        SharedTree::with_arenas(board, keys, root, nodes, Edges::new(), Links::new(), None)
+    }
+
+    fn with_arenas(
+        board: Chess,
+        keys: Vec<u64>,
+        root: usize,
+        nodes: Nodes,
+        edges: Edges,
+        links: Links,
+        graph: Option<SharedGraph>,
+    ) -> SharedTree {
         SharedTree {
             board,
             keys,
             root,
             nodes,
-            edges: Edges::new(),
-            links: Links::new(),
+            edges,
+            links,
             to_solidify: Mutex::new(Vec::new()),
             queued: AtomicUsize::new(0),
             garbage: Mutex::new(Garbage::default()),
@@ -218,7 +231,7 @@ impl SharedTree {
             gate: RwLock::new(()),
             writers: AtomicUsize::new(0),
             counts: Alone(Counts::default()),
-            graph: None,
+            graph,
         }
     }
 
@@ -262,9 +275,10 @@ impl SharedTree {
         self.nodes.len() * NODE_BYTES + self.edges.len() * EDGE_BYTES + self.links.len() * LINK_BYTES + self.links.slots() * SLOT_BYTES
     }
 
-    //whether the arenas hold much more than the memory limit allows in use, which freed room that nothing fits does
-    pub fn sprawls(&self, memory_limit: usize) -> bool {
-        memory_limit != usize::MAX && self.footprint_bytes() > memory_limit + memory_limit / 4
+    //whether a search gives out the room a move freed, scattered among what the root reaches: under a memory limit, once the arenas have
+    //grown to it (holds_back_freed_room)
+    pub fn gives_out_freed_room(&self, memory_limit: usize) -> bool {
+        memory_limit != usize::MAX && !holds_back_freed_room(memory_limit, self.footprint_bytes(), self.nodes.len())
     }
 
     pub fn pending(&self) -> usize {
@@ -1246,6 +1260,11 @@ impl SharedTree {
 
     pub fn node(&self, id: usize) -> &Node {
         self.nodes.get(id)
+    }
+
+    //whether the arenas hold much more than the memory limit allows in use, which freed room that nothing fits does
+    pub fn sprawls(&self, memory_limit: usize) -> bool {
+        memory_limit != usize::MAX && self.footprint_bytes() > memory_limit + memory_limit / 4
     }
 
     //what a compaction would leave: the part the root reaches copied in breadth first order

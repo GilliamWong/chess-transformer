@@ -260,6 +260,25 @@ impl Node {
     pub fn clear_proof(&self) {
         self.proof_meta.store(0, Ordering::Release);
     }
+
+    //the node as `from` is, with its edges from `first_edge` and its moves' nodes from `children`, for a copy nothing reads yet; its
+    //references are the copy's moves' (add_reference)
+    pub fn copy_of(&self, from: &Node, first_edge: usize, children: u32) {
+        let copied = [&self.count, &self.value_sum, &self.visited_policy_sqrt, &self.proof_value, &self.key];
+        for (to, from) in copied.into_iter().zip([&from.count, &from.value_sum, &from.visited_policy_sqrt, &from.proof_value, &from.key]) {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        let moves = from.edges().len();
+        self.edges_at.store(if moves == 0 { 0 } else { (first_edge as u64) << 8 | moves as u64 }, Ordering::Relaxed);
+        self.proof_meta.store(from.proof_meta.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.halfmoves.store(from.halfmoves(), Ordering::Relaxed);
+        self.children.store(children, Ordering::Relaxed);
+    }
+
+    //a move of a copy nothing reads yet names the node
+    pub fn add_reference(&self) {
+        self.references.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 //chunks of `1 << bits` elements, each made on first use by whichever thread needs it first and freed only with the table
@@ -556,8 +575,7 @@ fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> (u
     debug_assert!(count > 0 && count <= 1 << bits);
     let mut at = next.load(Ordering::Relaxed);
     let (first, skipped) = loop {
-        let chunk_end = (at | ((1 << bits) - 1)) + 1;
-        let first = if at + count <= chunk_end { at } else { chunk_end };
+        let first = run_start(at, count, bits);
         match next.compare_exchange_weak(at, first + count, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break (first, first - at),
             Err(now) => at = now,
@@ -565,6 +583,12 @@ fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> (u
     };
     assert!(first + count <= capacity, "the tree is past its room");
     (first, skipped)
+}
+
+//where a run of `count` elements given out from `at` starts: at the next chunk if it would cross this one's end
+fn run_start(at: usize, count: usize, bits: u32) -> usize {
+    let chunk_end = (at | ((1 << bits) - 1)) + 1;
+    if at + count <= chunk_end { at } else { chunk_end }
 }
 
 //runs of elements, each in one chunk: from the runs given back, else from the end of those given out so far
@@ -688,15 +712,20 @@ impl Links {
 
     //link 0 is NO_LINK's, never given out
     pub fn new() -> Links {
-        let links = Links {
+        let links = Links::empty();
+        links.make(0);
+        links
+    }
+
+    //without link 0's chunk
+    fn empty() -> Links {
+        Links {
             table: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
             next: Alone(AtomicUsize::new(1)),
             freed: Pool::default(),
             slots: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
             slot_runs: Runs::new(LINK_CHUNK_BITS, Self::CAPACITY),
-        };
-        links.make(0);
-        links
+        }
     }
 
     //the links given out so far, those given back included
@@ -801,12 +830,16 @@ impl Links {
     //`count` solid slots, none with a node: returns the first, SOLID with its index
     pub fn solid(&self, count: usize) -> u32 {
         let first = self.slot_runs.alloc(count);
-        self.slots.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Slot::new()).collect());
+        self.make_slots(first);
         for slot in self.slots.slice(first, count) {
             slot.child.store(NO_NODE, Ordering::Relaxed);
             slot.visits.store(0, Ordering::Relaxed);
         }
         first as u32 | SOLID
+    }
+
+    fn make_slots(&self, first: usize) {
+        self.slots.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Slot::new()).collect());
     }
 
     #[cfg(test)]
@@ -876,6 +909,15 @@ impl Links {
         let slot = self.slot(link);
         slot.child.store(child, Ordering::Relaxed);
         slot.visits.store(visits, Ordering::Relaxed);
+    }
+
+    //a list's link of a copy nothing reads yet
+    pub fn write(&self, link: u32, child: u32, visits: u32, place: usize, next: u32) {
+        let written = self.get(link);
+        written.child.store(child, Ordering::Relaxed);
+        written.visits.store(visits, Ordering::Relaxed);
+        written.place.store(place as u32, Ordering::Relaxed);
+        written.next.store(next, Ordering::Relaxed);
     }
 
     pub fn linked<'a>(&'a self, node: &Node) -> Linked<'a> {
@@ -964,9 +1006,13 @@ impl Edges {
     //room for a node's `count` edges (at most 255), in one chunk; returns the first
     pub fn alloc(&self, count: usize) -> usize {
         let first = self.runs.alloc(count);
+        self.make(first);
+        first
+    }
+
+    fn make(&self, first: usize) {
         self.priors.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU32::new(0)).collect());
         self.moves.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
-        first
     }
 
     #[cfg(test)]
@@ -1015,6 +1061,105 @@ impl Edges {
     pub fn set(&self, edge: usize, chess_move: PackedMove, prior: f32) {
         self.moves.get(edge).store(chess_move.bits(), Ordering::Relaxed);
         self.priors.get(edge).store(prior.to_bits(), Ordering::Relaxed);
+    }
+
+    //`from`'s edges `edges` written from `first`, for a copy nothing reads yet
+    pub fn copy_from(&self, first: usize, from: &Edges, edges: Range<usize>) {
+        let count = edges.len();
+        for (to, from) in self.priors.slice(first, count).iter().zip(from.priors.slice(edges.start, count)) {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for (to, from) in self.moves.slice(first, count).iter().zip(from.moves.slice(edges.start, count)) {
+            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+}
+
+//where a copy puts its nodes' edges, links and slots, node after node from the arenas' starts as the allocators would give them
+//out; the fields are the room given out so far
+#[derive(Clone, Copy)]
+pub struct Layout {
+    edges: usize,
+    edges_in_runs: usize,
+    links: usize,
+    slots: usize,
+    slots_in_runs: usize,
+}
+
+impl Layout {
+    pub fn new() -> Layout {
+        Layout { edges: 0, edges_in_runs: 0, links: 1, slots: 0, slots_in_runs: 0 }
+    }
+
+    //the next node, with `edges` edges and `links` moves with a node, solid (a slot a move) or listed (a link each); returns its first edge
+    //and its children as Node::children has them
+    pub fn place(&mut self, edges: usize, links: usize, solid: bool) -> (usize, u32) {
+        if edges == 0 {
+            return (0, NO_LINK);
+        }
+        let first_edge = run_start(self.edges, edges, EDGE_CHUNK_BITS);
+        (self.edges, self.edges_in_runs) = (first_edge + edges, self.edges_in_runs + edges);
+        if solid {
+            let first_slot = run_start(self.slots, edges, LINK_CHUNK_BITS);
+            (self.slots, self.slots_in_runs) = (first_slot + edges, self.slots_in_runs + edges);
+            return (first_edge, first_slot as u32 | SOLID);
+        }
+        let first_link = if links == 0 { NO_LINK } else { self.links as u32 };
+        self.links += links;
+        (first_edge, first_link)
+    }
+}
+
+//a copy's arenas, its nodes and the room of its Layout given out from their starts; each chunk is made by one make_chunk
+pub struct Fresh {
+    pub nodes: Nodes,
+    pub edges: Edges,
+    pub links: Links,
+}
+
+impl Fresh {
+    pub fn new(nodes: usize, layout: &Layout) -> Fresh {
+        assert!(nodes <= Nodes::CAPACITY && layout.edges <= Edges::CAPACITY, "a copy past the arenas' room");
+        assert!(layout.links <= Links::CAPACITY && layout.slots <= Links::CAPACITY, "a copy past the arenas' room");
+        let fresh = Fresh { nodes: Nodes::new(), edges: Edges::new(), links: Links::empty() };
+        fresh.nodes.next.store(nodes, Ordering::Relaxed);
+        fresh.edges.runs.next.store(layout.edges, Ordering::Relaxed);
+        fresh.links.next.store(layout.links, Ordering::Relaxed);
+        fresh.links.slot_runs.next.store(layout.slots, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            fresh.edges.runs.skipped.store(layout.edges - layout.edges_in_runs, Ordering::Relaxed);
+            fresh.links.slot_runs.skipped.store(layout.slots - layout.slots_in_runs, Ordering::Relaxed);
+        }
+        fresh
+    }
+
+    //the chunks of nodes, edges, links and slots that the room given out lies in
+    fn chunk_counts(&self) -> [usize; 4] {
+        [
+            self.nodes.len().div_ceil(1 << NODE_CHUNK_BITS),
+            self.edges.len().div_ceil(1 << EDGE_CHUNK_BITS),
+            self.links.len().div_ceil(1 << LINK_CHUNK_BITS),
+            self.links.slots().div_ceil(1 << LINK_CHUNK_BITS),
+        ]
+    }
+
+    pub fn chunks(&self) -> usize {
+        self.chunk_counts().iter().sum()
+    }
+
+    //the chunk-th of chunks()
+    pub fn make_chunk(&self, chunk: usize) {
+        let [nodes, edges, links, _] = self.chunk_counts();
+        if chunk < nodes {
+            self.nodes.table.ensure_chunk(chunk << NODE_CHUNK_BITS, || (0..1 << NODE_CHUNK_BITS).map(|_| Node::default()).collect());
+        } else if chunk < nodes + edges {
+            self.edges.make((chunk - nodes) << EDGE_CHUNK_BITS);
+        } else if chunk < nodes + edges + links {
+            self.links.make((chunk - nodes - edges) << LINK_CHUNK_BITS);
+        } else {
+            self.links.make_slots((chunk - nodes - edges - links) << LINK_CHUNK_BITS);
+        }
     }
 }
 

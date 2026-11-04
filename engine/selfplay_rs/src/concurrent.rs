@@ -75,7 +75,7 @@ impl Searches {
         Ok(self.lock()?.shared_search(id).map(|search| search.tree.clone()))
     }
 
-    pub(crate) fn shared_start(&self, id: u64, fen: &str, moves: Vec<String>, simulations: u32) -> PyResult<()> {
+    pub(crate) fn shared_start(&self, id: u64, fen: &str, moves: Vec<String>, simulations: u32, seconds: Option<f64>) -> PyResult<()> {
         if simulations == 0 {
             return Err(PyValueError::new_err("a search needs at least one simulation"));
         }
@@ -88,7 +88,7 @@ impl Searches {
             return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
         }
         let tree = self
-            .shared_reused_tree(&mut state, id, fen, &moves)
+            .shared_reused_tree(&mut state, id, fen, &moves, seconds)
             .unwrap_or_else(|| SharedTree::new(board, keys).with_transpositions(self.settings.transpositions));
         let tree = Arc::new(tree);
         tree.start_sweepers(self.gc_threads);
@@ -263,8 +263,10 @@ impl Searches {
     }
 
     //None while a call of the id's last search still holds the tree. The root is moved down the line, which costs no more than the
-    //line is long; the dead rest of the tree is freed beside the search, or at once with no gc threads
-    fn shared_reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String]) -> Option<SharedTree> {
+    //line is long; the dead rest of the tree is freed beside the search, or at once with no gc threads. Once the arenas have grown to
+    //the memory limit, what the root reaches is copied out instead, unless that would take much of a search of `seconds`, and the old
+    //arenas are freed on a thread of their own
+    fn shared_reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String], seconds: Option<f64>) -> Option<SharedTree> {
         let kept = state.shared_kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
             kept.tree.abandon();
@@ -280,10 +282,6 @@ impl Searches {
         };
         let mut tree = into_owned(tree)?;
         tree.reopen();
-        if tree.sprawls(self.memory_limit) {
-            drop_later(tree);
-            return None;
-        }
         let Some((line, places)) = shared_line_to(&tree, since) else {
             drop_later(tree);
             return None;
@@ -293,6 +291,12 @@ impl Searches {
             None if line.is_empty() => {}
             Some(Some(candidates)) => tree.drop_stale_candidates(&places, &candidates, settings, tables),
             _ => tree.drop_stale_leaves(settings, tables),
+        }
+        if tree.gives_out_freed_room(self.memory_limit)
+            && let Some(compacted) = tree.compact(compaction_threads(), seconds)
+        {
+            drop_later(tree);
+            return Some(compacted);
         }
         if self.gc_threads == 0 {
             tree.drain();
@@ -333,6 +337,11 @@ impl Searches {
         state.shared_kept.insert(id, KeptTree { fen: fen.to_string(), moves, tree: Kept::Advancing(thread, stops) });
         Ok(true)
     }
+}
+
+//a search has not started when its tree is compacted: the cpus are the engine's
+fn compaction_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |threads| threads.get())
 }
 
 //the tree to itself again, once the sweepers of its last search have left: None while a call of that search still holds it

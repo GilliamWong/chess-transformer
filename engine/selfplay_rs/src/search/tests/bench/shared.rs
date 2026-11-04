@@ -281,5 +281,6 @@ fn gc_counts(tree: &SharedTree) -> (u64, u64) {
     (tree.counts.assists.load(Ordering::Relaxed), tree.counts.reclaimed.load(Ordering::Relaxed))
 }
 
+mod compact;
 mod replay;
 mod reuse;

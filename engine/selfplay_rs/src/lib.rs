@@ -738,9 +738,9 @@ fn line_to(tree: &Tree, moves: &[String]) -> Option<(Vec<usize>, Vec<u16>)> {
 
 #[pymethods]
 impl Searches {
-    //memory_limit_mb (RamLimitMb, 0 for none) limits a search's tree alone: the cache comes on top, and advance's copy without
-    //concurrent descents. gc_threads: with them, the threads that free the dead rest of a tree beside the search after a move; 0 frees
-    //it all at the search's start
+    //memory_limit_mb (RamLimitMb, 0 for none) limits a search's tree alone: the cache comes on top, and a kept tree's copy, advance's
+    //without concurrent descents and with them the compaction's beside the old arenas, which a thread frees after. gc_threads: with
+    //them, the threads that free the dead rest of a tree beside the search after a move; 0 frees it all at the search's start
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
@@ -803,11 +803,12 @@ impl Searches {
         })
     }
 
-    //the moves let the search see repetitions
-    fn start(&self, py: Python<'_>, id: u64, fen: &str, moves: Vec<String>, simulations: u32) -> PyResult<()> {
+    //the moves let the search see repetitions; seconds is the time the search has on the clock, None off it
+    #[pyo3(signature = (id, fen, moves, simulations, seconds=None))]
+    fn start(&self, py: Python<'_>, id: u64, fen: &str, moves: Vec<String>, simulations: u32, seconds: Option<f64>) -> PyResult<()> {
         py.detach(|| {
             if self.concurrent_descents {
-                return self.shared_start(id, fen, moves, simulations);
+                return self.shared_start(id, fen, moves, simulations, seconds);
             }
             if simulations == 0 {
                 return Err(PyValueError::new_err("a search needs at least one simulation"));

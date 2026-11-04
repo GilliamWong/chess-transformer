@@ -1287,8 +1287,16 @@ fn lost_races_free_their_references() {
 }
 
 //a game of `moves` moves of the engine's kind: a search, the most visited move played, again. The searches end at `visits` at the
-//root, or only when the memory is full; returns the footprint (arenas' bytes) the tree had at each move and its last owner
-fn play_a_game(moves: usize, visits: Option<u32>, limit: usize, sweepers: usize, check_footprint: bool) -> SharedTree {
+//root, or only when the memory is full. With `compact`, a moved tree whose arenas give out freed room is compacted, as Searches does.
+//Returns the tree's last owner and the compactions
+fn play_a_game(
+    moves: usize,
+    visits: Option<u32>,
+    limit: usize,
+    sweepers: usize,
+    check_footprint: bool,
+    compact: bool,
+) -> (SharedTree, usize) {
     let (settings, network) = (settings(true), SharedNetwork::new());
     let fresh_visits = {
         let tree = shared_tree_after(START, OPENING);
@@ -1296,7 +1304,7 @@ fn play_a_game(moves: usize, visits: Option<u32>, limit: usize, sweepers: usize,
         tree.root().visits()
     };
     let mut tree = shared_tree_after(START, OPENING);
-    let (mut restarts, mut played) = (0, 0);
+    let (mut restarts, mut played, mut compactions) = (0, 0, 0);
     while played < moves {
         let searching = Arc::new(tree);
         searching.start_sweepers(sweepers);
@@ -1327,10 +1335,20 @@ fn play_a_game(moves: usize, visits: Option<u32>, limit: usize, sweepers: usize,
                 restarts += 1;
             }
         }
+        if compact && tree.gives_out_freed_room(limit) {
+            let compacted = tree.compact(4, None).expect("a compaction without a time");
+            check_drained(&compacted);
+            assert!(
+                !compacted.gives_out_freed_room(limit),
+                "a compacted tree of {} bytes for a limit of {limit}",
+                compacted.footprint_bytes()
+            );
+            (tree, compactions) = (compacted, compactions + 1);
+        }
         played += 1;
     }
     assert!(restarts <= 3, "{restarts} games ended");
-    tree
+    (tree, compactions)
 }
 
 fn one_trees_bytes(visits: u32) -> usize {
@@ -1344,7 +1362,7 @@ fn one_trees_bytes(visits: u32) -> usize {
 fn a_game_stays_within_the_memory_limit() {
     let limit = one_trees_bytes(800) * 5 / 2;
     for sweepers in [0, 2] {
-        play_a_game(200, Some(800), limit, sweepers, true);
+        play_a_game(200, Some(800), limit, sweepers, true, false);
     }
 }
 
@@ -1353,11 +1371,91 @@ fn a_game_stays_within_the_memory_limit() {
 #[test]
 fn a_game_that_fills_the_memory_every_move_keeps_to_the_limit() {
     let limit = one_trees_bytes(800) * 8 / 5;
-    let tree = play_a_game(120, None, limit, 0, false);
+    let (tree, _) = play_a_game(120, None, limit, 0, false, false);
     assert!(tree.counts.assists.load(Ordering::Relaxed) > 0, "no descent freed any garbage");
     //the arenas have the room freed runs of every length left, but not much more than the limit: the runs are joined
     assert!(tree.footprint_bytes() <= limit * 3 / 2, "{} bytes of arenas for a limit of {limit}: {:?}", tree.footprint_bytes(), tree.arena_bytes());
-    play_a_game(120, None, limit, 2, false);
+    play_a_game(120, None, limit, 2, false, false);
+}
+
+//a game whose arenas reach the limit is compacted at the moves after, and its searches go on in the copies as in any tree
+#[test]
+fn a_game_compacted_at_the_memory_limit_keeps_to_it() {
+    let limit = one_trees_bytes(800) * 5 / 2;
+    for (visits, sweepers) in [(Some(800), 2), (None, 0)] {
+        let (_, compactions) = play_a_game(60, visits, limit, sweepers, true, true);
+        assert!(compactions >= 5, "{compactions} compactions");
+    }
+}
+
+//a tree with the engine's settings: transpositions or not, and lists made solid at SOLID_TREE_THRESHOLD visits as compacted() makes them
+fn compactable_tree_after(fen: &str, moves: &[&str], transpositions: bool) -> SharedTree {
+    let tree = tree_after(fen, moves);
+    SharedTree::new(tree.board, tree.keys).with_transpositions(transpositions)
+}
+
+//a compaction on any number of threads is compacted()'s tree in the same arenas, of a graph or not, with garbage after a move or
+//without; and a game goes on in the copies
+#[test]
+fn compacting_on_threads_makes_compacteds_tree() {
+    let network = SharedNetwork::new();
+    let (mut compactions, mut proven, mut shared_nodes) = (0, 0, 0);
+    for transpositions in [false, true] {
+        let settings = SearchSettings { transpositions, ..settings(true) };
+        for (fen, moves) in [(START, OPENING), (KING_AND_ROOK, &[][..])] {
+            let mut tree = compactable_tree_after(fen, moves, transpositions);
+            for turn in 0..6 {
+                let searching = Arc::new(tree);
+                searching.start_sweepers(1);
+                let target = searching.root().visits() + 3_000;
+                search_on_threads(&searching, 4, target, 2, 16, &settings, &network, usize::MAX);
+                tree = owned_again(searching);
+                for moved in [false, true] {
+                    let expected = tree.compacted();
+                    for threads in [1, 2, 5, 16] {
+                        let copy = tree.compact(threads, None).expect("a compaction without a time");
+                        copy.assert_same_arenas(&expected);
+                        check_drained(&copy);
+                    }
+                    shared_nodes += check_after_search(&expected, transpositions, true, &settings);
+                    proven += proven_nodes(&expected.to_reachable_tree());
+                    compactions += 1;
+                    if moved {
+                        break;
+                    }
+                    let Some(edge) = best_edge(&tree) else { break };
+                    tree.move_root(&[edge]);
+                    tree.drop_stale_leaves(&settings, None);
+                }
+                if turn % 2 == 1 {
+                    tree = tree.compact(3, None).expect("a compaction without a time");
+                }
+            }
+        }
+    }
+    assert!(compactions >= 30 && proven > 0 && shared_nodes > 0, "{compactions} compactions, {proven} proven nodes, {shared_nodes} shared");
+}
+
+//a compaction whose walk says it would take much of its search's time gives way: the tree is left as it was, and searched as it is
+#[test]
+fn a_compaction_too_long_for_its_search_leaves_the_tree_as_it_was() {
+    let network = SharedNetwork::new();
+    for transpositions in [false, true] {
+        let settings = SearchSettings { transpositions, ..settings(true) };
+        let mut tree = compactable_tree_after(START, OPENING, transpositions);
+        search_on_threads(&tree, 4, 20_000, 2, 16, &settings, &network, usize::MAX);
+        tree.move_root(&[best_edge(&tree).expect("a move")]);
+        let expected = tree.compacted();
+        for seconds in [None, Some(1e9)] {
+            tree.compact(4, seconds).expect("time enough").assert_same_arenas(&expected);
+        }
+        assert!(tree.compact(4, Some(0.0)).is_none(), "a compaction with no time");
+        tree.check_refs();
+        tree.compacted().assert_same_arenas(&expected);
+        let target = tree.root().visits() + 2_000;
+        search_on_threads(&tree, 4, target, 2, 16, &settings, &network, usize::MAX);
+        tree.check_refs();
+    }
 }
 
 #[test]
