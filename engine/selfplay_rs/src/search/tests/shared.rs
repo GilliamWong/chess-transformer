@@ -38,10 +38,17 @@ fn finish_round(tree: &SharedTree, round: u64, boards: &[u8], settings: &SearchS
     let boards = boards.as_chunks::<TOKENS_PER_BOARD>().0;
     assert_eq!(leaves.len(), boards.len());
     let mut logits = Vec::new();
-    for (leaf, board) in leaves.into_iter().zip(boards) {
+    for (index, (leaf, board)) in leaves.into_iter().zip(boards).enumerate() {
         let seed = seed_of(board);
         let answer = |column| answer(board, seed, column);
-        tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &network.move_ids, Some(&network.cache), settings, memory_limit, &mut logits);
+        //every other leaf is finished from its logits in move order, as the engine's lean rows give them
+        if index % 2 == 0 {
+            tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &network.move_ids, Some(&network.cache), settings, memory_limit, &mut logits);
+        } else {
+            logits.clear();
+            logits.extend(leaf.moves.iter().map(|&chess_move| answer(network.move_ids.id(chess_move, leaf.turn))));
+            tree.finish_leaf_in_order(leaf, &mut logits, answer(ANSWER_WIDTH_LAST), Some(&network.cache), settings, memory_limit);
+        }
     }
 }
 

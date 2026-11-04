@@ -164,8 +164,6 @@ impl Searches {
             (out, trees, width)
         };
         let mut rows = answers.chunks_exact(width);
-        //a lean answer put back in its columns of a whole row, where finish_leaf reads it
-        let mut row = if out.lean { vec![0.0; self.answer_width] } else { Vec::new() };
         let mut logits = Vec::new();
         for (&(_, count), tree) in out.leaves.iter().zip(&trees) {
             let mut hold = tree.hold();
@@ -173,24 +171,17 @@ impl Searches {
             assert_eq!(leaves.len(), count as usize, "the round's leaves in the tree");
             for (leaf, answer) in leaves.into_iter().zip(rows.by_ref()) {
                 hold.give_way();
+                let (cache, settings) = (self.shared_cache.as_ref(), &self.settings);
                 if out.lean {
-                    let columns = leaf.moves.iter().map(|&chess_move| self.move_ids.id(chess_move, leaf.turn));
-                    for (column, number) in
-                        columns.chain(std::iter::once(self.answer_width - 1)).zip(answer.iter().take(leaf.moves.len()).chain(answer.last()))
-                    {
-                        row[column] = number.number();
-                    }
+                    //the legal moves' logits in the leaf's move order, then the score
+                    logits.clear();
+                    logits.extend(answer[..leaf.moves.len()].iter().map(N::number));
+                    let value = answer[LEAN_COLUMNS - 1].number();
+                    tree.finish_leaf_in_order(leaf, &mut logits, value, cache, settings, self.memory_limit);
+                } else {
+                    let answer_at = |column: usize| answer[column].number();
+                    tree.finish_leaf(leaf, answer_at, self.answer_width, &self.move_ids, cache, settings, self.memory_limit, &mut logits);
                 }
-                tree.finish_leaf(
-                    leaf,
-                    |column| if out.lean { row[column] } else { answer[column].number() },
-                    self.answer_width,
-                    &self.move_ids,
-                    self.shared_cache.as_ref(),
-                    &self.settings,
-                    self.memory_limit,
-                    &mut logits,
-                );
             }
         }
         let mut state = self.lock()?;

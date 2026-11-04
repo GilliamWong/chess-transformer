@@ -3,9 +3,11 @@ use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
 use std::sync::Arc;
 
-//BENCH_DRIVERS threads on one tree, as rounds.rs runs a thread a gpu, each with BENCH_IN_FLIGHT rounds out
+//BENCH_DRIVERS threads on one tree, as rounds.rs runs a thread a gpu, each with BENCH_IN_FLIGHT rounds out. The answers are lean rows
+//as the engine's networks give them, unless BENCH_LEAN is 0 (whole rows read by move id)
 struct Drivers {
     drivers: usize,
+    lean: bool,
     in_flight: usize,
     collisions: u32,
     driver_cpus: Vec<usize>,
@@ -13,6 +15,9 @@ struct Drivers {
     move_ids: MoveIds,
     stand_in: StandIn,
     memory_limit: usize,
+    //the nanoseconds the threads spent gathering and finishing, all together
+    gather_nanos: AtomicU64,
+    finish_nanos: AtomicU64,
 }
 
 impl Drivers {
@@ -23,6 +28,7 @@ impl Drivers {
         let memory_limit = setting("BENCH_LIMIT_MB", 0usize);
         Drivers {
             drivers: setting("BENCH_DRIVERS", 8usize),
+            lean: setting("BENCH_LEAN", 1u32) == 1,
             in_flight: setting("BENCH_IN_FLIGHT", 2usize),
             collisions: setting("BENCH_COLLISIONS", 0u32),
             driver_cpus,
@@ -30,11 +36,29 @@ impl Drivers {
             move_ids: Network::new().move_ids,
             stand_in: StandIn::from_environment(),
             memory_limit: if memory_limit == 0 { usize::MAX } else { memory_limit * 1_000_000 },
+            gather_nanos: AtomicU64::new(0),
+            finish_nanos: AtomicU64::new(0),
         }
     }
 
     fn round(&self, id: u64, root_visits: u32) -> Round {
         Round { memory_limit: self.memory_limit, ..round_of(id, root_visits, self.collisions, u32::MAX) }
+    }
+
+    //concurrent.rs's shared_finish of one leaf: `row` is the lean row that the engine's gpu makes from the columns of the descent
+    fn finish(&self, tree: &SharedTree, cache: &SharedCache, leaf: PendingLeaf, board: &[u8], row: &mut Vec<f32>, logits: &mut Vec<f32>) {
+        let seed = StandIn::seed(board);
+        if !self.lean {
+            let answer = |column| self.stand_in.column(board, seed, column);
+            return tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &self.move_ids, Some(cache), &self.settings, self.memory_limit, logits);
+        }
+        row.clear();
+        row.extend(leaf.moves.iter().map(|&chess_move| self.stand_in.column(board, seed, self.move_ids.id(chess_move, leaf.turn))));
+        row.resize(crate::LEAN_COLUMNS, self.stand_in.column(board, seed, ANSWER_WIDTH - 1));
+        logits.clear();
+        logits.extend_from_slice(&row[..leaf.moves.len()]);
+        let value = row[crate::LEAN_COLUMNS - 1];
+        tree.finish_leaf_in_order(leaf, logits, value, Some(cache), &self.settings, self.memory_limit);
     }
 
     //rounds until `rounds` are started, the root has `stop_at` visits or `seconds` have passed; returns the seconds it took and the leaves
@@ -50,7 +74,7 @@ impl Drivers {
                         assert!(crate::affinity::pin_current(cpu), "driver pinned to cpu {cpu}");
                     }
                     let mut waiting: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
-                    let mut logits = Vec::new();
+                    let (mut logits, mut row) = (Vec::new(), Vec::new());
                     loop {
                         let next_round = {
                             let mut state = run.0.lock().expect("the run");
@@ -72,7 +96,9 @@ impl Drivers {
                         if let Some((id, answered)) = next_round {
                             let mut boards = Vec::new();
                             let round = self.round(id, tree.root().visits());
+                            let gathering = Instant::now();
                             tree.queue(id, tree.gather(&round, &self.settings, None, Some(cache), &mut boards));
+                            self.gather_nanos.fetch_add(gathering.elapsed().as_nanos() as u64, Ordering::Relaxed);
                             leaves.fetch_add((boards.len() / TOKENS_PER_BOARD) as u64, Ordering::Relaxed);
                             if boards.is_empty() {
                                 run.0.lock().expect("the run").starved = Some(answered);
@@ -81,22 +107,14 @@ impl Drivers {
                             continue;
                         }
                         let Some((id, boards)) = waiting.pop_front() else { break };
+                        let finishing = Instant::now();
                         {
                             let _hold = tree.hold();
                             for (leaf, board) in tree.take_round(id).into_iter().zip(boards.as_chunks::<TOKENS_PER_BOARD>().0) {
-                                let seed = StandIn::seed(board);
-                                tree.finish_leaf(
-                                    leaf,
-                                    |column| self.stand_in.column(board, seed, column),
-                                    ANSWER_WIDTH,
-                                    &self.move_ids,
-                                    Some(cache),
-                                    &self.settings,
-                                    self.memory_limit,
-                                    &mut logits,
-                                );
+                                self.finish(tree, cache, leaf, board, &mut row, &mut logits);
                             }
                         }
+                        self.finish_nanos.fetch_add(finishing.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         let mut state = run.0.lock().expect("the run");
                         state.out -= 1;
                         state.answered += u64::from(!boards.is_empty());
@@ -140,13 +158,17 @@ fn bench_shared_drivers() {
             (SharedTree::from_tree(&base), SharedCache::from_cache(&base_cache, 5_000_000))
         };
         let start = tree.root().visits();
+        drivers.gather_nanos.store(0, Ordering::Relaxed);
+        drivers.finish_nanos.store(0, Ordering::Relaxed);
         let (seconds, leaves) = drivers.drive(&tree, &cache, timed, u32::MAX, f64::MAX);
         let simulations = tree.root().visits() - start;
         println!(
-            "SHARED\trepeat {repeat}\tevals_per_s {:.0}\tsims_per_s {:.0}\tus_per_eval {:.3}\tleaves_per_round {:.1}\torphans {}\texclusive {}\tvisits_at_start {start}\tbytes_per_visit {:.0}",
+            "SHARED\trepeat {repeat}\tevals_per_s {:.0}\tsims_per_s {:.0}\tus_per_eval {:.3}\tgather_us {:.3}\tfinish_us {:.3}\tleaves_per_round {:.1}\torphans {}\texclusive {}\tvisits_at_start {start}\tbytes_per_visit {:.0}",
             leaves as f64 / seconds,
             f64::from(simulations) / seconds,
             seconds * 1e6 / leaves as f64,
+            drivers.gather_nanos.load(Ordering::Relaxed) as f64 / 1e3 / leaves as f64,
+            drivers.finish_nanos.load(Ordering::Relaxed) as f64 / 1e3 / leaves as f64,
             leaves as f64 / timed as f64,
             tree.counts.orphans.load(Ordering::Relaxed),
             tree.counts.exclusive.load(Ordering::Relaxed),
@@ -199,20 +221,9 @@ fn bench_shared_reuse() {
             let at = if leaves.is_empty() { f64::NAN } else { began.elapsed().as_secs_f64() };
             searching.queue(u64::MAX, leaves);
             let _hold = searching.hold();
-            let mut logits = Vec::new();
+            let (mut logits, mut row) = (Vec::new(), Vec::new());
             for (leaf, board) in searching.take_round(u64::MAX).into_iter().zip(boards.as_chunks::<TOKENS_PER_BOARD>().0) {
-                let seed = StandIn::seed(board);
-                let stand_in = drivers.stand_in;
-                searching.finish_leaf(
-                    leaf,
-                    |column| stand_in.column(board, seed, column),
-                    ANSWER_WIDTH,
-                    &drivers.move_ids,
-                    Some(&cache),
-                    &drivers.settings,
-                    drivers.memory_limit,
-                    &mut logits,
-                );
+                drivers.finish(&searching, &cache, leaf, board, &mut row, &mut logits);
             }
             at
         };

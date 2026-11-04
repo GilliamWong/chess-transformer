@@ -956,7 +956,15 @@ impl Tree {
         gathered
     }
 
-    //mcts.finish for the round's oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it, sharpened
+    fn next_waiting(&mut self, round: u64) -> PendingLeaf {
+        self.pending
+            .iter_mut()
+            .find(|(id, leaves)| *id == round && !leaves.is_empty())
+            .and_then(|(_, leaves)| leaves.pop_front())
+            .expect("a waiting simulation of the round")
+    }
+
+    //mcts.finish for the round's oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it sharpened
     pub fn finish_leaf(
         &mut self,
         round: u64,
@@ -966,15 +974,31 @@ impl Tree {
         cache: Option<&mut Cache>,
         settings: &SearchSettings,
     ) {
-        let leaf = self
-            .pending
-            .iter_mut()
-            .find(|(id, leaves)| *id == round && !leaves.is_empty())
-            .and_then(|(_, leaves)| leaves.pop_front())
-            .expect("a waiting simulation of the round");
+        let leaf = self.next_waiting(round);
         self.logits.clear();
         self.logits.extend(leaf.moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, leaf.turn))));
-        let (value, kept) = leaf_answer(&mut self.logits, answer(answer_width - 1), settings);
+        self.finish(leaf, answer(answer_width - 1), cache, settings);
+    }
+
+    //finish_leaf for the leaf's move logits and value, the logits in the order of its moves as a lean answer has them
+    pub fn finish_leaf_in_order(
+        &mut self,
+        round: u64,
+        logits: impl Iterator<Item = f32>,
+        value: f32,
+        cache: Option<&mut Cache>,
+        settings: &SearchSettings,
+    ) {
+        let leaf = self.next_waiting(round);
+        self.logits.clear();
+        self.logits.extend(logits);
+        assert_eq!(self.logits.len(), leaf.moves.len(), "a logit a move");
+        self.finish(leaf, value, cache, settings);
+    }
+
+    //the leaf's expansion and backup, from the move logits in self.logits and the value
+    fn finish(&mut self, leaf: PendingLeaf, value: f32, cache: Option<&mut Cache>, settings: &SearchSettings) {
+        let (value, kept) = leaf_answer(&mut self.logits, value, settings);
 
         let node = *leaf.path.last().expect("the root at least");
         let priors = std::mem::take(&mut self.logits);

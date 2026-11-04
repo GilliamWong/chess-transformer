@@ -618,28 +618,18 @@ impl Searches {
         let RoundOut { number, leaves: round_leaves, lean, .. } = state.rounds.remove(index).expect("the round");
         let index_of: HashMap<u64, usize> = state.searches.iter().enumerate().map(|(index, search)| (search.id, index)).collect();
         let mut rows = answers.chunks_exact(width);
-        //a lean answer put back in its columns of a whole row, where finish_leaf reads it
-        let mut row = if lean { vec![0.0; self.answer_width] } else { Vec::new() };
         for (id, leaves) in round_leaves {
             let tree = &mut state.searches[index_of[&id]].tree;
             for answer in rows.by_ref().take(leaves as usize) {
                 if lean {
-                    let (moves, turn) = tree.round_moves(number).next().expect("the round's next leaf");
-                    let columns = moves.iter().map(|&chess_move| self.move_ids.id(chess_move, turn));
-                    for (column, value) in
-                        columns.chain(std::iter::once(self.answer_width - 1)).zip(answer.iter().take(moves.len()).chain(answer.last()))
-                    {
-                        row[column] = value.number();
-                    }
+                    //the legal moves' logits in the leaf's move order, then the score
+                    let (moves, _) = tree.round_moves(number).next().expect("the round's next leaf");
+                    let logits = answer[..moves.len()].iter().map(N::number);
+                    tree.finish_leaf_in_order(number, logits, answer[LEAN_COLUMNS - 1].number(), state.cache.as_mut(), &self.settings);
+                } else {
+                    let answer_at = |column: usize| answer[column].number();
+                    tree.finish_leaf(number, answer_at, self.answer_width, &self.move_ids, state.cache.as_mut(), &self.settings);
                 }
-                tree.finish_leaf(
-                    number,
-                    |column| if lean { row[column] } else { answer[column].number() },
-                    self.answer_width,
-                    &self.move_ids,
-                    state.cache.as_mut(),
-                    &self.settings,
-                );
             }
         }
         Ok(self.take_reports(state))

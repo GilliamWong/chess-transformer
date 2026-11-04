@@ -1034,7 +1034,22 @@ impl SharedTree {
     ) {
         logits.clear();
         logits.extend(leaf.moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, leaf.turn))));
-        let (value, kept) = leaf_answer(logits, answer(answer_width - 1), settings);
+        self.finish_leaf_in_order(leaf, logits, answer(answer_width - 1), cache, settings, memory_limit);
+    }
+
+    //finish_leaf for the leaf's move logits and value, the logits in the order of its moves as a lean answer has them; they
+    //become the priors
+    pub fn finish_leaf_in_order(
+        &self,
+        leaf: PendingLeaf,
+        logits: &mut [f32],
+        value: f32,
+        cache: Option<&SharedCache>,
+        settings: &SearchSettings,
+        memory_limit: usize,
+    ) {
+        assert_eq!(logits.len(), leaf.moves.len(), "a logit a move");
+        let (value, kept) = leaf_answer(logits, value, settings);
         let node = *leaf.path.last().expect("the root at least");
         self.expand(node, &leaf.moves, logits);
         self.back_up(&leaf.path, &leaf.edges, f64::from(value));

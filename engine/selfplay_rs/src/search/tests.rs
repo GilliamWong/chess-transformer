@@ -69,7 +69,30 @@ fn finish_leaves(tree: &mut Tree, id: u64, boards: &[u8], settings: &SearchSetti
     }
 }
 
+//the leaves finished from their move logits in the order of their moves, as the engine's lean rows give them
+fn finish_leaves_in_order(tree: &mut Tree, id: u64, boards: &[u8], settings: &SearchSettings, network: &mut Network) {
+    for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
+        let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
+        let (moves, turn) = tree.round_moves(id).next().expect("a waiting leaf");
+        let logits: Vec<f32> = moves.iter().map(|&chess_move| answer(board, seed, network.move_ids.id(chess_move, turn))).collect();
+        let value = answer(board, seed, ANSWER_WIDTH_LAST);
+        tree.finish_leaf_in_order(id, logits.into_iter(), value, Some(&mut network.cache), settings);
+    }
+}
+
 fn search(
+    tree: &mut Tree,
+    simulations: u32,
+    memory_limit: usize,
+    settings: &SearchSettings,
+    tables: Option<&Tables>,
+    network: &mut Network,
+) {
+    search_with(finish_leaves, tree, simulations, memory_limit, settings, tables, network);
+}
+
+fn search_with(
+    finish: fn(&mut Tree, u64, &[u8], &SearchSettings, &mut Network),
     tree: &mut Tree,
     simulations: u32,
     memory_limit: usize,
@@ -82,7 +105,7 @@ fn search(
         let round = new_round(tree, 0, simulations, memory_limit);
         boards.clear();
         tree.gather(&round, settings, tables, Some(&network.cache), &mut boards);
-        finish_leaves(tree, round.id, &boards, settings, network);
+        finish(tree, round.id, &boards, settings, network);
     }
 }
 
@@ -531,6 +554,16 @@ fn the_nodes_stop_short_of_their_u32_indices() {
     assert_eq!(grown_capacity(8, 40, 13, usize::MAX), Some(40));
     assert_eq!(grown_capacity(8, 9, 13, 13 * 12), Some(12));
     assert_eq!(grown_capacity(8, 9, 13, 13 * 8), None);
+}
+
+#[test]
+fn leaves_finished_from_their_logits_in_move_order_are_those_finished_from_rows() {
+    let settings = settings(true);
+    let (mut by_rows, mut in_order) = (tree_after(START, OPENING), tree_after(START, OPENING));
+    search_with(finish_leaves, &mut by_rows, 3_000, usize::MAX, &settings, None, &mut Network::new());
+    search_with(finish_leaves_in_order, &mut in_order, 3_000, usize::MAX, &settings, None, &mut Network::new());
+    assert!(by_rows.nodes.len() > 1_000);
+    assert_same_trees(&by_rows, &in_order);
 }
 
 //a growth's copy counts toward the limit, so the vectors end half to two thirds of it
