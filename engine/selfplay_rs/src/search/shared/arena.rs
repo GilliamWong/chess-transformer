@@ -192,8 +192,9 @@ impl Node {
         if listed(children) { Children::List(children) } else { Children::Solid(children) }
     }
 
-    //the list's head, which a new first link is swapped into
-    pub fn list_head(&self) -> &AtomicU32 {
+    //the list's head, which a new first link is swapped into: for a thread that holds the gate or has the node to itself, and not for
+    //a reader, whose head is the one children() gave it
+    pub(super) fn list_head(&self) -> &AtomicU32 {
         &self.children
     }
 
@@ -781,6 +782,20 @@ impl Links {
             }
             pointer = &record.next;
         }
+    }
+
+    //the link of the move at `place` in the list from `head`, a head the caller has loaded: of a list made solid since, the old one
+    pub fn find_from(&self, head: u32, place: usize) -> Option<u32> {
+        let mut link = head;
+        while link != NO_LINK {
+            let record = self.get(link);
+            match record.place().cmp(&place) {
+                std::cmp::Ordering::Equal => return Some(link),
+                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Less => link = record.next(),
+            }
+        }
+        None
     }
 
     //puts `link` (Links::push's) into its list where `find` said, between `pointer` and the link `at` it held: false if the

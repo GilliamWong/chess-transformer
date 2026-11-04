@@ -2,11 +2,9 @@
 use super::*;
 use std::sync::{Arc, Weak};
 
-//the nodes a sweeper frees before it looks whether the tree was closed, and the garbage it takes at a time
+//the nodes a sweeper or drain frees before it looks again, and the garbage it takes at a time
 const SWEEP_BATCH: usize = 256;
 const GARBAGE_TAKEN: usize = 256;
-//the nodes freed, with their links, that wait to be given back to the pools together
-const FREED_KEPT: usize = 4096;
 
 #[derive(Default)]
 pub struct Garbage {
@@ -14,6 +12,9 @@ pub struct Garbage {
     pub(super) dead: Vec<u32>,
     //the first links of lists that no node has any more
     pub(super) lists: Vec<u32>,
+    //threads in the middle of freeing some. They are counted under the garbage's lock, as they take and leave their batch, so that
+    //"none left and none being freed" is one look
+    working: usize,
 }
 
 //what a batch frees, given back to the pools together
@@ -36,16 +37,28 @@ impl SharedTree {
         !garbage.dead.is_empty() || !garbage.lists.is_empty()
     }
 
-    //frees up to `budget` of the garbage (a node's children that die with it count, so a batch may go over by one node's
-    //worth) and returns what it freed: none when there is none for this thread, though another may be freeing some
-    pub fn reclaim(&self, budget: usize) -> usize {
-        self.working.fetch_add(1, Ordering::AcqRel);
-        let (mut dead, lists) = {
-            let mut garbage = self.garbage.lock().expect("the garbage");
-            let dead_from = garbage.dead.len().saturating_sub(GARBAGE_TAKEN);
-            let lists_from = garbage.lists.len().saturating_sub(GARBAGE_TAKEN);
-            (garbage.dead.split_off(dead_from), garbage.lists.split_off(lists_from))
-        };
+    //no garbage is left and no thread is freeing any: all that was freed is given back to the pools
+    pub fn idle(&self) -> bool {
+        let garbage = self.garbage.lock().expect("the garbage");
+        garbage.dead.is_empty() && garbage.lists.is_empty() && garbage.working == 0
+    }
+
+    //a batch of the garbage for the thread that takes it, who then counts as working; none if there is none
+    pub fn take_garbage(&self) -> Option<Garbage> {
+        let mut garbage = self.garbage.lock().expect("the garbage");
+        if garbage.dead.is_empty() && garbage.lists.is_empty() {
+            return None;
+        }
+        garbage.working += 1;
+        let dead_from = garbage.dead.len().saturating_sub(GARBAGE_TAKEN);
+        let lists_from = garbage.lists.len().saturating_sub(GARBAGE_TAKEN);
+        Some(Garbage { dead: garbage.dead.split_off(dead_from), lists: garbage.lists.split_off(lists_from), working: 0 })
+    }
+
+    //frees up to `budget` nodes of the batch taken and returns what it freed. What is left of the batch goes back to the
+    //garbage, and the thread stops working, once the room is given back to the pools
+    pub fn free_garbage(&self, taken: Garbage, budget: usize) -> usize {
+        let Garbage { mut dead, lists, .. } = taken;
         let mut freed = Freed::default();
         let mut nodes = 0;
         while nodes < budget
@@ -53,20 +66,22 @@ impl SharedTree {
         {
             self.free_node(id, &mut dead, &mut freed);
             nodes += 1;
-            if freed.nodes.len() >= FREED_KEPT {
-                self.give_back(&mut freed);
-            }
         }
         for &head in &lists {
             self.links.collect_list(head, &mut freed.links);
         }
         self.give_back(&mut freed);
         self.counts.reclaimed.fetch_add(nodes as u64, Ordering::Relaxed);
-        if !dead.is_empty() {
-            self.garbage.lock().expect("the garbage").dead.append(&mut dead);
-        }
-        self.working.fetch_sub(1, Ordering::AcqRel);
+        let mut garbage = self.garbage.lock().expect("the garbage");
+        garbage.dead.append(&mut dead);
+        garbage.working -= 1;
         nodes + lists.len()
+    }
+
+    //frees up to `budget` nodes of the garbage and returns what it freed: none when there is none for this thread, though
+    //another may be freeing some
+    pub fn reclaim(&self, budget: usize) -> usize {
+        self.take_garbage().map_or(0, |taken| self.free_garbage(taken, budget))
     }
 
     fn give_back(&self, freed: &mut Freed) {
@@ -100,8 +115,8 @@ impl SharedTree {
 
     //frees all the garbage, and waits for the other threads freeing some
     pub fn drain(&self) {
-        while self.has_garbage() || self.working.load(Ordering::Acquire) > 0 {
-            if self.reclaim(usize::MAX) == 0 {
+        while !self.idle() {
+            if self.reclaim(SWEEP_BATCH) == 0 {
                 std::thread::yield_now();
             }
         }
@@ -148,7 +163,7 @@ fn sweep(tree: Weak<SharedTree>) {
             return;
         }
         if tree.reclaim(SWEEP_BATCH) == 0 {
-            if tree.working.load(Ordering::Acquire) == 0 {
+            if tree.idle() {
                 return;
             }
             std::thread::yield_now();

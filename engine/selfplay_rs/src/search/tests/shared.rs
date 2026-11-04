@@ -146,6 +146,52 @@ fn a_shared_search_with_tables_that_fail_is_the_search_without_tables() {
     assert_eq!(with.allocated_bytes(), without.allocated_bytes());
 }
 
+//a reader of the moves' nodes needs no gate: a node made solid beside it must not turn a list it has found into a slot's number
+#[test]
+fn a_list_made_solid_between_a_readers_loads_is_read_as_it_was() {
+    let (settings, network) = (settings(false), SharedNetwork::new());
+    let tree = SharedTree::new(tree_after(START, OPENING).board, tree_after(START, OPENING).keys).with_solid_links(1_000, 2);
+    shared_in_flight(&tree, 600, 2, &settings, None, &network, usize::MAX);
+    let root = tree.root();
+    let found: Vec<_> = root.edges().map(|edge| (tree.child_index(root, edge), tree.visits(root, edge))).collect();
+    assert!(found.iter().filter(|(child, _)| child.is_some()).count() > 5);
+    assert_eq!(tree.lists_and_solids().1, 0);
+
+    crate::search::shared::AFTER_CHILDREN_LOADED.set(Some(|tree, node| tree.solidify(node)));
+    let read: Vec<_> = root.edges().map(|edge| (tree.child_index(root, edge), tree.visits(root, edge))).collect();
+    crate::search::shared::AFTER_CHILDREN_LOADED.set(None);
+    assert_eq!(read, found);
+    assert!(tree.lists_and_solids().1 > 0, "no list was made solid");
+}
+
+//a descent over the memory limit gives up when no garbage is left and no thread is freeing any, and the room is looked at then: the
+//thread that held the last batch may have freed it since the descent last looked
+#[test]
+fn a_descent_gets_the_room_that_the_last_batch_frees() {
+    let (settings, network) = (settings(false), SharedNetwork::new());
+    let searched = shared_tree_after(START, OPENING);
+    shared_in_flight(&searched, 2_000, 2, &settings, None, &network, usize::MAX);
+    let edge = best_edge(&searched).expect("a move");
+    let moved = || {
+        let mut tree = SharedTree::from_tree(&searched.to_tree());
+        tree.move_root(&[edge]);
+        tree
+    };
+    let mut drained = moved();
+    assert!(drained.has_garbage());
+    drained.drain();
+    let limit = drained.allocated_bytes() + crate::search::shared::DESCENT_BYTES;
+    let mut refused = 0;
+    for _ in 0..300 {
+        let tree = Arc::new(moved());
+        tree.start_sweepers(2);
+        refused += usize::from(!tree.reserve(limit, true));
+        tree.quiet(|| tree.close());
+        tree.join_sweepers();
+    }
+    assert_eq!(refused, 0, "{refused} descents of 300 were refused room that the garbage frees");
+}
+
 #[test]
 fn one_thread_searches_as_tree_does() {
     let tables = tables();

@@ -50,7 +50,7 @@ const LINK_BYTES: usize = size_of::<Link>();
 const SLOT_BYTES: usize = size_of::<Slot>();
 const TABLE_ENTRY_BYTES: usize = 32;
 const DESCENT_NODE_BYTES: usize = NODE_BYTES + LINK_BYTES;
-const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + MOST_MOVES * EDGE_BYTES;
+pub const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + MOST_MOVES * EDGE_BYTES;
 
 const SOLID_BATCH: usize = 32;
 
@@ -125,8 +125,6 @@ pub struct SharedTree {
     garbage: Mutex<Garbage>,
     //the first links of lists that were made solid since the last move: waiting leaves may still read them
     retired: Mutex<Vec<u32>>,
-    //threads in the middle of freeing garbage
-    working: AtomicUsize,
     sweepers: Mutex<Vec<JoinHandle<()>>>,
     solid_threshold: u32,
     solid_batch: usize,
@@ -173,6 +171,10 @@ fn jitter() {
 #[inline(always)]
 fn jitter() {}
 
+//a test's step between a reader's load of a node's children and what it does with them, to change the node as another thread could
+#[cfg(test)]
+thread_local!(pub static AFTER_CHILDREN_LOADED: std::cell::Cell<Option<fn(&SharedTree, &Node)>> = const { std::cell::Cell::new(None) });
+
 impl SharedTree {
     pub fn new(board: Chess, keys: Vec<u64>) -> SharedTree {
         let root_key = *keys.last().expect("the root's key");
@@ -189,7 +191,6 @@ impl SharedTree {
             queued: AtomicUsize::new(0),
             garbage: Mutex::new(Garbage::default()),
             retired: Mutex::new(Vec::new()),
-            working: AtomicUsize::new(0),
             sweepers: Mutex::new(Vec::new()),
             solid_threshold: SOLID_TREE_THRESHOLD,
             solid_batch: SOLID_BATCH,
@@ -286,12 +287,18 @@ impl SharedTree {
         self.edges.chess_move(edge)
     }
 
-    //the link of the parent's move `edge`, NO_LINK until a simulation has gone through it
+    //the link of the parent's move `edge`, NO_LINK until a simulation has gone through it. The node's children are loaded once: a
+    //list made solid meanwhile stays readable, and its head is read as it was
     fn link_of(&self, parent: &Node, edge: usize) -> u32 {
         let place = edge - parent.edges().start;
-        match parent.children() {
+        let children = parent.children();
+        #[cfg(test)]
+        if let Some(step) = AFTER_CHILDREN_LOADED.get() {
+            step(self, parent);
+        }
+        match children {
             Children::Solid(first) => Some(first + place as u32).filter(|&link| self.links.child(link) != NO_NODE).unwrap_or(NO_LINK),
-            Children::List(_) => self.links.find(parent.list_head(), place).unwrap_or(NO_LINK),
+            Children::List(head) => self.links.find_from(head, place).unwrap_or(NO_LINK),
         }
     }
 
@@ -813,7 +820,7 @@ impl SharedTree {
     //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent. Short of
     //room, the thread frees garbage until it has some or there is none and none being freed. Without `limited` the descent is
     //let through whatever the room, but reserves like the rest: finish_leaf gives back every leaf's
-    fn reserve(&self, memory_limit: usize, limited: bool) -> bool {
+    pub fn reserve(&self, memory_limit: usize, limited: bool) -> bool {
         if limited && self.nodes.len() + 64 >= Nodes::CAPACITY {
             return false;
         }
@@ -824,11 +831,13 @@ impl SharedTree {
         while limited && self.allocated_bytes() + reserved > memory_limit {
             if self.reclaim(ASSIST_BATCH) > 0 {
                 self.counts.assists.fetch_add(1, Ordering::Relaxed);
-            } else if self.working.load(Ordering::Acquire) == 0 && !self.has_garbage() {
+            } else if !self.idle() {
+                std::thread::yield_now();
+            } else if self.allocated_bytes() + reserved > memory_limit {
+                //nothing left to free, and nobody freeing it. The thread that held the last batch may have freed it since the
+                //loop's look, so the room is looked at again once all is idle
                 self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
                 return false;
-            } else {
-                std::thread::yield_now();
             }
         }
         true
@@ -1130,6 +1139,12 @@ impl SharedTree {
 
     pub fn root_index(&self) -> usize {
         self.root
+    }
+
+    //the node made solid at once, as a thread with the tree to itself would
+    pub fn solidify(&self, node: &Node) {
+        let id = (0..self.nodes.len()).find(|&id| std::ptr::eq(self.nodes.get(id), node)).expect("a node of the tree");
+        self.make_solid(id);
     }
 
     //edges numbered as a one thread search's Tree has them, in the order the nodes were expanded in
