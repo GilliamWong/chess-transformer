@@ -1,6 +1,9 @@
 import copy
 import logging
+import runpy
 import shutil
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import chess
@@ -510,6 +513,51 @@ def test_the_int8_weights_are_cached_by_the_checkpoints_content(tmp_path, small_
     monkeypatch.setattr(quantization, "DAMPENING", 2 * quantization.DAMPENING)
     assert quantization.cached_weights_path(tmp_path / "model.pt", 0) != path
 
+
+#a cache that cannot be written (its folder cannot be made, torch.save fails as it does for a path it cannot write, or there is no home folder)
+#costs only the next start's time
+@gpu
+@pytest.mark.parametrize("failure", ["folder", "save", "no home"])
+def test_the_weights_are_returned_when_the_cache_cannot_be_written(tmp_path, small_calibration, monkeypatch, capsys, failure):
+    small_checkpoint(tmp_path)
+    if failure == "folder":
+        (tmp_path / "file").write_text("")
+        monkeypatch.setattr(quantization, "CACHE", tmp_path / "file" / "cache")
+    elif failure == "save":
+        def cannot_write(weights, path):
+            Path(path).write_bytes(b"half")
+            raise RuntimeError("PytorchStreamWriter failed writing file data/0: file write failed")
+        monkeypatch.setattr(torch, "save", cannot_write)
+    else:
+        monkeypatch.setattr(quantization, "CACHE", None)
+
+    weights = quantization.int8_weights(tmp_path / "model.pt", 0)
+
+    assert sorted(weights) == [0, 1] and sorted(weights[0]) == ["down", "gate_up", "projection"]
+    assert "not cached" in capsys.readouterr().err
+    if failure == "save":
+        assert not any(quantization.CACHE.iterdir())
+
+def test_without_a_home_folder_nothing_is_cached(monkeypatch):
+    def no_home():
+        raise RuntimeError("Could not determine home directory.")
+    monkeypatch.setattr(Path, "home", no_home)
+
+    assert quantization.cache_folder() is None
+
+#the build runs this to fill the cache, so a cache it cannot write must fail it
+@gpu
+@pytest.mark.filterwarnings("ignore:'engine.quantization' found in sys.modules")
+def test_building_the_weights_fails_when_they_cannot_be_cached(tmp_path, monkeypatch):
+    small_checkpoint(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".cache").write_text("")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(sys, "argv", ["quantization.py", str(tmp_path / "model.pt")])
+
+    with pytest.raises(SystemExit, match="could not be cached"):
+        runpy.run_module("engine.quantization", run_name="__main__")
 
 #no fp16 blocks kept: the file name from before blocks could be kept
 @gpu

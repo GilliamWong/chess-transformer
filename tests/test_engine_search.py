@@ -27,11 +27,11 @@ from engine.inference import GraphedBatches, ImmediateBatches, cpu_batches, smal
 from model.model import ChessTransformer
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from model.checkpoint import save_checkpoint
-from engine.tablebase import SYZYGY_DIR
+from engine.tablebase import SYZYGY_DIR, TABLEBASE_PIECES
 from engine import engine_search
 from engine.engine_search import EngineSearch, SearchReport, engine_search_settings, parse_changes
 from engine import uci
-from engine.uci import MOST_EXTENSION, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock
+from engine.uci import MOST_EXTENSION, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock, Options
 
 REPOSITORY = Path(__file__).parent.parent
 FREE_QUEEN = "4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"
@@ -663,9 +663,28 @@ class RecordingPlayer:
         self.searches.append((board.fen(), nodes, seconds, extension))
         return SearchReport(0.5, [next(iter(board.legal_moves))], 1, [])
 
-#uci.main on the script with a RecordingPlayer: its searches (fen, nodes, seconds, extension), the lines sent and load_player's arguments
-def run_uci(monkeypatch, script: list[str], **main_arguments) -> tuple[list, list[str], list]:
-    player, sent, built = RecordingPlayer(), [], []
+#a search that raises (a rust panic is a BaseException)
+class Panic(BaseException):
+    pass
+
+#a RecordingPlayer whose searches numbered in `failing` (from 0) tell `reported` through info, if given, and then raise `error`; the others play the last legal move
+class FailingPlayer(RecordingPlayer):
+    def __init__(self, failing: set[int], error: BaseException, reported: str | None = None):
+        super().__init__()
+        self.failing, self.error, self.reported = failing, error, reported
+
+    def search(self, board, nodes, seconds, extension, stop=None, info=None):
+        number = len(self.searches)
+        self.searches.append((board.fen(), nodes, seconds, extension))
+        if number in self.failing:
+            if self.reported is not None:
+                info(SearchReport(0.5, [chess.Move.from_uci(self.reported)], 1, []))
+            raise self.error
+        return SearchReport(0.5, [list(board.legal_moves)[-1]], 1, [])
+
+#uci.main on the script with a RecordingPlayer (or `player`): its searches (fen, nodes, seconds, extension), the lines sent and load_player's arguments
+def run_uci(monkeypatch, script: list[str], player: RecordingPlayer | None = None, **main_arguments) -> tuple[list, list[str], list]:
+    player, sent, built = RecordingPlayer() if player is None else player, [], []
     monkeypatch.setattr(uci, "load_player", lambda *arguments: built.append(arguments) or player)
     monkeypatch.setattr(uci, "send", sent.append)
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(script)))
@@ -680,11 +699,47 @@ def test_go_nodes_0_plays_at_once(monkeypatch):
     given, sent = searched_gos(monkeypatch, ["go nodes 0", "go nodes -5", "go nodes 7"])
     assert given == [(1, None), (1, None), (7, None)] and len([line for line in sent if line.startswith("bestmove")]) == 3
 
+#Searches.start takes a u32: a bigger count would raise in the binding and end the engine
+def test_go_nodes_are_capped_at_what_a_search_takes(monkeypatch):
+    given, sent = searched_gos(monkeypatch, ["go nodes 5000000000", f"go nodes {engine_search.UNLIMITED}", "go nodes 99999999999999999999"])
+    assert given == [(engine_search.UNLIMITED, None)] * 3 and len([line for line in sent if line.startswith("bestmove")]) == 3
+
 def test_go_leaves_out_numbers_that_are_not_whole(monkeypatch):
     given, sent = searched_gos(monkeypatch, ["go nodes x", "go movetime 1.5 nodes 30", "go wtime 1000.5 btime 1000"])
     assert given == [(800, None), (30, None), (800, None)] and len([line for line in sent if line.startswith("bestmove")]) == 3
     told = [line for line in sent if line.startswith("info string")]
     assert told == [f"info string go's {number} is not a whole number: left out" for number in ("nodes x", "movetime 1.5", "wtime 1000.5")]
+
+#nodes are the root's visits, as lc0's (a kept tree's included); nps is the speed of this search's own
+def test_info_nps_counts_only_the_visits_this_search_made():
+    def reported(report: SearchReport) -> dict[str, str]:
+        words = uci.info_line(report, 2.0).split()
+        return {key: words[words.index(key) + 1] for key in ("nodes", "nps")}
+
+    line = [chess.Move.from_uci("e2e4")]
+    assert reported(SearchReport(0.5, line, 1500, [], reused=1000)) == {"nodes": "1500", "nps": "250"}
+    assert reported(SearchReport(0.5, line, 1500, [])) == {"nodes": "1500", "nps": "750"}
+
+#a search that fails still answers: with the newest info line's move, else the first legal move. The gui is told why, stderr has the traceback,
+#and the player, whose search may be left half done, is built again for the next go
+@pytest.mark.parametrize("error", [RuntimeError("syzygy tables:\nbad file"), Panic("boom")])
+@pytest.mark.parametrize("reported", [None, "d2d4"])
+def test_a_failed_search_still_answers_with_a_legal_move(monkeypatch, capsys, error, reported):
+    board = chess.Board()
+    normal, first = list(board.legal_moves)[-1].uci(), next(iter(board.legal_moves)).uci()
+    player = FailingPlayer({1}, error, reported)
+
+    searches, sent, built = run_uci(monkeypatch, ["isready", "position startpos", "go nodes 10", "go nodes 10", "go nodes 10", "quit"], player)
+
+    assert [line for line in sent if line.startswith("bestmove")] == [f"bestmove {move}" for move in (normal, reported or first, normal)]
+    told = [line for line in sent if line.startswith("info string")]
+    assert len(told) == 1 and "\n" not in told[0] and type(error).__name__ in told[0] and (reported or first) in told[0]
+    assert len(searches) == 3 and len(built) == 2
+    assert type(error).__name__ in capsys.readouterr().err
+
+def test_a_search_is_not_answered_for_an_exit(monkeypatch):
+    with pytest.raises(KeyboardInterrupt):
+        run_uci(monkeypatch, ["position startpos", "go nodes 10", "quit"], FailingPlayer({0}, KeyboardInterrupt()))
 
 def board_with_men(men: int) -> chess.Board:
     board = chess.Board()
@@ -1089,6 +1144,18 @@ def test_search_settings_take_true_and_false():
     with pytest.raises(ValueError):
         parse_changes("certainty=0", settings)
 
+#only numbers and true/false are settings to change; a gui's setoption must not end the engine
+def test_search_settings_that_are_not_numbers_are_refused():
+    settings = engine_search_settings(False)
+    assert settings["tablebase_folder"] is None and isinstance(settings["move_id_table"], list)
+    for change in ("move_id_table=1", "tablebase_folder=x"):
+        with pytest.raises(ValueError):
+            parse_changes(change, settings)
+    options = Options(False, TABLEBASE_PIECES)
+    for change in ("move_id_table=1", "tablebase_folder=x", "repetitions_for_a_draw=inf", "c_puct=x", "nope=1"):
+        assert options.set("SearchSettings", change, built=False).endswith("the search's settings stay as they were")
+    assert options.settings is None
+
 
 #answers come back late once, as on a cuda graph's first capture or a gpu shared with another engine: on the on_collect'th collect
 class StallsOnce(WrappedNetwork):
@@ -1207,6 +1274,18 @@ def test_advancing_the_tree_changes_no_search(middlegame):
     other.push(next(move for move in board.legal_moves if move != report.line[0]))
     other.push(next(iter(other.legal_moves)))
     assert search.search(other, simulations=50).line[0] in other.legal_moves
+
+#the visits the root already had are those of the tree kept from the last search
+def test_a_report_tells_the_visits_it_found_in_a_kept_tree():
+    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False)
+    board = chess.Board()
+    first = search.search(board, simulations=300)
+    board.push(first.line[0])
+    board.push(first.line[1])
+
+    second = search.search(board, simulations=600)
+
+    assert first.reused == 0 and 0 < second.reused < 300 < 600 <= second.simulations
 
 def test_a_search_ends_at_its_memory_limit():
     evaluate = cpu_batches(BoardModel()).evaluate_boards

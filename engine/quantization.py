@@ -1,7 +1,9 @@
 import argparse
+from contextlib import suppress
 import hashlib
 import os
 from pathlib import Path
+import sys
 
 import chess
 import chess.pgn
@@ -19,8 +21,15 @@ from model.model import ChessTransformer
 Int8Weights = dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]
 
 CARLSEN_PGN = Path(__file__).resolve().parent / "Carlsen.pgn"
-#not the checkpoint's folder: that may be read-only
-CACHE = Path.home() / ".cache" / "chess_transformer" / "int8"
+
+#not the checkpoint's folder: that may be read-only; None without a home folder
+def cache_folder() -> Path | None:
+    try:
+        return Path.home() / ".cache" / "chess_transformer" / "int8"
+    except RuntimeError:
+        return None
+
+CACHE = cache_folder()
 #bumped with the rounding code: it and the settings below name the cached file
 VERSION = 1
 CALIBRATION_POSITIONS = 1024
@@ -157,7 +166,9 @@ def block_errors(checkpoint_path: Path, weights: Int8Weights) -> dict[int, float
 
 
 #a count of 0 stays out of the name so the files cached without a count are still read
-def cached_weights_path(checkpoint_path: Path, fp16_blocks: int) -> Path:
+def cached_weights_path(checkpoint_path: Path, fp16_blocks: int) -> Path | None:
+    if CACHE is None:
+        return None
     with open(checkpoint_path, "rb") as checkpoint:
         digest = hashlib.file_digest(checkpoint, "sha256").hexdigest()
     rounding = (VERSION, CALIBRATION_POSITIONS, CALIBRATION_FIRST_GAME, CALIBRATION_STEP, DAMPENING, GPTQ_COLUMNS, FP16_LAST_LAYERS,
@@ -173,7 +184,7 @@ def int8_weights(checkpoint_path: Path, fp16_blocks: int) -> Int8Weights:
     if fp16_blocks < 0:
         raise ValueError(f"a count of blocks to keep in fp16, not {fp16_blocks}")
     path = cached_weights_path(checkpoint_path, fp16_blocks)
-    if path.exists():
+    if path is not None and path.exists():
         return torch.load(path, weights_only=True)
     if fp16_blocks:
         weights = int8_weights(checkpoint_path, 0)
@@ -187,12 +198,24 @@ def int8_weights(checkpoint_path: Path, fp16_blocks: int) -> Int8Weights:
                    for layer, matmuls in compute_int8_weights(model, encode_positions(calibration_positions())).items()}
         del model
         torch.cuda.empty_cache()
-    CACHE.mkdir(parents=True, exist_ok=True)
-    #written under another name first: engines starting together compute the same weights
-    partial = path.with_name(f"{path.name}.{os.getpid()}.partial")
-    torch.save(weights, partial)
-    os.replace(partial, path)
+    cache_weights(weights, path)
     return weights
+
+
+#written under another name first: engines starting together compute the same weights. A cache that cannot be written costs only the next start's time
+def cache_weights(weights: Int8Weights, path: Path | None) -> None:
+    if path is None:
+        print("the int8 weights are not cached: there is no home folder", file=sys.stderr)
+        return
+    partial = path.with_name(f"{path.name}.{os.getpid()}.partial")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(weights, partial)
+        os.replace(partial, path)
+    except (OSError, RuntimeError) as error: #torch.save raises RuntimeError for a path it cannot write
+        with suppress(OSError):
+            partial.unlink()
+        print(f"the int8 weights are not cached: {error}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -201,5 +224,8 @@ if __name__ == "__main__":
     parser.add_argument("checkpoint", type=Path)
     arguments = parser.parse_args()
     weights = int8_weights(arguments.checkpoint, ENGINE_FP16_BLOCKS)
-    print(cached_weights_path(arguments.checkpoint, ENGINE_FP16_BLOCKS))
+    path = cached_weights_path(arguments.checkpoint, ENGINE_FP16_BLOCKS)
+    if path is None or not path.exists():
+        raise SystemExit("the int8 weights could not be cached, which is what this is for: the engine would compute them at its first isready")
+    print(path)
     print("kept in fp16 besides the last:", sorted(set(int8_weights(arguments.checkpoint, 0)) - set(weights)))

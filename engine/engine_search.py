@@ -50,13 +50,14 @@ ROOT_MOVES_REPORTED = 3
 MAX_REPORTED_SCORE = 0.9999 #about 25 pawns
 
 
-#score is for the side to move (0 lost to 1 won), line starts with the move played
+#score is for the side to move (0 lost to 1 won), line starts with the move played; simulations are the root's visits, reused those it had at the start
 @dataclass
 class SearchReport:
     score: float
     line: list[chess.Move]
     simulations: int
     root_moves: list[tuple[chess.Move, int]]
+    reused: int = 0
 
 def score_to_centipawns(score: float) -> int:
     score = min(max(score, 1 - MAX_REPORTED_SCORE), MAX_REPORTED_SCORE)
@@ -79,6 +80,8 @@ def parse_changes(text: str, settings: dict) -> dict:
         if name not in settings:
             raise ValueError(f"{name} is not a setting, these are: {', '.join(sorted(settings))}")
         kind = type(settings[name])
+        if kind not in (bool, int, float):
+            raise ValueError(f"{name} is not a number or true or false")
         if kind is bool:
             if value not in ("true", "false"):
                 raise ValueError(f"{name} is true or false, not {value}")
@@ -88,7 +91,7 @@ def parse_changes(text: str, settings: dict) -> dict:
     return changes
 
 #int8 is not for self-play or labels: its answers depend on the rest of the batch
-PRECISIONS = {"fp16": fp16_model, "int8": int8_model}
+PRECISIONS = ("fp16", "int8")
 ENGINE_PRECISION = "int8"
 #the int8 network's blocks kept in fp16 besides the last; 0 is every block but the last in int8
 ENGINE_FP16_BLOCKS = 1
@@ -141,7 +144,7 @@ def engine_networks(checkpoint_path: Path, max_batch: int, precision: str, fp16_
 
 
 def network_model(checkpoint_path: Path, precision: str, fp16_blocks: int, weights: dict | None = None) -> torch.nn.Module:
-    return int8_model(checkpoint_path, fp16_blocks, weights) if precision == "int8" else PRECISIONS[precision](checkpoint_path)
+    return int8_model(checkpoint_path, fp16_blocks, weights) if precision == "int8" else fp16_model(checkpoint_path)
 
 
 def network_graphs(model: torch.nn.Module, max_batch: int, blocking_wait: bool = False, lean: bool | None = None) -> GraphedBatches:
@@ -176,6 +179,7 @@ class SearchRun:
         self.progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
         #Searches.root_visits' numbers as the newest descend or finish left them, so that no thread asks for them
         self.root = root
+        self.reused = root[0] #the visits of a kept tree, which this search did not make
 
     #numbers a descend or finish gave (None once the search is done): visits only grow, so the most is the newest
     def seen(self, root: tuple[int, int, int] | None) -> None:
@@ -273,7 +277,7 @@ class EngineSearch:
                         started + INFO_SECONDS, self.searches.root_visits(GAME))
         if self.rust_rounds:
             self.rounds_in_rust(run)
-            return self.search_report(run.report)
+            return self.search_report(run.report, run.reused)
         cpus = self.network_cpus or [None] * len(self.networks)
         driven = [self.threads.submit(self.drive, network, run, cpu) for network, cpu in list(zip(self.networks, cpus))[self.drives_first:]]
         try:
@@ -282,12 +286,12 @@ class EngineSearch:
         finally:
             for drive in driven:
                 drive.result()
-        return self.search_report(run.report)
+        return self.search_report(run.report, run.reused)
 
-    def search_report(self, report: tuple) -> SearchReport:
+    def search_report(self, report: tuple, reused: int) -> SearchReport:
         _, line, score, root_moves, visits = report
         return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
-                            [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]])
+                            [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]], reused)
 
     #rounds_on on the thread pinned to cpu if it is given, a failure stopping the other networks' rounds too
     def drive(self, network, run: SearchRun, cpu: int | None = None) -> None:
@@ -323,7 +327,7 @@ class EngineSearch:
                 except ValueError:
                     running = None
                 if running is not None:
-                    run.info(self.search_report(running))
+                    run.info(self.search_report(running, run.reused))
         round_times, batches, boards = loop.counts()
         self.round_times = deque(round_times, maxlen=ROUND_TIMES)
         self.round_seconds = statistics.median(self.round_times)
@@ -414,7 +418,7 @@ class EngineSearch:
                     run.next_info = time.perf_counter() + INFO_SECONDS
                     running = self.searches.report_now(GAME)
                     if running is not None:
-                        run.info(self.search_report(running))
+                        run.info(self.search_report(running, run.reused))
                 if reports:
                     run.report = reports[0]
                 #a round without leaves counts too: all its simulations may have ended the game (a mate found)

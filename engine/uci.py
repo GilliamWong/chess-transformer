@@ -8,13 +8,14 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import chess
 import torch
 from engine.inference import cpu_batches
 from model.checkpoint import latest_checkpoint, load_model
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GC_THREADS, LEAVES, PRECISIONS,
-                                  SMART_PRUNING_FACTOR, EngineSearch, SearchReport, engine_network, engine_networks, engine_search_settings,
-                                  parse_changes, score_to_centipawns)
+                                  SMART_PRUNING_FACTOR, UNLIMITED, EngineSearch, SearchReport, engine_network, engine_networks,
+                                  engine_search_settings, parse_changes, score_to_centipawns)
 from engine.mcts import SIMULATIONS
 from engine.tablebase import MOST_PIECES, TABLE_SETS, TABLEBASE_PIECES, complete_pieces, open_tablebase, open_tablebase_path
 
@@ -117,9 +118,11 @@ def parse_position(arguments: list[str]) -> chess.Board:
 
     return board
 
-#depth is the length of the expected line: cutechess keeps score, depth and time in the pgn
+#depth is the length of the expected line: cutechess keeps score, depth and time in the pgn. As lc0's, nodes are the root's visits, those of a kept tree
+#included, and nps the speed of this search's own
 def info_line(report: SearchReport, seconds: float) -> str:
-    return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {round(report.simulations / max(seconds, 1e-3))} "
+    nps = round((report.simulations - report.reused) / max(seconds, 1e-3))
+    return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {nps} "
             f"score cp {score_to_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
 
 #a new game needs a new Clock
@@ -155,8 +158,8 @@ class Clock:
                                                             chess.popcount(board.occupied), bonus)
             if self.last_score is not None:
                 self.extension = (self.last_score, self.extra_seconds(seconds_left))
-        #go nodes 0 plays at once on the root's one simulation, as lc0 does
-        nodes = max(1, numbers["nodes"]) if "nodes" in numbers else None
+        #go nodes 0 plays at once on the root's one simulation, as lc0 does; Searches.start takes at most UNLIMITED
+        nodes = min(UNLIMITED, max(1, numbers["nodes"])) if "nodes" in numbers else None
         if nodes is None and seconds is None:
             nodes = simulations
         return nodes, seconds
@@ -329,7 +332,7 @@ class Options:
         if name == "SearchSettings":
             try:
                 self.settings = parse_changes("" if value == "<empty>" else value, engine_search_settings(self.tablebase or self.syzygy_path is not None))
-            except ValueError as error:
+            except (ValueError, OverflowError) as error: #a whole number setting of inf
                 return f"{error}: the search's settings stay as they were"
             return None
         if name in DECIMAL_OPTIONS:
@@ -445,6 +448,7 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
     board = chess.Board()
     clock = Clock(**options.clock())
     commands = Commands(sys.stdin, infinite_until_stop)
+    newest: list[chess.Move] = [] #the move of the newest info line of the search under way, which answers if the search fails
 
     def load() -> EngineSearch:
         use_tablebase, set_options = options.search()
@@ -454,6 +458,7 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
     #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by itself, as UCI asks
     def move_for(go: Go) -> chess.Move | None:
         nonlocal player
+        newest.clear()
         if not any(board.legal_moves):
             send("info string the game is over, there is no move to play")
             return None
@@ -464,13 +469,26 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
         nodes, seconds = clock.limits(go.arguments, board, simulations)
         if go.until_stop:
             nodes = seconds = None
-        running = lambda report: send(info_line(report, time.perf_counter() - go.received))
+
+        def running(report: SearchReport) -> None:
+            newest[:] = report.line[:1]
+            send(info_line(report, time.perf_counter() - go.received))
         report = player.search(board, nodes, seconds, clock.extension, go.stop, running)
         clock.searched(time.perf_counter() - go.received, score_to_centipawns(report.score))
         move = report.line[0]
         send(info_line(report, time.perf_counter() - go.received))
         if go.until_stop:
             go.stop.wait()
+        return move
+
+    #a search that fails still answers, with its newest info line's move or else the first legal move; the gui is told, stderr has the traceback. The
+    #player is built again for the next go, as its search may be left half done
+    def fallback_move(error: BaseException) -> chess.Move:
+        nonlocal player
+        traceback.print_exception(error)
+        move = newest[0] if newest else next(iter(board.legal_moves))
+        send(f"info string the search failed ({error!r}): playing {move.uci()}")
+        player = None
         return move
 
     while (received := commands.next()) is not None:
@@ -509,7 +527,12 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
                 send(f"info string {error}: the last position stays")
 
         elif command == "go":
-            move = move_for(go)
+            try:
+                move = move_for(go)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as error: #pyo3's PanicException, a rust panic, is not an Exception
+                move = fallback_move(error)
             send(f"bestmove {move.uci() if move is not None else '0000'}")
             if move is not None:
                 advance_after(player, board, move)
