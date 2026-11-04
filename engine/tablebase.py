@@ -127,12 +127,14 @@ def open_tablebase(pieces: int = TABLEBASE_PIECES) -> chess.syzygy.Tablebase:
 def open_tablebase_path(path: str, pieces: int) -> tuple[chess.syzygy.Tablebase, int]:
     folders = path_folders(path)
     found = found_tables(folders)
-    ranked = 0
+    ranked, ranking = 0, True
     for size in range(3, pieces + 1):
         wdl, dtz, whole = size_counts(found, size)
         if not usable(wdl, dtz, whole, size):
             raise FileNotFoundError(f"{path} has {wdl} of the {whole} wdl and {dtz} of the {whole} dtz tables of {size} pieces")
-        ranked = size if dtz else ranked
+        ranking = ranking and dtz > 0
+        if ranking:
+            ranked = size
     tablebase = chess.syzygy.Tablebase()
     for folder in folders:
         tablebase.add_directory(folder)
@@ -158,9 +160,14 @@ def size_counts(found: dict[str, set[str]], size: int) -> tuple[int, int, int]:
     names = {name for name in chess.syzygy.tablenames(piece_count=size) if len(name) == size + 1}
     return len(names & found["rtbw"]), len(names & found["rtbz"]), len(names)
 
-#the most pieces of a position ranked_moves can rank with open_tablebase(pieces): the sizes with dtz tables
+#the most pieces of a position ranked_moves can rank with open_tablebase(pieces): the sizes with dtz tables, unbroken from the smallest
 def ranked_pieces(pieces: int) -> int:
-    return max(table_set.pieces for table_set in table_sets(pieces) if table_set.count("rtbz") > 0)
+    ranked = 0
+    for table_set in table_sets(pieces):
+        if not table_set.count("rtbz"):
+            break
+        ranked = table_set.pieces
+    return ranked
 
 #syzygy leaves out positions with castling rights
 def covers(board: chess.Board, pieces: int = TABLEBASE_PIECES) -> bool:
@@ -185,6 +192,7 @@ class TablebaseMove:
 #best first; ties keep the order of the legal moves
 def ranked_moves(tablebase: chess.syzygy.Tablebase, board: chess.Board) -> list[TablebaseMove]:
     moves = []
+    clock = board.halfmove_clock
     for move in list(board.legal_moves):
         zeroing = board.is_zeroing(move)
         board.push(move)
@@ -195,8 +203,8 @@ def ranked_moves(tablebase: chess.syzygy.Tablebase, board: chess.Board) -> list[
             wdl, plies = -tablebase.probe_wdl(board), 1
         else:
             wdl, plies = -tablebase.probe_wdl(board), abs(tablebase.probe_dtz(board)) + 1
-            #the probe counts the 50-move rule from the next position, but this move used one ply of it
-            if abs(wdl) == 2 and plies > 100:
+            #the tables count the 50-move rule from a clock of 0 at the next position: the root's clock and this move's plies must fit in 100
+            if abs(wdl) == 2 and clock + plies > 100:
                 wdl //= 2
         moves.append(TablebaseMove(move, wdl, plies))
         board.pop()

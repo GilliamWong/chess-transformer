@@ -34,6 +34,28 @@ def test_the_best_move_keeps_the_roots_result_at_the_50_move_edge(tablebase, fen
     assert ranked_moves(tablebase, board)[0].wdl == 1
 
 
+#the tables assume a clock of 0: a quiet move's win or loss needs the clock plus its plies to reach the zeroing move within 100, else it is a draw
+@pytest.mark.parametrize("fen", ["6K1/1B5N/8/8/8/8/8/3k4 w - - 0 1", "6K1/1B5N/8/8/8/8/8/3k4 b - - 0 1"])
+def test_a_result_the_halfmove_clock_makes_a_draw_is_ranked_as_one(tablebase, fen):
+    board = chess.Board(fen)
+    best = ranked_moves(tablebase, board)[0]
+    assert abs(best.wdl) == 2 and best.plies_to_zeroing > 1
+
+    board.halfmove_clock = 100 - best.plies_to_zeroing
+    assert ranked_moves(tablebase, board)[0].wdl == best.wdl
+    board.halfmove_clock += 1
+    assert ranked_moves(tablebase, board)[0].wdl == best.wdl // 2
+
+
+def test_the_report_scores_a_win_the_halfmove_clock_makes_a_draw_as_a_draw(tablebase):
+    board = chess.Board("6K1/1B5N/8/8/8/8/8/3k4 w - - 0 1")
+    search = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True)
+
+    assert search.search(board, simulations=10).score == 1.0
+    board.halfmove_clock = 90
+    assert search.search(board, simulations=10).score == 0.5
+
+
 def test_the_search_scores_the_positions_the_tables_cover(tablebase, monkeypatch):
     monkeypatch.setattr(mcts, "tablebase", tablebase)
     simulations = 200
@@ -64,7 +86,7 @@ def test_the_tables_cover_the_pieces_asked_for():
 
 #empty files for each half and a folder for each size; python-chess and shakmaty skip files not named for a table
 def fake_table_sets(folder: Path, monkeypatch, tables: dict[int, tuple[int, int]]) -> tuple[TableSet, ...]:
-    table_sets = tuple(TableSet(pieces, folder / str(pieces), str(pieces), 3) for pieces in (5, 6))
+    table_sets = tuple(TableSet(pieces, folder / str(pieces), str(pieces), 3) for pieces in tables)
     for table_set in table_sets:
         table_set.folder.mkdir()
         wdl, dtz = tables[table_set.pieces]
@@ -85,6 +107,13 @@ def test_which_tables_open(tmp_path, monkeypatch, five, six, ranked):
     else:
         open_tablebase(6).close()
         assert ranked_pieces(6) == ranked
+
+#ranking probes the dtz tables of every size up to the root's: they must run unbroken from 5 pieces, not just exist at some larger size
+def test_the_dtz_tables_rank_only_up_to_the_first_size_without_them(tmp_path, monkeypatch):
+    fake_table_sets(tmp_path, monkeypatch, {5: (3, 3), 6: (3, 0), 7: (3, 3)})
+
+    open_tablebase(7).close()
+    assert ranked_pieces(7) == 5
 
 def fake_syzygy_path(folder: Path, left_out: tuple[str, ...] = (), pieces: int = 6) -> str:
     names = list(chess.syzygy.tablenames(piece_count=pieces))
@@ -138,6 +167,13 @@ def test_which_tables_open_from_a_syzygy_path(tmp_path, left_out, ranked):
         tables, ranked_by_path = open_tablebase_path(path, 6)
         tables.close()
         assert ranked_by_path == ranked
+
+def test_a_syzygy_path_ranks_only_up_to_the_first_size_without_dtz_tables(tmp_path):
+    path = fake_syzygy_path(tmp_path, tuple(f"{name}.rtbz" for name in tables_of(6)), pieces=7)
+
+    tables, ranked = open_tablebase_path(path, 7)
+    tables.close()
+    assert ranked == 5
 
 def test_a_syzygy_path_of_5_pieces(tmp_path):
     path = fake_syzygy_path(tmp_path)
