@@ -205,12 +205,7 @@ impl SelfPlayGames {
                 visit_limit: self.settings.simulations.max(game.tree.root().visit_count + 1),
                 memory_limit: usize::MAX,
             };
-            if game
-                .tree
-                .gather(&round, &self.settings.search, self.tables.as_ref(), self.cache.as_ref(), &mut boards)
-                .map_err(tablebase_error)?
-                > 0
-            {
+            if game.tree.gather(&round, &self.settings.search, self.tables.as_ref(), self.cache.as_ref(), &mut boards) > 0 {
                 self.waiting.push(index);
             }
         }
@@ -290,8 +285,7 @@ impl SelfPlayGames {
         let move_ids = legal_moves.iter().map(|&chess_move| self.move_ids.id(chess_move, board.turn())).collect();
         let tables = self.tables.as_ref();
         let search = &self.settings.search;
-        let in_search =
-            game_result(&board, &keys, &legal_moves, search.draw, tables).map_err(tablebase_error)?;
+        let in_search = game_result(&board, &keys, &legal_moves, search.draw, tables);
         let over = final_result(&board, &keys, self.start_plies + moves.len(), self.settings.max_plies, tables).map_err(tablebase_error)?;
         Ok((PyBytes::new(py, &encoding), move_ids, in_search, over))
     }
@@ -418,11 +412,12 @@ fn find_search(state: &State, id: u64) -> PyResult<&Search> {
     state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))
 }
 
-//the chosen move's score; with no visit on it yet, the root's for its side to move
+//the chosen move's score; with no visit on it yet, the root's for its side to move, and with none on the root, a half
 fn score_of(tree: &Tree, best: Option<usize>) -> f64 {
     match best.and_then(|edge| tree.child(tree.root_index(), edge)) {
         Some(chosen) if chosen.visit_count > 0 => chosen.mean_score(),
-        _ => 1.0 - tree.root().mean_score(),
+        _ if tree.root().visit_count > 0 => 1.0 - tree.root().mean_score(),
+        _ => 0.5,
     }
 }
 
@@ -548,8 +543,7 @@ impl Searches {
                 visit_limit: search.simulations,
                 memory_limit: self.memory_limit,
             };
-            let gathered =
-                search.tree.gather(&limits, &self.settings, self.tables.as_ref(), state.cache.as_ref(), boards).map_err(tablebase_error)?;
+            let gathered = search.tree.gather(&limits, &self.settings, self.tables.as_ref(), state.cache.as_ref(), boards);
             if gathered > 0 {
                 round_leaves.push((search.id, gathered));
             }
@@ -693,19 +687,25 @@ impl Searches {
         let (settings, tables) = (&self.settings, self.tables.as_ref());
         match kept.tree.ready()? {
             Kept::Searched(mut tree) => {
-                let (line, _) = line_to(&tree, since)?;
+                let Some((line, _)) = line_to(&tree, since) else {
+                    drop_later(tree);
+                    return None;
+                };
                 if !line.is_empty() {
                     tree.play_line(&line);
-                    tree.drop_stale_leaves(settings, tables).ok()?;
+                    tree.drop_stale_leaves(settings, tables);
                 }
                 Some(tree)
             }
             Kept::Advanced(mut tree, candidates) => {
-                let (line, places) = line_to(&tree, since)?;
+                let Some((line, places)) = line_to(&tree, since) else {
+                    drop_later(tree);
+                    return None;
+                };
                 tree.move_root(&line);
                 match candidates {
-                    Some(candidates) => tree.drop_stale_candidates(&places, &candidates, settings, tables).ok()?,
-                    None => tree.drop_stale_leaves(settings, tables).ok()?,
+                    Some(candidates) => tree.drop_stale_candidates(&places, &candidates, settings, tables),
+                    None => tree.drop_stale_leaves(settings, tables),
                 }
                 Some(tree)
             }
@@ -971,7 +971,10 @@ impl Searches {
                 return Ok(false);
             }
             let Some(Kept::Searched(mut tree) | Kept::Advanced(mut tree, _)) = kept.tree.ready() else { return Ok(false) };
-            let Some((line, _)) = line_to(&tree, &moves[kept.moves.len()..]) else { return Ok(false) };
+            let Some((line, _)) = line_to(&tree, &moves[kept.moves.len()..]) else {
+                drop_later(tree);
+                return Ok(false);
+            };
             tree.move_root(&line);
             let (stops, threads) = (Arc::new(Stops::default()), self.advance_threads);
             let thread_stops = stops.clone();

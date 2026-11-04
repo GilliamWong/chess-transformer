@@ -3,7 +3,6 @@ use crate::rules::{MoveIds, PackedMove, Tables, encode_board, game_result, posit
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Gamma};
 use shakmaty::{Chess, Color, Move, MoveList, Position};
-use shakmaty_syzygy::SyzygyError;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::MaybeUninit;
@@ -795,7 +794,7 @@ impl Tree {
         tables: Option<&Tables>,
         cache: Option<&Cache>,
         boards: &mut Vec<u8>,
-    ) -> Result<u32, SyzygyError> {
+    ) -> u32 {
         let (mut simulations, mut gathered) = (0, 0);
         let mut collisions: Vec<Vec<usize>> = Vec::new();
         let mut path = Vec::new();
@@ -882,7 +881,7 @@ impl Tree {
             let game_over = if node == self.root {
                 None
             } else {
-                game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables)?
+                game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables)
             };
             //a repeat inside the search is a draw, but not a proven one: the game need not repeat (as in lc0)
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
@@ -936,7 +935,7 @@ impl Tree {
                 self.nodes[node].in_flight -= 1;
             }
         }
-        Ok(gathered)
+        gathered
     }
 
     //mcts.finish for the round's oldest waiting leaf; answer is the move logits, then the expected score. The cache keeps it, sharpened
@@ -1077,17 +1076,16 @@ impl Tree {
     //from the old root comes out of the tree, its visits taken off its ancestors, as lc0 drops a two-fold draw whose first position is no
     //longer in the search, or a tables' result the new root would not probe. Leaves below a proven node stay: no descent reaches them.
     //With transpositions nothing is taken out: that would miscount a node other paths share
-    pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) -> Result<(), SyzygyError> {
+    pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) {
         if self.graph.is_some() {
-            return Ok(());
+            return;
         }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut stale = Vec::new();
-        self.find_stale_leaves(&mut vec![self.root], &mut Vec::new(), settings, tables, root_covered, &mut stale)?;
+        self.find_stale_leaves(&mut vec![self.root], &mut Vec::new(), settings, tables, root_covered, &mut stale);
         for path in stale {
             self.take_out(&path);
         }
-        Ok(())
     }
 
     //the paths to the stale leaves under the path's last node, which the line's moves (edges) reach from the root; self.keys has its keys
@@ -1099,14 +1097,14 @@ impl Tree {
         tables: Option<&Tables>,
         root_covered: bool,
         stale: &mut Vec<Vec<usize>>,
-    ) -> Result<(), SyzygyError> {
+    ) {
         let node = *path.last().expect("the root at least");
         let edges = self.nodes[node].edges();
         if edges.is_empty() {
-            if node != self.root && self.nodes[node].visit_count > 0 && self.is_stale(path, line, settings, tables, root_covered)? {
+            if node != self.root && self.nodes[node].visit_count > 0 && self.is_stale(path, line, settings, tables, root_covered) {
                 stale.push(path.clone());
             }
-            return Ok(());
+            return;
         }
         let children: Vec<(usize, u32)> = self.linked(node).map(|(place, link)| (place, self.link_child(link))).collect();
         for (place, child) in children {
@@ -1116,34 +1114,25 @@ impl Tree {
             path.push(child as usize);
             line.push(edges.start + place);
             self.keys.push(self.node_keys[child as usize]);
-            let found = self.find_stale_leaves(path, line, settings, tables, root_covered, stale);
+            self.find_stale_leaves(path, line, settings, tables, root_covered, stale);
             self.keys.pop();
             line.pop();
             path.pop();
-            found?;
         }
-        Ok(())
     }
 
     //whether the leaf at the end of path, which the line's moves (edges) reach from the root, is no longer what gather scored it as;
     //self.keys ends with the path's keys
-    fn is_stale(
-        &self,
-        path: &[usize],
-        line: &[usize],
-        settings: &SearchSettings,
-        tables: Option<&Tables>,
-        root_covered: bool,
-    ) -> Result<bool, SyzygyError> {
+    fn is_stale(&self, path: &[usize], line: &[usize], settings: &SearchSettings, tables: Option<&Tables>, root_covered: bool) -> bool {
         let mut board = self.board.clone();
         for &edge in line {
             board.play_unchecked(self.moves[edge].to_move(&board));
         }
         let legal_moves = board.legal_moves();
         let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
-        let over = game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables)?;
+        let over = game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables);
         let (&leaf_key, path_keys) = self.keys[self.keys.len() - path.len()..].split_last().expect("the leaf's key");
-        Ok(over.is_none() && !path_keys.contains(&leaf_key))
+        over.is_none() && !path_keys.contains(&leaf_key)
     }
 
     //the leaves drop_stale_leaves may find stale once the root has moved further down, found before the moves are known (Searches'
@@ -1240,9 +1229,9 @@ impl Tree {
         candidates: &[Vec<u16>],
         settings: &SearchSettings,
         tables: Option<&Tables>,
-    ) -> Result<(), SyzygyError> {
+    ) {
         if self.graph.is_some() {
-            return Ok(());
+            return;
         }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let root_keys = self.keys.len();
@@ -1265,7 +1254,7 @@ impl Tree {
                 self.keys.extend(path[1..].iter().map(|&node| self.node_keys[node]));
                 let found = self.is_stale(&path, &edges, settings, tables, root_covered);
                 self.keys.truncate(root_keys);
-                if found? {
+                if found {
                     stale.push(path);
                 }
             }
@@ -1273,7 +1262,6 @@ impl Tree {
         for path in stale {
             self.take_out(&path);
         }
-        Ok(())
     }
 
     //takes a leaf's visits out of the tree: a visit's score s went to the leaf, 1 - s to its parent and so on up

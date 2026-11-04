@@ -31,18 +31,17 @@ impl SharedTree {
     }
 
     //takes out the leaves scored by a rule that held only from the old root (Tree::drop_stale_leaves); nothing with transpositions
-    pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) -> Result<(), SyzygyError> {
+    pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) {
         if self.graph.is_some() {
-            return Ok(());
+            return;
         }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut stale = Vec::new();
         let mut keys = self.keys.clone();
-        self.find_stale_leaves(&mut vec![self.root], &mut Vec::new(), &mut keys, settings, tables, root_covered, &mut stale)?;
+        self.find_stale_leaves(&mut vec![self.root], &mut Vec::new(), &mut keys, settings, tables, root_covered, &mut stale);
         for path in stale {
             self.take_out(&path);
         }
-        Ok(())
     }
 
     //pushes the paths of the stale leaves below the path's last node; line is the path's edges from the root, keys end with its keys
@@ -56,14 +55,14 @@ impl SharedTree {
         tables: Option<&Tables>,
         root_covered: bool,
         stale: &mut Vec<Vec<usize>>,
-    ) -> Result<(), SyzygyError> {
+    ) {
         let node = *path.last().expect("the root at least");
         let edges = self.nodes.get(node).edges();
         if edges.is_empty() {
-            if node != self.root && self.nodes.get(node).visits() > 0 && self.is_stale(path, line, keys, settings, tables, root_covered)? {
+            if node != self.root && self.nodes.get(node).visits() > 0 && self.is_stale(path, line, keys, settings, tables, root_covered) {
                 stale.push(path.clone());
             }
-            return Ok(());
+            return;
         }
         for (place, link) in self.links.linked(self.nodes.get(node)) {
             let child = self.links.child(link) as usize;
@@ -73,12 +72,11 @@ impl SharedTree {
             path.push(child);
             line.push(edges.start + place);
             keys.push(self.nodes.get(child).key());
-            self.find_stale_leaves(path, line, keys, settings, tables, root_covered, stale)?;
+            self.find_stale_leaves(path, line, keys, settings, tables, root_covered, stale);
             keys.pop();
             line.pop();
             path.pop();
         }
-        Ok(())
     }
 
     //whether the path's leaf is no longer what gather scored; line and keys as in find_stale_leaves
@@ -90,16 +88,16 @@ impl SharedTree {
         settings: &SearchSettings,
         tables: Option<&Tables>,
         root_covered: bool,
-    ) -> Result<bool, SyzygyError> {
+    ) -> bool {
         let mut board = self.board.clone();
         for &edge in line {
             board.play_unchecked(self.edges.chess_move(edge).to_move(&board));
         }
         let legal_moves = board.legal_moves();
         let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
-        let over = game_result(&board, keys, &legal_moves, settings.draw, node_tables)?;
+        let over = game_result(&board, keys, &legal_moves, settings.draw, node_tables);
         let (&leaf_key, path_keys) = keys[keys.len() - path.len()..].split_last().expect("the leaf's key");
-        Ok(over.is_none() && !path_keys.contains(&leaf_key))
+        over.is_none() && !path_keys.contains(&leaf_key)
     }
 
     //the leaves drop_stale_leaves may find stale once the root has moved further down: those with visits, no moves and no proof,
@@ -195,9 +193,9 @@ impl SharedTree {
         candidates: &[Vec<u16>],
         settings: &SearchSettings,
         tables: Option<&Tables>,
-    ) -> Result<(), SyzygyError> {
+    ) {
         if self.graph.is_some() {
-            return Ok(());
+            return;
         }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut keys = self.keys.clone();
@@ -221,7 +219,7 @@ impl SharedTree {
                 keys.extend(path[1..].iter().map(|&node| self.nodes.get(node).key()));
                 let found = self.is_stale(&path, &edges, &keys, settings, tables, root_covered);
                 keys.truncate(root_keys);
-                if found? {
+                if found {
                     stale.push(path);
                 }
             }
@@ -229,7 +227,6 @@ impl SharedTree {
         for path in stale {
             self.take_out(&path);
         }
-        Ok(())
     }
 
     //a visit's score s went to the leaf, 1 - s to its parent and so on up

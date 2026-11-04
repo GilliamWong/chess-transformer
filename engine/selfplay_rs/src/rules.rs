@@ -4,6 +4,7 @@ use shakmaty::{CastlingSide, Chess, Color, EnPassantMode, File, Move, MoveList, 
 use shakmaty_syzygy::filesystem::MmapFilesystem;
 use shakmaty_syzygy::{SyzygyError, Tablebase, Wdl};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const TOKENS_PER_BOARD: usize = 70;
 //encoding.py's token offsets
@@ -214,6 +215,7 @@ fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
 pub struct Tables {
     tablebase: Tablebase<Chess>,
     pieces: usize,
+    failures: AtomicUsize,
 }
 
 impl Tables {
@@ -224,7 +226,7 @@ impl Tables {
         for folder in std::env::split_paths(folders) {
             tablebase.add_directory(folder)?;
         }
-        Ok(Tables { tablebase, pieces })
+        Ok(Tables { tablebase, pieces, failures: AtomicUsize::new(0) })
     }
 
     pub fn covers(&self, board: &Chess) -> bool {
@@ -239,28 +241,34 @@ impl Tables {
             _ => draw,
         })
     }
+
+    //score for a search: after a failed probe (a table missing or unreadable) none, so that the network scores the position, as
+    //lc0 does. The first failure is said
+    fn search_score(&self, board: &Chess, draw: f64) -> Option<f64> {
+        self.score(board, draw)
+            .inspect_err(|error| {
+                if self.failures.fetch_add(1, Ordering::Relaxed) == 0 {
+                    eprintln!("syzygy tables: {error}; the positions they fail on are searched without them");
+                }
+            })
+            .ok()
+    }
+
+    #[cfg(test)]
+    pub fn failures(&self) -> usize {
+        self.failures.load(Ordering::Relaxed)
+    }
 }
 
-//mcts.game_result; keys end with the board's own
-pub fn game_result(
-    board: &Chess,
-    keys: &[u64],
-    legal_moves: &MoveList,
-    draw: f64,
-    tables: Option<&Tables>,
-) -> Result<Option<f64>, SyzygyError> {
+//mcts.game_result; keys end with the board's own. A position the tables cannot score is not a result: the network scores it
+pub fn game_result(board: &Chess, keys: &[u64], legal_moves: &MoveList, draw: f64, tables: Option<&Tables>) -> Option<f64> {
     if legal_moves.is_empty() {
-        return Ok(Some(if board.is_check() { 0.0 } else { draw }));
+        return Some(if board.is_check() { 0.0 } else { draw });
     }
     if board.is_insufficient_material() || board.halfmoves() >= 100 || repetitions(keys, board.halfmoves()) >= THREEFOLD {
-        return Ok(Some(draw));
+        return Some(draw);
     }
-    if let Some(tables) = tables
-        && tables.covers(board)
-    {
-        return Ok(Some(tables.score(board, draw)?));
-    }
-    Ok(None)
+    tables.filter(|tables| tables.covers(board)).and_then(|tables| tables.search_score(board, draw))
 }
 
 //reference_selfplay.final_result (outcome(claim_draw=True), the tablebase, max_plies); keys end with the board's own

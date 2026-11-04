@@ -65,7 +65,7 @@ fn run_rounds(
             let id = next_round.fetch_add(1, Ordering::Relaxed);
             let round = Round { id, leaves, simulations: 3 * leaves, collisions: leaves, visit_limit: simulations, memory_limit };
             let mut boards = Vec::new();
-            let queued = tree.gather(&round, settings, tables, Some(&network.cache), &mut boards).expect("the tables");
+            let queued = tree.gather(&round, settings, tables, Some(&network.cache), &mut boards);
             assert_eq!(boards.len(), queued.len() * TOKENS_PER_BOARD);
             tree.queue(id, queued);
             gathered.push(boards.clone());
@@ -113,11 +113,37 @@ fn gather_with<'a>(
     settings: &'a SearchSettings,
     tables: Option<&'a Tables>,
 ) -> impl FnMut(&mut Tree, &Round, &Cache, &mut Vec<u8>) -> u32 + 'a {
-    move |tree, round, cache, boards| tree.gather(round, settings, tables, Some(cache), boards).expect("the tables")
+    move |tree, round, cache, boards| tree.gather(round, settings, tables, Some(cache), boards)
 }
 
 fn proven_nodes(tree: &Tree) -> usize {
     tree.nodes.iter().filter(|node| node.proof.is_some()).count()
+}
+
+//the same, in a shared tree: no leaf stays waiting for the probe that failed, and the numbers are the search without tables'
+#[test]
+fn a_shared_search_with_tables_that_fail_is_the_search_without_tables() {
+    let (tables, settings) = (failing_tables(), settings(true));
+    for in_flight in [1, 3] {
+        let (with, without) = (shared_tree_after(QUEEN_AND_PAWN, &[]), shared_tree_after(QUEEN_AND_PAWN, &[]));
+        let rounds_with = shared_in_flight(&with, 3_000, in_flight, &settings, Some(&tables), &SharedNetwork::new(), usize::MAX);
+        let rounds_without = shared_in_flight(&without, 3_000, in_flight, &settings, None, &SharedNetwork::new(), usize::MAX);
+        assert_eq!(rounds_with, rounds_without);
+        assert_eq!((with.pending(), with.root().visits()), (0, without.root().visits()));
+        assert_eq!(with.principal_variation(), without.principal_variation());
+    }
+    assert!(tables.failures() > 0, "no probe failed");
+    let (mut with, mut without) = (shared_tree_after(QUEEN_AND_PAWN, &[]), shared_tree_after(QUEEN_AND_PAWN, &[]));
+    shared_in_flight(&with, 1_000, 1, &settings, Some(&tables), &SharedNetwork::new(), usize::MAX);
+    shared_in_flight(&without, 1_000, 1, &settings, None, &SharedNetwork::new(), usize::MAX);
+    let line = [best_edge(&with).expect("a move")];
+    for (tree, tables) in [(&mut with, Some(&tables)), (&mut without, None)] {
+        tree.move_root(&line);
+        tree.drop_stale_leaves(&settings, tables);
+        tree.drain();
+    }
+    assert_eq!(with.root().visits(), without.root().visits());
+    assert_eq!(with.allocated_bytes(), without.allocated_bytes());
 }
 
 #[test]
@@ -170,7 +196,7 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, settin
         let over = if id == tree.root_index() {
             None
         } else {
-            game_result(board, keys, &legal_moves, settings.draw, None).expect("no tables")
+            game_result(board, keys, &legal_moves, settings.draw, None)
         };
         let (&leaf_key, path_keys) = keys[tree.keys.len() - 1..].split_last().expect("the root's key");
         let value = over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
@@ -386,8 +412,8 @@ fn shared_advanced(
     advanced.move_root(&rest);
     assert!(advanced.root().proof().is_none(), "a root is never proven");
     match candidates {
-        Some(candidates) => advanced.drop_stale_candidates(&places[1..], &candidates, settings, tables).expect("the tables"),
-        None => advanced.drop_stale_leaves(settings, tables).expect("the tables"),
+        Some(candidates) => advanced.drop_stale_candidates(&places[1..], &candidates, settings, tables),
+        None => advanced.drop_stale_leaves(settings, tables),
     }
     advanced.drain();
     advanced
@@ -435,7 +461,7 @@ fn moving_the_root_then_draining_leaves_the_tree_a_compacted_one_is() {
 
             let mut at_once = SharedTree::from_tree(&shared.to_tree());
             at_once.move_root(&edges_of(&at_once, &line_moves));
-            at_once.drop_stale_leaves(&settings, tables).expect("the tables");
+            at_once.drop_stale_leaves(&settings, tables);
             assert_moved_as_compacted(&old, at_once);
             for (threads, walk_stopped) in [(1, false), (1, true), (4, false), (4, true)] {
                 let advanced = shared_advanced(&shared, &line_moves, threads, walk_stopped, &settings, tables);
@@ -465,14 +491,14 @@ fn moving_the_root_of_a_tree_with_transpositions_then_draining_leaves_the_tree_a
             let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
             let mut old = copied(&tree);
             old.play_line(&line);
-            old.drop_stale_leaves(&settings, tables).expect("the tables");
+            old.drop_stale_leaves(&settings, tables);
 
             //a graph is not copied by from_tree: the search is made again, as the tree's was
             let mut shared = graph_shared_tree_after(fen, moves);
             shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
             assert_same_trees(&tree, &shared.to_tree());
             shared.move_root(&edges_of(&shared, &line_moves));
-            shared.drop_stale_leaves(&settings, tables).expect("the tables");
+            shared.drop_stale_leaves(&settings, tables);
             assert_moved_as_compacted(&old, shared);
             lines += 1;
         }
@@ -493,7 +519,7 @@ fn proven_nodes_hide_stale_leaves_from_a_shared_trees_advance_as_from_the_walk()
             let mut moved = copied(&tree);
             moved.move_root(&line);
             let mut stale = Vec::new();
-            moved.find_stale_leaves(&mut vec![moved.root], &mut Vec::new(), &settings, None, false, &mut stale).expect("no tables");
+            moved.find_stale_leaves(&mut vec![moved.root], &mut Vec::new(), &settings, None, false, &mut stale);
             stale.into_iter().find(|path| path.len() >= 3).map(|path| (line, path))
         })
         .expect("a stale leaf two nodes below a reusable line");
@@ -504,7 +530,7 @@ fn proven_nodes_hide_stale_leaves_from_a_shared_trees_advance_as_from_the_walk()
         proved.nodes[proven].proof = Some(draw);
         let mut walked = copied(&proved);
         walked.play_line(&line);
-        walked.drop_stale_leaves(&settings, None).expect("no tables");
+        walked.drop_stale_leaves(&settings, None);
         let advanced = shared_advanced(&SharedTree::from_tree(&proved), &line_moves, 4, false, &settings, None);
         assert_same_trees(&walked, &advanced.to_reachable_tree());
     }
@@ -517,7 +543,7 @@ fn a_closed_tree_gathers_nothing() {
     shared_in_flight(&tree, 200, 1, &settings, None, &network, usize::MAX);
     let round = Round { id: 0, leaves: 8, simulations: 24, collisions: 8, visit_limit: u32::MAX, memory_limit: usize::MAX };
     let gathered =
-        |tree: &SharedTree| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables").len();
+        |tree: &SharedTree| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).len();
     assert!(gathered(&tree) > 0);
     tree.close();
     assert_eq!(gathered(&tree), 0);
@@ -579,7 +605,7 @@ fn a_call_takes_no_leaf_once_its_search_has_ended() {
         shared_in_flight(&tree, 20_000, 2, &settings, None, &network, usize::MAX);
         let (gathered, at_close) = std::thread::scope(|scope| {
             let gathering =
-                scope.spawn(|| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables").len());
+                scope.spawn(|| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).len());
             std::thread::sleep(Duration::from_millis(5));
             let at_close = tree.quiet(|| {
                 tree.close();
@@ -605,7 +631,7 @@ fn a_thread_that_wants_the_tree_to_itself_waits_for_a_descent_not_a_call() {
         let (call, wait) = std::thread::scope(|scope| {
             let gathering = scope.spawn(|| {
                 let started = Instant::now();
-                tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).expect("no tables");
+                tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new());
                 started.elapsed()
             });
             std::thread::sleep(Duration::from_millis(5));
@@ -747,7 +773,7 @@ fn reusing_a_tree_with_transpositions_keeps_it_whole() {
             let (visits, value_sum) = (tree.nodes[new_root].visit_count, tree.nodes[new_root].value_sum);
             let mut at_once = copied(&tree);
             at_once.play_line(&line);
-            at_once.drop_stale_leaves(&settings, tables).expect("the tables");
+            at_once.drop_stale_leaves(&settings, tables);
             check_graph(&at_once);
             assert_eq!((at_once.root().visit_count, at_once.root().value_sum.to_bits()), (visits, value_sum.to_bits()));
             assert_eq!(at_once.nodes.len(), reachable(&tree, new_root), "a node copied twice or one left out");
@@ -760,7 +786,7 @@ fn reusing_a_tree_with_transpositions_keeps_it_whole() {
             advanced.compact(4, Some(&never));
             let rest = line_after(&advanced, &line_moves[1..]);
             advanced.move_root(&rest);
-            advanced.drop_stale_candidates(&[], &candidates, &settings, tables).expect("the tables");
+            advanced.drop_stale_candidates(&[], &candidates, &settings, tables);
             advanced.compact(1, None);
             assert_same_trees(&at_once, &advanced);
             lines += 1;
@@ -809,14 +835,14 @@ fn continuing_a_reused_tree_searches_as_a_compacted_one_does() {
                 let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
                 let mut old = copied(&tree);
                 old.play_line(&line);
-                old.drop_stale_leaves(&settings, tables).expect("the tables");
+                old.drop_stale_leaves(&settings, tables);
                 search(&mut old, simulations + 3_000, usize::MAX, &settings, tables, &mut Network::new());
                 old.compact(1, None);
 
                 let mut shared = shared_tree_after(fen, moves).with_transpositions(transpositions);
                 shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
                 shared.move_root(&edges_of(&shared, &line_moves));
-                shared.drop_stale_leaves(&settings, tables).expect("the tables");
+                shared.drop_stale_leaves(&settings, tables);
                 shared.drain();
                 shared_in_flight(&shared, simulations + 3_000, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
                 assert_same_trees(&old, &shared.to_reachable_tree());
@@ -924,7 +950,7 @@ fn gc_workers_beside_searching_threads_lose_no_live_node() {
                     let Some(edge) = best_edge(&tree) else { break };
                     tree.move_root(&[edge]);
                     //a repeat or a game's end of the old root's game may be neither from the new root's
-                    tree.drop_stale_leaves(&settings, None).expect("no tables");
+                    tree.drop_stale_leaves(&settings, None);
                 }
                 //whatever the sweepers left is freed at the end
                 tree.drain();
@@ -1105,7 +1131,7 @@ fn starting_on_a_reused_300k_node_tree_takes_under_20_ms() {
     tree.reopen();
     assert!(!tree.sprawls(usize::MAX));
     tree.move_root(&[edge]);
-    tree.drop_stale_leaves(&settings, None).expect("no tables");
+    tree.drop_stale_leaves(&settings, None);
     let searching = Arc::new(tree);
     searching.start_sweepers(2);
     let took = started.elapsed();

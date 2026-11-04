@@ -175,6 +175,22 @@ def test_lean_rounds_search_as_whole_rows():
         rounds += 1
     assert rounds > 10 and reports[0][4] == 800
 
+#a table file of the right size with nothing in it: the tables cover the position after the capture and cannot score it
+def test_tables_that_fail_to_probe_are_searched_without_them(tmp_path):
+    (tmp_path / "KQvK.rtbw").write_bytes(bytes(16))
+    board, evaluate = chess.Board("8/8/8/4k3/8/2p5/8/3QK3 w - - 0 1"), cpu_batches(BoardModel()).evaluate_boards
+    for concurrent_descents in (False, True):
+        found = []
+        for settings in (rust_search_settings(True, 3, str(tmp_path)), rust_search_settings(False)):
+            searches = selfplay_rs.Searches(**settings, cache_positions=1000, concurrent_descents=concurrent_descents)
+            searches.start(0, board.fen(), [], 800)
+            reports = []
+            while not reports:
+                boards = leaf_boards(searches.descend(8, 8, 24))
+                reports = searches.finish(evaluate(boards) if len(boards) else np.zeros((0, ANSWER_WIDTH), dtype=np.float32))
+            found.append(reports)
+        assert found[0] == found[1] and found[0][0][4] == 800 and len(searches) == 0
+
 def test_a_failed_search_settles_its_network():
     class Failing(ImmediateBatches):
         settled = 0
@@ -246,6 +262,30 @@ def test_a_cuda_error_in_the_rust_rounds_is_raised():
     search = EngineSearch(network, 16, rust_rounds=True)
     with pytest.raises(RuntimeError, match="cuda error"):
         search.search(chess.Board(), simulations=600)
+
+#a thread that finds the deadline due must not stop a fresh tree before the first leaf of another thread is out
+@gpu
+def test_a_deadline_already_due_on_a_fresh_tree_still_gives_a_move():
+    search = EngineSearch([lean_network(True) for _ in range(4)], 16, rust_rounds=True, concurrent_descents=True)
+    board = chess.Board()
+    for _ in range(1500):
+        search.new_game()
+        report = search.search(board, seconds=0.0)
+        assert report.simulations >= 1 and report.line[0] in board.legal_moves
+
+#the extension of a score that fell is judged on the root's answer: before it, the score is no number
+@gpu
+@pytest.mark.parametrize("concurrent_descents", [False, True])
+def test_an_extension_on_a_fresh_tree_does_not_keep_a_due_search_running(concurrent_descents):
+    search = EngineSearch(lean_network(True), 16, rust_rounds=True, concurrent_descents=concurrent_descents)
+    stop = threading.Event()
+    timer = threading.Timer(4, stop.set)
+    timer.start()
+    try:
+        report = search.search(chess.Board(), seconds=0.0, extension=(0, 0.1), stop=stop)
+    finally:
+        timer.cancel()
+    assert not stop.is_set() and report.simulations >= 1
 
 def current_cpu() -> int:
     if sys.platform == "win32":

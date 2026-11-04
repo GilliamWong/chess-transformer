@@ -863,14 +863,14 @@ impl SharedTree {
         tables: Option<&Tables>,
         cache: Option<&SharedCache>,
         boards: &mut Vec<u8>,
-    ) -> Result<Vec<PendingLeaf>, SyzygyError> {
+    ) -> Vec<PendingLeaf> {
         let mut hold = self.hold();
         let mut call = Call { simulations: 0, collisions: Vec::new(), leaves: Vec::new() };
-        let gathered = self.gather_in(&mut hold, round, settings, tables, cache, boards, &mut call);
+        self.gather_in(&mut hold, round, settings, tables, cache, boards, &mut call);
         for path in &call.collisions {
             self.take_off(path);
         }
-        gathered.map(|()| call.leaves)
+        call.leaves
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -883,7 +883,7 @@ impl SharedTree {
         cache: Option<&SharedCache>,
         boards: &mut Vec<u8>,
         call: &mut Call,
-    ) -> Result<(), SyzygyError> {
+    ) {
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
         let mut keys = self.keys.clone();
         let root_keys = keys.len();
@@ -947,18 +947,7 @@ impl SharedTree {
             let mut moves = board.legal_moves();
             let node_tables = tables.filter(|_| node != self.root && (!root_covered || board.halfmoves() == 0));
             //the root is searched whatever the rules say of it: Searches.start refuses only a mate or stalemate
-            let game_over = if node == self.root {
-                None
-            } else {
-                match game_result(&board, &keys, &moves, settings.draw, node_tables) {
-                    Ok(game_over) => game_over,
-                    Err(error) => {
-                        give_back(false);
-                        self.take_off(&path);
-                        return Err(error);
-                    }
-                }
-            };
+            let game_over = if node == self.root { None } else { game_result(&board, &keys, &moves, settings.draw, node_tables) };
             //a repeat inside the search is a draw, but not a proven one: the game need not repeat
             let (&leaf_key, path_keys) = keys[root_keys - 1..].split_last().expect("the root's key");
             //with transpositions a leaf is no repeat inside the search (Tree::gather's)
@@ -1019,7 +1008,6 @@ impl SharedTree {
                 }
             }
         }
-        Ok(())
     }
 
     //`answer` gives the move logits, then the expected score; the cache keeps it sharpened. The caller holds a share of the

@@ -29,13 +29,17 @@ impl SharedSearch {
         })
     }
 
-    //the root's score for its side to move while the chosen move has no visit (a one-simulation search)
+    //the root's score for its side to move while the chosen move has no visit (a one-simulation search), a half while the root
+    //has none. A mean read beside backups may be off by their values, so it is kept a score
     fn score(&self, best: Option<usize>) -> f64 {
         let tree = &self.tree;
-        match best.and_then(|edge| tree.child(tree.root(), edge)) {
+        let root_visits = tree.root().visits();
+        let score = match best.and_then(|edge| tree.child(tree.root(), edge)) {
             Some(chosen) if chosen.visits() > 0 => chosen.mean_score(chosen.visits()),
-            _ => 1.0 - tree.root().mean_score(tree.root().visits()),
-        }
+            _ if root_visits > 0 => 1.0 - tree.root().mean_score(root_visits),
+            _ => 0.5,
+        };
+        score.clamp(0.0, 1.0)
     }
 
     fn root_score(&self) -> f64 {
@@ -124,8 +128,7 @@ impl Searches {
                 visit_limit,
                 memory_limit: self.memory_limit,
             };
-            let queued =
-                tree.gather(&limits, &self.settings, self.tables.as_ref(), self.shared_cache.as_ref(), boards).map_err(tablebase_error)?;
+            let queued = tree.gather(&limits, &self.settings, self.tables.as_ref(), self.shared_cache.as_ref(), boards);
             if !queued.is_empty() {
                 round_leaves.push((id, queued.len() as u32));
             }
@@ -308,14 +311,10 @@ impl Searches {
             return None;
         };
         tree.move_root(&line);
-        let dropped = match candidates {
-            None if line.is_empty() => Ok(()),
+        match candidates {
+            None if line.is_empty() => {}
             Some(Some(candidates)) => tree.drop_stale_candidates(&places, &candidates, settings, tables),
             _ => tree.drop_stale_leaves(settings, tables),
-        };
-        if dropped.is_err() {
-            drop_later(tree);
-            return None;
         }
         if self.gc_threads == 0 {
             tree.drain();
@@ -376,4 +375,51 @@ fn shared_line_to(tree: &SharedTree, moves: &[String]) -> Option<(Vec<usize>, Ve
         places.push((edge - edges.start) as u16);
     }
     (!root.edges().is_empty()).then_some((line, places))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::MOVE_ID_TABLE_LENGTH;
+    use crate::search::{Round, SearchSettings};
+
+    const ANSWER_WIDTH: usize = 1859;
+
+    //a score is between 0 and 1 whatever the search has read: before the root has a visit, and beside backups that count their value
+    //before their visit
+    #[test]
+    fn a_score_is_a_score_whatever_was_read() {
+        let board = Chess::default();
+        let tree = Arc::new(SharedTree::new(board.clone(), vec![position_key(&board)]));
+        let search = SharedSearch { id: 0, fen: String::new(), moves: Vec::new(), simulations: 100, stopped: false, tree: tree.clone() };
+        assert_eq!((search.root_score(), search.score(None)), (0.5, 0.5));
+
+        let settings = SearchSettings {
+            c_puct: 0.9,
+            c_puct_factor: 1.9,
+            c_puct_base: 38739.0,
+            fpu_reduction: 0.16,
+            draw: 0.5,
+            value_sharpness: 1.0,
+            certainty: false,
+            transpositions: false,
+        };
+        let move_ids = MoveIds::new((0..MOVE_ID_TABLE_LENGTH).map(|index| (index % (ANSWER_WIDTH - 1)) as i16).collect());
+        for id in 0..2 {
+            let round = Round { id, leaves: 4, simulations: 4, collisions: 0, visit_limit: 100, memory_limit: usize::MAX };
+            let queued = tree.gather(&round, &settings, None, None, &mut Vec::new());
+            tree.queue(id, queued);
+            let _hold = tree.hold();
+            for leaf in tree.take_round(id) {
+                tree.finish_leaf(leaf, |_| 0.25, ANSWER_WIDTH, &move_ids, None, &settings, usize::MAX, &mut Vec::new());
+            }
+        }
+        let edge = tree.principal_variation()[0];
+        let chosen = tree.child(tree.root(), edge).expect("the most visited move has a node");
+        assert!(chosen.visits() > 0);
+        chosen.set_counts(2, 0, 3.0);
+        assert_eq!(search.score(Some(edge)), 1.0);
+        chosen.set_counts(2, 0, -1.0);
+        assert_eq!(search.score(Some(edge)), 0.0);
+    }
 }

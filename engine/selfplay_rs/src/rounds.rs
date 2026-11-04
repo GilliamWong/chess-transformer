@@ -336,7 +336,8 @@ impl Rounds<'_> {
                     let round_times = if settings.rounds_at_once { rounds.len().max(1) } else { rounds.len() + 1 } as f64;
                     let told_to_stop = shared.told.load(Ordering::Relaxed);
                     let late = run.deadline.is_some_and(|deadline| shared.now() + round_times * run.round_seconds >= deadline);
-                    if run.gathered && (told_to_stop || late) {
+                    //as lc0, no stop before the root has an answer: a search with no visit and no leaf out cannot be stopped
+                    if run.gathered && run.root.0 > 0 && (told_to_stop || late) {
                         if let Some(extension) = run.extension
                             && !told_to_stop
                         {
@@ -440,7 +441,7 @@ impl Rounds<'_> {
                 while run.progress.len() > settings.speed_rounds {
                     run.progress.pop_front();
                 }
-                let decided = f64::from(most - second) > run.simulations_left() / settings.smart_pruning_factor;
+                let decided = visits > 0 && f64::from(most - second) > run.simulations_left() / settings.smart_pruning_factor;
                 let proven = settings.certainty
                     && if self.searches.concurrent_descents {
                         self.searches.shared_tree(settings.game)?.is_some_and(|tree| tree.root_decided())
@@ -460,7 +461,7 @@ impl Rounds<'_> {
                 }
                 if extra > 0.0 {
                     run.deadline = run.deadline.map(|deadline| deadline + extra);
-                } else if run.only_move || decided || proven {
+                } else if visits > 0 && (run.only_move || decided || proven) {
                     let report = self.searches.stop_running(settings.game)?;
                     run.stop(report);
                 }

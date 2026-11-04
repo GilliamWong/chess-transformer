@@ -85,7 +85,7 @@ impl Searcher for Locked {
         let mut boards = Vec::new();
         let mut guard = self.tree.lock().expect("the tree");
         let (tree, cache) = &mut *guard;
-        tree.gather(round, &self.settings, None, Some(cache), &mut boards).expect("no tables");
+        tree.gather(round, &self.settings, None, Some(cache), &mut boards);
         boards
     }
 
@@ -112,7 +112,7 @@ impl Searcher for Concurrent {
 
     fn gather(&self, round: &Round) -> Vec<u8> {
         let mut boards = Vec::new();
-        let queued = self.tree.gather(round, &self.settings, None, Some(&self.cache), &mut boards).expect("no tables");
+        let queued = self.tree.gather(round, &self.settings, None, Some(&self.cache), &mut boards);
         self.tree.queue(round.id, queued);
         boards
     }
@@ -136,7 +136,7 @@ fn base_search(fen: &str, moves: &[String], visits: u32, replay: &Replay, move_i
         if tree.root().visit_count as usize + tree.pending() < visits as usize && waiting.len() < 2 {
             let round = round_of(id, tree.root().visit_count, 0, visits);
             let mut boards = Vec::new();
-            tree.gather(&round, settings, None, Some(&cache), &mut boards).expect("no tables");
+            tree.gather(&round, settings, None, Some(&cache), &mut boards);
             waiting.push_back((id, replay.rows(&boards)));
             id += 1;
             continue;

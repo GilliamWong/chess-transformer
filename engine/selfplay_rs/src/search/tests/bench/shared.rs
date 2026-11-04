@@ -72,7 +72,7 @@ impl Drivers {
                         if let Some((id, answered)) = next_round {
                             let mut boards = Vec::new();
                             let round = self.round(id, tree.root().visits());
-                            tree.queue(id, tree.gather(&round, &self.settings, None, Some(cache), &mut boards).expect("no tables"));
+                            tree.queue(id, tree.gather(&round, &self.settings, None, Some(cache), &mut boards));
                             leaves.fetch_add((boards.len() / TOKENS_PER_BOARD) as u64, Ordering::Relaxed);
                             if boards.is_empty() {
                                 run.0.lock().expect("the run").starved = Some(answered);
@@ -194,7 +194,7 @@ fn bench_shared_reuse() {
         let first_round = {
             let mut boards = Vec::new();
             let round = Round { leaves: 1, simulations: 3, collisions: 1, ..drivers.round(u64::MAX, searching.root().visits()) };
-            let leaves = searching.gather(&round, &drivers.settings, None, Some(&cache), &mut boards).expect("no tables");
+            let leaves = searching.gather(&round, &drivers.settings, None, Some(&cache), &mut boards);
             //a tree that fills the memory limit by itself has no room for a leaf
             let at = if leaves.is_empty() { f64::NAN } else { began.elapsed().as_secs_f64() };
             searching.queue(u64::MAX, leaves);
@@ -250,7 +250,7 @@ fn move_owned(tree: Arc<SharedTree>, line: &[usize], gc: usize, drivers: &Driver
     let mut tree = Arc::into_inner(tree).expect("the last owner");
     tree.reopen();
     tree.move_root(line);
-    tree.drop_stale_leaves(&drivers.settings, None).expect("no tables");
+    tree.drop_stale_leaves(&drivers.settings, None);
     if gc == 0 {
         tree.drain();
     }

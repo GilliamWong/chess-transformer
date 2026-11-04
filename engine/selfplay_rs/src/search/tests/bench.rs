@@ -117,7 +117,7 @@ fn rounds(
         if more && waiting.len() < in_flight {
             let round = round_of(gathered as u64, tree.root().visit_count, collisions, visits);
             let mut boards = Vec::new();
-            tree.gather(&round, settings, tables, Some(cache), &mut boards).expect("the tables");
+            tree.gather(&round, settings, tables, Some(cache), &mut boards);
             gathered += 1;
             waiting.push_back((round.id, boards.as_chunks::<TOKENS_PER_BOARD>().0.iter().map(|board| stand_in.row(board)).collect()));
             continue;
@@ -193,7 +193,7 @@ fn bench_drivers() {
                             let mut guard = shared.lock().expect("the tree");
                             let (tree, cache) = &mut *guard;
                             let round = round_of(id, tree.root().visit_count, collisions, u32::MAX);
-                            tree.gather(&round, settings, None, Some(cache), &mut boards).expect("no tables");
+                            tree.gather(&round, settings, None, Some(cache), &mut boards);
                             drop(guard);
                             leaves.fetch_add((boards.len() / TOKENS_PER_BOARD) as u64, Ordering::Relaxed);
                             if boards.is_empty() {

@@ -80,7 +80,7 @@ fn search(
     while tree.root().visit_count < simulations && !(tree.full && tree.pending() == 0) {
         let round = new_round(tree, 0, simulations, memory_limit);
         boards.clear();
-        tree.gather(&round, settings, tables, Some(&network.cache), &mut boards).expect("the tables");
+        tree.gather(&round, settings, tables, Some(&network.cache), &mut boards);
         finish_leaves(tree, round.id, &boards, settings, network);
     }
 }
@@ -132,8 +132,7 @@ fn stale_leaves_by_positions(
         if node != 0 && tree.nodes[node].visit_count > 0 {
             let legal_moves = board.legal_moves();
             let node_tables = tables.filter(|_| !root_covered || board.halfmoves() == 0);
-            let over = game_result(board, &tree.keys, &legal_moves, settings.draw, node_tables)
-                .expect("the tables");
+            let over = game_result(board, &tree.keys, &legal_moves, settings.draw, node_tables);
             let (&leaf_key, path_keys) = tree.keys[tree.keys.len() - path.len()..].split_last().expect("the leaf's key");
             if over.is_none() && !path_keys.contains(&leaf_key) {
                 stale.push(path.clone());
@@ -272,8 +271,8 @@ fn advanced(
     assert!(advanced.nodes[advanced.root].proof.is_none(), "a root is never proven");
     let found = candidates.is_some();
     match candidates {
-        Some(candidates) => advanced.drop_stale_candidates(&places[1..], &candidates, settings, tables).expect("the tables"),
-        None => advanced.drop_stale_leaves(settings, tables).expect("the tables"),
+        Some(candidates) => advanced.drop_stale_candidates(&places[1..], &candidates, settings, tables),
+        None => advanced.drop_stale_leaves(settings, tables),
     }
     advanced.compact(1, None);
     (advanced, found)
@@ -298,6 +297,18 @@ fn tables() -> Option<Tables> {
     std::path::Path::new(folder).is_dir().then(|| Tables::open(folder, 5).expect("the tables"))
 }
 
+//tables that fail every probe: KQvK is a file of the right size with nothing in it, and any other table is missing
+fn failing_tables() -> Tables {
+    static FOLDER: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let folder = FOLDER.get_or_init(|| {
+        let folder = std::env::temp_dir().join("selfplay_rs_failing_tables");
+        std::fs::create_dir_all(&folder).expect("a folder");
+        std::fs::write(folder.join("KQvK.rtbw"), [0u8; 16]).expect("a table file");
+        folder
+    });
+    Tables::open(folder.to_str().expect("a path"), 3).expect("the folder's tables")
+}
+
 const START: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 const OPENING: &[&str] = &["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6", "c1g5", "f8e7", "e2e3", "e8g8", "g1f3", "b8d7"];
 //rooks and locked pawns repeat positions (draws that go stale), the mate in two is proven, the tables score the captures
@@ -305,6 +316,8 @@ const ROOKS: &str = "8/8/4k3/8/8/4K3/R7/7r w - - 0 1";
 const LOCKED_PAWNS: &str = "4k3/8/8/1p1p1p1p/1P1P1P1P/8/8/4K3 w - - 0 1";
 const MATE_IN_TWO: &str = "k7/8/2K5/8/8/8/8/7R w - - 0 1";
 const PAWNS_AND_ROOKS: &str = "8/8/4k3/3p4/3P4/4K3/R7/7r w - - 0 1";
+//the queen takes the pawn into a king and queen ending, which three man tables cover
+const QUEEN_AND_PAWN: &str = "8/8/8/4k3/8/2p5/8/3QK3 w - - 0 1";
 
 fn cases(tables: &Option<Tables>) -> Vec<(&'static str, &'static [&'static str], u32, bool, Option<&Tables>)> {
     let mut cases = vec![
@@ -379,7 +392,7 @@ fn a_line_played_at_once_leaves_the_tree_its_moves_played_one_at_a_time_leave() 
             stale += reused_move_by_move(&mut old, &line_moves, &settings, tables);
             let mut new = copied(&tree);
             new.play_line(&line);
-            new.drop_stale_leaves(&settings, tables).expect("the tables");
+            new.drop_stale_leaves(&settings, tables);
             assert_same_trees(&old, &new);
             for (threads, stopped) in [(1, None), (1, Some("copy")), (1, Some("walk")), (4, None), (4, Some("copy")), (4, Some("walk"))] {
                 let (advanced, found) = advanced(&tree, &line, threads, stopped, &settings, tables);
@@ -418,7 +431,7 @@ fn proven_nodes_hide_stale_leaves_from_advance_as_from_the_walk() {
             let mut moved = copied(&tree);
             moved.move_root(&line);
             let mut stale = Vec::new();
-            moved.find_stale_leaves(&mut vec![moved.root], &mut Vec::new(), &settings, None, false, &mut stale).expect("no tables");
+            moved.find_stale_leaves(&mut vec![moved.root], &mut Vec::new(), &settings, None, false, &mut stale);
             stale.into_iter().find(|path| path.len() >= 3).map(|path| (line, path))
         })
         .expect("a stale leaf two nodes below a reusable line");
@@ -428,7 +441,7 @@ fn proven_nodes_hide_stale_leaves_from_advance_as_from_the_walk() {
         proved.nodes[proven].proof = Some(draw);
         let mut walked = copied(&proved);
         walked.play_line(&line);
-        walked.drop_stale_leaves(&settings, None).expect("no tables");
+        walked.drop_stale_leaves(&settings, None);
         let (advanced, _) = advanced(&proved, &line, 4, None, &settings, None);
         assert_same_trees(&walked, &advanced);
     }
@@ -459,6 +472,25 @@ fn the_cache_keeps_two_generations_and_turns_one_over_at_once() {
     assert_eq!(found(3 * generation), Some((priors(7), 7.0)));
     assert_eq!(found(2 * generation - 1), None);
     assert!(slowest_turnover.as_millis() < 20, "a turnover took {slowest_turnover:?}");
+}
+
+//a probe that fails is no result: the network scores the position, as if there were no tables, and the stale check agrees with it
+#[test]
+fn a_search_with_tables_that_fail_is_the_search_without_tables() {
+    let (tables, settings) = (failing_tables(), settings(true));
+    let (mut with, mut without) = (tree_after(QUEEN_AND_PAWN, &[]), tree_after(QUEEN_AND_PAWN, &[]));
+    search(&mut with, 3_000, usize::MAX, &settings, Some(&tables), &mut Network::new());
+    search(&mut without, 3_000, usize::MAX, &settings, None, &mut Network::new());
+    assert!(tables.failures() > 0, "no probe failed");
+    assert_same_trees(&with, &without);
+    assert_eq!(with.pending(), 0);
+
+    let line = [with.principal_variation()[0]];
+    for (tree, tables) in [(&mut with, Some(&tables)), (&mut without, None)] {
+        tree.play_line(&line);
+        tree.drop_stale_leaves(&settings, tables);
+    }
+    assert_same_trees(&with, &without);
 }
 
 #[test]
