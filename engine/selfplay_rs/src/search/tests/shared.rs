@@ -825,10 +825,153 @@ fn one_thread_with_transpositions_searches_as_tree_does() {
     assert!(shared > 0, "no node shared by two moves");
 }
 
+const FIRST_LINE: [&str; 3] = ["a2a3", "a7a6", "h2h3"];
+const SECOND_LINE: [&str; 3] = ["h2h3", "a7a6", "a2a3"];
+
+//the nodes (the root first) and the links of the line's moves, made as needed; a node it makes moves for favours the `favoured` move
+fn graph_line(tree: &mut Tree, line: &[&str], favoured: &[&str]) -> (Vec<usize>, Vec<u32>) {
+    let (mut board, mut node) = (tree.board.clone(), tree.root_index());
+    let (mut nodes, mut links) = (vec![node], Vec::new());
+    let uci_move = |board: &Chess, uci: &str| uci.parse::<UciMove>().expect("a uci move").to_move(board).expect("a legal move");
+    for (&played, &favourite) in line.iter().zip(favoured) {
+        if !tree.nodes[node].has_edges() {
+            let (moves, favourite) = (board.legal_moves(), uci_move(&board, favourite));
+            let priors: Vec<f32> = moves.iter().map(|&chess_move| if chess_move == favourite { 0.97 } else { 0.03 / 20.0 }).collect();
+            tree.expand(node, &moves, &priors);
+        }
+        let played = uci_move(&board, played);
+        let edge = tree.nodes[node].edges().find(|&edge| tree.chess_move(edge).to_move(&board) == played).expect("a move of the node");
+        board.play_unchecked(played);
+        let (child, link) = tree.child_node(node, edge, NO_LINK, &board);
+        node = child;
+        nodes.push(child);
+        links.push(link);
+    }
+    (nodes, links)
+}
+
+//two move orders to one position, whose node is proven by the first line's descent only: the second line's node before it has a winning
+//move to it, and is not proven. Returns the tree and the second line's nodes
+fn proven_after_the_first_of_two_lines() -> (Tree, Vec<usize>) {
+    let mut tree = graph_tree_after(START, &[]);
+    let (second, second_links) = graph_line(&mut tree, &SECOND_LINE, &SECOND_LINE);
+    let (first, first_links) = graph_line(&mut tree, &FIRST_LINE, &FIRST_LINE);
+    assert_eq!(first[3], second[3], "one node for the position");
+    for (nodes, links, extra) in [(&first, &first_links, 0), (&second, &second_links, 1)] {
+        for (depth, (&node, &link)) in nodes[1..].iter().zip(links).enumerate() {
+            let visits = [3, 2, 1][depth] + extra;
+            (tree.nodes[node].visit_count, tree.nodes[node].value_sum) = (visits, f64::from(visits) / 2.0);
+            *tree.link_visits(link) = visits;
+        }
+    }
+    (tree.nodes[0].visit_count, tree.nodes[0].value_sum) = (20, 10.0);
+    tree.prove(&first, Proof { outcome: Outcome::Win, value: 1.0, plies: 0 });
+    tree.propagate_proofs(&first);
+    (tree, second)
+}
+
+fn one_round(visit_limit: u32) -> Round {
+    Round { id: 0, leaves: 1, simulations: 1, collisions: 1, visit_limit, memory_limit: usize::MAX }
+}
+
+#[test]
+fn a_descent_to_a_proven_node_proves_its_other_parents_in_a_graph() {
+    let settings = graph_settings(true);
+    let (mut tree, second) = proven_after_the_first_of_two_lines();
+    let parent = second[2];
+    assert!(tree.nodes[parent].proof.is_none() && tree.proof_from_moves(parent).is_some(), "a parent the proof has not reached");
+    let shared = SharedTree::from_tree(&tree);
+    let visits = tree.nodes[second[3]].visit_count;
+
+    assert_eq!(tree.gather(&one_round(1_000), &settings, None, None, &mut Vec::new()), 0);
+    assert_eq!(tree.nodes[second[3]].visit_count, visits + 1, "the descent reached the proven node");
+    let proof = tree.nodes[parent].proof.expect("the parent proven by the descent");
+    assert_eq!((proof.outcome, proof.value, proof.plies), (Outcome::Loss, 0.0, 1));
+    assert!(tree.nodes[second[1]].proof.is_none(), "a grandparent with moves unproven stays so");
+
+    assert!(shared.gather(&one_round(1_000), &settings, None, None, &mut Vec::new()).is_empty());
+    assert_same_trees(&tree, &shared.to_tree());
+
+    let (mut tree, _) = proven_after_the_first_of_two_lines();
+    tree.gather(&one_round(1_000), &SearchSettings { certainty: false, ..settings }, None, None, &mut Vec::new());
+    assert!(tree.nodes[parent].proof.is_none(), "no proofs without certainty");
+}
+
+//whether the side to move loses by force within `plies` plies: a checkmate it is in counts, a draw by the fifty-move rule or on material
+//does not (repetitions are left out)
+fn loses_within(board: &Chess, plies: u32) -> bool {
+    if board.is_checkmate() {
+        return true;
+    }
+    if plies == 0 || board.halfmoves() >= 100 || board.is_insufficient_material() {
+        return false;
+    }
+    let moves = board.legal_moves();
+    !moves.is_empty() && moves.iter().all(|&chess_move| wins_within(&played(board, chess_move), plies - 1))
+}
+
+fn wins_within(board: &Chess, plies: u32) -> bool {
+    if plies == 0 || board.halfmoves() >= 100 || board.is_insufficient_material() {
+        return false;
+    }
+    board.legal_moves().iter().any(|&chess_move| loses_within(&played(board, chess_move), plies - 1))
+}
+
+fn played(board: &Chess, chess_move: Move) -> Chess {
+    let mut next = board.clone();
+    next.play_unchecked(chess_move);
+    next
+}
+
+const MATES_CHECKED: u32 = 4;
+
+//the proofs of mates within MATES_CHECKED plies, each checked by playing the position out; returns how many
+fn check_mates(tree: &Tree) -> usize {
+    let (mut seen, mut order, mut checked) = (vec![false; tree.nodes.len()], vec![(tree.root_index(), tree.board.clone())], 0);
+    seen[tree.root_index()] = true;
+    while let Some((id, board)) = order.pop() {
+        if let Some(proof) = tree.nodes[id].proof.filter(|proof| proof.outcome != Outcome::Draw && proof.plies <= MATES_CHECKED) {
+            let forced = if proof.outcome == Outcome::Win { loses_within(&board, proof.plies) } else { wins_within(&board, proof.plies) };
+            assert!(forced, "a proof of {:?} in {} plies at {}", proof.outcome, proof.plies, Fen::from_position(&board, EnPassantMode::Legal));
+            checked += 1;
+        }
+        for (place, link) in tree.linked(id) {
+            let child = tree.link_child(link) as usize;
+            if !std::mem::replace(&mut seen[child], true) {
+                let chess_move = tree.chess_move(tree.nodes[id].edges().start + place).to_move(&board);
+                order.push((child, played(&board, chess_move)));
+            }
+        }
+    }
+    checked
+}
+
+//the mate in two with the fifty-move count at which it still fits, and at which it does not
+const MATE_IN_TWO_AT_97: &str = "k7/8/2K5/8/8/8/8/7R w - - 97 80";
+const MATE_IN_TWO_AT_98: &str = "k7/8/2K5/8/8/8/8/7R w - - 98 80";
+
+#[test]
+fn the_proofs_in_a_graph_are_mates() {
+    let settings = graph_settings(true);
+    let mut checked = 0;
+    for fen in [MATE_IN_TWO, MATE_IN_TWO_AT_97, MATE_IN_TWO_AT_98, CORNERED_KING, KING_AND_ROOK, ROOKS] {
+        let mut old = graph_tree_after(fen, &[]);
+        search(&mut old, 3_000, usize::MAX, &settings, None, &mut Network::new());
+        let new = graph_shared_tree_after(fen, &[]);
+        shared_in_flight(&new, 3_000, 2, &settings, None, &SharedNetwork::new(), usize::MAX);
+        checked += check_mates(&old) + check_mates(&new.to_tree());
+    }
+    assert!(checked > 20, "{checked} mates checked");
+}
+
 #[test]
 fn searches_with_transpositions_on_many_threads_leave_a_consistent_graph() {
     let mut shared = 0;
-    search_each_position_on_threads(true, |tree, _| shared += check_graph(&tree.to_tree()));
+    search_each_position_on_threads(true, |tree, _| {
+        let tree = tree.to_tree();
+        shared += check_graph(&tree);
+        check_mates(&tree);
+    });
     assert!(shared > 0, "no node shared by two moves");
 }
 

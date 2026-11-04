@@ -906,6 +906,10 @@ impl Tree {
                 self.keys.truncate(root_keys);
                 simulations += 1;
                 self.back_up(&path, &edges, 1.0 - proof.value, 0);
+                //with transpositions this parent may not have met the proof, made on another path
+                if self.graph.is_some() && settings.certainty {
+                    self.propagate_proofs(&path);
+                }
                 continue;
             }
 

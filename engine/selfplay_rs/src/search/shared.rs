@@ -1007,6 +1007,10 @@ impl SharedTree {
                     give_back();
                     call.simulations += 1;
                     self.back_up(&path, &edges, 1.0 - proof.value);
+                    //with transpositions this parent may not have met the proof, made on another path
+                    if self.graph.is_some() && settings.certainty && self.proves_parent(&path) {
+                        self.exclusive(hold, || self.propagate_proofs(&path));
+                    }
                     continue;
                 }
                 //a repeat is a draw for this path, a transposition visit the shared node's mean: the visit is the
@@ -1180,6 +1184,9 @@ impl SharedTree {
             let copy = nodes.get(id);
             copy.set_counts(node.visit_count, node.in_flight, node.value_sum);
             copy.set_visited_policy_sqrt(node.visited_policy_sqrt);
+            if let Some(graph) = &tree.graph {
+                copy.set_halfmoves(graph.halfmoves[id]);
+            }
             if let Some(proof) = node.proof {
                 copy.set_proof(proof);
             }
@@ -1193,12 +1200,21 @@ impl SharedTree {
                 copy.publish_edges(first, node.edges().len());
             }
         }
+        let graph = tree.graph.as_ref().map(|graph| {
+            let copy = SharedGraph::new();
+            for (&entry, &id) in &graph.table {
+                copy.shard(entry).lock().expect("a table shard").insert(entry, id);
+            }
+            copy.entries.store(graph.table.len(), Ordering::Relaxed);
+            copy
+        });
         let shared = SharedTree {
             root: tree.root_index(),
             nodes,
             edges,
             links,
             full: AtomicBool::new(tree.full),
+            graph,
             ..SharedTree::new(tree.board.clone(), tree.keys.clone())
         };
         shared.count_references();
