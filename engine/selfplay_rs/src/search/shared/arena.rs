@@ -21,6 +21,18 @@ const FREED: u64 = u64::MAX;
 //proof_meta keeps a proof's plies in the bits above its outcome's two
 const PROOF_PLIES_BITS: u32 = 30;
 
+//a counter that every thread writes, on a line of its own: the fields beside it are read by every descent
+#[repr(align(64))]
+pub struct Alone<T>(pub T);
+
+impl<T> std::ops::Deref for Alone<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 //the orderings are the tree's protocol (shared.rs)
 #[repr(align(64))]
 #[derive(Default)]
@@ -450,7 +462,7 @@ impl FreeRuns {
 
 pub struct Nodes {
     table: Table<Node>,
-    next: AtomicUsize,
+    next: Alone<AtomicUsize>,
     freed: Pool,
 }
 
@@ -459,7 +471,7 @@ impl Nodes {
     pub const CAPACITY: usize = (NODE_CHUNKS << NODE_CHUNK_BITS) - 1;
 
     pub fn new() -> Nodes {
-        Nodes { table: Table::new(NODE_CHUNKS, NODE_CHUNK_BITS), next: AtomicUsize::new(0), freed: Pool::default() }
+        Nodes { table: Table::new(NODE_CHUNKS, NODE_CHUNK_BITS), next: Alone(AtomicUsize::new(0)), freed: Pool::default() }
     }
 
     //the nodes made so far, those given back included
@@ -527,7 +539,7 @@ fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> (u
 
 //runs of elements, each in one chunk: from the runs given back, else from the end of those given out so far
 struct Runs {
-    next: AtomicUsize,
+    next: Alone<AtomicUsize>,
     #[cfg(test)]
     skipped: AtomicUsize, //the elements left unused at chunk ends
     freed: FreeRuns,
@@ -538,7 +550,7 @@ struct Runs {
 impl Runs {
     fn new(bits: u32, capacity: usize) -> Runs {
         Runs {
-            next: AtomicUsize::new(0),
+            next: Alone(AtomicUsize::new(0)),
             #[cfg(test)]
             skipped: AtomicUsize::new(0),
             freed: FreeRuns::new(bits),
@@ -630,7 +642,7 @@ impl Slot {
 
 pub struct Links {
     table: Table<Link>,
-    next: AtomicUsize,
+    next: Alone<AtomicUsize>,
     freed: Pool,
     slots: Table<Slot>,
     slot_runs: Runs,
@@ -643,7 +655,7 @@ impl Links {
     pub fn new() -> Links {
         let links = Links {
             table: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
-            next: AtomicUsize::new(1),
+            next: Alone(AtomicUsize::new(1)),
             freed: Pool::default(),
             slots: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
             slot_runs: Runs::new(LINK_CHUNK_BITS, Self::CAPACITY),

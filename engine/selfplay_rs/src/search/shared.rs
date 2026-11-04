@@ -16,7 +16,7 @@ mod reuse;
 #[cfg(test)]
 mod audit;
 
-use arena::{Children, Edges, Link, Links, Node, Nodes, Slot};
+use arena::{Alone, Children, Edges, Link, Links, Node, Nodes, Slot};
 pub use cache::SharedCache;
 use reclaim::Garbage;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -67,12 +67,12 @@ const TABLE_SHARDS: usize = 256;
 
 struct SharedGraph {
     shards: Box<[Mutex<KeyMap<u32>>]>,
-    entries: AtomicUsize,
+    entries: Alone<AtomicUsize>,
 }
 
 impl SharedGraph {
     fn new() -> SharedGraph {
-        SharedGraph { shards: (0..TABLE_SHARDS).map(|_| Mutex::new(KeyMap::default())).collect(), entries: AtomicUsize::new(0) }
+        SharedGraph { shards: (0..TABLE_SHARDS).map(|_| Mutex::new(KeyMap::default())).collect(), entries: Alone(AtomicUsize::new(0)) }
     }
 
     fn shard(&self, entry: u64) -> &Mutex<KeyMap<u32>> {
@@ -138,7 +138,7 @@ pub struct SharedTree {
     solid_batch: usize,
     pending: Mutex<HashMap<u64, Vec<PendingLeaf>>>,
     //network leaves gathered and not yet backed up
-    waiting: AtomicUsize,
+    waiting: Alone<AtomicUsize>,
     //bytes that the descents in progress that reserved room may still allocate (under a memory limit); a waiting leaf's are
     //counted by `waiting`
     reserved: AtomicUsize,
@@ -148,7 +148,7 @@ pub struct SharedTree {
     //calls hold the gate shared, whatever needs the tree to itself holds it exclusive; writers counts the threads waiting
     gate: RwLock<()>,
     writers: AtomicUsize,
-    pub counts: Counts,
+    pub counts: Alone<Counts>,
     graph: Option<SharedGraph>,
 }
 
@@ -204,13 +204,13 @@ impl SharedTree {
             solid_threshold: SOLID_TREE_THRESHOLD,
             solid_batch: SOLID_BATCH,
             pending: Mutex::new(HashMap::new()),
-            waiting: AtomicUsize::new(0),
+            waiting: Alone(AtomicUsize::new(0)),
             reserved: AtomicUsize::new(0),
             full: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             gate: RwLock::new(()),
             writers: AtomicUsize::new(0),
-            counts: Counts::default(),
+            counts: Alone(Counts::default()),
             graph: None,
         }
     }
