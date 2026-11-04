@@ -117,13 +117,9 @@ impl Node {
 
     //the node as new, with a reference: for a node out of the pool or the table's end, before its index is given out
     fn recycle(&self, key: u64) {
-        for field in [&self.count, &self.value_sum, &self.visited_policy_sqrt, &self.edges_at, &self.proof_value] {
-            field.store(0, Ordering::Relaxed);
-        }
-        self.proof_meta.store(0, Ordering::Relaxed);
+        self.reset();
         self.refreshes.store(0, Ordering::Relaxed);
         self.halfmoves.store(0, Ordering::Relaxed);
-        self.children.store(NO_LINK, Ordering::Relaxed);
         self.key.store(key, Ordering::Relaxed);
         self.references.store(1, Ordering::Release);
     }
@@ -192,8 +188,7 @@ impl Node {
         if listed(children) { Children::List(children) } else { Children::Solid(children) }
     }
 
-    //the list's head, which a new first link is swapped into: for a thread that holds the gate or has the node to itself, and not for
-    //a reader, whose head is the one children() gave it
+    //the list's head, which a new first link is swapped into: for threads that hold the gate, not for a reader (children() gives its head)
     pub(super) fn list_head(&self) -> &AtomicU32 {
         &self.children
     }
@@ -533,6 +528,7 @@ fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> (u
 //runs of elements, each in one chunk: from the runs given back, else from the end of those given out so far
 struct Runs {
     next: AtomicUsize,
+    #[cfg(test)]
     skipped: AtomicUsize, //the elements left unused at chunk ends
     freed: FreeRuns,
     bits: u32,
@@ -541,13 +537,21 @@ struct Runs {
 
 impl Runs {
     fn new(bits: u32, capacity: usize) -> Runs {
-        Runs { next: AtomicUsize::new(0), skipped: AtomicUsize::new(0), freed: FreeRuns::new(bits), bits, capacity }
+        Runs {
+            next: AtomicUsize::new(0),
+            #[cfg(test)]
+            skipped: AtomicUsize::new(0),
+            freed: FreeRuns::new(bits),
+            bits,
+            capacity,
+        }
     }
 
     fn alloc(&self, count: usize) -> usize {
         self.freed.take(count).unwrap_or_else(|| {
-            let (first, skipped) = alloc_run(&self.next, count, self.bits, self.capacity);
-            self.skipped.fetch_add(skipped, Ordering::Relaxed);
+            let (first, _skipped) = alloc_run(&self.next, count, self.bits, self.capacity);
+            #[cfg(test)]
+            self.skipped.fetch_add(_skipped, Ordering::Relaxed);
             first
         })
     }
@@ -705,7 +709,8 @@ impl Links {
         let link = match self.freed.take() {
             Some(freed) => freed as usize,
             None => {
-                let (link, _) = alloc_run(&self.next, 1, LINK_CHUNK_BITS, Self::CAPACITY);
+                let link = self.next.fetch_add(1, Ordering::Relaxed);
+                assert!(link < Self::CAPACITY, "the tree is past its links");
                 self.make(link);
                 link
             }
@@ -784,7 +789,7 @@ impl Links {
         }
     }
 
-    //the link of the move at `place` in the list from `head`, a head the caller has loaded: of a list made solid since, the old one
+    //the link of the move at `place` in the list from `head`, which the caller loaded; a list made solid since stays readable
     pub fn find_from(&self, head: u32, place: usize) -> Option<u32> {
         let mut link = head;
         while link != NO_LINK {
@@ -931,9 +936,6 @@ impl Edges {
 
     //a node's moves and priors from edge `first`, by the thread that owns the node, before its edges are published
     pub fn write(&self, first: usize, moves: &[Move], priors: &[f32]) {
-        if moves.is_empty() {
-            return;
-        }
         let slots = self.moves.slice(first, moves.len()).iter().zip(self.priors.slice(first, moves.len()));
         for ((move_slot, prior_slot), (&chess_move, &prior)) in slots.zip(moves.iter().zip(priors)) {
             move_slot.store(PackedMove::new(chess_move).bits(), Ordering::Relaxed);

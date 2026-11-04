@@ -157,8 +157,8 @@ pub fn sharpen(value: f32, sharpness: f64) -> f32 {
     (1.0 / (1.0 + ((1.0 - value) / value).powf(sharpness))) as f32
 }
 
-//a leaf's priors, from the network's logits, and its value, sharpened. A network answer that is no number would spoil every node it is
-//backed up through for good: the priors are then equal, the value a draw's, and false says the answer is not worth keeping
+//a leaf's priors and sharpened value; an answer that is no number would spoil every node it is backed up through, so it gives equal
+//priors or a draw's value, and false for the cache
 pub fn leaf_answer(logits: &mut [f32], value: f32, settings: &SearchSettings) -> (f32, bool) {
     let priors_are_numbers = softmax(logits);
     let value = sharpen(value, settings.value_sharpness);
@@ -166,7 +166,7 @@ pub fn leaf_answer(logits: &mut [f32], value: f32, settings: &SearchSettings) ->
     if !(priors_are_numbers && value_is_number) {
         static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
-            eprintln!("the network answered with a number that is none: that leaf has equal priors or a draw's value, as any other so answered");
+            eprintln!("the network gave a NaN or an infinity: a leaf so answered has equal priors, or a draw's value");
         }
     }
     (if value_is_number { value } else { settings.draw as f32 }, priors_are_numbers && value_is_number)
@@ -899,11 +899,8 @@ impl Tree {
             let mut legal_moves = board.legal_moves();
             let node_tables = tables.filter(|_| node != self.root && (!root_covered || board.halfmoves() == 0));
             //the root is searched whatever the rules say of it: Searches.start refuses only a mate or stalemate
-            let game_over = if node == self.root {
-                None
-            } else {
-                game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables)
-            };
+            let game_over =
+                if node == self.root { None } else { game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables) };
             //a repeat inside the search is a draw, but not a proven one: the game need not repeat (as in lc0)
             let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
             //with transpositions a descent stops above a repeat, so a leaf is none; a repetition the rules count holds for every path
@@ -1243,13 +1240,7 @@ impl Tree {
 
     //drop_stale_leaves from the candidates found at the root the moves at `line`'s places moved it down from: of those below the root,
     //the leaves its walk would find stale, taken out in its order
-    pub fn drop_stale_candidates(
-        &mut self,
-        line: &[u16],
-        candidates: &[Vec<u16>],
-        settings: &SearchSettings,
-        tables: Option<&Tables>,
-    ) {
+    pub fn drop_stale_candidates(&mut self, line: &[u16], candidates: &[Vec<u16>], settings: &SearchSettings, tables: Option<&Tables>) {
         if self.graph.is_some() {
             return;
         }

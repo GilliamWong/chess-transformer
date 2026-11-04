@@ -187,13 +187,7 @@ impl SharedTree {
 
     //drop_stale_leaves from candidates found at the old root, `line` being the places of the moves down from it; takes out in
     //the walk's order
-    pub fn drop_stale_candidates(
-        &mut self,
-        line: &[u16],
-        candidates: &[Vec<u16>],
-        settings: &SearchSettings,
-        tables: Option<&Tables>,
-    ) {
+    pub fn drop_stale_candidates(&mut self, line: &[u16], candidates: &[Vec<u16>], settings: &SearchSettings, tables: Option<&Tables>) {
         if self.graph.is_some() {
             return;
         }

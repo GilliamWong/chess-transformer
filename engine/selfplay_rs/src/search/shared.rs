@@ -287,10 +287,10 @@ impl SharedTree {
         self.edges.chess_move(edge)
     }
 
-    //the link of the parent's move `edge`, NO_LINK until a simulation has gone through it. The node's children are loaded once: a
-    //list made solid meanwhile stays readable, and its head is read as it was
+    //the link of the parent's move `edge`, NO_LINK until a simulation has gone through it
     fn link_of(&self, parent: &Node, edge: usize) -> u32 {
         let place = edge - parent.edges().start;
+        //loaded once: a list made solid meanwhile stays readable, and this is its head
         let children = parent.children();
         #[cfg(test)]
         if let Some(step) = AFTER_CHILDREN_LOADED.get() {
@@ -834,8 +834,7 @@ impl SharedTree {
             } else if !self.idle() {
                 std::thread::yield_now();
             } else if self.allocated_bytes() + reserved > memory_limit {
-                //nothing left to free, and nobody freeing it. The thread that held the last batch may have freed it since the
-                //loop's look, so the room is looked at again once all is idle
+                //nothing is left to free, but the last batch's thread may have freed it since the loop's look: the room is looked at again
                 self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
                 return false;
             }

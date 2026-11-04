@@ -29,8 +29,7 @@ impl SharedSearch {
         })
     }
 
-    //the root's score for its side to move while the chosen move has no visit (a one-simulation search), a half while the root
-    //has none. A mean read beside backups may be off by their values, so it is kept a score
+    //the root's score for its side to move while the chosen move has no visit (a one-simulation search), a half with none on the root
     fn score(&self, best: Option<usize>) -> f64 {
         let tree = &self.tree;
         let root_visits = tree.root().visits();
@@ -39,6 +38,7 @@ impl SharedSearch {
             _ if root_visits > 0 => 1.0 - tree.root().mean_score(root_visits),
             _ => 0.5,
         };
+        //a mean read beside backups may be off by their values
         score.clamp(0.0, 1.0)
     }
 
@@ -137,16 +137,8 @@ impl Searches {
                 round_leaves.push((id, queued.len() as u32));
             }
             if let Some(columns) = columns.as_deref_mut() {
-                let score = (self.answer_width - 1) as u16;
                 for leaf in &queued {
-                    if leaf.moves.len() > LEGAL_SLOTS {
-                        return Err(PyRuntimeError::new_err(format!(
-                            "a leaf with {} legal moves, past a lean row's {LEGAL_SLOTS}",
-                            leaf.moves.len()
-                        )));
-                    }
-                    columns.extend(leaf.moves.iter().map(|&chess_move| self.move_ids.id(chess_move, leaf.turn) as u16));
-                    columns.extend(std::iter::repeat_n(score, LEAN_COLUMNS - leaf.moves.len()));
+                    self.lean_columns(columns, &leaf.moves, leaf.turn)?;
                 }
             }
             tree.queue(number, queued);
@@ -158,16 +150,7 @@ impl Searches {
     pub(crate) fn shared_finish<N: Number>(&self, answers: &[N], round: Option<u64>) -> PyResult<Vec<SearchReport>> {
         let (out, trees, width) = {
             let mut state = self.lock()?;
-            let index = match round {
-                None => {
-                    (!state.rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers"))
-                }
-                Some(name) => state
-                    .rounds
-                    .iter()
-                    .position(|out| out.name == Some(name))
-                    .ok_or_else(|| PyRuntimeError::new_err(format!("round {name} is not waiting for its answers"))),
-            }?;
+            let index = round_index(&state.rounds, round)?;
             let boards = state.rounds[index].leaves.iter().map(|&(_, leaves)| leaves as usize).sum();
             let width = if state.rounds[index].lean { LEAN_COLUMNS } else { self.answer_width };
             answers_for(answers, boards, width)?;
@@ -389,8 +372,7 @@ mod tests {
 
     const ANSWER_WIDTH: usize = 1859;
 
-    //a score is between 0 and 1 whatever the search has read: before the root has a visit, and beside backups that count their value
-    //before their visit
+    //a score is between 0 and 1 whatever was read: before the root's first visit, or beside backups that count their value first
     #[test]
     fn a_score_is_a_score_whatever_was_read() {
         let board = Chess::default();

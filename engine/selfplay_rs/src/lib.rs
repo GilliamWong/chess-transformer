@@ -17,7 +17,7 @@ use rules::{
 use search::{Cache, Round, SearchSettings, SharedCache, SharedTree, Tree};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
-use shakmaty::{CastlingMode, Chess, Position};
+use shakmaty::{CastlingMode, Chess, Color, Move, Position};
 use shakmaty_syzygy::SyzygyError;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -408,6 +408,17 @@ struct Searches {
 //(the root's visits, the visits of its two most visited moves)
 type RootNumbers = (u32, u32, u32);
 
+//the round a finish is for: the one named, else the oldest
+fn round_index(rounds: &VecDeque<RoundOut>, round: Option<u64>) -> PyResult<usize> {
+    match round {
+        None => (!rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers")),
+        Some(name) => rounds
+            .iter()
+            .position(|out| out.name == Some(name))
+            .ok_or_else(|| PyRuntimeError::new_err(format!("round {name} is not waiting for its answers"))),
+    }
+}
+
 fn find_search(state: &State, id: u64) -> PyResult<&Search> {
     state.searches.iter().find(|search| search.id == id).ok_or_else(|| PyValueError::new_err(format!("no search {id}")))
 }
@@ -515,6 +526,16 @@ impl Searches {
         self.state.lock().map_err(|_| PyRuntimeError::new_err("a call to these searches panicked, which may have left them broken"))
     }
 
+    //a leaf's lean columns: its moves' ids, then the score's, to a row's length
+    fn lean_columns(&self, columns: &mut Vec<u16>, moves: &[Move], turn: Color) -> PyResult<()> {
+        if moves.len() > LEGAL_SLOTS {
+            return Err(PyRuntimeError::new_err(format!("a leaf with {} legal moves, past a lean row's {LEGAL_SLOTS}", moves.len())));
+        }
+        columns.extend(moves.iter().map(|&chess_move| self.move_ids.id(chess_move, turn) as u16));
+        columns.extend(std::iter::repeat_n((self.answer_width - 1) as u16, LEAN_COLUMNS - moves.len()));
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn descend_round(
         &self,
@@ -548,16 +569,8 @@ impl Searches {
                 round_leaves.push((search.id, gathered));
             }
             if let Some(columns) = columns.as_deref_mut() {
-                let score = (self.answer_width - 1) as u16;
                 for (moves, turn) in search.tree.round_moves(number) {
-                    if moves.len() > LEGAL_SLOTS {
-                        return Err(PyRuntimeError::new_err(format!(
-                            "a leaf with {} legal moves, past a lean row's {LEGAL_SLOTS}",
-                            moves.len()
-                        )));
-                    }
-                    columns.extend(moves.iter().map(|&chess_move| self.move_ids.id(chess_move, turn) as u16));
-                    columns.extend(std::iter::repeat_n(score, LEAN_COLUMNS - moves.len()));
+                    self.lean_columns(columns, moves, turn)?;
                 }
             }
         }
@@ -598,14 +611,7 @@ impl Searches {
     }
 
     fn finish_round<N: Number>(&self, state: &mut State, answers: &[N], round: Option<u64>) -> PyResult<Vec<SearchReport>> {
-        let index = match round {
-            None => (!state.rounds.is_empty()).then_some(0).ok_or_else(|| PyRuntimeError::new_err("no round is waiting for its answers")),
-            Some(name) => state
-                .rounds
-                .iter()
-                .position(|out| out.name == Some(name))
-                .ok_or_else(|| PyRuntimeError::new_err(format!("round {name} is not waiting for its answers"))),
-        }?;
+        let index = round_index(&state.rounds, round)?;
         let boards = state.rounds[index].leaves.iter().map(|&(_, leaves)| leaves as usize).sum();
         let width = if state.rounds[index].lean { LEAN_COLUMNS } else { self.answer_width };
         let answers = answers_for(answers, boards, width)?;
@@ -666,10 +672,9 @@ impl Searches {
         Ok(self.take_reports(state).into_iter().next())
     }
 
-    //a search whose round loop failed is gone, its tree freed beside the engine, and so are the rounds the loop had out: the leaves they
-    //wait for will not come back. A panic in the search's descent or finish may have left the state locked as broken: the search was
-    //what it left broken, and the searches go on without it
+    //a failed round loop's search is dropped with the rounds the loop had out, whose leaves will not come back
     fn abort(&self, id: u64) {
+        //a panic may have poisoned the state with this search, which goes: the others go on
         let mut state = self.state.lock().unwrap_or_else(|broken| {
             self.state.clear_poison();
             broken.into_inner()

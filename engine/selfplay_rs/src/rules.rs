@@ -242,8 +242,7 @@ impl Tables {
         })
     }
 
-    //score for a search: after a failed probe (a table missing or unreadable) none, so that the network scores the position, as
-    //lc0 does. The first failure is said
+    //the tables' score for a search: none after a failed probe, so that the network scores the position (as lc0 does); the first is said
     fn search_score(&self, board: &Chess, draw: f64) -> Option<f64> {
         self.score(board, draw)
             .inspect_err(|error| {

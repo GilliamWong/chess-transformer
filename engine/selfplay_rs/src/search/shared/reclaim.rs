@@ -12,8 +12,7 @@ pub struct Garbage {
     pub(super) dead: Vec<u32>,
     //the first links of lists that no node has any more
     pub(super) lists: Vec<u32>,
-    //threads in the middle of freeing some. They are counted under the garbage's lock, as they take and leave their batch, so that
-    //"none left and none being freed" is one look
+    //threads freeing some, counted under this lock as they take and leave their batch: "none left and none freeing" is one look
     working: usize,
 }
 
@@ -38,13 +37,13 @@ impl SharedTree {
     }
 
     //no garbage is left and no thread is freeing any: all that was freed is given back to the pools
-    pub fn idle(&self) -> bool {
+    pub(super) fn idle(&self) -> bool {
         let garbage = self.garbage.lock().expect("the garbage");
         garbage.dead.is_empty() && garbage.lists.is_empty() && garbage.working == 0
     }
 
     //a batch of the garbage for the thread that takes it, who then counts as working; none if there is none
-    pub fn take_garbage(&self) -> Option<Garbage> {
+    fn take_garbage(&self) -> Option<(Vec<u32>, Vec<u32>)> {
         let mut garbage = self.garbage.lock().expect("the garbage");
         if garbage.dead.is_empty() && garbage.lists.is_empty() {
             return None;
@@ -52,13 +51,11 @@ impl SharedTree {
         garbage.working += 1;
         let dead_from = garbage.dead.len().saturating_sub(GARBAGE_TAKEN);
         let lists_from = garbage.lists.len().saturating_sub(GARBAGE_TAKEN);
-        Some(Garbage { dead: garbage.dead.split_off(dead_from), lists: garbage.lists.split_off(lists_from), working: 0 })
+        Some((garbage.dead.split_off(dead_from), garbage.lists.split_off(lists_from)))
     }
 
-    //frees up to `budget` nodes of the batch taken and returns what it freed. What is left of the batch goes back to the
-    //garbage, and the thread stops working, once the room is given back to the pools
-    pub fn free_garbage(&self, taken: Garbage, budget: usize) -> usize {
-        let Garbage { mut dead, lists, .. } = taken;
+    //frees up to `budget` nodes of the batch and returns what it freed; the rest goes back to the garbage, once the room is given back
+    fn free_garbage(&self, (mut dead, lists): (Vec<u32>, Vec<u32>), budget: usize) -> usize {
         let mut freed = Freed::default();
         let mut nodes = 0;
         while nodes < budget
@@ -78,8 +75,7 @@ impl SharedTree {
         nodes + lists.len()
     }
 
-    //frees up to `budget` nodes of the garbage and returns what it freed: none when there is none for this thread, though
-    //another may be freeing some
+    //frees up to `budget` nodes of the garbage: none when there is none to take, though another thread may be freeing some
     pub fn reclaim(&self, budget: usize) -> usize {
         self.take_garbage().map_or(0, |taken| self.free_garbage(taken, budget))
     }

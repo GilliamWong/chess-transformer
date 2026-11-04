@@ -270,7 +270,7 @@ impl Shared {
         self.run.lock().map_err(panicked)
     }
 
-    //for ending a loop: also after a thread panicked with the run held, when the rounds fail to lock it but the loop is still to end
+    //the run also after a thread panicked holding it, so that the loop ends
     fn lock_always(&self) -> MutexGuard<'_, Run> {
         self.run.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -348,7 +348,7 @@ impl Rounds<'_> {
                     let round_times = if settings.rounds_at_once { rounds.len().max(1) } else { rounds.len() + 1 } as f64;
                     let told_to_stop = shared.told.load(Ordering::Relaxed);
                     let late = run.deadline.is_some_and(|deadline| shared.now() + round_times * run.round_seconds >= deadline);
-                    //as lc0, no stop before the root has an answer: a search with no visit and no leaf out cannot be stopped
+                    //as lc0, no stop before the root has an answer: with no visit and no leaf out there is nothing to report
                     if run.gathered && run.root.0 > 0 && (told_to_stop || late) {
                         if let Some(extension) = run.extension
                             && !told_to_stop
@@ -510,8 +510,7 @@ pub(crate) struct RoundLoop {
 
 #[pymethods]
 impl RoundLoop {
-    //None if the rounds take longer than `seconds`; a thread's failure (a cuda error, a panic) is raised here, once all the threads have
-    //ended, and the search is then gone from the searches, with the rounds it had out
+    //None if the rounds take longer than `seconds`; a thread's failure (a cuda error, a panic) is raised when all have ended
     fn wait(&mut self, py: Python<'_>, seconds: f64) -> PyResult<Option<SearchReport>> {
         let done = py.detach(|| {
             let run = self.shared.lock_always();
@@ -618,8 +617,9 @@ pub(crate) fn start_loop(
                 }
                 let rounds = Rounds { searches: searches.get(), settings: &settings, shared: &shared, calls, networks: count };
                 //a panic ends the thread as an error does: the loop is to end, not to wait for a thread that is gone
-                let failed =
-                    catch_unwind(AssertUnwindSafe(|| rounds.rounds_on(&mut network))).unwrap_or_else(|payload| Err(panic_error(payload))).err();
+                let failed = catch_unwind(AssertUnwindSafe(|| rounds.rounds_on(&mut network)))
+                    .unwrap_or_else(|payload| Err(panic_error(payload)))
+                    .err();
                 if failed.is_some() {
                     network.settle(&calls);
                 }

@@ -269,11 +269,7 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, settin
     if edges.is_empty() {
         //a game's end or a repeat, reached again and again: every visit scored its result
         let legal_moves = board.legal_moves();
-        let over = if id == tree.root_index() {
-            None
-        } else {
-            game_result(board, keys, &legal_moves, settings.draw, None)
-        };
+        let over = if id == tree.root_index() { None } else { game_result(board, keys, &legal_moves, settings.draw, None) };
         let (&leaf_key, path_keys) = keys[tree.keys.len() - 1..].split_last().expect("the root's key");
         let value = over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
         match (node.proof(), value) {
@@ -618,8 +614,7 @@ fn a_closed_tree_gathers_nothing() {
     let mut tree = shared_tree_after(START, &[]);
     shared_in_flight(&tree, 200, 1, &settings, None, &network, usize::MAX);
     let round = Round { id: 0, leaves: 8, simulations: 24, collisions: 8, visit_limit: u32::MAX, memory_limit: usize::MAX };
-    let gathered =
-        |tree: &SharedTree| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).len();
+    let gathered = |tree: &SharedTree| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).len();
     assert!(gathered(&tree) > 0);
     tree.close();
     assert_eq!(gathered(&tree), 0);
@@ -680,8 +675,7 @@ fn a_call_takes_no_leaf_once_its_search_has_ended() {
         let tree = shared_tree_after(START, &[]);
         shared_in_flight(&tree, 20_000, 2, &settings, None, &network, usize::MAX);
         let (gathered, at_close) = std::thread::scope(|scope| {
-            let gathering =
-                scope.spawn(|| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).len());
+            let gathering = scope.spawn(|| tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new()).len());
             std::thread::sleep(Duration::from_millis(5));
             let at_close = tree.quiet(|| {
                 tree.close();
