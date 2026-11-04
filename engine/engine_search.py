@@ -363,7 +363,8 @@ class EngineSearch:
                     round_times = max(len(rounds), 1) if self.rounds_at_once else len(rounds) + 1
                     told_to_stop = run.told is not None and run.told.is_set()
                     late = run.deadline is not None and time.perf_counter() + round_times * self.round_seconds >= run.deadline
-                    if run.gathered and (told_to_stop or late):
+                    #not before the root's first answer, so that a stop always has a move
+                    if run.gathered and run.root[0] > 0 and (told_to_stop or late):
                         #once: a search whose score has fallen runs on, unless told to stop
                         if run.extension is not None and not told_to_stop:
                             run.deadline += self.extra_for_fall(run.extension)

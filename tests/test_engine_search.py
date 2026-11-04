@@ -311,8 +311,9 @@ def test_a_thread_that_panics_or_fails_ends_the_search_with_an_error(concurrent_
 
 #a thread that finds the deadline due must not stop a fresh tree before the first leaf of another thread is out
 @gpu
-def test_a_deadline_already_due_on_a_fresh_tree_still_gives_a_move():
-    search = EngineSearch([lean_network(True) for _ in range(4)], 16, rust_rounds=True, concurrent_descents=True)
+@pytest.mark.parametrize("rust_rounds", [False, True])
+def test_a_deadline_already_due_on_a_fresh_tree_still_gives_a_move(rust_rounds):
+    search = EngineSearch([lean_network(True) for _ in range(4)], 16, rust_rounds=rust_rounds, concurrent_descents=True)
     board = chess.Board()
     for _ in range(1500):
         search.new_game()
