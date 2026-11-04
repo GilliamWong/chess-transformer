@@ -104,6 +104,11 @@ impl SharedTree {
             if !edges.is_empty() {
                 edge_runs.push((edges.start, edges.len()));
             }
+            //select_edge stops at the first move without a node
+            let priors: Vec<f32> = edges.clone().map(|edge| self.edges.prior(edge)).collect();
+            assert!(priors.is_sorted_by(|before, after| before >= after), "the priors of node {id}");
+            let places: Vec<usize> = self.links.linked(node).map(|(place, _)| place).collect();
+            assert!(places.iter().copied().eq(0..places.len()), "node {id}'s moves with a node are {places:?}");
             match node.children() {
                 Children::List(mut link) => {
                     while link != NO_LINK {

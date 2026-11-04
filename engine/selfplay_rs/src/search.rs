@@ -340,6 +340,19 @@ pub struct Round {
 //MoveList's capacity: a waiting leaf's expansion needs that many edges
 const MOST_MOVES: usize = 256;
 
+//a node's edges are in the order of their priors, the highest first, equal priors in the order the moves came in (python-chess's).
+//Of the moves without a node the first is then the one select_edge picks: they all have the same score but for their priors.
+//Returns keys sorted so, whose low byte is a move's place among the `priors` it came with
+pub fn by_prior<'a>(priors: &[f32], keys: &'a mut [u64; MOST_MOVES]) -> &'a [u64] {
+    let keys = &mut keys[..priors.len()];
+    for (place, (key, prior)) in keys.iter_mut().zip(priors).enumerate() {
+        //the bits of a prior, which is not negative, are in the order of its value
+        *key = u64::from(!prior.to_bits()) << 32 | place as u64;
+    }
+    keys.sort_unstable();
+    keys
+}
+
 fn node_fits(nodes: usize) -> bool {
     nodes < NO_NODE as usize
 }
@@ -385,7 +398,7 @@ pub struct Tree {
     pub nodes: Vec<Node>,
     root: usize, //the root's node: 0 but after move_root, until compact
     node_keys: Vec<u64>,
-    //the edges: every expanded node's moves in python-chess's order with their priors
+    //the edges: every expanded node's moves with their priors, in the order of by_prior
     moves: Vec<PackedMove>,
     priors: Vec<f32>,        //as the network gives them, read as f64s
     noised_priors: Vec<f64>, //the root's once add_root_noise has mixed its noise in; empty without
@@ -657,21 +670,8 @@ impl Tree {
     //slot's whether it has a node or not)
     fn select_edge(&self, node: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> (usize, u32) {
         let parent = &self.nodes[node];
-        let c_puct =
-            settings.c_puct + settings.c_puct_factor * ((f64::from(parent.visit_count) + settings.c_puct_base) / settings.c_puct_base).ln();
-        let children_visits = parent.visit_count.saturating_sub(1).max(1);
         let edges = parent.edges();
-        let first_play_urgency = (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt;
-        let sqrt_children_visits = f64::from(children_visits).sqrt();
-
-        let scan = Scan {
-            c_puct,
-            sqrt_children_visits,
-            first_play_urgency,
-            noised: node == self.root && !self.noised_priors.is_empty(),
-            transpositions: self.graph.is_some(),
-            draw: settings.draw,
-        };
+        let scan = self.scan(node, settings);
         let value =
             |index: usize, prior: f32, child: u32, own_visits: u32| self.move_value(&scan, repeats, index, prior, child, own_visits);
         let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
@@ -697,15 +697,38 @@ impl Tree {
                     (next_link, next_place) = (next, place_of(next));
                 } else {
                     consider(index, NO_LINK, value(index, prior, NO_NODE, 0));
+                    //the first move without a node is the best of those that follow it; noise puts the root's out of order
+                    if !scan.noised {
+                        break;
+                    }
                 }
             }
         } else {
             let first = (children & !SOLID) as usize;
             for (index, (&prior, slot)) in priors.iter().zip(&self.slots[first..first + edges.len()]).enumerate() {
                 consider(index, children + index as u32, value(index, prior, slot.child, slot.visits));
+                if slot.child == NO_NODE && !scan.noised {
+                    break;
+                }
             }
         }
         (edges.start + best, best_link)
+    }
+
+    //what select_edge's scores of the node's moves are made of
+    fn scan(&self, node: usize, settings: &SearchSettings) -> Scan {
+        let parent = &self.nodes[node];
+        let c_puct =
+            settings.c_puct + settings.c_puct_factor * ((f64::from(parent.visit_count) + settings.c_puct_base) / settings.c_puct_base).ln();
+        let children_visits = parent.visit_count.saturating_sub(1).max(1);
+        Scan {
+            c_puct,
+            sqrt_children_visits: f64::from(children_visits).sqrt(),
+            first_play_urgency: (1.0 - parent.mean_score()) - settings.fpu_reduction * parent.visited_policy_sqrt,
+            noised: node == self.root && !self.noised_priors.is_empty(),
+            transpositions: self.graph.is_some(),
+            draw: settings.draw,
+        }
     }
 
     //select_edge's value of a move from its prior, node (NO_NODE for none) and own visits, with its node's edges_at and children (0 and
@@ -1010,11 +1033,13 @@ impl Tree {
         self.logits = priors;
     }
 
+    //the node's moves and their priors, which come in the order of the moves, as edges in the order of by_prior
     fn expand(&mut self, node: usize, moves: &MoveList, priors: &[f32]) {
         let first_edge = self.moves.len();
-        for (&chess_move, &prior) in moves.iter().zip(priors) {
-            self.moves.push(PackedMove::new(chess_move));
-            self.priors.push(prior);
+        for key in by_prior(priors, &mut [0; MOST_MOVES]) {
+            let place = (key & 255) as usize;
+            self.moves.push(PackedMove::new(moves[place]));
+            self.priors.push(priors[place]);
         }
         self.nodes[node].edges_at = (first_edge as u64) << 8 | (self.moves.len() - first_edge) as u64;
     }

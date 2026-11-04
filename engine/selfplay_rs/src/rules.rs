@@ -149,7 +149,7 @@ impl PackedMove {
     }
 }
 
-//python-chess's generation order, which is mcts.py's children order: of equal children the first is searched and played
+//python-chess's generation order, which is mcts.py's children order among equal priors: of equal children the first is searched and played
 pub fn legal_moves_in_python_order(board: &Chess) -> MoveList {
     let mut moves = board.legal_moves();
     sort_moves_in_python_order(board, &mut moves);

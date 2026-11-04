@@ -125,7 +125,8 @@ def descend(root: Node, board: chess.Board) -> Leaf:
 
 def finish(leaf: Leaf, priors: dict[chess.Move, float] | None, value: float) -> None:
     if priors is not None:
-        leaf.path[-1].children = {move: Node(prior=prior) for move, prior in priors.items()}
+        #the highest prior first, equal priors in the order given (python-chess's): the rust search stops at the first move without a node
+        leaf.path[-1].children = {move: Node(prior=prior) for move, prior in sorted(priors.items(), key=lambda item: -item[1])}
     backup(leaf.path, value)
 
 

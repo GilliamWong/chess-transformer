@@ -209,7 +209,38 @@ fn line_end(tree: &Tree, line: &[usize]) -> usize {
     line.iter().fold(tree.root_index(), |node, &edge| tree.child_index(node, edge).expect("a line through the tree's nodes"))
 }
 
+//a node's edges are in the order of their priors and its moves with a node are the first ones (a root with noise has them as the noise
+//put them), so that select_edge may stop at the first move without a node: it must pick what a look at every move picks
+fn assert_by_prior(tree: &Tree) {
+    let settings = settings(true);
+    for (id, node) in tree.nodes.iter().enumerate() {
+        let edges = node.edges();
+        assert!(edges.clone().map(|edge| tree.priors[edge]).is_sorted_by(|before, after| before >= after), "node {id}'s priors");
+        if id != tree.root || tree.noised_priors.is_empty() {
+            let places: Vec<usize> = tree.linked(id).map(|(place, _)| place).collect();
+            assert!(places.iter().copied().eq(0..places.len()), "node {id}'s moves with a node are {places:?}");
+        }
+        if edges.is_empty() {
+            continue;
+        }
+        let scan = tree.scan(id, &settings);
+        let mut best = (edges.start, f64::NEG_INFINITY);
+        for (place, edge) in edges.enumerate() {
+            let link = tree.link_of(id, edge);
+            let (child, own_visits) = if link == NO_LINK { (NO_NODE, 0) } else { (tree.link_child(link), tree.own_visits(link)) };
+            if let Some((score, ..)) = tree.move_value(&scan, None, place, tree.priors[edge], child, own_visits)
+                && score > best.1
+            {
+                best = (edge, score);
+            }
+        }
+        assert_eq!(tree.select_edge(id, &settings, None).0, best.0, "node {id}'s pick");
+    }
+}
+
 fn assert_same_trees(old: &Tree, new: &Tree) {
+    assert_by_prior(old);
+    assert_by_prior(new);
     let fen = |tree: &Tree| Fen::from_position(&tree.board, EnPassantMode::Legal).to_string();
     assert_eq!(fen(old), fen(new));
     assert_same("keys", &old.keys, &new.keys);

@@ -286,6 +286,8 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, settin
         }
         return;
     }
+    let (picked, best) = tree.picked_and_best(id, settings);
+    assert_eq!(picked, best, "the pick of node {id}");
     let mut tokens = Vec::new();
     encode_board(board, &mut tokens);
     let own = 1.0 - f64::from(sharpen(answer(&tokens, seed_of(&tokens), ANSWER_WIDTH - 1), settings.value_sharpness));

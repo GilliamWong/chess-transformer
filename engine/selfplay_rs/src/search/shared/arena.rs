@@ -1,5 +1,5 @@
 use crate::rules::PackedMove;
-use crate::search::{NO_LINK, NO_NODE, Outcome, Proof, SOLID, listed};
+use crate::search::{MOST_MOVES, NO_LINK, NO_NODE, Outcome, Proof, SOLID, by_prior, listed};
 use shakmaty::Move;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -971,12 +971,14 @@ impl Edges {
         PackedMove::from_bits(self.moves.get(edge).load(Ordering::Relaxed))
     }
 
-    //a node's moves and priors from edge `first`, by the thread that owns the node, before its edges are published
+    //a node's moves and priors, which come in the order of the moves, as edges from `first` in the order of by_prior; by the thread
+    //that owns the node, before its edges are published
     pub fn write(&self, first: usize, moves: &[Move], priors: &[f32]) {
         let slots = self.moves.slice(first, moves.len()).iter().zip(self.priors.slice(first, moves.len()));
-        for ((move_slot, prior_slot), (&chess_move, &prior)) in slots.zip(moves.iter().zip(priors)) {
-            move_slot.store(PackedMove::new(chess_move).bits(), Ordering::Relaxed);
-            prior_slot.store(prior.to_bits(), Ordering::Relaxed);
+        for ((move_slot, prior_slot), key) in slots.zip(by_prior(priors, &mut [0; MOST_MOVES])) {
+            let place = (key & 255) as usize;
+            move_slot.store(PackedMove::new(moves[place]).bits(), Ordering::Relaxed);
+            prior_slot.store(priors[place].to_bits(), Ordering::Relaxed);
         }
     }
 

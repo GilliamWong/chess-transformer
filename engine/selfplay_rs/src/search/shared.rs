@@ -433,32 +433,24 @@ impl SharedTree {
     //returns the edge and its link (NO_LINK for a list's move without one, a solid slot whether it has a node or not)
     fn select_edge(&self, id: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> (usize, u32) {
         let parent = self.nodes.get(id);
-        let (parent_visits, _) = parent.counts();
-        let c_puct =
-            settings.c_puct + settings.c_puct_factor * ((f64::from(parent_visits) + settings.c_puct_base) / settings.c_puct_base).ln();
         let edges = parent.edges();
-        let first_play_urgency = (1.0 - parent.mean_score(parent_visits)) - settings.fpu_reduction * parent.visited_policy_sqrt();
-        let sqrt_children_visits = f64::from(parent_visits.saturating_sub(1).max(1)).sqrt();
-
-        let scan = Scan {
-            c_puct,
-            sqrt_children_visits,
-            first_play_urgency,
-            noised: false,
-            transpositions: self.graph.is_some(),
-            draw: settings.draw,
-        };
+        let scan = self.scan(parent, settings);
         let value = |prior: &AtomicU32, child: u32, own_visits: &AtomicU32| self.move_value(&scan, repeats, prior, child, own_visits);
         let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
         let priors = self.edges.priors(edges.clone());
         match parent.children() {
             Children::Solid(first) => {
                 for (index, (prior, slot)) in priors.iter().zip(self.links.solid_slots(first, edges.len())).enumerate() {
-                    if let Some((u, child)) = value(prior, slot.child(), slot.visits())
+                    let child = slot.child();
+                    if let Some((u, node)) = value(prior, child, slot.visits())
                         && u > best_u
                     {
                         (best, best_u, best_link) = (index, u, first + index as u32);
-                        self.prefetch_children(child);
+                        self.prefetch_children(node);
+                    }
+                    //the first move without a node is the best of those that follow it: their priors are no higher
+                    if child == NO_NODE {
+                        break;
                     }
                 }
             }
@@ -483,6 +475,9 @@ impl SharedTree {
                         (best, best_u, best_link) = (index, u, link);
                         self.prefetch_children(child);
                     }
+                    if link == NO_LINK {
+                        break;
+                    }
                 }
             }
         }
@@ -498,6 +493,21 @@ impl SharedTree {
                 self.edges.prefetch(edges.start);
                 self.links.prefetch(child.children());
             }
+        }
+    }
+
+    //what select_edge's scores of the node's moves are made of
+    fn scan(&self, parent: &Node, settings: &SearchSettings) -> Scan {
+        let (parent_visits, _) = parent.counts();
+        let c_puct =
+            settings.c_puct + settings.c_puct_factor * ((f64::from(parent_visits) + settings.c_puct_base) / settings.c_puct_base).ln();
+        Scan {
+            c_puct,
+            sqrt_children_visits: f64::from(parent_visits.saturating_sub(1).max(1)).sqrt(),
+            first_play_urgency: (1.0 - parent.mean_score(parent_visits)) - settings.fpu_reduction * parent.visited_policy_sqrt(),
+            noised: false,
+            transpositions: self.graph.is_some(),
+            draw: settings.draw,
         }
     }
 
@@ -1197,6 +1207,27 @@ impl SharedTree {
 
     pub fn node(&self, id: usize) -> &Node {
         self.nodes.get(id)
+    }
+
+    //select_edge's pick for a node nothing is working in, and the pick of a look at every move: the first of the best scores
+    pub fn picked_and_best(&self, id: usize, settings: &SearchSettings) -> (usize, usize) {
+        let parent = self.nodes.get(id);
+        let scan = self.scan(parent, settings);
+        let unvisited = AtomicU32::new(0);
+        let mut best = (parent.edges().start, f64::NEG_INFINITY);
+        for edge in parent.edges() {
+            let (child, visits) = match self.link_of(parent, edge) {
+                NO_LINK => (NO_NODE, &unvisited),
+                link => (self.links.child(link), self.links.visits(link)),
+            };
+            let prior = &AtomicU32::new(self.edges.prior(edge).to_bits());
+            if let Some((u, _)) = self.move_value(&scan, None, prior, child, visits)
+                && u > best.1
+            {
+                best = (edge, u);
+            }
+        }
+        (self.select_edge(id, settings, None).0, best.0)
     }
 
     pub fn with_solid_links(mut self, threshold: u32, batch: usize) -> SharedTree {

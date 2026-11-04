@@ -142,11 +142,9 @@ def test_rust_games_end_where_the_tablebase_knows_the_result(tablebase, monkeypa
     assert len(games[-1].boards) == 0
 
 
-#one position per network call, so that no bit depends on the batch
-@pytest.mark.parametrize("model", ["board", "uniform"])
-def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
-    monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
-    model = BoardModel() if model == "board" else UniformModel()
+#the rust searches of some positions of the games, one position per network call so that no bit depends on the batch:
+#(the positions, each one's line, score, root moves by visits and root visits)
+def rust_searches_of_game_positions(model: nn.Module, carlsen_games, simulations: int) -> tuple[list[chess.Board], dict[int, tuple]]:
     positions = []
     for game in carlsen_games:
         board = game.board()
@@ -157,7 +155,7 @@ def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
 
     searches = selfplay_rs.Searches(**rust_search_settings(False))
     for number, board in enumerate(positions):
-        searches.start(number, board.root().fen(), [move.uci() for move in board.move_stack], 40)
+        searches.start(number, board.root().fen(), [move.uci() for move in board.move_stack], simulations)
     evaluate = cpu_batches(model).evaluate_boards
     found = {}
     while len(searches):
@@ -167,6 +165,16 @@ def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
             found[number] = (line, score, root_moves, visits)
 
     assert len(positions) > 20 and sorted(found) == list(range(len(positions)))
+    with pytest.raises(ValueError):
+        searches.start(0, "R5k1/5ppp/8/8/8/8/5PPP/6K1 b - - 1 30", [], 40) #mated: nothing to search
+    return positions, found
+
+
+@pytest.mark.parametrize("model", ["board", "uniform"])
+def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
+    monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
+    model = BoardModel() if model == "board" else UniformModel()
+    positions, found = rust_searches_of_game_positions(model, carlsen_games, 40)
     for number, board in enumerate(positions):
         root = mcts.search(model, board, CPU, 40)
         line = mcts.principal_variation(root)
@@ -176,8 +184,26 @@ def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
         assert found[number] == ([move.uci() for move in line], score, [(move.uci(), child.visit_count) for move, child in by_visits],
                                  root.visit_count), board.fen()
 
-    with pytest.raises(ValueError):
-        searches.start(0, "R5k1/5ppp/8/8/8/8/5PPP/6K1 b - - 1 30", [], 40) #mated: nothing to search
+
+#python-chess's order of the moves, which the order of the priors replaced in the children of a node: the same search but for ties
+def test_rust_searches_pick_the_moves_a_search_in_the_order_of_python_chess_picks(monkeypatch, carlsen_games):
+    def finish_in_the_order_of_moves(leaf: mcts.Leaf, priors: dict[chess.Move, float] | None, value: float) -> None:
+        if priors is not None:
+            leaf.path[-1].children = {move: mcts.Node(prior=prior) for move, prior in priors.items()}
+        mcts.backup(leaf.path, value)
+
+    monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
+    monkeypatch.setattr(mcts, "finish", finish_in_the_order_of_moves)
+    model = BoardModel()
+    positions, found = rust_searches_of_game_positions(model, carlsen_games, 1000)
+    for number, board in enumerate(positions):
+        root = mcts.search(model, board, CPU, 1000)
+        line = mcts.principal_variation(root)
+        chosen = root.children[line[0]]
+        score = chosen.value_sum / chosen.visit_count if chosen.visit_count > 0 else 1 - root.value_sum / root.visit_count
+        rust_line, rust_score, rust_root_moves, rust_visits = found[number]
+        assert (rust_line, rust_score, rust_visits) == ([move.uci() for move in line], score, root.visit_count), board.fen()
+        assert dict(rust_root_moves) == {move.uci(): child.visit_count for move, child in root.children.items()}, board.fen()
 
 
 def test_the_rust_numbers_are_numpys():
