@@ -130,16 +130,22 @@ fn python_sum(mut values: impl Iterator<Item = f64>) -> f64 {
     if compensation != 0.0 && compensation.is_finite() { total + compensation } else { total }
 }
 
-pub fn softmax(logits: &mut [f32]) {
+//false if the logits were no numbers (a NaN, or an infinity that leaves none for the others): the moves are then equally likely
+pub fn softmax(logits: &mut [f32]) -> bool {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut total = 0.0;
     for logit in logits.iter_mut() {
         *logit = (*logit - max).exp();
         total += *logit;
     }
+    if !total.is_finite() {
+        logits.fill(1.0 / logits.len() as f32);
+        return false;
+    }
     for weight in logits.iter_mut() {
         *weight /= total;
     }
+    true
 }
 
 //the value's logit times sharpness
@@ -149,6 +155,21 @@ pub fn sharpen(value: f32, sharpness: f64) -> f32 {
     }
     let value = f64::from(value);
     (1.0 / (1.0 + ((1.0 - value) / value).powf(sharpness))) as f32
+}
+
+//a leaf's priors, from the network's logits, and its value, sharpened. A network answer that is no number would spoil every node it is
+//backed up through for good: the priors are then equal, the value a draw's, and false says the answer is not worth keeping
+pub fn leaf_answer(logits: &mut [f32], value: f32, settings: &SearchSettings) -> (f32, bool) {
+    let priors_are_numbers = softmax(logits);
+    let value = sharpen(value, settings.value_sharpness);
+    let value_is_number = value.is_finite();
+    if !(priors_are_numbers && value_is_number) {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            eprintln!("the network answered with a number that is none: that leaf has equal priors or a draw's value, as any other so answered");
+        }
+    }
+    (if value_is_number { value } else { settings.draw as f32 }, priors_are_numbers && value_is_number)
 }
 
 //a simulation waiting for the network: its path, the links between its nodes (transpositions only), and its leaf's moves
@@ -956,14 +977,13 @@ impl Tree {
             .expect("a waiting simulation of the round");
         self.logits.clear();
         self.logits.extend(leaf.moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, leaf.turn))));
-        softmax(&mut self.logits);
-        let value = sharpen(answer(answer_width - 1), settings.value_sharpness);
+        let (value, kept) = leaf_answer(&mut self.logits, answer(answer_width - 1), settings);
 
         let node = *leaf.path.last().expect("the root at least");
         let priors = std::mem::take(&mut self.logits);
         self.expand(node, &leaf.moves, &priors);
         self.back_up(&leaf.path, &leaf.edges, f64::from(value), 1);
-        if let Some(cache) = cache {
+        if let Some(cache) = cache.filter(|_| kept) {
             cache.insert(leaf.key, &priors, value);
         }
         self.logits = priors;

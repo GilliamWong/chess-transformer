@@ -11,6 +11,7 @@ mod shared;
 //model.encoding.NUM_MOVE_IDS
 const MOVE_IDS: usize = 1858;
 const ANSWER_WIDTH: usize = MOVE_IDS + 1;
+const ANSWER_WIDTH_LAST: usize = ANSWER_WIDTH - 1;
 //indexed by shakmaty's role numbers, which the piece tokens are
 const PIECE_VALUES: [f32; 7] = [0.0, 1.0, 3.0, 3.0, 5.0, 9.0, 0.0];
 
@@ -491,6 +492,35 @@ fn a_search_with_tables_that_fail_is_the_search_without_tables() {
         tree.drop_stale_leaves(&settings, tables);
     }
     assert_same_trees(&with, &without);
+}
+
+//(the first move's logit, the value, whether the priors come out equal, the value backed up) for answers that are no numbers: a logit or
+//the value is a NaN or an infinity. A logit that is none leaves the priors equal, a value that is none makes the leaf a draw
+const NOT_NUMBERS: [(f32, f32, bool, f32); 4] =
+    [(f32::NAN, 0.25, true, 0.25), (f32::INFINITY, 0.25, true, 0.25), (0.5, f32::NAN, false, 0.5), (0.5, f32::INFINITY, false, 0.5)];
+
+#[test]
+fn an_answer_that_is_no_number_leaves_equal_priors_or_a_draw_and_is_not_cached() {
+    let settings = SearchSettings { value_sharpness: 1.0, ..settings(false) };
+    for (logit, value, equal, backed_up) in NOT_NUMBERS {
+        let (mut tree, mut network) = (tree_after(START, &[]), Network::new());
+        let mut boards = Vec::new();
+        tree.gather(&new_round(&tree, 0, 100, usize::MAX), &settings, None, Some(&network.cache), &mut boards);
+        let leaf = &tree.round_leaves(0)[0];
+        let (key, first_move) = (leaf.key, network.move_ids.id(leaf.moves[0], leaf.turn));
+        let answer = |column: usize| match column {
+            ANSWER_WIDTH_LAST => value,
+            _ if column == first_move => logit,
+            _ => 0.01 * column as f32,
+        };
+        tree.finish_leaf(0, answer, ANSWER_WIDTH, &network.move_ids, Some(&mut network.cache), &settings);
+        let moves = tree.nodes[0].edges();
+        let equal_priors = moves.clone().all(|edge| tree.priors[edge] == tree.priors[moves.start]);
+        assert_eq!((tree.nodes[0].visit_count, equal_priors), (1, equal), "{logit} {value}");
+        assert!(moves.clone().all(|edge| tree.priors[edge].is_finite()), "{logit} {value}: priors {:?}", &tree.priors[moves.clone()]);
+        assert_eq!(tree.nodes[0].value_sum, f64::from(1.0 - backed_up), "{logit} {value}");
+        assert!(network.cache.get(key).is_none(), "{logit} {value}: the answer is cached");
+    }
 }
 
 #[test]

@@ -1035,12 +1035,11 @@ impl SharedTree {
     ) {
         logits.clear();
         logits.extend(leaf.moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, leaf.turn))));
-        softmax(logits);
-        let value = sharpen(answer(answer_width - 1), settings.value_sharpness);
+        let (value, kept) = leaf_answer(logits, answer(answer_width - 1), settings);
         let node = *leaf.path.last().expect("the root at least");
         self.expand(node, &leaf.moves, logits);
         self.back_up(&leaf.path, &leaf.edges, f64::from(value));
-        if let Some(cache) = cache {
+        if let Some(cache) = cache.filter(|_| kept) {
             cache.insert(leaf.key, logits, value);
         }
         if memory_limit != usize::MAX {

@@ -177,7 +177,7 @@ fn a_descent_gets_the_room_that_the_last_batch_frees() {
         tree.move_root(&[edge]);
         tree
     };
-    let mut drained = moved();
+    let drained = moved();
     assert!(drained.has_garbage());
     drained.drain();
     let limit = drained.allocated_bytes() + crate::search::shared::DESCENT_BYTES;
@@ -190,6 +190,36 @@ fn a_descent_gets_the_room_that_the_last_batch_frees() {
         tree.join_sweepers();
     }
     assert_eq!(refused, 0, "{refused} descents of 300 were refused room that the garbage frees");
+}
+
+//the same, in a shared tree: and the leaf stops waiting and gives back its reservation, as any leaf does
+#[test]
+fn a_shared_answer_that_is_no_number_leaves_equal_priors_or_a_draw_and_is_not_cached() {
+    let settings = SearchSettings { value_sharpness: 1.0, ..settings(false) };
+    for (logit, value, equal, backed_up) in NOT_NUMBERS {
+        let (tree, network) = (shared_tree_after(START, &[]), SharedNetwork::new());
+        let round = Round { id: 0, leaves: 1, simulations: 1, collisions: 0, visit_limit: 100, memory_limit: 1 << 30 };
+        let queued = tree.gather(&round, &settings, None, Some(&network.cache), &mut Vec::new());
+        let (key, first_move) = (queued[0].key, network.move_ids.id(queued[0].moves[0], queued[0].turn));
+        tree.queue(0, queued);
+        let answer = |column: usize| match column {
+            ANSWER_WIDTH_LAST => value,
+            _ if column == first_move => logit,
+            _ => 0.01 * column as f32,
+        };
+        {
+            let _hold = tree.hold();
+            for leaf in tree.take_round(0) {
+                tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &network.move_ids, Some(&network.cache), &settings, 1 << 30, &mut Vec::new());
+            }
+        }
+        let root = tree.root();
+        let equal_priors = root.edges().all(|edge| tree.prior(edge) == tree.prior(root.edges().start));
+        assert_eq!((root.visits(), tree.pending(), tree.reserved_bytes(), equal_priors), (1, 0, 0, equal), "{logit} {value}");
+        assert!(root.edges().all(|edge| tree.prior(edge).is_finite()), "{logit} {value}");
+        assert_eq!(root.value_sum(), f64::from(1.0 - backed_up), "{logit} {value}");
+        assert!(network.cache.get(key, &mut Vec::new()).is_none(), "{logit} {value}: the answer is cached");
+    }
 }
 
 #[test]

@@ -191,6 +191,21 @@ def test_tables_that_fail_to_probe_are_searched_without_them(tmp_path):
             found.append(reports)
         assert found[0] == found[1] and found[0][0][4] == 800 and len(searches) == 0
 
+#a NaN logit or value would stay in every node it is backed up through, the root's among them
+@pytest.mark.parametrize("concurrent_descents", [False, True])
+def test_answers_that_are_no_numbers_do_not_spoil_a_search(concurrent_descents):
+    searches = selfplay_rs.Searches(**rust_search_settings(False), cache_positions=1000, concurrent_descents=concurrent_descents)
+    searches.start(0, chess.STARTING_FEN, [], 400)
+    reports = []
+    while not reports:
+        answers = answers_by_board(leaf_boards(searches.descend(8, 8, 24)))
+        if len(answers) > 1:
+            answers[::2, -1] = np.nan
+            answers[1::3, :-1] = np.inf
+        reports = searches.finish(answers)
+    _, line, score, root_moves, visits = reports[0]
+    assert 0 <= score <= 1 and visits == 400 and sum(move_visits for _, move_visits in root_moves) == 399
+
 def test_a_failed_search_settles_its_network():
     class Failing(ImmediateBatches):
         settled = 0
