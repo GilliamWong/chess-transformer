@@ -65,6 +65,13 @@ const ASSIST_BATCH: usize = 64;
 
 const TABLE_SHARDS: usize = 256;
 
+//under a memory limit, the room freed is kept until the arenas have grown to the limit: what a search makes then lies together at
+//their ends, which is faster to search than it scattered over the holes a move leaves. Without a limit it is given out at once, and
+//so it is once the node table is three quarters full, which a tree of few moves a node reaches before a large limit
+pub(super) fn holds_back_freed_room(memory_limit: usize, footprint_bytes: usize, nodes: usize) -> bool {
+    memory_limit != usize::MAX && footprint_bytes < memory_limit && nodes < Nodes::CAPACITY / 4 * 3
+}
+
 struct SharedGraph {
     shards: Box<[Mutex<KeyMap<u32>>]>,
     entries: Alone<AtomicUsize>,
@@ -880,6 +887,15 @@ impl SharedTree {
         *self.closed.get_mut() = false;
     }
 
+    fn hold_back_freed_room(&self, memory_limit: usize) {
+        let held = holds_back_freed_room(memory_limit, self.footprint_bytes(), self.nodes.len());
+        if held != self.nodes.holds_back() {
+            self.nodes.hold_back(held);
+            self.links.hold_back(held);
+            self.edges.hold_back(held);
+        }
+    }
+
     //the descents a call may make without `reserve`: its share of a quarter of the room left (nodes, and bytes under a memory
     //limit), on the thought that at most MOST_CALLS calls are descending. Far from the limit that is more than a call descends
     pub fn free_descents(&self, memory_limit: usize) -> usize {
@@ -981,6 +997,7 @@ impl SharedTree {
         let mut unplayed = Vec::new();
         let mut priors = Vec::new();
         let mut free_descents = self.free_descents(round.memory_limit);
+        self.hold_back_freed_room(round.memory_limit);
         loop {
             //a writer let in here may have ended the search and closed the tree (end's quiet), so the room is looked at
             //after: a leaf taken in a closed tree belongs to a search that is gone
@@ -1229,6 +1246,11 @@ impl SharedTree {
 
     pub fn node(&self, id: usize) -> &Node {
         self.nodes.get(id)
+    }
+
+    //what a compaction would leave: the part the root reaches copied in breadth first order
+    pub fn compacted(&self) -> SharedTree {
+        SharedTree::from_tree(&self.to_reachable_tree())
     }
 
     //select_edge's pick for a node nothing is working in, and the pick of a look at every move: the first of the best scores

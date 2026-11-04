@@ -34,7 +34,7 @@ the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clon
 | `SyzygyProbeLimit` | 7 | The most pieces the tables are used for, 5 to 7: `SyzygyPath` uses the most its folders hold up to it |
 | `MoveOverhead` | 20 | Milliseconds kept back from each move's time for the GUI's lag |
 | `CachePositions` | 5000000 | Network answers kept by position, ~190-260 bytes each |
-| `RamLimitMb` | 0 | MB the search tree may take (0 for no limit); the cache comes on top, and the tree's arenas may hold up to a quarter more (freed room no node fits; a tree past that is dropped at the next move), so set it to about (memory - cache) / 1.3 |
+| `RamLimitMb` | 0 | MB the search tree may take (0 for no limit); the cache comes on top, and the tree's arenas grow to the limit before the room a move freed is used again (what a search makes then lies together, which is faster) and may hold up to a quarter more (freed room no node fits; a tree past that is dropped at the next move), so set it to about (memory - cache) / 1.3 |
 | `AdvanceThreads` | 4 | Threads that look for the stale leaves of a kept tree without transpositions while the opponent thinks (a tree with transpositions has none and moves at no cost); 0 looks at the next search's start instead, on the engine's own time, as lc0 does |
 | `GcThreads` | 2 | Threads that free the dead rest of the tree beside a search after a move, as lc0 does (never on the opponent's time); 0 frees it all at the search's start, on the engine's own time |
 | `Leaves` | 64 | Positions sent to the network at once on each GPU |

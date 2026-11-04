@@ -282,3 +282,4 @@ fn gc_counts(tree: &SharedTree) -> (u64, u64) {
 }
 
 mod replay;
+mod reuse;

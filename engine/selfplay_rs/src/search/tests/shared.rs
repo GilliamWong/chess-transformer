@@ -171,6 +171,49 @@ fn a_list_made_solid_between_a_readers_loads_is_read_as_it_was() {
     assert!(tree.lists_and_solids().1 > 0, "no list was made solid");
 }
 
+//under a memory limit the room a move freed is left alone while the arenas are below it, so that what the next search makes lies together
+//at their ends; without a limit, or once the arenas have grown to it, it is given out at once
+#[test]
+fn the_room_a_move_freed_is_given_out_without_a_memory_limit_or_once_the_arenas_have_grown_to_it() {
+    let (settings, network) = (settings(true), SharedNetwork::new());
+    let searched = shared_tree_after(START, OPENING);
+    shared_in_flight(&searched, 3_000, 2, &settings, None, &network, usize::MAX);
+    //a move whose tree is a part of the whole
+    let root = searched.root();
+    let edge = root
+        .edges()
+        .filter(|&edge| searched.child(root, edge).is_some_and(|child| child.has_edges() && child.visits() >= 20))
+        .min_by_key(|&edge| searched.visits(root, edge))
+        .expect("a move");
+    //the arenas' growth and the bytes in use's, in a search that goes on after the move
+    let growth = |memory_limit: fn(&SharedTree) -> usize| {
+        let mut tree = SharedTree::from_tree(&searched.to_tree());
+        tree.move_root(&[edge]);
+        tree.drain();
+        let (arenas, in_use) = (tree.footprint_bytes(), tree.allocated_bytes());
+        let visits = tree.root().visits() + 1_500;
+        shared_in_flight(&tree, visits, 2, &settings, None, &network, memory_limit(&tree));
+        (tree.footprint_bytes() - arenas, tree.allocated_bytes() - in_use)
+    };
+    let (arenas, in_use) = growth(|_| 1 << 30);
+    assert!(in_use > 100_000 && arenas * 10 >= in_use * 9, "{arenas} bytes of arenas for {in_use} bytes made, below a limit");
+    let (arenas, in_use) = growth(|_| usize::MAX);
+    assert!(arenas * 2 < in_use, "{arenas} bytes of arenas for {in_use} bytes made, without a limit");
+    //a limit the arenas are at already
+    let (arenas, in_use) = growth(|tree| tree.footprint_bytes());
+    assert!(arenas * 2 < in_use, "{arenas} bytes of arenas for {in_use} bytes made, at a limit");
+}
+
+//freed room is held back only under a limit the arenas are below, with room left in the node table
+#[test]
+fn freed_room_is_held_back_only_below_a_limit_with_nodes_to_spare() {
+    use crate::search::shared::holds_back_freed_room;
+    assert!(holds_back_freed_room(1 << 30, 1 << 20, 0));
+    assert!(!holds_back_freed_room(usize::MAX, 1 << 20, 0));
+    assert!(!holds_back_freed_room(1 << 30, 1 << 30, 0));
+    assert!(!holds_back_freed_room(1 << 30, 1 << 20, usize::MAX));
+}
+
 //a descent over the memory limit gives up when no garbage is left and no thread is freeing any, and the room is looked at then: the
 //thread that held the last batch may have freed it since the descent last looked
 #[test]
@@ -1257,15 +1300,19 @@ fn play_a_game(moves: usize, visits: Option<u32>, limit: usize, sweepers: usize,
     while played < moves {
         let searching = Arc::new(tree);
         searching.start_sweepers(sweepers);
-        //the room is looked at between steps of the search
-        while !searching.is_full() && visits.is_none_or(|visits| searching.root().visits() < visits) {
+        //the room is looked at between steps of the search, which ends with a root that is decided as well: a mate found has no end
+        while !searching.is_full() && !searching.root_decided() && visits.is_none_or(|visits| searching.root().visits() < visits) {
             let target = searching.root().visits() + 50;
             shared_in_flight(&searching, visits.map_or(target, |visits| target.min(visits)), 2, &settings, None, &network, limit);
             assert!(searching.allocated_bytes() <= limit, "{} bytes of {limit}", searching.allocated_bytes());
         }
         assert!(!searching.has_garbage() || !searching.is_full(), "a search ended full with garbage left");
         let reached = f64::from(searching.root().visits());
-        assert!(reached >= 0.8 * f64::from(fresh_visits), "move {played}: {reached} visits against a fresh tree's {fresh_visits}");
+        let decided = searching.root_decided();
+        assert!(
+            decided || reached >= 0.8 * f64::from(fresh_visits),
+            "move {played}: {reached} visits against a fresh tree's {fresh_visits}"
+        );
         tree = owned_again(searching);
         assert!(
             !check_footprint || played < 20 || !tree.sprawls(limit),

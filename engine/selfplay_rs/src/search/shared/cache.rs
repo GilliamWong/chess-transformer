@@ -24,6 +24,21 @@ impl SharedCache {
         shared
     }
 
+    //the same answers in a cache of its own, for the benches that search twice from one cache
+    #[cfg(test)]
+    pub fn duplicate(&self, positions: usize) -> SharedCache {
+        let copy = SharedCache::new(positions);
+        for shard in &self.shards {
+            let shard = shard.lock().expect("a cache shard");
+            for generation in [&shard.older, &shard.newer] {
+                for (&key, &(start, count, value)) in &generation.places {
+                    copy.insert(key, &generation.priors[start..start + usize::from(count)], value);
+                }
+            }
+        }
+        copy
+    }
+
     fn shard(&self, key: u64) -> MutexGuard<'_, Cache> {
         self.shards[(key >> (64 - SHARD_BITS)) as usize].lock().expect("a cache shard")
     }

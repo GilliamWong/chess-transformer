@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::ptr::{null_mut, slice_from_raw_parts_mut};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const NODE_CHUNK_BITS: u32 = if cfg!(test) { 6 } else { 16 };
 const NODE_CHUNKS: usize = 1 << 14;
@@ -24,6 +24,12 @@ const PROOF_PLIES_BITS: u32 = 30;
 //a counter that every thread writes, on a line of its own: the fields beside it are read by every descent
 #[repr(align(64))]
 pub struct Alone<T>(pub T);
+
+impl<T: Default> Default for Alone<T> {
+    fn default() -> Alone<T> {
+        Alone(T::default())
+    }
+}
 
 impl<T> std::ops::Deref for Alone<T> {
     type Target = T;
@@ -330,11 +336,13 @@ impl<T> Drop for Table<T> {
 struct Pool {
     indices: Mutex<Vec<u32>>,
     idle: AtomicUsize,
+    //the indices are kept, not given out: what is made lies together, at the table's end
+    held_back: Alone<AtomicBool>,
 }
 
 impl Pool {
     fn take(&self) -> Option<u32> {
-        if self.idle.load(Ordering::Relaxed) == 0 {
+        if self.held_back.load(Ordering::Relaxed) || self.idle.load(Ordering::Relaxed) == 0 {
             return None;
         }
         let mut indices = self.indices.lock().expect("a pool");
@@ -375,6 +383,8 @@ struct FreeRuns {
     runs: Mutex<RunSets>,
     idle: AtomicUsize, //the elements in the pieces and the runs, looked at without a lock
     chunk_mask: usize,
+    //the runs are kept, not given out
+    held_back: Alone<AtomicBool>,
 }
 
 const PIECE_LENGTHS: usize = 256;
@@ -405,6 +415,7 @@ impl FreeRuns {
             runs: Mutex::new(RunSets::default()),
             idle: AtomicUsize::new(0),
             chunk_mask: (1 << chunk_bits) - 1,
+            held_back: Alone::default(),
         }
     }
 
@@ -438,7 +449,7 @@ impl FreeRuns {
     //a run of `count` elements
     fn take(&self, count: usize) -> Option<usize> {
         assert!((1..PIECE_LENGTHS).contains(&count), "a run of {count}");
-        if self.idle() == 0 {
+        if self.held_back.load(Ordering::Relaxed) || self.idle() == 0 {
             return None;
         }
         if let Some(first) = self.pieces[count].lock().expect("the pieces").pop() {
@@ -478,6 +489,14 @@ pub struct Nodes {
 }
 
 impl Nodes {
+    pub fn hold_back(&self, held: bool) {
+        self.freed.held_back.store(held, Ordering::Relaxed);
+    }
+
+    pub fn holds_back(&self) -> bool {
+        self.freed.held_back.load(Ordering::Relaxed)
+    }
+
     //below NO_NODE, and the table's
     pub const CAPACITY: usize = (NODE_CHUNKS << NODE_CHUNK_BITS) - 1;
 
@@ -661,6 +680,11 @@ pub struct Links {
 
 impl Links {
     const CAPACITY: usize = LINK_CHUNKS << LINK_CHUNK_BITS;
+
+    pub fn hold_back(&self, held: bool) {
+        self.freed.held_back.store(held, Ordering::Relaxed);
+        self.slot_runs.freed.held_back.store(held, Ordering::Relaxed);
+    }
 
     //link 0 is NO_LINK's, never given out
     pub fn new() -> Links {
@@ -909,6 +933,10 @@ pub struct Edges {
 impl Edges {
     const CAPACITY: usize = EDGE_CHUNKS << EDGE_CHUNK_BITS;
 
+    pub fn hold_back(&self, held: bool) {
+        self.runs.freed.held_back.store(held, Ordering::Relaxed);
+    }
+
     pub fn new() -> Edges {
         Edges {
             priors: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS),
@@ -1026,6 +1054,20 @@ mod tests {
 
     fn run_in_one_chunk(first: usize, count: usize, bits: u32) {
         assert_eq!(first >> bits, (first + count - 1) >> bits, "a run across a chunk");
+    }
+
+    //a pool or runs that are held back give out nothing, and what they hold is given out once they are not
+    #[test]
+    fn room_held_back_is_given_out_once_it_is_not() {
+        let (pool, runs) = (Pool::default(), FreeRuns::new(8));
+        pool.give_all(&mut vec![5, 3]);
+        runs.give(100, 40);
+        pool.held_back.store(true, Ordering::Relaxed);
+        runs.held_back.store(true, Ordering::Relaxed);
+        assert_eq!((pool.take(), runs.take(5), pool.idle(), runs.idle()), (None, None, 2, 40));
+        pool.held_back.store(false, Ordering::Relaxed);
+        runs.held_back.store(false, Ordering::Relaxed);
+        assert_eq!((pool.take(), runs.take(5)), (Some(3), Some(100)));
     }
 
     #[test]
