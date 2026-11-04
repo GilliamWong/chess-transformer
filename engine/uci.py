@@ -12,7 +12,7 @@ import chess
 import torch
 from engine.inference import cpu_batches
 from model.checkpoint import latest_checkpoint, load_model
-from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, LEAVES, PRECISIONS,
+from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GC_THREADS, LEAVES, PRECISIONS,
                                   SMART_PRUNING_FACTOR, EngineSearch, SearchReport, engine_network, engine_networks, engine_search_settings,
                                   parse_changes, score_to_centipawns)
 from engine.mcts import SIMULATIONS
@@ -274,11 +274,11 @@ class Commands:
 #setoption's whole number options, (lowest, highest); MoveOverhead is in ms, RamLimitMb in MB
 SPIN_OPTIONS = {"SyzygyProbeLimit": (min(table_set.pieces for table_set in TABLE_SETS), max(table_set.pieces for table_set in TABLE_SETS)),
                 "MoveOverhead": (0, 5000), "CachePositions": (0, 1_000_000_000), "RamLimitMb": (0, 100_000_000), "AdvanceThreads": (0, 256),
-                "Leaves": (1, 1024)}
+                "GcThreads": (0, 64), "Leaves": (1, 1024)}
 #setoption's decimal options, as strings since uci has no decimal type, (lowest, highest); SmartPruningFactor 0 is no smart pruning
 DECIMAL_OPTIONS = {"SmartPruningFactor": (0.0, 100.0), "FirstMoveBonus": (0.0, 100.0), "BookPlyBonus": (0.0, 100.0)}
 GPU_OPTIONS = ("GPUs", "Leaves", "SmartPruningFactor")
-BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb", "AdvanceThreads", "GPUs", "Leaves", "SearchSettings",
+BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb", "AdvanceThreads", "GcThreads", "GPUs", "Leaves", "SearchSettings",
                  "SmartPruningFactor")
 
 #setoption's "name <name> value <value>", each of any number of words (a path may hold spaces)
@@ -300,6 +300,7 @@ class Options:
         self.cache_positions = CACHE_POSITIONS
         self.ram_limit_mb = 0
         self.advance_threads = ADVANCE_THREADS
+        self.gc_threads = GC_THREADS
         self.gpu, self.command_line_gpus, self.gpus, self.leaves = gpu, gpus, gpus, leaves
         self.command_line_settings = search_options.get("settings", {})
         self.settings: dict | None = None #None for the command line's alone
@@ -314,7 +315,7 @@ class Options:
 
     def lines(self) -> list[str]:
         defaults = {"SyzygyProbeLimit": MOST_PIECES, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": CACHE_POSITIONS,
-                    "RamLimitMb": 0, "AdvanceThreads": ADVANCE_THREADS, "Leaves": self.leaves, "SmartPruningFactor": self.command_line_factor,
+                    "RamLimitMb": 0, "AdvanceThreads": ADVANCE_THREADS, "GcThreads": GC_THREADS, "Leaves": self.leaves, "SmartPruningFactor": self.command_line_factor,
                     "FirstMoveBonus": self.first_move_bonus, "BookPlyBonus": self.book_ply_bonus,
                     "GPUs": ",".join(map(str, self.command_line_gpus)) if self.command_line_gpus else "<empty>"}
         lines = []
@@ -364,6 +365,8 @@ class Options:
             self.cache_positions = number
         elif name == "RamLimitMb":
             self.ram_limit_mb = number
+        elif name == "GcThreads":
+            self.gc_threads = number
         elif name == "Leaves":
             if number == 1 and self.gpus is not None and len(self.gpus) > 1:
                 return "1 leaf a round is mcts.py's search, on one gpu: Leaves stays as it was"
@@ -434,7 +437,7 @@ class Options:
     #(whether the search uses tables, the search options)
     def search(self) -> tuple[bool, dict]:
         options = {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": self.cache_positions,
-                   "memory_limit_mb": self.ram_limit_mb, "advance_threads": self.advance_threads}
+                   "memory_limit_mb": self.ram_limit_mb, "advance_threads": self.advance_threads, "gc_threads": self.gc_threads}
         if self.settings is not None:
             options["settings"] = {**self.command_line_settings, **self.settings}
         if self.smart_pruning_factor == 0:

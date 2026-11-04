@@ -2,9 +2,11 @@
 use super::*;
 
 impl SharedTree {
-    //the rest of the tree stays in the arenas until compact; a root is never proven, so the new root's proof is dropped
+    //the rest of the tree is left dead for the sweepers; a root is never proven, so the new root's proof is dropped. The line's
+    //last node is the root and keeps a count of its own, which the nodes above it lose with their moves when they are freed
     pub fn move_root(&mut self, line: &[usize]) {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
+        let old_root = self.root;
         for &edge in line {
             let child = self.child_index(self.nodes.get(self.root), edge).expect("a line through the tree's nodes");
             self.board.play_unchecked(self.edges.chess_move(edge).to_move(&self.board));
@@ -12,82 +14,20 @@ impl SharedTree {
             self.root = child;
         }
         if !line.is_empty() {
-            self.nodes.get(self.root).clear_proof();
+            let root = self.nodes.get(self.root);
+            assert!(root.acquire(), "the line's last node is dead");
+            self.drop_reference(old_root);
+            root.clear_proof();
             *self.full.get_mut() = false;
-        }
-    }
-
-    pub fn play_line(&mut self, line: &[usize]) {
-        self.move_root(line);
-        let old = self.compact(None);
-        let _ = std::thread::Builder::new().spawn(move || drop(old));
-    }
-
-    //copies the root's part out as a tree of its own, numbered as Tree::compact (compact_graph with transpositions) numbers it;
-    //returns the old storage to free, or None once abort is set (the tree then as it was)
-    pub fn compact(&mut self, abort: Option<&AtomicBool>) -> Option<(Nodes, Edges, Links)> {
-        let (nodes, edges, links) = (Nodes::new(), Edges::new(), Links::new());
-        let mut children = Vec::new();
-        let mut order = vec![self.root];
-        //each old node's new number; empty without transpositions
-        let mut copied_as = if self.graph.is_some() { vec![NO_NODE; self.nodes.len()] } else { Vec::new() };
-        if let Some(first) = copied_as.get_mut(self.root) {
-            *first = 0;
-        }
-        let mut index = 0;
-        while index < order.len() {
-            if aborted(index, abort) {
-                return None;
+            //nothing can be freed yet, so the nodes queued still have their lists
+            let queued = std::mem::take(self.to_solidify.get_mut().expect("the solid queue"));
+            for id in queued {
+                self.make_solid(id as usize);
             }
-            let old = self.nodes.get(order[index]);
-            assert_eq!(nodes.push(old.key()), index);
-            let node = nodes.get(index);
-            old.copy_to(node);
-            let old_edges = old.edges();
-            if !old_edges.is_empty() {
-                let first = edges.alloc(old_edges.len());
-                for (place, edge) in old_edges.clone().enumerate() {
-                    edges.set(first + place, self.edges.chess_move(edge), self.edges.prior(edge));
-                }
-                children.clear();
-                for (place, link) in self.links.linked(old) {
-                    let child = self.links.child(link) as usize;
-                    let child = if copied_as.is_empty() {
-                        order.push(child);
-                        (order.len() - 1) as u32
-                    } else {
-                        if copied_as[child] == NO_NODE {
-                            copied_as[child] = order.len() as u32;
-                            order.push(child);
-                        }
-                        copied_as[child]
-                    };
-                    children.push((place, child, self.links.visits(link).load(Ordering::Relaxed)));
-                }
-                set_links(&links, node, old_edges.len(), old.visits() >= self.solid_threshold, children.iter().copied());
-                node.publish_edges(first, old_edges.len());
-            }
-            index += 1;
+            *self.queued.get_mut() = 0;
         }
-        if let Some(graph) = &mut self.graph {
-            let fresh = SharedGraph::new();
-            for number in 0..order.len() {
-                let node = nodes.get(number);
-                let entry = graph_key(node.key(), u32::from(node.halfmoves()));
-                fresh.shard(entry).lock().expect("a table shard").insert(entry, number as u32);
-                fresh.entries.fetch_add(1, Ordering::Relaxed);
-            }
-            *graph = fresh;
-        }
-        self.root = 0;
-        //the copy made the solid slots that were queued
-        self.to_solidify.get_mut().expect("the solid queue").clear();
-        *self.queued.get_mut() = 0;
-        Some((
-            std::mem::replace(&mut self.nodes, nodes),
-            std::mem::replace(&mut self.edges, edges),
-            std::mem::replace(&mut self.links, links),
-        ))
+        //no leaf waits, so no list made solid is read any more
+        self.release_retired_lists();
     }
 
     //takes out the leaves scored by a rule that held only from the old root (Tree::drop_stale_leaves); nothing with transpositions

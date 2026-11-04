@@ -2,16 +2,26 @@
 //node's value is added, and readers load both with acquire. A move's link is written before it is put into its node's list
 //(release); of two threads that put one in for a move, one link is kept. A reader may see a half backed up path, never a torn
 //field. A proof rewrites a node's sum and its ancestors', which cannot happen beside backups, so proving a node with visits
-//holds the gate exclusively
+//holds the gate exclusively.
+//A node keeps a count of the moves (list links and solid slots) that name it, and 1 if it is the root. The thread that makes a
+//move's node, or takes it from the table (only a node with a count can be taken), gives the move that count. The thread that
+//drops the last count owns the node's death (a count never rises from 0) and puts it on the garbage, which sweepers and descents
+//short of room free: its table entry, then its children's counts, links, slots and edges, the node last. A descent reaches a
+//node only through a move or a table hit that takes a count, so a dead node is read by no one but whoever frees it
 
 mod arena;
 mod cache;
+mod reclaim;
 mod reuse;
+#[cfg(test)]
+mod audit;
 
 use arena::{Children, Edges, Link, Links, Node, Nodes, Slot};
 pub use cache::SharedCache;
+use reclaim::Garbage;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::thread::JoinHandle;
 
 use super::*;
 
@@ -44,6 +54,9 @@ const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + MOST_MOVES * EDGE_BYTES;
 
 const SOLID_BATCH: usize = 32;
 
+//the nodes a descent short of room frees at a time
+const ASSIST_BATCH: usize = 64;
+
 const TABLE_SHARDS: usize = 256;
 
 struct SharedGraph {
@@ -58,6 +71,15 @@ impl SharedGraph {
 
     fn shard(&self, entry: u64) -> &Mutex<KeyMap<u32>> {
         &self.shards[(entry >> 56) as usize % TABLE_SHARDS]
+    }
+
+    //the entry's node is `id`'s no more; an entry made over meanwhile by a new node stays
+    fn remove_if(&self, entry: u64, id: u32) {
+        let mut shard = self.shard(entry).lock().expect("a table shard");
+        if shard.get(&entry) == Some(&id) {
+            shard.remove(&entry);
+            self.entries.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -85,6 +107,9 @@ pub struct Counts {
     pub gave_way: AtomicU64,
     pub exclusive: AtomicU64,
     pub orphans: AtomicU64,
+    //nodes freed, and the times a descent short of room freed some
+    pub reclaimed: AtomicU64,
+    pub assists: AtomicU64,
 }
 
 pub struct SharedTree {
@@ -96,6 +121,13 @@ pub struct SharedTree {
     links: Links,
     to_solidify: Mutex<Vec<u32>>,
     queued: AtomicUsize,
+    //what is dead and not yet freed
+    garbage: Mutex<Garbage>,
+    //the first links of lists that were made solid since the last move: waiting leaves may still read them
+    retired: Mutex<Vec<u32>>,
+    //threads in the middle of freeing garbage
+    working: AtomicUsize,
+    sweepers: Mutex<Vec<JoinHandle<()>>>,
     solid_threshold: u32,
     solid_batch: usize,
     pending: Mutex<HashMap<u64, Vec<PendingLeaf>>>,
@@ -155,6 +187,10 @@ impl SharedTree {
             links: Links::new(),
             to_solidify: Mutex::new(Vec::new()),
             queued: AtomicUsize::new(0),
+            garbage: Mutex::new(Garbage::default()),
+            retired: Mutex::new(Vec::new()),
+            working: AtomicUsize::new(0),
+            sweepers: Mutex::new(Vec::new()),
             solid_threshold: SOLID_TREE_THRESHOLD,
             solid_batch: SOLID_BATCH,
             pending: Mutex::new(HashMap::new()),
@@ -174,7 +210,7 @@ impl SharedTree {
         if transpositions {
             let graph = SharedGraph::new();
             self.root().set_halfmoves(halfmove_count(self.board.halfmoves()));
-            let entry = graph_key(self.root().key(), self.board.halfmoves());
+            let entry = graph_key(self.root().key(), u32::from(self.root().halfmoves()));
             graph.shard(entry).lock().expect("a table shard").insert(entry, self.root as u32);
             graph.entries.fetch_add(1, Ordering::Relaxed);
             self.graph = Some(graph);
@@ -186,17 +222,32 @@ impl SharedTree {
         self.nodes.get(self.root)
     }
 
+    pub fn has_transpositions(&self) -> bool {
+        self.graph.is_some()
+    }
+
     pub fn is_full(&self) -> bool {
         self.full.load(Ordering::Relaxed)
     }
 
+    //the bytes in use: what is dead and not yet freed counts, what was freed does not
     pub fn allocated_bytes(&self) -> usize {
         let graph = self.graph.as_ref().map_or(0, |graph| graph.entries.load(Ordering::Relaxed) * TABLE_ENTRY_BYTES);
-        self.nodes.len() * NODE_BYTES
-            + self.edges.len() * EDGE_BYTES
-            + self.links.len() * LINK_BYTES
-            + self.links.slots() * SLOT_BYTES
+        self.nodes.used() * NODE_BYTES
+            + self.edges.taken() * EDGE_BYTES
+            + self.links.used() * LINK_BYTES
+            + self.links.slots_taken() * SLOT_BYTES
             + graph
+    }
+
+    //the bytes the arenas have been grown to: freed room stays, to be given out again
+    pub fn footprint_bytes(&self) -> usize {
+        self.nodes.len() * NODE_BYTES + self.edges.len() * EDGE_BYTES + self.links.len() * LINK_BYTES + self.links.slots() * SLOT_BYTES
+    }
+
+    //whether the arenas hold much more than the memory limit allows in use, which freed room that nothing fits does
+    pub fn sprawls(&self, memory_limit: usize) -> bool {
+        memory_limit != usize::MAX && self.footprint_bytes() > memory_limit + memory_limit / 4
     }
 
     pub fn pending(&self) -> usize {
@@ -453,15 +504,18 @@ impl SharedTree {
         let made = match &self.graph {
             None => self.nodes.push(key),
             Some(graph) => {
-                let entry = graph_key(key, board.halfmoves());
+                let halfmoves = halfmove_count(board.halfmoves());
+                let entry = graph_key(key, u32::from(halfmoves));
                 let mut shard = graph.shard(entry).lock().expect("a table shard");
-                match shard.get(&entry) {
-                    Some(&shared) => shared as usize,
+                //a node with no reference left is dead: it is made again, and the entry now names the new one
+                match shard.get(&entry).copied().filter(|&shared| self.nodes.get(shared as usize).acquire()) {
+                    Some(shared) => shared as usize,
                     None => {
                         let made = self.nodes.push(key);
-                        self.nodes.get(made).set_halfmoves(halfmove_count(board.halfmoves()));
-                        shard.insert(entry, made as u32);
-                        graph.entries.fetch_add(1, Ordering::Relaxed);
+                        self.nodes.get(made).set_halfmoves(halfmoves);
+                        if shard.insert(entry, made as u32).is_none() {
+                            graph.entries.fetch_add(1, Ordering::Relaxed);
+                        }
                         made
                     }
                 }
@@ -470,33 +524,44 @@ impl SharedTree {
         jitter();
         let parent = self.nodes.get(parent);
         let place = edge - parent.edges().start;
+        //the node's reference becomes the move's if the move is kept
         let kept = match parent.children() {
             Children::Solid(first) => {
                 let link = first + place as u32;
                 self.links.slot(link).claim(made as u32).map(|_| (made, link)).map_err(|other| (other as usize, link))
             }
-            Children::List(_) => {
-                let mut mine = NO_LINK;
-                loop {
-                    match self.links.find(parent.list_head(), place) {
-                        Ok(found) => break Err((self.links.child(found) as usize, found)),
-                        Err((pointer, at)) => {
-                            if mine == NO_LINK {
-                                mine = self.links.push(made as u32, place);
-                            }
-                            if self.links.insert(pointer, at, mine) {
-                                break Ok((made, mine));
-                            }
-                            jitter();
-                        }
-                    }
-                }
-            }
+            Children::List(_) => self.insert_link(parent, place, made),
         };
         kept.unwrap_or_else(|other| {
             self.counts.orphans.fetch_add(1, Ordering::Relaxed);
+            self.drop_reference(made);
             other
         })
+    }
+
+    //a link for the node `made` in the parent's list, at the place of its move: Ok if it is kept, else Err of the node and link
+    //the move has
+    fn insert_link(&self, parent: &Node, place: usize, made: usize) -> Result<(usize, u32), (usize, u32)> {
+        let mut mine = NO_LINK;
+        loop {
+            match self.links.find(parent.list_head(), place) {
+                Ok(found) => {
+                    if mine != NO_LINK {
+                        self.links.free_link(mine);
+                    }
+                    return Err((self.links.child(found) as usize, found));
+                }
+                Err((pointer, at)) => {
+                    if mine == NO_LINK {
+                        mine = self.links.push(made as u32, place);
+                    }
+                    if self.links.insert(pointer, at, mine) {
+                        return Ok((made, mine));
+                    }
+                    jitter();
+                }
+            }
+        }
     }
 
     //the link a waiting leaf's path holds for a move of the node, in case the node's list was made solid since
@@ -534,16 +599,21 @@ impl SharedTree {
         });
     }
 
-    //the node's list copied into one slot a move; needs the tree to itself
+    //the node's list copied into one slot a move, each move's count with it; needs the tree to itself. The list stays readable
+    //until the next move: a waiting leaf may name one of its links
     fn make_solid(&self, id: usize) {
         let node = self.nodes.get(id);
         let moves = node.edges().len();
-        if moves == 0 || !matches!(node.children(), Children::List(_)) {
+        let Children::List(head) = node.children() else { return };
+        if moves == 0 {
             return;
         }
         let children =
             self.links.linked(node).map(|(place, link)| (place, self.links.child(link), self.links.visits(link).load(Ordering::Relaxed)));
         set_links(&self.links, node, moves, true, children);
+        if head != NO_LINK {
+            self.retired.lock().expect("the retired lists").push(head);
+        }
     }
 
     fn arrive(&self, id: usize) -> Arrival {
@@ -731,7 +801,7 @@ impl SharedTree {
         self.pending() + (self.root().visits() as usize) < visit_limit as usize && !self.closed.load(Ordering::Acquire)
     }
 
-    //no call gathers any more; the caller has the tree to itself (quiet)
+    //no call gathers any more and the sweepers leave; the caller has the tree to itself (quiet)
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
     }
@@ -740,8 +810,9 @@ impl SharedTree {
         *self.closed.get_mut() = false;
     }
 
-    //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent. Without
-    //`limited` the descent is let through whatever the room, but reserves like the rest: finish_leaf gives back every leaf's
+    //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent. Short of
+    //room, the thread frees garbage until it has some or there is none and none being freed. Without `limited` the descent is
+    //let through whatever the room, but reserves like the rest: finish_leaf gives back every leaf's
     fn reserve(&self, memory_limit: usize, limited: bool) -> bool {
         if limited && self.nodes.len() + 64 >= Nodes::CAPACITY {
             return false;
@@ -750,11 +821,17 @@ impl SharedTree {
             return true;
         }
         let reserved = self.reserved.fetch_add(DESCENT_BYTES, Ordering::AcqRel) + DESCENT_BYTES;
-        if !limited || self.allocated_bytes() + reserved <= memory_limit {
-            return true;
+        while limited && self.allocated_bytes() + reserved > memory_limit {
+            if self.reclaim(ASSIST_BATCH) > 0 {
+                self.counts.assists.fetch_add(1, Ordering::Relaxed);
+            } else if self.working.load(Ordering::Acquire) == 0 && !self.has_garbage() {
+                self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
+                return false;
+            } else {
+                std::thread::yield_now();
+            }
         }
-        self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
-        false
+        true
     }
 
     //a descent's reservation back, but the moves of the leaf it leaves waiting
@@ -1026,14 +1103,16 @@ impl SharedTree {
                 copy.publish_edges(first, node.edges().len());
             }
         }
-        SharedTree {
+        let shared = SharedTree {
             root: tree.root_index(),
             nodes,
             edges,
             links,
             full: AtomicBool::new(tree.full),
             ..SharedTree::new(tree.board.clone(), tree.keys.clone())
-        }
+        };
+        shared.count_references();
+        shared
     }
 
     pub fn node(&self, id: usize) -> &Node {
@@ -1067,6 +1146,7 @@ impl SharedTree {
 
     //edges numbered as a one thread search's Tree has them, in the order the nodes were expanded in
     pub fn to_tree(&self) -> Tree {
+        assert_eq!(self.nodes.used(), self.nodes.len(), "nodes given back: to_reachable_tree numbers what is left");
         let count = self.nodes.len();
         let mut expanded: Vec<(usize, usize)> = (0..count)
             .filter_map(|id| Some(self.nodes.get(id).edges()).filter(|edges| !edges.is_empty()).map(|edges| (edges.start, id)))

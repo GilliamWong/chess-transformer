@@ -360,7 +360,12 @@ struct Stops {
     walk: AtomicBool,
 }
 
-impl<T> Kept<T> {
+//drops a tree on a thread of its own: the search's clock does not wait for the memory to be given back
+fn drop_later<T: Send + 'static>(value: T) {
+    let _ = std::thread::Builder::new().spawn(move || drop(value));
+}
+
+impl<T: Send + 'static> Kept<T> {
     //an advance not done has its copy stopped and is waited for: its walk is the quickest way to the stale leaves
     fn ready(self) -> Option<Kept<T>> {
         match self {
@@ -373,10 +378,11 @@ impl<T> Kept<T> {
     }
 
     fn abandon(self) {
-        if let Kept::Advancing(_, stops) = self {
+        if let Kept::Advancing(_, stops) = &self {
             stops.copy.store(true, Ordering::Relaxed);
             stops.walk.store(true, Ordering::Relaxed);
         }
+        drop_later(self);
     }
 }
 
@@ -401,6 +407,7 @@ struct Searches {
     tree_reuse: bool,
     memory_limit: usize, //bytes a search's tree may take, usize::MAX for no limit
     advance_threads: usize,
+    gc_threads: usize,
     concurrent_descents: bool,
     shared_cache: Option<SharedCache>,
     state: Mutex<State>,
@@ -725,11 +732,13 @@ fn line_to(tree: &Tree, moves: &[String]) -> Option<(Vec<usize>, Vec<u16>)> {
 
 #[pymethods]
 impl Searches {
-    //memory_limit_mb (RamLimitMb, 0 for none) limits a search's tree alone: the cache and advance's copy come on top
+    //memory_limit_mb (RamLimitMb, 0 for none) limits a search's tree alone: the cache comes on top, and advance's copy without
+    //concurrent descents. gc_threads: with them, the threads that free the dead rest of a tree beside the search after a move; 0 frees
+    //it all at the search's start
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw, repetitions_for_a_draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0, advance_threads=4, concurrent_descents=false, transpositions=false))]
+                        memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -748,6 +757,7 @@ impl Searches {
         certainty: bool,
         memory_limit_mb: usize,
         advance_threads: usize,
+        gc_threads: usize,
         concurrent_descents: bool,
         transpositions: bool,
     ) -> PyResult<Searches> {
@@ -774,6 +784,7 @@ impl Searches {
             tree_reuse,
             memory_limit: if memory_limit_mb == 0 { usize::MAX } else { memory_limit_mb.saturating_mul(1_000_000) },
             advance_threads: advance_threads.max(1),
+            gc_threads,
             concurrent_descents,
             shared_cache: (concurrent_descents && cache_positions > 0).then(|| SharedCache::new(cache_positions)),
             state: Mutex::new(State {

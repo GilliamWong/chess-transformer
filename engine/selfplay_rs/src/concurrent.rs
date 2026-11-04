@@ -82,7 +82,9 @@ impl Searches {
         let tree = self
             .shared_reused_tree(&mut state, id, fen, &moves)
             .unwrap_or_else(|| SharedTree::new(board, keys).with_transpositions(self.settings.transpositions));
-        state.shared_searches.push(SharedSearch { id, fen: fen.to_string(), moves, simulations, stopped: false, tree: Arc::new(tree) });
+        let tree = Arc::new(tree);
+        tree.start_sweepers(self.gc_threads);
+        state.shared_searches.push(SharedSearch { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
         Ok(())
     }
 
@@ -279,7 +281,8 @@ impl Searches {
         Ok(())
     }
 
-    //None while a call of the id's last search still holds the tree
+    //None while a call of the id's last search still holds the tree. The root is moved down the line, which costs no more than the
+    //line is long; the dead rest of the tree is freed beside the search, or at once with no gc threads
     fn shared_reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String]) -> Option<SharedTree> {
         let kept = state.shared_kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
@@ -288,33 +291,40 @@ impl Searches {
         }
         let since = &moves[kept.moves.len()..];
         let (settings, tables) = (&self.settings, self.tables.as_ref());
-        match kept.tree.ready()? {
-            Kept::Searched(tree) => {
-                let mut tree = Arc::into_inner(tree)?;
-                tree.reopen();
-                let (line, _) = shared_line_to(&tree, since)?;
-                if !line.is_empty() {
-                    tree.play_line(&line);
-                    tree.drop_stale_leaves(settings, tables).ok()?;
-                }
-                Some(tree)
-            }
-            Kept::Advanced(tree, candidates) => {
-                let mut tree = Arc::into_inner(tree)?;
-                tree.reopen();
-                let (line, places) = shared_line_to(&tree, since)?;
-                tree.move_root(&line);
-                match candidates {
-                    Some(candidates) => tree.drop_stale_candidates(&places, &candidates, settings, tables).ok()?,
-                    None => tree.drop_stale_leaves(settings, tables).ok()?,
-                }
-                Some(tree)
-            }
+        //the walk's candidates of an advance, the inner None if it was stopped: without an advance, no walk was made
+        let (tree, candidates) = match kept.tree.ready()? {
+            Kept::Searched(tree) => (tree, None),
+            Kept::Advanced(tree, candidates) => (tree, Some(candidates)),
             Kept::Advancing(..) => unreachable!("ready waits for the thread"),
+        };
+        let mut tree = into_owned(tree)?;
+        tree.reopen();
+        if tree.sprawls(self.memory_limit) {
+            drop_later(tree);
+            return None;
         }
+        let Some((line, places)) = shared_line_to(&tree, since) else {
+            drop_later(tree);
+            return None;
+        };
+        tree.move_root(&line);
+        let dropped = match candidates {
+            None if line.is_empty() => Ok(()),
+            Some(Some(candidates)) => tree.drop_stale_candidates(&places, &candidates, settings, tables),
+            _ => tree.drop_stale_leaves(settings, tables),
+        };
+        if dropped.is_err() {
+            drop_later(tree);
+            return None;
+        }
+        if self.gc_threads == 0 {
+            tree.drain();
+        }
+        Some(tree)
     }
 
-    //the root moves down in place; a thread then finds the leaves the next root may make stale and copies the kept part out of the rest
+    //moves the kept tree on towards the next search while the opponent thinks. A tree with transpositions is moved at the next
+    //search's start, which costs no more than the line is long; one without has its stale leaves looked for by a thread
     pub(crate) fn shared_advance(&self, id: u64, fen: &str, moves: Vec<String>) -> PyResult<bool> {
         let mut state = self.lock()?;
         if state.shared_search(id).is_some() {
@@ -326,22 +336,32 @@ impl Searches {
             return Ok(false);
         }
         let Some(Kept::Searched(tree) | Kept::Advanced(tree, _)) = kept.tree.ready() else { return Ok(false) };
-        let Some(mut tree) = Arc::into_inner(tree) else { return Ok(false) };
-        let Some((line, _)) = shared_line_to(&tree, &moves[kept.moves.len()..]) else { return Ok(false) };
+        let Some((line, _)) = shared_line_to(&tree, &moves[kept.moves.len()..]) else {
+            drop_later(tree);
+            return Ok(false);
+        };
+        if tree.has_transpositions() {
+            state.shared_kept.insert(id, KeptTree { fen: kept.fen, moves: kept.moves, tree: Kept::Searched(tree) });
+            return Ok(true);
+        }
+        let Some(mut tree) = into_owned(tree) else { return Ok(false) };
         tree.move_root(&line);
         let stops = Arc::new(Stops::default());
         let (thread_stops, threads) = (stops.clone(), self.advance_threads);
         let carry = move || {
             let candidates = tree.stale_candidates(threads, &thread_stops.walk);
-            if candidates.is_some() {
-                drop(tree.compact(Some(&thread_stops.copy)));
-            }
             (Arc::new(tree), candidates)
         };
         let Ok(thread) = std::thread::Builder::new().spawn(carry) else { return Ok(false) };
         state.shared_kept.insert(id, KeptTree { fen: fen.to_string(), moves, tree: Kept::Advancing(thread, stops) });
         Ok(true)
     }
+}
+
+//the tree to itself again, once the sweepers of its last search have left: None while a call of that search still holds it
+fn into_owned(tree: Arc<SharedTree>) -> Option<SharedTree> {
+    tree.join_sweepers();
+    Arc::into_inner(tree)
 }
 
 //the edges down from the root along `moves` (uci) and each one's place among its node's moves; None unless every move has its

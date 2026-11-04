@@ -39,8 +39,11 @@ SPEED_ROUNDS = 8
 INFO_SECONDS = 1.0
 RUST_WAIT_SECONDS = 0.005
 CACHE_POSITIONS = 5_000_000
-#the threads that carry the kept tree on after a move, while the opponent thinks; 0 for the next search's start to do it
+#the threads that look for a kept tree's stale leaves after a move, while the opponent thinks (a tree with transpositions has none to look for);
+#0 for the next search's start to look
 ADVANCE_THREADS = 4
+#the threads that free the dead rest of a moved tree beside the next search; 0 for the search's start to free it all, on the engine's own clock
+GC_THREADS = 2
 #the engine's changes to mcts.py's search, which self-play keeps as it is
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
 ROOT_MOVES_REPORTED = 3
@@ -189,13 +192,14 @@ class EngineSearch:
     #network has GraphedBatches' launch and collect (inference.ImmediateBatches on the cpu), or is a list of them, one a gpu, each driven by a thread of its own
     #one leaf a round is mcts.py's search: its settings (without ENGINE_SETTINGS), a fresh tree every move, one round on the network, no smart pruning
     #use_tablebase: the tables of up to tablebase_pieces pieces, from the folders of syzygy_path (a SyzygyPath) rather than the downloaded ones if given
-    #memory_limit_mb: 0 for none; rust_rounds: the rounds in Searches' own loop (rounds.rs), a thread a network and no python between them, the python
-    #loop's search exactly; concurrent_descents: the networks' threads descend, finish and back up in the tree at once (search/shared.rs); pin_threads:
-    #the networks' threads each on a cpu of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes, so only on sm_120's)
+    #memory_limit_mb: 0 for none (the tree's arenas may hold up to a quarter more: freed room no node fits); gc_threads: those that free a moved tree's dead rest;
+    #rust_rounds: the rounds in Searches' own loop (rounds.rs), a thread a network and no python between them, the python loop's search exactly;
+    #concurrent_descents: the networks' threads descend, finish and back up in the tree at once (search/shared.rs); pin_threads: the networks' threads each on a cpu
+    #of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes, so only on sm_120's)
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
-                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, rust_rounds: bool | None = None,
+                 memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, gc_threads: int = GC_THREADS, rust_rounds: bool | None = None,
                  concurrent_descents: bool | None = None, pin_threads: bool | None = None):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
@@ -222,7 +226,7 @@ class EngineSearch:
         pinned = several if pin_threads is None else pin_threads
         self.network_cpus = thread_cpus(len(self.networks) if pinned and batched else 0)
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
-                                             advance_threads=advance_threads, concurrent_descents=self.concurrent_descents)
+                                             advance_threads=advance_threads, gc_threads=gc_threads, concurrent_descents=self.concurrent_descents)
         #reports give the score on the network's own scale, before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
@@ -243,8 +247,9 @@ class EngineSearch:
     def new_game(self) -> None:
         self.searches.new_game(GAME)
 
-    #once the engine's move is sent, while the opponent thinks: carries the kept tree on to board on a thread of Searches', so that the next search's start only
-    #moves its root down the reply. False when there is no tree to carry on, or no advance threads (the next search's start then carries it on)
+    #once the engine's move is sent, while the opponent thinks: has threads of Searches' look for the leaves the next root may make stale in a kept tree without
+    #transpositions. A tree with transpositions has none to look for: its root moves at the next search's start, which costs next to nothing. False when there is no
+    #tree to carry on, or no advance threads (the next search's start then does it)
     def advance(self, board: chess.Board) -> bool:
         return (self.leaves > 1 and self.advance_threads > 0
                 and self.searches.advance(GAME, board.root().fen(), [move.uci() for move in board.move_stack]))

@@ -1,5 +1,6 @@
 use super::*;
 use crate::search::shared::{SharedCache, SharedTree};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant};
 
@@ -142,16 +143,27 @@ fn one_thread_searches_as_tree_does() {
 }
 
 fn check_tree(tree: &SharedTree, settings: &SearchSettings) {
-    walk(tree, tree.root_index(), &tree.board, &mut tree.keys.clone(), settings);
+    walk(tree, tree.root_index(), &tree.board, &mut tree.keys.clone(), settings, false);
 }
 
-fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, settings: &SearchSettings) {
+//a tree whose root moved: a leaf taken out as stale has no visit until it is searched again
+fn check_reused_tree(tree: &SharedTree, settings: &SearchSettings) {
+    walk(tree, tree.root_index(), &tree.board, &mut tree.keys.clone(), settings, true);
+}
+
+fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, settings: &SearchSettings, reused: bool) {
     let node = tree.node(id);
     let (visits, in_flight) = node.counts();
     assert_eq!(in_flight, 0, "a node with simulations in flight after the search");
-    assert!(visits > 0, "a node of the tree without a visit");
+    assert!(visits > 0 || reused, "a node of the tree without a visit");
+    if visits == 0 {
+        assert!(node.edges().is_empty(), "a node without a visit has moves");
+        return;
+    }
     let edges = node.edges();
-    let children: Vec<(usize, usize)> = edges.clone().filter_map(|edge| tree.child_index(node, edge).map(|child| (edge, child))).collect();
+    let has_visits = |child: &usize| !reused || tree.node(*child).visits() > 0;
+    let children: Vec<(usize, usize)> =
+        edges.clone().filter_map(|edge| tree.child_index(node, edge).map(|child| (edge, child))).filter(|(_, child)| has_visits(child)).collect();
     if edges.is_empty() {
         //a game's end or a repeat, reached again and again: every visit scored its result
         let legal_moves = board.legal_moves();
@@ -208,7 +220,7 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, settin
         let mut next = board.clone();
         next.play_unchecked(tree.chess_move(edge).to_move(&next));
         keys.push(tree.node(child).key());
-        walk(tree, child, &next, keys, settings);
+        walk(tree, child, &next, keys, settings, reused);
         keys.pop();
     }
 }
@@ -347,12 +359,12 @@ fn edges_of(tree: &SharedTree, line: &[PackedMove]) -> Vec<usize> {
         .collect()
 }
 
-//tests.rs advanced() on a SharedTree, stopped in the "walk" or the "copy"
+//tests.rs advanced() on a SharedTree, with the walk stopped or not: the root moves one move, then the rest, and the garbage is freed
 fn shared_advanced(
     tree: &SharedTree,
     line: &[PackedMove],
     threads: usize,
-    stopped: Option<&str>,
+    walk_stopped: bool,
     settings: &SearchSettings,
     tables: Option<&Tables>,
 ) -> SharedTree {
@@ -369,10 +381,7 @@ fn shared_advanced(
         .collect();
     advanced.move_root(&edges[..1]);
     let (never, always) = (AtomicBool::new(false), AtomicBool::new(true));
-    let candidates = advanced.stale_candidates(threads, if stopped == Some("walk") { &always } else { &never });
-    if candidates.is_some() {
-        advanced.compact(Some(if stopped == Some("copy") { &always } else { &never }));
-    }
+    let candidates = advanced.stale_candidates(threads, if walk_stopped { &always } else { &never });
     let rest = edges_of(&advanced, &line[1..]);
     advanced.move_root(&rest);
     assert!(advanced.root().proof().is_none(), "a root is never proven");
@@ -380,12 +389,34 @@ fn shared_advanced(
         Some(candidates) => advanced.drop_stale_candidates(&places[1..], &candidates, settings, tables).expect("the tables"),
         None => advanced.drop_stale_leaves(settings, tables).expect("the tables"),
     }
-    advanced.compact(None);
+    advanced.drain();
     advanced
 }
 
+//a tree whose garbage was all freed holds what the root reaches and nothing else
+fn check_drained(tree: &SharedTree) {
+    tree.check_refs();
+    assert_eq!(tree.in_use(), tree.reachable(), "room in use that the root does not reach");
+    if let Some(entries) = tree.table_entries() {
+        assert_eq!(entries, tree.reachable().nodes, "table entries of nodes the root does not reach");
+    }
+}
+
+//the root moved and the stale leaves dropped as a Tree's reuse does: before, halfway through and after the garbage is freed, the
+//tree the root reaches is the Tree's compacted one
+fn assert_moved_as_compacted(old: &Tree, moved: SharedTree) {
+    assert_same_trees(old, &moved.to_reachable_tree());
+    moved.check_refs();
+    moved.reclaim(7);
+    assert_same_trees(old, &moved.to_reachable_tree());
+    moved.check_refs();
+    moved.drain();
+    assert_same_trees(old, &moved.to_reachable_tree());
+    check_drained(&moved);
+}
+
 #[test]
-fn reusing_a_shared_tree_leaves_the_tree_a_tree_is_left() {
+fn moving_the_root_then_draining_leaves_the_tree_a_compacted_one_is() {
     let tables = tables();
     let (mut lines, mut stale, mut proven) = (0, 0, 0);
     //a draw of 0.5 takes as much from a parent as it leaves it: 0.35 tells which of the two a sign took
@@ -403,12 +434,13 @@ fn reusing_a_shared_tree_leaves_the_tree_a_tree_is_left() {
             stale += reused_move_by_move(&mut old, &line_moves, &settings, tables);
 
             let mut at_once = SharedTree::from_tree(&shared.to_tree());
-            at_once.play_line(&edges_of(&at_once, &line_moves));
+            at_once.move_root(&edges_of(&at_once, &line_moves));
             at_once.drop_stale_leaves(&settings, tables).expect("the tables");
-            assert_same_trees(&old, &at_once.to_tree());
-            for (threads, stopped) in [(1, None), (1, Some("copy")), (1, Some("walk")), (4, None), (4, Some("copy")), (4, Some("walk"))] {
-                let advanced = shared_advanced(&shared, &line_moves, threads, stopped, &settings, tables);
-                assert_same_trees(&old, &advanced.to_tree());
+            assert_moved_as_compacted(&old, at_once);
+            for (threads, walk_stopped) in [(1, false), (1, true), (4, false), (4, true)] {
+                let advanced = shared_advanced(&shared, &line_moves, threads, walk_stopped, &settings, tables);
+                assert_same_trees(&old, &advanced.to_reachable_tree());
+                check_drained(&advanced);
             }
             let mut moved = SharedTree::from_tree(&shared.to_tree());
             moved.move_root(&edges_of(&moved, &line_moves[..1]));
@@ -419,6 +451,33 @@ fn reusing_a_shared_tree_leaves_the_tree_a_tree_is_left() {
         }
     }
     assert!(lines >= 15 && stale > 0 && proven > 0, "{lines} lines, {stale} stale leaves, {proven} proven nodes");
+}
+
+#[test]
+fn moving_the_root_of_a_tree_with_transpositions_then_draining_leaves_the_tree_a_compacted_one_is() {
+    let tables = tables();
+    let mut lines = 0;
+    for (fen, moves, simulations, certainty, tables) in cases(&tables) {
+        let settings = graph_settings(certainty);
+        let mut tree = graph_tree_after(fen, moves);
+        search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
+        for line in reusable_lines(&tree) {
+            let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+            let mut old = copied(&tree);
+            old.play_line(&line);
+            old.drop_stale_leaves(&settings, tables).expect("the tables");
+
+            //a graph is not copied by from_tree: the search is made again, as the tree's was
+            let mut shared = graph_shared_tree_after(fen, moves);
+            shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
+            assert_same_trees(&tree, &shared.to_tree());
+            shared.move_root(&edges_of(&shared, &line_moves));
+            shared.drop_stale_leaves(&settings, tables).expect("the tables");
+            assert_moved_as_compacted(&old, shared);
+            lines += 1;
+        }
+    }
+    assert!(lines >= 15, "{lines} lines");
 }
 
 //a proof hides the leaves below it from the stale walk unless it is the new root
@@ -446,8 +505,8 @@ fn proven_nodes_hide_stale_leaves_from_a_shared_trees_advance_as_from_the_walk()
         let mut walked = copied(&proved);
         walked.play_line(&line);
         walked.drop_stale_leaves(&settings, None).expect("no tables");
-        let advanced = shared_advanced(&SharedTree::from_tree(&proved), &line_moves, 4, None, &settings, None);
-        assert_same_trees(&walked, &advanced.to_tree());
+        let advanced = shared_advanced(&SharedTree::from_tree(&proved), &line_moves, 4, false, &settings, None);
+        assert_same_trees(&walked, &advanced.to_reachable_tree());
     }
 }
 
@@ -675,7 +734,7 @@ fn line_after(tree: &Tree, line: &[PackedMove]) -> Vec<usize> {
 }
 
 #[test]
-fn reusing_a_graph_keeps_it_whole() {
+fn reusing_a_tree_with_transpositions_keeps_it_whole() {
     let tables = tables();
     let mut lines = 0;
     for (fen, moves, simulations, certainty, tables) in cases(&tables) {
@@ -704,15 +763,361 @@ fn reusing_a_graph_keeps_it_whole() {
             advanced.drop_stale_candidates(&[], &candidates, &settings, tables).expect("the tables");
             advanced.compact(1, None);
             assert_same_trees(&at_once, &advanced);
-
-            let mut shared = graph_shared_tree_after(fen, moves);
-            shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
-            assert_same_trees(&tree, &shared.to_tree());
-            shared.play_line(&edges_of(&shared, &line_moves));
-            shared.drop_stale_leaves(&settings, tables).expect("the tables");
-            assert_same_trees(&at_once, &shared.to_tree());
             lines += 1;
         }
     }
     assert!(lines >= 15, "{lines} lines");
+}
+
+//the root's most visited move, if the node it leads to has moves to search on
+fn best_edge(tree: &SharedTree) -> Option<usize> {
+    let edge = *tree.principal_variation().first()?;
+    tree.child(tree.root(), edge).filter(|child| child.has_edges()).map(|_| edge)
+}
+
+//a search over: the sweepers leave, and the tree is its owner's again, open for the next
+fn owned_again(tree: Arc<SharedTree>) -> SharedTree {
+    tree.quiet(|| tree.close());
+    tree.join_sweepers();
+    let mut tree = Arc::into_inner(tree).expect("no one else holds the tree");
+    tree.reopen();
+    tree
+}
+
+//the visits of the nodes that moves of the reachable tree do not account for: a node's visits come with its moves', but those of
+//a node a dead node's move led to are in its numbers and not in any move that is left
+fn visits_without_a_move(tree: &Tree) -> usize {
+    let mut by_moves = vec![0u32; tree.nodes.len()];
+    for id in 0..tree.nodes.len() {
+        for (_, link) in tree.linked(id) {
+            by_moves[tree.link_child(link) as usize] += tree.move_visits(link);
+        }
+    }
+    (1..tree.nodes.len()).filter(|&id| tree.nodes[id].visit_count > by_moves[id]).count()
+}
+
+#[test]
+fn continuing_a_reused_tree_searches_as_a_compacted_one_does() {
+    let tables = tables();
+    let mut continued = 0;
+    for transpositions in [false, true] {
+        for (fen, moves, simulations, certainty, tables) in cases(&tables).into_iter().take(4) {
+            let settings = SearchSettings { transpositions, ..settings(certainty) };
+            let mut tree = tree_after(fen, moves).with_transpositions(transpositions);
+            search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
+            for line in reusable_lines(&tree).into_iter().take(2) {
+                let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+                let mut old = copied(&tree);
+                old.play_line(&line);
+                old.drop_stale_leaves(&settings, tables).expect("the tables");
+                search(&mut old, simulations + 3_000, usize::MAX, &settings, tables, &mut Network::new());
+                old.compact(1, None);
+
+                let mut shared = shared_tree_after(fen, moves).with_transpositions(transpositions);
+                shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
+                shared.move_root(&edges_of(&shared, &line_moves));
+                shared.drop_stale_leaves(&settings, tables).expect("the tables");
+                shared.drain();
+                shared_in_flight(&shared, simulations + 3_000, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
+                assert_same_trees(&old, &shared.to_reachable_tree());
+                shared.move_root(&[]);
+                shared.drain();
+                check_drained(&shared);
+                continued += 1;
+            }
+        }
+    }
+    assert!(continued >= 12, "{continued} continued searches");
+}
+
+#[test]
+fn a_dead_node_is_revived_by_a_transposition_before_the_sweep() {
+    let tables = tables();
+    let (mut revived_trees, mut lazy_visits, mut strict_visits) = (0, 0, 0);
+    for (fen, moves, simulations, certainty, tables) in cases(&tables).into_iter().take(4) {
+        let settings = graph_settings(certainty);
+        let built = || {
+            let tree = graph_shared_tree_after(fen, moves);
+            shared_in_flight(&tree, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
+            tree
+        };
+        let lines: Vec<Vec<PackedMove>> = {
+            let tree = built().to_tree();
+            reusable_lines(&tree).into_iter().take(2).map(|line| line.iter().map(|&edge| tree.chess_move(edge)).collect()).collect()
+        };
+        for line in lines {
+            //the same search twice: the dead rest of the tree freed at once, and not at all before the search goes on
+            let mut strict = built();
+            strict.move_root(&edges_of(&strict, &line));
+            strict.drain();
+            shared_in_flight(&strict, simulations + 2_000, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
+            let strict_tree = strict.to_reachable_tree();
+            check_graph(&strict_tree);
+            strict.move_root(&[]);
+            strict.drain();
+            check_drained(&strict);
+
+            //halfway, the first dead nodes freed: their children have no references left, and their table entries are made over
+            for freed in [0, 1, 40] {
+                let mut lazy = built();
+                lazy.move_root(&edges_of(&lazy, &line));
+                lazy.reclaim(freed);
+                shared_in_flight(&lazy, simulations + 2_000, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
+                lazy.check_refs();
+                let lazy_tree = lazy.to_reachable_tree();
+                check_graph(&lazy_tree);
+                lazy.move_root(&[]);
+                lazy.drain();
+                assert_same_trees(&lazy_tree, &lazy.to_reachable_tree());
+                check_drained(&lazy);
+                if freed == 0 {
+                    lazy_visits += visits_without_a_move(&lazy_tree);
+                    strict_visits += visits_without_a_move(&strict_tree);
+                    revived_trees += usize::from(!trees_alike(&lazy_tree, &strict_tree));
+                }
+            }
+        }
+    }
+    assert!(revived_trees > 0, "no dead node was revived");
+    assert!(lazy_visits > strict_visits, "{lazy_visits} nodes carry old visits against {strict_visits} in a tree made afresh");
+}
+
+//whether two trees have the same nodes' numbers, whatever the order
+fn trees_alike(one: &Tree, other: &Tree) -> bool {
+    let numbers = |tree: &Tree| -> Vec<(u32, u64)> {
+        let mut numbers: Vec<_> = tree.nodes.iter().map(|node| (node.visit_count, node.value_sum.to_bits())).collect();
+        numbers.sort_unstable();
+        numbers
+    };
+    numbers(one) == numbers(other)
+}
+
+//the checks of a tree no thread works in, whatever garbage it holds; returns the nodes that several moves lead to
+fn check_after_search(tree: &SharedTree, transpositions: bool, certainty: bool, settings: &SearchSettings) -> usize {
+    tree.check_refs();
+    if transpositions {
+        return check_graph(&tree.to_reachable_tree());
+    }
+    if !certainty {
+        check_reused_tree(tree, settings);
+    }
+    0
+}
+
+#[test]
+fn gc_workers_beside_searching_threads_lose_no_live_node() {
+    let network = SharedNetwork::new();
+    let (mut reclaimed, mut shared_nodes) = (0, 0);
+    for transpositions in [false, true] {
+        for certainty in [false, true] {
+            let settings = SearchSettings { transpositions, ..settings(certainty) };
+            for threads in [2, 8, 24] {
+                let mut tree = shared_tree_after(START, OPENING).with_transpositions(transpositions);
+                for _ in 0..8 {
+                    let searching = Arc::new(tree);
+                    searching.start_sweepers(2);
+                    let target = searching.root().visits() + 1_500;
+                    search_on_threads(&searching, threads, target, 2, 16, &settings, &network, usize::MAX);
+                    tree = owned_again(searching);
+                    shared_nodes += check_after_search(&tree, transpositions, certainty, &settings);
+                    reclaimed += tree.counts.reclaimed.load(Ordering::Relaxed);
+                    let Some(edge) = best_edge(&tree) else { break };
+                    tree.move_root(&[edge]);
+                    //a repeat or a game's end of the old root's game may be neither from the new root's
+                    tree.drop_stale_leaves(&settings, None).expect("no tables");
+                }
+                //whatever the sweepers left is freed at the end
+                tree.drain();
+                check_drained(&tree);
+            }
+        }
+    }
+    assert!(reclaimed > 0 && shared_nodes > 0, "{reclaimed} nodes freed, {shared_nodes} shared");
+}
+
+#[test]
+fn lost_races_free_their_references() {
+    let network = SharedNetwork::new();
+    for transpositions in [false, true] {
+        let settings = SearchSettings { transpositions, ..settings(true) };
+        let mut orphans = 0;
+        for _ in 0..6 {
+            let mut tree = shared_tree_after(START, &[]).with_transpositions(transpositions);
+            search_on_threads(&tree, 24, 3_000, 3, 16, &settings, &network, usize::MAX);
+            orphans += tree.counts.orphans.load(Ordering::Relaxed);
+            //the node and the link a thread that lost made are in the pools again, and every reference is one of the moves'
+            tree.check_refs();
+            tree.move_root(&[]);
+            tree.drain();
+            check_drained(&tree);
+        }
+        assert!(orphans > 0, "no thread lost a race, transpositions {transpositions}");
+    }
+}
+
+//a game of `moves` moves of the engine's kind: a search, the most visited move played, again. The searches end at `visits` at the
+//root, or only when the memory is full; returns the footprint (arenas' bytes) the tree had at each move and its last owner
+fn play_a_game(moves: usize, visits: Option<u32>, limit: usize, sweepers: usize, check_footprint: bool) -> SharedTree {
+    let (settings, network) = (settings(true), SharedNetwork::new());
+    let fresh_visits = {
+        let tree = shared_tree_after(START, OPENING);
+        shared_in_flight(&tree, visits.unwrap_or(u32::MAX >> 1), 2, &settings, None, &network, limit);
+        tree.root().visits()
+    };
+    let mut tree = shared_tree_after(START, OPENING);
+    let (mut restarts, mut played) = (0, 0);
+    while played < moves {
+        let searching = Arc::new(tree);
+        searching.start_sweepers(sweepers);
+        //the room is looked at between steps of the search
+        while !searching.is_full() && visits.is_none_or(|visits| searching.root().visits() < visits) {
+            let target = searching.root().visits() + 50;
+            shared_in_flight(&searching, visits.map_or(target, |visits| target.min(visits)), 2, &settings, None, &network, limit);
+            assert!(searching.allocated_bytes() <= limit, "{} bytes of {limit}", searching.allocated_bytes());
+        }
+        assert!(!searching.has_garbage() || !searching.is_full(), "a search ended full with garbage left");
+        let reached = f64::from(searching.root().visits());
+        assert!(reached >= 0.8 * f64::from(fresh_visits), "move {played}: {reached} visits against a fresh tree's {fresh_visits}");
+        tree = owned_again(searching);
+        assert!(
+            !check_footprint || played < 20 || !tree.sprawls(limit),
+            "move {played}: {} bytes of arenas for a limit of {limit}; (arena, in use) of nodes, edges, links and slots: {:?}",
+            tree.footprint_bytes(),
+            tree.arena_bytes()
+        );
+        match best_edge(&tree) {
+            Some(edge) => tree.move_root(&[edge]),
+            None => {
+                tree = shared_tree_after(START, OPENING);
+                restarts += 1;
+            }
+        }
+        played += 1;
+    }
+    assert!(restarts <= 3, "{restarts} games ended");
+    tree
+}
+
+fn one_trees_bytes(visits: u32) -> usize {
+    let tree = shared_tree_after(START, OPENING);
+    shared_in_flight(&tree, visits, 2, &settings(true), None, &SharedNetwork::new(), usize::MAX);
+    tree.allocated_bytes()
+}
+
+//the memory is more than a move's tree and the last move's dead rest: descents seldom free any, and the arenas stay near the limit
+#[test]
+fn a_game_stays_within_the_memory_limit() {
+    let limit = one_trees_bytes(800) * 5 / 2;
+    for sweepers in [0, 2] {
+        play_a_game(200, Some(800), limit, sweepers, true);
+    }
+}
+
+//the memory is full at every move and the last move's dead rest is more than the room left: the descents or the sweepers free
+//it as the search needs it, and the freed room is used again
+#[test]
+fn a_game_that_fills_the_memory_every_move_keeps_to_the_limit() {
+    let limit = one_trees_bytes(800) * 8 / 5;
+    let tree = play_a_game(120, None, limit, 0, false);
+    assert!(tree.counts.assists.load(Ordering::Relaxed) > 0, "no descent freed any garbage");
+    //the arenas have the room freed runs of every length left, but not much more than the limit: the runs are joined
+    assert!(tree.footprint_bytes() <= limit * 3 / 2, "{} bytes of arenas for a limit of {limit}: {:?}", tree.footprint_bytes(), tree.arena_bytes());
+    play_a_game(120, None, limit, 2, false);
+}
+
+#[test]
+fn search_move_drain_100_times_returns_to_the_same_bytes() {
+    let (settings, network) = (settings(true), SharedNetwork::new());
+    let mut tree = shared_tree_after(START, OPENING);
+    let (mut footprints, mut restarts) = (Vec::new(), 0);
+    while footprints.len() < 100 {
+        let target = tree.root().visits() + 500;
+        shared_in_flight(&tree, target, 2, &settings, None, &network, usize::MAX);
+        match best_edge(&tree) {
+            Some(edge) => tree.move_root(&[edge]),
+            None => {
+                tree = shared_tree_after(START, OPENING);
+                restarts += 1;
+                continue;
+            }
+        }
+        tree.drain();
+        //the room in use is what the root reaches: no node, link, slot or edge is left behind by a move, a list made solid or a loss
+        check_drained(&tree);
+        footprints.push(tree.footprint_bytes());
+    }
+    assert!(restarts <= 3, "{restarts} games ended");
+    let (settled, last) = (footprints[20..].iter().copied().min().expect("moves"), footprints[99]);
+    assert!(last <= settled * 3, "arenas of {last} bytes against {settled} a while ago");
+}
+
+#[test]
+fn a_kept_tree_is_owned_again_after_every_search() {
+    let (settings, network) = (graph_settings(true), SharedNetwork::new());
+    let mut tree = graph_shared_tree_after(START, OPENING);
+    for _ in 0..50 {
+        let searching = Arc::new(tree);
+        searching.start_sweepers(2);
+        let target = searching.root().visits() + 300;
+        search_on_threads(&searching, 4, target, 2, 16, &settings, &network, usize::MAX);
+        searching.quiet(|| searching.close());
+        searching.join_sweepers();
+        assert_eq!(Arc::weak_count(&searching), 0, "a sweeper still holds the tree");
+        tree = Arc::into_inner(searching).expect("the last owner");
+        tree.reopen();
+        match best_edge(&tree) {
+            Some(edge) => tree.move_root(&[edge]),
+            None => tree = graph_shared_tree_after(START, OPENING),
+        }
+    }
+
+    //a tree dropped with its sweepers at work: they find it gone and leave
+    let searching = Arc::new(graph_shared_tree_after(START, OPENING));
+    search_on_threads(&searching, 8, 20_000, 2, 16, &settings, &network, usize::MAX);
+    let mut tree = owned_again(searching);
+    tree.move_root(&[best_edge(&tree).expect("a move")]);
+    let searching = Arc::new(tree);
+    assert!(searching.has_garbage());
+    searching.start_sweepers(2);
+    let sweepers = searching.take_sweepers();
+    assert_eq!(sweepers.len(), 2);
+    drop(searching);
+    let (done, left) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        sweepers.into_iter().for_each(|sweeper| sweeper.join().expect("a sweeper"));
+        done.send(()).expect("the test");
+    });
+    left.recv_timeout(Duration::from_secs(20)).expect("the sweepers leave once the tree is gone");
+}
+
+#[test]
+fn starting_on_a_reused_300k_node_tree_takes_under_20_ms() {
+    let (settings, network) = (graph_settings(true), SharedNetwork::new());
+    let mut tree = graph_shared_tree_after(START, OPENING);
+    search_on_threads(&tree, 8, 340_000, 3, 64, &settings, &network, usize::MAX);
+    let nodes = tree.in_use().nodes;
+    assert!(nodes >= 300_000, "{nodes} nodes");
+    let edge = best_edge(&tree).expect("a move");
+    let started = Instant::now();
+    let searching = Arc::new(tree);
+    searching.join_sweepers();
+    tree = Arc::into_inner(searching).expect("the last owner");
+    tree.reopen();
+    assert!(!tree.sprawls(usize::MAX));
+    tree.move_root(&[edge]);
+    tree.drop_stale_leaves(&settings, None).expect("no tables");
+    let searching = Arc::new(tree);
+    searching.start_sweepers(2);
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(20), "starting took {took:?}");
+
+    //the search goes on beside the sweepers, which leave their garbage when it ends
+    let target = searching.root().visits() + 2_000;
+    search_on_threads(&searching, 4, target, 2, 16, &settings, &network, usize::MAX);
+    let mut tree = owned_again(searching);
+    tree.check_refs();
+    tree.move_root(&[]);
+    tree.drain();
+    check_drained(&tree);
+    assert!(tree.counts.reclaimed.load(Ordering::Relaxed) > 0);
 }

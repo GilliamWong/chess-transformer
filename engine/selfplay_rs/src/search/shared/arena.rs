@@ -1,8 +1,10 @@
 use crate::rules::PackedMove;
 use crate::search::{NO_LINK, NO_NODE, Outcome, Proof, SOLID, listed};
 use shakmaty::Move;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::ptr::{null_mut, slice_from_raw_parts_mut};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 const NODE_CHUNK_BITS: u32 = if cfg!(test) { 6 } else { 16 };
@@ -14,6 +16,10 @@ const LINK_CHUNK_BITS: u32 = if cfg!(test) { 8 } else { 18 };
 const LINK_CHUNKS: usize = 1 << 13;
 
 const IN_FLIGHT: u64 = 1 << 32;
+//a freed node's count in a debug build, for a descent that reaches it to find
+const FREED: u64 = u64::MAX;
+//proof_meta keeps a proof's plies in the bits above its outcome's two
+const PROOF_PLIES_BITS: u32 = 30;
 
 //the orderings are the tree's protocol (shared.rs)
 #[repr(align(64))]
@@ -24,12 +30,15 @@ pub struct Node {
     visited_policy_sqrt: AtomicU64,
     edges_at: AtomicU64, //the first edge above the low 8 bits, the number of edges in them; 0 until expanded
     proof_value: AtomicU64,
-    proof_meta: AtomicU64, //0 without a proof, else the plies above the low 2 bits and the outcome in them (1 loss, 2 draw, 3 win)
     key: AtomicU64,
-    refreshes: AtomicU16, //begun, wrapping
-    halfmoves: AtomicU16, //with transpositions the node's fifty-move count
-    children: AtomicU32,  //a list's first link, or once solid its first slot (SOLID set): see Children
+    proof_meta: AtomicU32, //0 without a proof, else the plies above the low 2 bits and the outcome in them (1 loss, 2 draw, 3 win)
+    references: AtomicU32, //the moves (links and slots) that name the node, and 1 for the root; 0 once it is dead: see SharedTree
+    refreshes: AtomicU16,  //begun, wrapping
+    halfmoves: AtomicU16,  //with transpositions the node's fifty-move count
+    children: AtomicU32,   //a list's first link, or once solid its first slot (SOLID set): see Children
 }
+
+const _: () = assert!(size_of::<Node>() == 64);
 
 //a node's moves with a node: a list of links in the moves' order, or once solid one slot a move
 #[derive(Clone, Copy)]
@@ -51,6 +60,7 @@ impl Node {
     //one more simulation in flight; returns the (visits, in flight) before
     pub fn bump(&self) -> (u32, u32) {
         let before = self.count.fetch_add(IN_FLIGHT, Ordering::AcqRel);
+        debug_assert!(before != FREED, "a descent reached a freed node");
         (before as u32, (before >> 32) as u32)
     }
 
@@ -77,23 +87,61 @@ impl Node {
         self.count.fetch_sub(u64::from(visits), Ordering::Relaxed);
     }
 
-    //the node as if never visited, its key kept
+    //the node as if never visited, its key and references kept
     pub fn reset(&self) {
-        for field in [&self.count, &self.value_sum, &self.visited_policy_sqrt, &self.edges_at, &self.proof_value, &self.proof_meta] {
+        for field in [&self.count, &self.value_sum, &self.visited_policy_sqrt, &self.edges_at, &self.proof_value] {
             field.store(0, Ordering::Relaxed);
         }
+        self.proof_meta.store(0, Ordering::Relaxed);
         self.children.store(NO_LINK, Ordering::Relaxed);
     }
 
-    //the numbers, key and proof (not the edges or links) copied to a node of a tree being made
-    pub fn copy_to(&self, target: &Node) {
-        target.count.store(self.count.load(Ordering::Relaxed), Ordering::Relaxed);
-        target.value_sum.store(self.value_sum.load(Ordering::Relaxed), Ordering::Relaxed);
-        target.visited_policy_sqrt.store(self.visited_policy_sqrt.load(Ordering::Relaxed), Ordering::Relaxed);
-        target.proof_value.store(self.proof_value.load(Ordering::Relaxed), Ordering::Relaxed);
-        target.proof_meta.store(self.proof_meta.load(Ordering::Relaxed), Ordering::Relaxed);
-        target.key.store(self.key.load(Ordering::Relaxed), Ordering::Relaxed);
-        target.halfmoves.store(self.halfmoves.load(Ordering::Relaxed), Ordering::Relaxed);
+    //a reference to a node that has one: false for a dead node, which no one revives
+    pub fn acquire(&self) -> bool {
+        let mut seen = self.references.load(Ordering::Relaxed);
+        while seen > 0 {
+            match self.references.compare_exchange_weak(seen, seen + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(now) => seen = now,
+            }
+        }
+        false
+    }
+
+    //a reference gone; true for the last, whose thread then owns the node's death
+    pub fn release(&self) -> bool {
+        let before = self.references.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(before > 0, "a reference released from a dead node");
+        before == 1
+    }
+
+    //the node as new, with a reference: for a node out of the pool or the table's end, before its index is given out
+    fn recycle(&self, key: u64) {
+        for field in [&self.count, &self.value_sum, &self.visited_policy_sqrt, &self.edges_at, &self.proof_value] {
+            field.store(0, Ordering::Relaxed);
+        }
+        self.proof_meta.store(0, Ordering::Relaxed);
+        self.refreshes.store(0, Ordering::Relaxed);
+        self.halfmoves.store(0, Ordering::Relaxed);
+        self.children.store(NO_LINK, Ordering::Relaxed);
+        self.key.store(key, Ordering::Relaxed);
+        self.references.store(1, Ordering::Release);
+    }
+
+    //for a node of a tree being copied, before anything else sees it
+    #[cfg(test)]
+    pub fn set_references(&self, references: u32) {
+        self.references.store(references, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn references(&self) -> u32 {
+        self.references.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn is_freed(&self) -> bool {
+        self.count.load(Ordering::Relaxed) == FREED
     }
 
     pub fn value_sum(&self) -> f64 {
@@ -177,7 +225,7 @@ impl Node {
             2 => Outcome::Draw,
             _ => Outcome::Win,
         };
-        Some(Proof { outcome, value: f64::from_bits(self.proof_value.load(Ordering::Relaxed)), plies: (meta >> 2) as u32 })
+        Some(Proof { outcome, value: f64::from_bits(self.proof_value.load(Ordering::Relaxed)), plies: meta >> 2 })
     }
 
     pub fn proves_a_loss(&self) -> bool {
@@ -190,8 +238,9 @@ impl Node {
             Outcome::Draw => 2,
             Outcome::Win => 3,
         };
+        assert!(proof.plies < 1 << PROOF_PLIES_BITS, "a proof of {} plies", proof.plies);
         self.proof_value.store(proof.value.to_bits(), Ordering::Relaxed);
-        self.proof_meta.store(u64::from(proof.plies) << 2 | outcome, Ordering::Release);
+        self.proof_meta.store(proof.plies << 2 | outcome, Ordering::Release);
     }
 
     pub fn clear_proof(&self) {
@@ -256,9 +305,157 @@ impl<T> Drop for Table<T> {
     }
 }
 
+//indices given back, to be given out again. `idle` is how many it holds, looked at without the lock: a pool never used leaves
+//the tables to hand out in the order of their ends
+#[derive(Default)]
+struct Pool {
+    indices: Mutex<Vec<u32>>,
+    idle: AtomicUsize,
+}
+
+impl Pool {
+    fn take(&self) -> Option<u32> {
+        if self.idle.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let mut indices = self.indices.lock().expect("a pool");
+        let index = indices.pop();
+        self.idle.store(indices.len(), Ordering::Relaxed);
+        index
+    }
+
+    fn give(&self, index: u32) {
+        let mut indices = self.indices.lock().expect("a pool");
+        indices.push(index);
+        self.idle.store(indices.len(), Ordering::Relaxed);
+    }
+
+    //the indices come out of the pool lowest first within a batch, so that nodes made together lie together
+    fn give_all(&self, given: &mut Vec<u32>) {
+        given.sort_unstable_by(|one, other| other.cmp(one));
+        let mut indices = self.indices.lock().expect("a pool");
+        indices.append(given);
+        self.idle.store(indices.len(), Ordering::Relaxed);
+    }
+
+    fn idle(&self) -> usize {
+        self.idle.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn held(&self) -> Vec<u32> {
+        self.indices.lock().expect("a pool").clone()
+    }
+}
+
+//runs given back, joined with the runs next to them, kept by their first element and by their length; no run crosses a chunk. A
+//take of up to PIECE_LENGTHS - 1 elements pops a piece of that length; when there is none, the shortest run that is long enough is
+//cut into as many as PIECE_BATCH, so that the runs' sets are visited once in that many takes and the pieces come side by side
+struct FreeRuns {
+    pieces: Box<[Mutex<Vec<usize>>]>, //by length
+    runs: Mutex<RunSets>,
+    idle: AtomicUsize, //the elements in the pieces and the runs, looked at without a lock
+    chunk_mask: usize,
+}
+
+const PIECE_LENGTHS: usize = 256;
+const PIECE_BATCH: usize = 32;
+
+#[derive(Default)]
+struct RunSets {
+    by_first: BTreeMap<usize, usize>,
+    by_length: BTreeSet<(usize, usize)>, //(length, first)
+}
+
+impl RunSets {
+    fn insert(&mut self, first: usize, length: usize) {
+        self.by_first.insert(first, length);
+        self.by_length.insert((length, first));
+    }
+
+    fn remove(&mut self, first: usize, length: usize) {
+        self.by_first.remove(&first);
+        self.by_length.remove(&(length, first));
+    }
+}
+
+impl FreeRuns {
+    fn new(chunk_bits: u32) -> FreeRuns {
+        FreeRuns {
+            pieces: (0..PIECE_LENGTHS).map(|_| Mutex::new(Vec::new())).collect(),
+            runs: Mutex::new(RunSets::default()),
+            idle: AtomicUsize::new(0),
+            chunk_mask: (1 << chunk_bits) - 1,
+        }
+    }
+
+    fn idle(&self) -> usize {
+        self.idle.load(Ordering::Relaxed)
+    }
+
+    fn give(&self, first: usize, count: usize) {
+        assert!((1..PIECE_LENGTHS).contains(&count), "a run of {count}");
+        let mut runs = self.runs.lock().expect("the runs given back");
+        let (mut first, mut length) = (first, count);
+        //a run before or after, unless the chunk starts or ends between them
+        if first & self.chunk_mask != 0
+            && let Some((&before, &before_length)) = runs.by_first.range(..first).next_back()
+            && before + before_length == first
+        {
+            runs.remove(before, before_length);
+            (first, length) = (before, length + before_length);
+        }
+        let end = first + length;
+        if end & self.chunk_mask != 0
+            && let Some(&after_length) = runs.by_first.get(&end)
+        {
+            runs.remove(end, after_length);
+            length += after_length;
+        }
+        runs.insert(first, length);
+        self.idle.fetch_add(count, Ordering::Relaxed);
+    }
+
+    //a run of `count` elements
+    fn take(&self, count: usize) -> Option<usize> {
+        assert!((1..PIECE_LENGTHS).contains(&count), "a run of {count}");
+        if self.idle() == 0 {
+            return None;
+        }
+        if let Some(first) = self.pieces[count].lock().expect("the pieces").pop() {
+            self.idle.fetch_sub(count, Ordering::Relaxed);
+            return Some(first);
+        }
+        let mut runs = self.runs.lock().expect("the runs given back");
+        let &(length, first) = runs.by_length.range((count, 0)..).next()?;
+        runs.remove(first, length);
+        let cut = (length / count).min(PIECE_BATCH);
+        if length > cut * count {
+            runs.insert(first + cut * count, length - cut * count);
+        }
+        if cut > 1 {
+            self.pieces[count].lock().expect("the pieces").extend((1..cut).rev().map(|piece| first + piece * count));
+        }
+        self.idle.fetch_sub(count, Ordering::Relaxed);
+        Some(first)
+    }
+
+    #[cfg(test)]
+    fn held(&self) -> Vec<(usize, usize)> {
+        let runs = self.runs.lock().expect("the runs given back");
+        let mut held: Vec<(usize, usize)> = runs.by_first.iter().map(|(&first, &length)| (first, length)).collect();
+        for (length, pieces) in self.pieces.iter().enumerate() {
+            held.extend(pieces.lock().expect("the pieces").iter().map(|&first| (first, length)));
+        }
+        held.sort_unstable();
+        held
+    }
+}
+
 pub struct Nodes {
     table: Table<Node>,
     next: AtomicUsize,
+    freed: Pool,
 }
 
 impl Nodes {
@@ -266,41 +463,109 @@ impl Nodes {
     pub const CAPACITY: usize = (NODE_CHUNKS << NODE_CHUNK_BITS) - 1;
 
     pub fn new() -> Nodes {
-        Nodes { table: Table::new(NODE_CHUNKS, NODE_CHUNK_BITS), next: AtomicUsize::new(0) }
+        Nodes { table: Table::new(NODE_CHUNKS, NODE_CHUNK_BITS), next: AtomicUsize::new(0), freed: Pool::default() }
     }
 
+    //the nodes made so far, those given back included
     pub fn len(&self) -> usize {
         self.next.load(Ordering::Relaxed)
+    }
+
+    pub fn used(&self) -> usize {
+        self.len() - self.freed.idle()
     }
 
     pub fn get(&self, index: usize) -> &Node {
         self.table.get(index)
     }
 
-    //a new node with its position's key; its index is given to others only once it is published
+    //a new node with its position's key and a reference; its index is given to others only once it is published
     pub fn push(&self, key: u64) -> usize {
-        let index = self.next.fetch_add(1, Ordering::Relaxed);
-        assert!(index < Self::CAPACITY, "the tree is past its nodes");
-        self.table.ensure_chunk(index, || (0..1 << NODE_CHUNK_BITS).map(|_| Node::default()).collect());
-        self.table.get(index).key.store(key, Ordering::Relaxed);
+        let index = match self.freed.take() {
+            Some(freed) => freed as usize,
+            None => {
+                let index = self.next.fetch_add(1, Ordering::Relaxed);
+                assert!(index < Self::CAPACITY, "the tree is past its nodes");
+                self.table.ensure_chunk(index, || (0..1 << NODE_CHUNK_BITS).map(|_| Node::default()).collect());
+                index
+            }
+        };
+        self.table.get(index).recycle(key);
         index
+    }
+
+    //dead nodes whose children and room were given back: the last thing done with them
+    pub fn free(&self, indices: &mut Vec<u32>) {
+        for &index in indices.iter() {
+            let node = self.table.get(index as usize);
+            debug_assert_eq!(node.references.load(Ordering::Relaxed), 0, "a node freed with references");
+            if cfg!(debug_assertions) {
+                node.count.store(FREED, Ordering::Relaxed);
+            }
+        }
+        self.freed.give_all(indices);
+    }
+
+    #[cfg(test)]
+    pub fn freed(&self) -> Vec<u32> {
+        self.freed.held()
     }
 }
 
-//the first of `count` elements (at most a chunk of `1 << bits`) in one chunk, from `next` and below `capacity`
-fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> usize {
+//the first of `count` elements (at most a chunk of `1 << bits`) in one chunk, from `next` and below `capacity`, and the
+//elements skipped at the chunk's end before it
+fn alloc_run(next: &AtomicUsize, count: usize, bits: u32, capacity: usize) -> (usize, usize) {
     debug_assert!(count > 0 && count <= 1 << bits);
     let mut at = next.load(Ordering::Relaxed);
-    let first = loop {
+    let (first, skipped) = loop {
         let chunk_end = (at | ((1 << bits) - 1)) + 1;
         let first = if at + count <= chunk_end { at } else { chunk_end };
         match next.compare_exchange_weak(at, first + count, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break first,
+            Ok(_) => break (first, first - at),
             Err(now) => at = now,
         }
     };
     assert!(first + count <= capacity, "the tree is past its room");
-    first
+    (first, skipped)
+}
+
+//runs of elements, each in one chunk: from the runs given back, else from the end of those given out so far
+struct Runs {
+    next: AtomicUsize,
+    skipped: AtomicUsize, //the elements left unused at chunk ends
+    freed: FreeRuns,
+    bits: u32,
+    capacity: usize,
+}
+
+impl Runs {
+    fn new(bits: u32, capacity: usize) -> Runs {
+        Runs { next: AtomicUsize::new(0), skipped: AtomicUsize::new(0), freed: FreeRuns::new(bits), bits, capacity }
+    }
+
+    fn alloc(&self, count: usize) -> usize {
+        self.freed.take(count).unwrap_or_else(|| {
+            let (first, skipped) = alloc_run(&self.next, count, self.bits, self.capacity);
+            self.skipped.fetch_add(skipped, Ordering::Relaxed);
+            first
+        })
+    }
+
+    //the elements given out so far, the gaps at chunk ends and the runs given back included
+    fn len(&self) -> usize {
+        self.next.load(Ordering::Relaxed)
+    }
+
+    //the elements and gaps in use: as much memory
+    fn taken(&self) -> usize {
+        self.len() - self.freed.idle()
+    }
+
+    //the elements in the runs in use
+    #[cfg(test)]
+    fn used(&self) -> usize {
+        self.taken() - self.skipped.load(Ordering::Relaxed)
+    }
 }
 
 //a list's move with a node; written before it is swapped into its list (release) and read after its predecessor's `next` (acquire)
@@ -361,8 +626,9 @@ impl Slot {
 pub struct Links {
     table: Table<Link>,
     next: AtomicUsize,
+    freed: Pool,
     slots: Table<Slot>,
-    next_slot: AtomicUsize,
+    slot_runs: Runs,
 }
 
 impl Links {
@@ -373,21 +639,38 @@ impl Links {
         let links = Links {
             table: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
             next: AtomicUsize::new(1),
+            freed: Pool::default(),
             slots: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
-            next_slot: AtomicUsize::new(0),
+            slot_runs: Runs::new(LINK_CHUNK_BITS, Self::CAPACITY),
         };
         links.make(0);
         links
     }
 
-    //the links given out so far, the gaps at chunk ends included
+    //the links given out so far, those given back included
     pub fn len(&self) -> usize {
         self.next.load(Ordering::Relaxed)
     }
 
-    //the slots given out so far, the gaps included
+    //the links in use
+    pub fn used(&self) -> usize {
+        self.len() - self.freed.idle()
+    }
+
+    //the slots given out so far, the gaps at chunk ends and the runs given back included
     pub fn slots(&self) -> usize {
-        self.next_slot.load(Ordering::Relaxed)
+        self.slot_runs.len()
+    }
+
+    //the slots and gaps in use
+    pub fn slots_taken(&self) -> usize {
+        self.slot_runs.taken()
+    }
+
+    //the slots in the runs in use
+    #[cfg(test)]
+    pub fn slots_used(&self) -> usize {
+        self.slot_runs.used()
     }
 
     fn make(&self, first: usize) {
@@ -418,19 +701,65 @@ impl Links {
 
     //a list link for the move at `place` with its node, not yet in a list
     pub fn push(&self, child: u32, place: usize) -> u32 {
-        let link = alloc_run(&self.next, 1, LINK_CHUNK_BITS, Self::CAPACITY);
-        self.make(link);
+        let link = match self.freed.take() {
+            Some(freed) => freed as usize,
+            None => {
+                let (link, _) = alloc_run(&self.next, 1, LINK_CHUNK_BITS, Self::CAPACITY);
+                self.make(link);
+                link
+            }
+        };
         let made = self.table.get(link);
         made.child.store(child, Ordering::Relaxed);
+        made.visits.store(0, Ordering::Relaxed);
+        made.next.store(NO_LINK, Ordering::Relaxed);
         made.place.store(place as u32, Ordering::Relaxed);
         link as u32
     }
 
+    //a link that was never put into its list, given back
+    pub fn free_link(&self, link: u32) {
+        self.freed.give(link);
+    }
+
+    //links of lists, given back
+    pub fn free(&self, links: &mut Vec<u32>) {
+        self.freed.give_all(links);
+    }
+
+    //the links of the list from `head`, added to `links` to give back (Links::free)
+    pub fn collect_list(&self, head: u32, links: &mut Vec<u32>) {
+        let mut link = head;
+        while link != NO_LINK {
+            links.push(link);
+            link = self.get(link).next();
+        }
+    }
+
     //`count` solid slots, none with a node: returns the first, SOLID with its index
     pub fn solid(&self, count: usize) -> u32 {
-        let first = alloc_run(&self.next_slot, count, LINK_CHUNK_BITS, Self::CAPACITY);
+        let first = self.slot_runs.alloc(count);
         self.slots.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Slot::new()).collect());
+        for slot in self.slots.slice(first, count) {
+            slot.child.store(NO_NODE, Ordering::Relaxed);
+            slot.visits.store(0, Ordering::Relaxed);
+        }
         first as u32 | SOLID
+    }
+
+    #[cfg(test)]
+    pub fn freed_links(&self) -> Vec<u32> {
+        self.freed.held()
+    }
+
+    #[cfg(test)]
+    pub fn freed_slot_runs(&self) -> Vec<(usize, usize)> {
+        self.slot_runs.freed.held()
+    }
+
+    //a solid node's `count` slots from `first`, given back
+    pub fn free_slots(&self, first: u32, count: usize) {
+        self.slot_runs.freed.give((first & !SOLID) as usize, count);
     }
 
     //the link of the move at `place` in the list from `head`, or Err of the pointer a new link for it goes into (the head or
@@ -522,7 +851,7 @@ impl Iterator for Linked<'_> {
 pub struct Edges {
     priors: Table<AtomicU32>,
     moves: Table<AtomicU16>,
-    next: AtomicUsize,
+    runs: Runs,
 }
 
 impl Edges {
@@ -532,21 +861,42 @@ impl Edges {
         Edges {
             priors: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS),
             moves: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS),
-            next: AtomicUsize::new(0),
+            runs: Runs::new(EDGE_CHUNK_BITS, Self::CAPACITY),
         }
     }
 
-    //the edges given out so far, the gaps at chunk ends included
+    //the edges given out so far, the gaps at chunk ends and the runs given back included
     pub fn len(&self) -> usize {
-        self.next.load(Ordering::Relaxed)
+        self.runs.len()
     }
 
-    //room for a node's `count` edges (at most a chunk), in one chunk; returns the first
+    //the edges and gaps in use
+    pub fn taken(&self) -> usize {
+        self.runs.taken()
+    }
+
+    //the edges in the runs in use
+    #[cfg(test)]
+    pub fn used(&self) -> usize {
+        self.runs.used()
+    }
+
+    //room for a node's `count` edges (at most 255), in one chunk; returns the first
     pub fn alloc(&self, count: usize) -> usize {
-        let first = alloc_run(&self.next, count, EDGE_CHUNK_BITS, Self::CAPACITY);
+        let first = self.runs.alloc(count);
         self.priors.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU32::new(0)).collect());
         self.moves.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
         first
+    }
+
+    #[cfg(test)]
+    pub fn freed_runs(&self) -> Vec<(usize, usize)> {
+        self.runs.freed.held()
+    }
+
+    //a dead node's `count` edges from `first`, given back
+    pub fn free(&self, first: usize, count: usize) {
+        self.runs.freed.give(first, count);
     }
 
     pub fn priors(&self, edges: Range<usize>) -> &[AtomicU32] {
@@ -576,6 +926,8 @@ impl Edges {
         }
     }
 
+    //for a tree being copied
+    #[cfg(test)]
     pub fn set(&self, edge: usize, chess_move: PackedMove, prior: f32) {
         self.moves.get(edge).store(chess_move.bits(), Ordering::Relaxed);
         self.priors.get(edge).store(prior.to_bits(), Ordering::Relaxed);
@@ -585,6 +937,163 @@ impl Edges {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    //what is out of the pools as (first, count): room given out twice is found at once
+    #[derive(Default)]
+    struct Out(Mutex<std::collections::BTreeMap<usize, usize>>);
+
+    impl Out {
+        fn take(&self, first: usize, count: usize, what: &str) {
+            let mut out = self.0.lock().expect("what is out");
+            if let Some((&before, &length)) = out.range(..=first).next_back() {
+                assert!(before + length <= first, "{what}: {first}+{count} is out while {before}+{length} is");
+            }
+            if let Some((&after, &length)) = out.range(first..).next() {
+                assert!(first + count <= after, "{what}: {first}+{count} is out while {after}+{length} is");
+            }
+            out.insert(first, count);
+        }
+
+        fn give(&self, first: usize, count: usize) {
+            assert_eq!(self.0.lock().expect("what is out").remove(&first), Some(count));
+        }
+    }
+
+    //a draw's turn: take one more of something held, or give one back
+    fn churn<T>(held: &mut Vec<T>, draw: u64, make: impl FnOnce() -> T, give: impl FnOnce(T)) {
+        if held.len() < 300 && (draw >> 8) % 5 < 3 || held.is_empty() {
+            held.push(make());
+        } else {
+            give(held.swap_remove((draw >> 16) as usize % held.len()));
+        }
+    }
+
+    fn run_in_one_chunk(first: usize, count: usize, bits: u32) {
+        assert_eq!(first >> bits, (first + count - 1) >> bits, "a run across a chunk");
+    }
+
+    #[test]
+    fn pools_hand_out_each_slot_once() {
+        let (nodes, links, edges) = (Nodes::new(), Links::new(), Edges::new());
+        let (out_nodes, out_links, out_edges, out_slots) = (Out::default(), Out::default(), Out::default(), Out::default());
+        std::thread::scope(|scope| {
+            for worker in 0..8u64 {
+                let (nodes, links, edges) = (&nodes, &links, &edges);
+                let (out_nodes, out_links, out_edges, out_slots) = (&out_nodes, &out_links, &out_edges, &out_slots);
+                scope.spawn(move || {
+                    let mut state = 0x2545_f491_4f6c_dd1d ^ (worker + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let mut draw = move || {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state
+                    };
+                    //runs of one to a few, and of any length: exact hits, splits and the table's end
+                    let length = |draw: u64| if draw >> 40 & 1 == 0 { 1 + (draw >> 41) as usize % 6 } else { 1 + (draw >> 41) as usize % 218 };
+                    let free_node = |index: usize| {
+                        out_nodes.give(index, 1);
+                        assert!(nodes.get(index).release());
+                        nodes.free(&mut vec![index as u32]);
+                    };
+                    let free_link = |link: usize| {
+                        out_links.give(link, 1);
+                        links.free_link(link as u32);
+                    };
+                    let free_edges = |(first, count): (usize, usize)| {
+                        out_edges.give(first, count);
+                        edges.free(first, count);
+                    };
+                    let free_slots = |(first, count): (u32, usize)| {
+                        out_slots.give((first & !SOLID) as usize, count);
+                        links.free_slots(first, count);
+                    };
+                    let (mut held_nodes, mut held_links, mut held_edges, mut held_slots) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                    for _ in 0..20_000 {
+                        let turn = draw();
+                        match turn % 4 {
+                            0 => churn(
+                                &mut held_nodes,
+                                turn,
+                                || {
+                                    let index = nodes.push(turn);
+                                    out_nodes.take(index, 1, "nodes");
+                                    index
+                                },
+                                free_node,
+                            ),
+                            1 => churn(
+                                &mut held_links,
+                                turn,
+                                || {
+                                    let link = links.push(NO_NODE, 0) as usize;
+                                    out_links.take(link, 1, "links");
+                                    link
+                                },
+                                free_link,
+                            ),
+                            2 => churn(
+                                &mut held_edges,
+                                turn,
+                                || {
+                                    let count = length(turn);
+                                    let first = edges.alloc(count);
+                                    run_in_one_chunk(first, count, EDGE_CHUNK_BITS);
+                                    out_edges.take(first, count, "edges");
+                                    (first, count)
+                                },
+                                free_edges,
+                            ),
+                            _ => churn(
+                                &mut held_slots,
+                                turn,
+                                || {
+                                    let count = length(turn);
+                                    let first = links.solid(count);
+                                    run_in_one_chunk((first & !SOLID) as usize, count, LINK_CHUNK_BITS);
+                                    out_slots.take((first & !SOLID) as usize, count, "slots");
+                                    (first, count)
+                                },
+                                free_slots,
+                            ),
+                        }
+                    }
+                    held_nodes.into_iter().for_each(free_node);
+                    held_links.into_iter().for_each(free_link);
+                    held_edges.into_iter().for_each(free_edges);
+                    held_slots.into_iter().for_each(free_slots);
+                });
+            }
+        });
+        assert_eq!((nodes.used(), links.used(), edges.used(), links.slots_used()), (0, 1, 0, 0), "room not given back");
+    }
+
+    #[test]
+    fn freed_runs_join_their_neighbours_but_not_across_a_chunk() {
+        //chunks of 16
+        let runs = FreeRuns::new(4);
+        runs.give(7, 5);
+        runs.give(3, 4);
+        runs.give(12, 4);
+        runs.give(16, 8);
+        assert_eq!(runs.held(), [(3, 13), (16, 8)]);
+        assert_eq!(runs.idle(), 21);
+        assert_eq!(runs.take(14), None);
+        assert_eq!(runs.take(9), Some(3));
+        assert_eq!(runs.take(4), Some(12));
+        assert_eq!(runs.take(8), Some(16));
+        assert_eq!((runs.take(1), runs.idle()), (None, 0));
+    }
+
+    #[test]
+    fn a_run_is_cut_into_pieces_that_come_side_by_side() {
+        let runs = FreeRuns::new(8);
+        runs.give(100, 40);
+        runs.give(150, 3);
+        assert_eq!([runs.take(5), runs.take(5), runs.take(5)], [Some(100), Some(105), Some(110)]);
+        assert_eq!(runs.idle(), 43 - 15);
+        assert_eq!(runs.held(), [(115, 5), (120, 5), (125, 5), (130, 5), (135, 5), (150, 3)]);
+        assert_eq!(runs.take(4), None);
+    }
 
     #[test]
     fn edges_are_given_out_whole_and_once() {

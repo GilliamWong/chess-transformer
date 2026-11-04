@@ -1372,21 +1372,23 @@ def test_go_ponder_searches_until_ponderhit(monkeypatch):
 #MoveOverhead reaches the next go's time; an option set once the search is built, or to a value it could not take, stays as it was and the gui is told why
 def test_the_options_reach_the_search(monkeypatch):
     script = ["uci", "setoption name cachepositions value 1000", "setoption name RamLimitMb value 64", "setoption name SyzygyProbeLimit value 6",
-              "setoption name AdvanceThreads value 12", "setoption name AdvanceThreads value 257",
+              "setoption name AdvanceThreads value 12", "setoption name AdvanceThreads value 257", "setoption name GcThreads value 6", "setoption name GcThreads value 65",
               "setoption name MoveOverhead value 500", "setoption name MoveOverhead value -1", "setoption name SyzygyProbeLimit value 8",
               "setoption name Hash value 16", "isready", "setoption name CachePositions value 5", "go movetime 1000",
               "setoption name MoveOverhead value 100", "go movetime 1000", "ucinewgame", "go movetime 1000", "quit"]
     searches, sent, built = run_uci(monkeypatch, script, search_options={"smart_pruning": False})
 
     assert [line.split()[2] for line in sent if line.startswith("option name")] == ["SyzygyPath", "SyzygyProbeLimit", "MoveOverhead", "CachePositions",
-                                                                                     "RamLimitMb", "AdvanceThreads", "FirstMoveBonus", "BookPlyBonus",
-                                                                                     "SearchSettings"]
+                                                                                     "RamLimitMb", "AdvanceThreads", "GcThreads", "FirstMoveBonus",
+                                                                                     "BookPlyBonus", "SearchSettings"]
     assert len(built) == 1 and built[0][3] is False
     assert built[0][4] == {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64,
-                           "advance_threads": 12}
+                           "advance_threads": 12, "gc_threads": 6}
     assert [seconds for _, _, seconds, _ in searches] == [pytest.approx(0.5), pytest.approx(0.9), pytest.approx(0.9)]
     told = [line for line in sent if line.startswith("info string")]
-    assert len(told) == 5 and "AdvanceThreads" in told[0] and "-1" in told[1] and "8" in told[2] and "Hash" in told[3] and "CachePositions" in told[4]
+    assert len(told) == 6 and "AdvanceThreads" in told[0] and "GcThreads" in told[1] and "-1" in told[2] and "8" in told[3] and "Hash" in told[4]
+    assert "CachePositions" in told[5]
+    assert "option name GcThreads type spin default 2 min 0 max 64" in sent
 
 #values the engine could not take (a device that is not there, one leaf on several gpus, an unknown setting) leave the options as they were
 def test_the_competition_options_reach_the_search(monkeypatch):
@@ -1399,7 +1401,7 @@ def test_the_competition_options_reach_the_search(monkeypatch):
     searches, sent, built = run_uci(monkeypatch, script, gpu=True, gpus=[0], search_options={"settings": {"c_puct": 0.7}})
 
     names = [line.split()[2] for line in sent if line.startswith("option name")]
-    assert names[6:] == ["Leaves", "GPUs", "SmartPruningFactor", "FirstMoveBonus", "BookPlyBonus", "SearchSettings"]
+    assert names[7:] == ["Leaves", "GPUs", "SmartPruningFactor", "FirstMoveBonus", "BookPlyBonus", "SearchSettings"]
     assert "option name GPUs type string default 0" in sent
     (_, _, leaves, _, options, _, _, gpus), = built
     assert (leaves, gpus) == (32, [0, 1, 2])
@@ -1409,14 +1411,14 @@ def test_the_competition_options_reach_the_search(monkeypatch):
     told = [line for line in sent if line.startswith("info string")]
     assert len(told) == 4 and "device 7" in told[0] and "nope" in told[1] and "BookPlyBonus" in told[2] and "Leaves" in told[3]
 
-def test_the_search_takes_its_cache_size_memory_limit_and_advance_threads(monkeypatch):
+def test_the_search_takes_its_cache_size_memory_limit_advance_and_gc_threads(monkeypatch):
     made = []
     searches = selfplay_rs.Searches
     monkeypatch.setattr(selfplay_rs, "Searches", lambda **settings: made.append(settings) or searches(**settings))
     EngineSearch(cpu_batches(BoardModel()), 16)
-    limited = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, cache_positions=1000, memory_limit_mb=1, advance_threads=12)
-    assert ([(settings["cache_positions"], settings["memory_limit_mb"], settings["advance_threads"]) for settings in made]
-            == [(engine_search.CACHE_POSITIONS, 0, engine_search.ADVANCE_THREADS), (1000, 1, 12)])
+    limited = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, cache_positions=1000, memory_limit_mb=1, advance_threads=12, gc_threads=3)
+    assert ([(settings["cache_positions"], settings["memory_limit_mb"], settings["advance_threads"], settings["gc_threads"]) for settings in made]
+            == [(engine_search.CACHE_POSITIONS, 0, engine_search.ADVANCE_THREADS, engine_search.GC_THREADS), (1000, 1, 12, 3)])
     report = limited.search(chess.Board(), simulations=100_000)
     assert 100 < report.simulations < 3000 and report.line[0] in chess.Board().legal_moves
 
@@ -1502,13 +1504,13 @@ def test_a_rounds_collisions_are_at_most_its_leaves():
 def test_concurrent_descents_on_one_network_are_the_plain_search(middlegame):
     for way in ("plain", "advance", "drop"):
         reports, replies, boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, way)
-        concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True)
+        concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True, gc_threads=0)
         assert concurrent[0] == reports and concurrent[2] == boards and concurrent[3] == advanced
 
     model = shuffling_model()
     for options in ({}, {"settings": {"certainty": True}}):
         plain = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, **options)
-        concurrent = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, concurrent_descents=True, **options)
+        concurrent = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, concurrent_descents=True, gc_threads=0, **options)
         assert concurrent[0] == plain[0] and concurrent[3] == plain[3] == len(SHUFFLES)
 
 def test_concurrent_descents_start_afresh_where_the_tree_does_not_follow():
@@ -1540,6 +1542,19 @@ def test_concurrent_descents_on_several_networks_search_one_tree(networks):
     stop.cancel()
     assert again.simulations >= report.simulations + 500
 
+#the dead rest of the moved tree is freed beside the next search (2 gc threads) or at its start (0), and a move down the tree costs no more than a line's length
+@pytest.mark.parametrize("gc_threads", [0, 2])
+def test_a_game_on_several_networks_moves_its_tree_beside_the_gc_threads(gc_threads):
+    group = SlowNetworks(3, 0.002, BoardModel())
+    search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, gc_threads=gc_threads)
+    board = chess.Board()
+    for _ in range(6):
+        report = search.search(board, simulations=2000)
+        assert report.simulations >= 2000 and report.line[0] in board.legal_moves and len(report.line) > 1
+        board.push(report.line[0])
+        assert search.advance(board)
+        board.push(report.line[1])
+
 @pytest.mark.parametrize("settings", [{"certainty": True}, {"certainty": True, "transpositions": True}], ids=["certainty", "certainty_and_transpositions"])
 def test_concurrent_descents_prove_a_mate_on_several_networks(settings):
     search = EngineSearch(SlowNetworks(3, 0.003, UniformModel()).networks, 16, concurrent_descents=True, settings=settings)
@@ -1565,7 +1580,7 @@ def test_concurrent_descents_by_default_on_several_networks(monkeypatch):
 def test_rust_rounds_with_concurrent_descents_search_as_the_python_loop(blocking_wait, settings):
     board, reports = chess.Board(), {}
     for rust_rounds in (False, True):
-        search = EngineSearch(lean_network(blocking_wait), 16, rust_rounds=rust_rounds, concurrent_descents=True, **settings)
+        search = EngineSearch(lean_network(blocking_wait), 16, rust_rounds=rust_rounds, concurrent_descents=True, gc_threads=0, **settings)
         found = []
         for move in ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]:
             found.append(search.search(board, simulations=600))
@@ -1637,7 +1652,7 @@ def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
     graph = {"settings": {"transpositions": True}}
     for way in ("plain", "advance", "drop"):
         reports, replies, boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, way, **graph)
-        concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True, **graph)
+        concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True, gc_threads=0, **graph)
         assert concurrent[0] == reports and concurrent[2] == boards and concurrent[3] == advanced
     assert advancing_game(BoardModel(), middlegame.copy(), 1, "plain")[0] != reports[:1]
 
@@ -1645,7 +1660,7 @@ def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
     for certainty in (False, True):
         options = {"settings": {"transpositions": True, "certainty": certainty}}
         plain = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, **options)
-        concurrent = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, concurrent_descents=True, **options)
+        concurrent = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, concurrent_descents=True, gc_threads=0, **options)
         assert concurrent[0] == plain[0] and concurrent[3] == plain[3] == len(SHUFFLES)
 
 def test_transpositions_on_several_networks():
