@@ -50,7 +50,7 @@ impl Drivers {
         let seed = StandIn::seed(board);
         if !self.lean {
             let answer = |column| self.stand_in.column(board, seed, column);
-            return tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &self.move_ids, Some(cache), &self.settings, self.memory_limit, logits);
+            return tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &self.move_ids, Some(cache), &self.settings, logits);
         }
         row.clear();
         row.extend(leaf.moves.iter().map(|&chess_move| self.stand_in.column(board, seed, self.move_ids.id(chess_move, leaf.turn))));
@@ -58,7 +58,7 @@ impl Drivers {
         logits.clear();
         logits.extend_from_slice(&row[..leaf.moves.len()]);
         let value = row[crate::LEAN_COLUMNS - 1];
-        tree.finish_leaf_in_order(leaf, logits, value, Some(cache), &self.settings, self.memory_limit);
+        tree.finish_leaf_in_order(leaf, logits, value, Some(cache), &self.settings);
     }
 
     //rounds until `rounds` are started, the root has `stop_at` visits or `seconds` have passed; returns the seconds it took and the leaves

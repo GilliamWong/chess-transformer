@@ -177,10 +177,10 @@ impl Searches {
                     logits.clear();
                     logits.extend(answer[..leaf.moves.len()].iter().map(N::number));
                     let value = answer[LEAN_COLUMNS - 1].number();
-                    tree.finish_leaf_in_order(leaf, &mut logits, value, cache, settings, self.memory_limit);
+                    tree.finish_leaf_in_order(leaf, &mut logits, value, cache, settings);
                 } else {
                     let answer_at = |column: usize| answer[column].number();
-                    tree.finish_leaf(leaf, answer_at, self.answer_width, &self.move_ids, cache, settings, self.memory_limit, &mut logits);
+                    tree.finish_leaf(leaf, answer_at, self.answer_width, &self.move_ids, cache, settings, &mut logits);
                 }
             }
         }
@@ -388,7 +388,7 @@ mod tests {
             tree.queue(id, queued);
             let _hold = tree.hold();
             for leaf in tree.take_round(id) {
-                tree.finish_leaf(leaf, |_| 0.25, ANSWER_WIDTH, &move_ids, None, &settings, usize::MAX, &mut Vec::new());
+                tree.finish_leaf(leaf, |_| 0.25, ANSWER_WIDTH, &move_ids, None, &settings, &mut Vec::new());
             }
         }
         let edge = tree.principal_variation()[0];

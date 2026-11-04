@@ -54,6 +54,9 @@ pub const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + MOST_MOVES * EDGE_BYTES;
 
 const SOLID_BATCH: usize = 32;
 
+//the most calls that descend at once, which the room left is shared out by
+const MOST_CALLS: usize = 64;
+
 //the leaves a call has room for from the start: rounds are of a few dozen
 const LEAVES_AT_ONCE: usize = 64;
 
@@ -136,7 +139,8 @@ pub struct SharedTree {
     pending: Mutex<HashMap<u64, Vec<PendingLeaf>>>,
     //network leaves gathered and not yet backed up
     waiting: AtomicUsize,
-    //bytes that descents in progress and waiting leaves may still allocate (under a memory limit)
+    //bytes that the descents in progress that reserved room may still allocate (under a memory limit); a waiting leaf's are
+    //counted by `waiting`
     reserved: AtomicUsize,
     //no room for another simulation: the search ends as at its simulations, until a move is played
     full: AtomicBool,
@@ -258,6 +262,11 @@ impl SharedTree {
 
     pub fn pending(&self) -> usize {
         self.waiting.load(Ordering::Acquire)
+    }
+
+    //the bytes that descents in progress and waiting leaves may still allocate: the most a leaf's moves take
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved.load(Ordering::Acquire) + self.pending() * MOST_MOVES * EDGE_BYTES
     }
 
     pub fn hold(&self) -> Hold<'_> {
@@ -808,9 +817,11 @@ impl SharedTree {
     }
 
     //room for one more descent: the root's own visits and the leaves waiting are within the simulations, the leaves read
-    //first (a finished leaf adds its visit before it stops waiting, so it is never missed)
+    //first (a finished leaf adds its visit before it stops waiting, so it is never missed). A search by time (UNLIMITED
+    //simulations) counts neither
     fn has_room(&self, visit_limit: u32) -> bool {
-        self.pending() + (self.root().visits() as usize) < visit_limit as usize && !self.closed.load(Ordering::Acquire)
+        let within_visits = visit_limit == u32::MAX || self.pending() + (self.root().visits() as usize) < visit_limit as usize;
+        within_visits && !self.closed.load(Ordering::Acquire)
     }
 
     //no call gathers any more and the sweepers leave; the caller has the tree to itself (quiet)
@@ -822,9 +833,20 @@ impl SharedTree {
         *self.closed.get_mut() = false;
     }
 
-    //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent. Short of
-    //room, the thread frees garbage until it has some or there is none and none being freed. Without `limited` the descent is
-    //let through whatever the room, but reserves like the rest: finish_leaf gives back every leaf's
+    //the descents a call may make without `reserve`: its share of a quarter of the room left (nodes, and bytes under a memory
+    //limit), on the thought that at most MOST_CALLS calls are descending. Far from the limit that is more than a call descends
+    pub fn free_descents(&self, memory_limit: usize) -> usize {
+        let nodes = Nodes::CAPACITY.saturating_sub(self.nodes.len());
+        let bytes = match memory_limit {
+            usize::MAX => usize::MAX,
+            _ => memory_limit.saturating_sub(self.allocated_bytes() + self.reserved_bytes()),
+        };
+        nodes.min(bytes / DESCENT_BYTES) / (4 * MOST_CALLS)
+    }
+
+    //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent (`release`
+    //gives it back). Short of room, the thread frees garbage until it has some or there is none and none being freed. Without
+    //`limited` the descent is let through whatever the room. A leaf that waits has its moves' room counted by `waiting`
     pub fn reserve(&self, memory_limit: usize, limited: bool) -> bool {
         if limited && self.nodes.len() + 64 >= Nodes::CAPACITY {
             return false;
@@ -832,13 +854,13 @@ impl SharedTree {
         if memory_limit == usize::MAX {
             return true;
         }
-        let reserved = self.reserved.fetch_add(DESCENT_BYTES, Ordering::AcqRel) + DESCENT_BYTES;
-        while limited && self.allocated_bytes() + reserved > memory_limit {
+        self.reserved.fetch_add(DESCENT_BYTES, Ordering::AcqRel);
+        while limited && self.allocated_bytes() + self.reserved_bytes() > memory_limit {
             if self.reclaim(ASSIST_BATCH) > 0 {
                 self.counts.assists.fetch_add(1, Ordering::Relaxed);
             } else if !self.idle() {
                 std::thread::yield_now();
-            } else if self.allocated_bytes() + reserved > memory_limit {
+            } else if self.allocated_bytes() + self.reserved_bytes() > memory_limit {
                 //nothing is left to free, but the last batch's thread may have freed it since the loop's look: the room is looked at again
                 self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
                 return false;
@@ -847,10 +869,10 @@ impl SharedTree {
         true
     }
 
-    //a descent's reservation back, but the moves of the leaf it leaves waiting
-    fn release(&self, memory_limit: usize, waiting: bool) {
-        if memory_limit != usize::MAX {
-            self.reserved.fetch_sub(if waiting { DESCENT_NODE_BYTES } else { DESCENT_BYTES }, Ordering::AcqRel);
+    //the room of a descent back, if it reserved some: its node is allocated and its leaf's moves are counted as waiting or allocated
+    fn release(&self, memory_limit: usize, reserved: bool) {
+        if reserved && memory_limit != usize::MAX {
+            self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
         }
     }
 
@@ -910,6 +932,7 @@ impl SharedTree {
         let mut path = Vec::new();
         let mut edges = Vec::new();
         let mut priors = Vec::new();
+        let mut free_descents = self.free_descents(round.memory_limit);
         loop {
             //a writer let in here may have ended the search and closed the tree (end's quiet), so the room is looked at
             //after: a leaf taken in a closed tree belongs to a search that is gone
@@ -918,22 +941,27 @@ impl SharedTree {
             if !(call.leaves.len() < round.leaves as usize && call.simulations < round.simulations && self.has_room(round.visit_limit)) {
                 break;
             }
-            //the root's own evaluation always fits, so that a full search still has moves to report
-            if !self.reserve(round.memory_limit, self.root().has_edges()) {
-                self.full.store(true, Ordering::Relaxed);
-                break;
+            let reserved = free_descents == 0;
+            if reserved {
+                //the root's own evaluation always fits, so that a full search still has moves to report
+                if !self.reserve(round.memory_limit, self.root().has_edges()) {
+                    self.full.store(true, Ordering::Relaxed);
+                    break;
+                }
+            } else {
+                free_descents -= 1;
             }
             let mut board = self.board.clone();
             keys.truncate(root_keys);
             path.clear();
             edges.clear();
             let arrival = self.descend(settings, &mut board, &mut keys, &mut path, &mut edges);
-            let give_back = |waiting: bool| self.release(round.memory_limit, waiting);
+            let give_back = || self.release(round.memory_limit, reserved);
             let node = *path.last().expect("the root at least");
             match arrival {
                 Arrival::Inner => unreachable!("a descent ends on a leaf"),
                 Arrival::Proven(proof) => {
-                    give_back(false);
+                    give_back();
                     call.simulations += 1;
                     self.back_up(&path, &edges, 1.0 - proof.value);
                     continue;
@@ -941,7 +969,7 @@ impl SharedTree {
                 //a repeat is a draw for this path, a transposition visit the shared node's mean: the visit is the
                 //move's, the node's numbers stay as they are
                 Arrival::Repeat | Arrival::CatchUp => {
-                    give_back(false);
+                    give_back();
                     call.simulations += 1;
                     let shared = self.nodes.get(path.pop().expect("the shared node"));
                     //a mean read while other threads back up through the node may be off by their values: kept a score
@@ -953,7 +981,7 @@ impl SharedTree {
                     continue;
                 }
                 Arrival::Collision => {
-                    give_back(false);
+                    give_back();
                     if call.collisions == round.collisions as usize {
                         self.take_off(&path);
                         break;
@@ -975,7 +1003,7 @@ impl SharedTree {
             let value = game_over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
             call.simulations += 1;
             if let Some(value) = value {
-                give_back(false);
+                give_back();
                 match game_over {
                     //the result is for the side to move, the proof for the side that moved here. A win or loss with moves
                     //left is the tables', after any mate
@@ -1017,7 +1045,7 @@ impl SharedTree {
             let cached = cache.and_then(|cache| cache.get(leaf_key, &mut priors)).filter(|_| priors.len() == moves.len());
             match cached {
                 Some(value) => {
-                    give_back(false);
+                    give_back();
                     self.expand(node, &moves, &priors);
                     self.back_up(&path, &edges, f64::from(value));
                 }
@@ -1025,7 +1053,7 @@ impl SharedTree {
                     encode_board(&board, boards);
                     self.waiting.fetch_add(1, Ordering::AcqRel);
                     call.leaves.push(PendingLeaf { path: path.clone(), edges: edges.clone(), key: leaf_key, moves, turn: board.turn() });
-                    give_back(true);
+                    give_back();
                 }
             }
         }
@@ -1042,12 +1070,11 @@ impl SharedTree {
         move_ids: &MoveIds,
         cache: Option<&SharedCache>,
         settings: &SearchSettings,
-        memory_limit: usize,
         logits: &mut Vec<f32>,
     ) {
         logits.clear();
         logits.extend(leaf.moves.iter().map(|&chess_move| answer(move_ids.id(chess_move, leaf.turn))));
-        self.finish_leaf_in_order(leaf, logits, answer(answer_width - 1), cache, settings, memory_limit);
+        self.finish_leaf_in_order(leaf, logits, answer(answer_width - 1), cache, settings);
     }
 
     //finish_leaf for the leaf's move logits and value, the logits in the order of its moves as a lean answer has them; they
@@ -1059,7 +1086,6 @@ impl SharedTree {
         value: f32,
         cache: Option<&SharedCache>,
         settings: &SearchSettings,
-        memory_limit: usize,
     ) {
         assert_eq!(logits.len(), leaf.moves.len(), "a logit a move");
         let (value, kept) = leaf_answer(logits, value, settings);
@@ -1068,9 +1094,6 @@ impl SharedTree {
         self.back_up(&leaf.path, &leaf.edges, f64::from(value));
         if let Some(cache) = cache.filter(|_| kept) {
             cache.insert(leaf.key, logits, value);
-        }
-        if memory_limit != usize::MAX {
-            self.reserved.fetch_sub(MOST_MOVES * EDGE_BYTES, Ordering::AcqRel);
         }
         self.waiting.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1140,10 +1163,6 @@ impl SharedTree {
 
     pub fn node(&self, id: usize) -> &Node {
         self.nodes.get(id)
-    }
-
-    pub fn reserved_bytes(&self) -> usize {
-        self.reserved.load(Ordering::Acquire)
     }
 
     pub fn with_solid_links(mut self, threshold: u32, batch: usize) -> SharedTree {

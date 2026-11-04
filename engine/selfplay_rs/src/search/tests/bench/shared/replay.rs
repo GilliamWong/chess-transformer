@@ -122,7 +122,7 @@ impl Searcher for Concurrent {
         let mut logits = Vec::new();
         for (leaf, row) in self.tree.take_round(id).into_iter().zip(rows) {
             let (cache, settings) = (Some(&self.cache), &self.settings);
-            self.tree.finish_leaf(leaf, |column| row[column], WIDTH, &self.move_ids, cache, settings, usize::MAX, &mut logits);
+            self.tree.finish_leaf(leaf, |column| row[column], WIDTH, &self.move_ids, cache, settings, &mut logits);
         }
     }
 }

@@ -32,7 +32,7 @@ fn seed_of(board: &[u8]) -> u64 {
     board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)))
 }
 
-fn finish_round(tree: &SharedTree, round: u64, boards: &[u8], settings: &SearchSettings, network: &SharedNetwork, memory_limit: usize) {
+fn finish_round(tree: &SharedTree, round: u64, boards: &[u8], settings: &SearchSettings, network: &SharedNetwork) {
     let _hold = tree.hold();
     let leaves = tree.take_round(round);
     let boards = boards.as_chunks::<TOKENS_PER_BOARD>().0;
@@ -43,11 +43,11 @@ fn finish_round(tree: &SharedTree, round: u64, boards: &[u8], settings: &SearchS
         let answer = |column| answer(board, seed, column);
         //every other leaf is finished from its logits in move order, as the engine's lean rows give them
         if index % 2 == 0 {
-            tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &network.move_ids, Some(&network.cache), settings, memory_limit, &mut logits);
+            tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &network.move_ids, Some(&network.cache), settings, &mut logits);
         } else {
             logits.clear();
             logits.extend(leaf.moves.iter().map(|&chess_move| answer(network.move_ids.id(chess_move, leaf.turn))));
-            tree.finish_leaf_in_order(leaf, &mut logits, answer(ANSWER_WIDTH_LAST), Some(&network.cache), settings, memory_limit);
+            tree.finish_leaf_in_order(leaf, &mut logits, answer(ANSWER_WIDTH_LAST), Some(&network.cache), settings);
         }
     }
 }
@@ -80,7 +80,7 @@ fn run_rounds(
             continue;
         }
         let Some((id, boards)) = rounds.pop_front() else { break };
-        finish_round(tree, id, &boards, settings, network, memory_limit);
+        finish_round(tree, id, &boards, settings, network);
     }
     gathered
 }
@@ -217,7 +217,7 @@ fn a_shared_answer_that_is_no_number_leaves_equal_priors_or_a_draw_and_is_not_ca
         {
             let _hold = tree.hold();
             for leaf in tree.take_round(0) {
-                tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &network.move_ids, Some(&network.cache), &settings, 1 << 30, &mut Vec::new());
+                tree.finish_leaf(leaf, answer, ANSWER_WIDTH, &network.move_ids, Some(&network.cache), &settings, &mut Vec::new());
             }
         }
         let root = tree.root();
@@ -423,6 +423,26 @@ fn a_search_under_a_memory_limit_gives_back_every_reservation() {
         search_on_threads(&crowded, threads, 3_000, 2, 16, &settings, &SharedNetwork::new(), 4_000_000);
         assert_eq!(crowded.reserved_bytes(), 0, "{threads} threads");
     }
+}
+
+//a call far from the limit descends without reserving room, and one near it reserves for every descent: the search is the same
+//either way, and many calls at once together stay within the limit
+#[test]
+fn a_search_far_from_its_memory_limit_is_the_search_without_one() {
+    let settings = settings(true);
+    let far = 1 << 30;
+    let (limited, unlimited) = (shared_tree_after(START, &[]), shared_tree_after(START, &[]));
+    assert!(limited.free_descents(far) > 1_000 && limited.free_descents(100_000) == 0);
+    shared_in_flight(&limited, 3_000, 2, &settings, None, &SharedNetwork::new(), far);
+    shared_in_flight(&unlimited, 3_000, 2, &settings, None, &SharedNetwork::new(), usize::MAX);
+    assert_eq!(limited.reserved_bytes(), 0);
+    assert_same_trees(&unlimited.to_tree(), &limited.to_tree());
+
+    let crowded_limit = 2_000_000;
+    let crowded = shared_tree_after(START, &[]);
+    search_on_threads(&crowded, 24, 1_000_000, 2, 64, &settings, &SharedNetwork::new(), crowded_limit);
+    assert!(crowded.is_full() && crowded.pending() == 0 && crowded.allocated_bytes() <= crowded_limit);
+    assert_eq!(crowded.reserved_bytes(), 0);
 }
 
 #[test]
