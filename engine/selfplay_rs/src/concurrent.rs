@@ -60,6 +60,10 @@ impl State {
     fn shared_search(&self, id: u64) -> Option<&SharedSearch> {
         self.shared_searches.iter().find(|search| search.id == id)
     }
+
+    pub(crate) fn drop_shared_search(&mut self, id: u64) {
+        self.shared_searches.extract_if(.., |search| search.id == id).for_each(|search| drop_later(search.tree));
+    }
 }
 
 fn no_search(id: u64) -> PyErr {

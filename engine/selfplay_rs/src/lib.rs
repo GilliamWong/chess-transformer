@@ -666,6 +666,19 @@ impl Searches {
         Ok(self.take_reports(state).into_iter().next())
     }
 
+    //a search whose round loop failed is gone, its tree freed beside the engine, and so are the rounds the loop had out: the leaves they
+    //wait for will not come back. A panic in the search's descent or finish may have left the state locked as broken: the search was
+    //what it left broken, and the searches go on without it
+    fn abort(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|broken| {
+            self.state.clear_poison();
+            broken.into_inner()
+        });
+        state.rounds.retain(|out| !out.leaves.iter().all(|&(search, _)| search == id));
+        state.searches.extract_if(.., |search| search.id == id).for_each(|search| drop_later(search.tree));
+        state.drop_shared_search(id);
+    }
+
     fn take_reports(&self, state: &mut State) -> Vec<SearchReport> {
         let mut reports = Vec::new();
         for search in state.searches.extract_if(.., |search| search.done()) {

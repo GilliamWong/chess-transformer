@@ -4,10 +4,12 @@ use crate::{LEAN_COLUMNS, LEAN_ROW, RootNumbers, Search, SearchReport, Searches,
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,11 @@ impl CudaCalls {
 
 fn panicked<E>(_: E) -> PyErr {
     PyRuntimeError::new_err("a round loop thread panicked")
+}
+
+fn panic_error(payload: Box<dyn Any + Send>) -> PyErr {
+    let message = payload.downcast_ref::<&str>().map(|message| message.to_string()).or_else(|| payload.downcast_ref::<String>().cloned());
+    PyRuntimeError::new_err(format!("a round loop thread panicked: {}", message.unwrap_or_default()))
 }
 
 struct Lane {
@@ -261,6 +268,11 @@ impl Shared {
 
     fn lock(&self) -> PyResult<MutexGuard<'_, Run>> {
         self.run.lock().map_err(panicked)
+    }
+
+    //for ending a loop: also after a thread panicked with the run held, when the rounds fail to lock it but the loop is still to end
+    fn lock_always(&self) -> MutexGuard<'_, Run> {
+        self.run.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -489,6 +501,7 @@ pub(crate) unsafe fn write_lean_rows(rows: *mut u8, tokens: &[u8], columns: &[u1
 #[pyclass]
 pub(crate) struct RoundLoop {
     shared: Arc<Shared>,
+    game: u64,
     threads: Vec<JoinHandle<()>>,
     //held while the threads use them; the last Arc of the searches is dropped with the gil
     _searches: Arc<Py<Searches>>,
@@ -497,17 +510,18 @@ pub(crate) struct RoundLoop {
 
 #[pymethods]
 impl RoundLoop {
-    //None if the rounds take longer than `seconds`; a thread's failure (a cuda error among them) is raised here
+    //None if the rounds take longer than `seconds`; a thread's failure (a cuda error, a panic) is raised here, once all the threads have
+    //ended, and the search is then gone from the searches, with the rounds it had out
     fn wait(&mut self, py: Python<'_>, seconds: f64) -> PyResult<Option<SearchReport>> {
-        let done = py.detach(|| -> PyResult<bool> {
-            let run = self.shared.lock()?;
+        let done = py.detach(|| {
+            let run = self.shared.lock_always();
             let (run, _) = self
                 .shared
                 .changed
                 .wait_timeout_while(run, Duration::from_secs_f64(seconds.max(0.0)), |run| run.running > 0)
-                .map_err(panicked)?;
-            Ok(run.running == 0)
-        })?;
+                .unwrap_or_else(PoisonError::into_inner);
+            run.running == 0
+        });
         if !done {
             return Ok(None);
         }
@@ -517,8 +531,10 @@ impl RoundLoop {
             }
             Ok::<_, PyErr>(())
         })?;
-        let mut run = self.shared.lock()?;
+        let mut run = self.shared.lock_always();
         if let Some(error) = run.error.take() {
+            drop(run);
+            self._searches.get().abort(self.game);
             return Err(error);
         }
         run.report.take().map(Some).ok_or_else(|| PyRuntimeError::new_err("the round loop ended without a report"))
@@ -560,6 +576,7 @@ pub(crate) fn start_loop(
     let calls = CudaCalls::new(&addresses)?;
     let built = networks.iter().map(|(_, network)| Network::get(network)).collect::<PyResult<Vec<_>>>()?;
     let objects = networks.into_iter().map(|(object, _)| object).collect();
+    let game = settings.game;
     let round_times: VecDeque<f64> = round_times.into();
     let round_seconds = median(&round_times);
     let started = Instant::now();
@@ -600,11 +617,14 @@ pub(crate) fn start_loop(
                     affinity::pin_current(cpu);
                 }
                 let rounds = Rounds { searches: searches.get(), settings: &settings, shared: &shared, calls, networks: count };
-                let failed = rounds.rounds_on(&mut network).err();
+                //a panic ends the thread as an error does: the loop is to end, not to wait for a thread that is gone
+                let failed =
+                    catch_unwind(AssertUnwindSafe(|| rounds.rounds_on(&mut network))).unwrap_or_else(|payload| Err(panic_error(payload))).err();
                 if failed.is_some() {
                     network.settle(&calls);
                 }
-                if let Ok(mut run) = shared.run.lock() {
+                {
+                    let mut run = shared.lock_always();
                     if let Some(error) = failed {
                         run.stopping = true;
                         run.error.get_or_insert(error);
@@ -615,5 +635,5 @@ pub(crate) fn start_loop(
             })
         })
         .collect();
-    Ok(RoundLoop { shared, threads, _searches: searches, _networks: objects })
+    Ok(RoundLoop { shared, game, threads, _searches: searches, _networks: objects })
 }

@@ -278,6 +278,37 @@ def test_a_cuda_error_in_the_rust_rounds_is_raised():
     with pytest.raises(RuntimeError, match="cuda error"):
         search.search(chess.Board(), simulations=600)
 
+#a thread that fails ends the search with its error, and the search and its rounds are gone from Searches: the next can start
+@gpu
+@pytest.mark.parametrize("concurrent_descents", [False, True])
+def test_a_thread_that_panics_or_fails_ends_the_search_with_an_error(concurrent_descents):
+    network = lean_network()
+    search = EngineSearch(network, 16, rust_rounds=True, concurrent_descents=concurrent_descents)
+    settings = engine_search_settings(False)
+    #a legal move without an id panics in the thread (the Rust way of a bug), a device that is none fails it (a cuda error)
+    broken = selfplay_rs.Searches(**{**settings, "move_id_table": [-1] * len(settings["move_id_table"])}, tree_reuse=True,
+                                  concurrent_descents=concurrent_descents)
+    handles = network.rust_network()
+    for searches, rust_network, message in ((broken, handles, "panicked"),
+                                            (search.searches, {**handles, "lanes": [{**lane, "device": 99} for lane in handles["lanes"]]}, "cuda error")):
+        search.searches = searches
+        network.rust_network = lambda handles=rust_network: handles
+        errors = []
+
+        def run():
+            try:
+                search.search(chess.Board(), simulations=600)
+            except BaseException as error:
+                errors.append(error)
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(30)
+        assert not worker.is_alive(), "the search never ended"
+        assert len(errors) == 1 and isinstance(errors[0], RuntimeError) and message in str(errors[0]), errors
+        assert len(searches) == 0
+        searches.start(0, chess.STARTING_FEN, [], 600)
+        assert len(searches) == 1
+
 #a thread that finds the deadline due must not stop a fresh tree before the first leaf of another thread is out
 @gpu
 def test_a_deadline_already_due_on_a_fresh_tree_still_gives_a_move():
