@@ -1026,6 +1026,16 @@ impl Searches {
         })
     }
 
+    //whether at most one of the root's moves is not a proven loss
+    fn one_move_left(&self, py: Python<'_>, id: u64) -> PyResult<bool> {
+        py.detach(|| {
+            if self.concurrent_descents {
+                return Ok(self.shared_running(id)?.one_move_left());
+            }
+            Ok(find_search(&*self.lock()?, id)?.tree.one_move_left())
+        })
+    }
+
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
         py.detach(|| {
             let state = self.lock()?;

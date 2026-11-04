@@ -976,8 +976,8 @@ def test_pruning_never_changes_the_move(carlsen_games):
 #Searches scripted for smart pruning: the root has `root` after every round, the search is done after 30 rounds unless stopped,
 #which notes the time
 class ScriptedSearches:
-    def __init__(self, visits: int, most: int, second: int, proven: bool = False):
-        self.root, self.proven = (visits, most, second), proven
+    def __init__(self, visits: int, most: int, second: int, proven: bool = False, lone: bool = False):
+        self.root, self.proven, self.lone = (visits, most, second), proven, lone
         self.finishes, self.stopped_at = 0, None
 
     def start(self, game, fen, moves, simulations):
@@ -1000,6 +1000,9 @@ class ScriptedSearches:
 
     def decided(self, game):
         return self.proven
+
+    def one_move_left(self, game):
+        return self.lone
 
     def report(self):
         return engine_search.GAME, ["a1a2"], 0.5, [], self.root[0]
@@ -1035,6 +1038,31 @@ def test_a_decided_proven_or_only_move_search_stops_at_the_first_answers(monkeyp
     search.searches = ScriptedSearches(*root, proven)
     search.search(chess.Board(fen), simulations=1000)
     assert search.searches.stopped_at == stopped_at
+
+#every move but one proven lost stops the search at the first answers, as a proven result does, with smart pruning and proofs only
+@pytest.mark.parametrize("smart_pruning, certainty, stopped_at", [(True, True, 1 / 16), (False, True, None), (True, False, None)])
+def test_a_root_with_one_move_not_lost_stops_at_the_first_answers(monkeypatch, smart_pruning, certainty, stopped_at):
+    now = [0.0]
+    monkeypatch.setattr(engine_search.time, "perf_counter", lambda: now[0])
+    search = EngineSearch(SixteenthsNetwork(now), 16, grow_leaves=0, smart_pruning=smart_pruning, settings={"certainty": certainty})
+    search.searches = ScriptedSearches(600, 300, 290, lone=True)
+    search.search(chess.Board(), simulations=1000)
+    assert search.searches.stopped_at == stopped_at
+
+#the king has three moves, two of which lose to a mate in one
+THREE_MOVES_TWO_LOST = "8/1K2r3/3r4/5P2/8/4k3/8/5Q2 w - - 0 1"
+
+def certain_python_search() -> EngineSearch:
+    return EngineSearch(cpu_batches(UniformModel()), 16, settings={"certainty": True})
+
+def certain_rust_search() -> EngineSearch:
+    return EngineSearch(lean_network(), 16, rust_rounds=True, settings={"certainty": True})
+
+#once the two lost moves are proven the third is the move, not when its visits pass the simulations left (half of them)
+@pytest.mark.parametrize("make_search", [certain_python_search, pytest.param(certain_rust_search, marks=gpu)])
+def test_a_search_stops_once_one_move_is_not_proven_lost(make_search):
+    report = make_search().search(chess.Board(THREE_MOVES_TWO_LOST), simulations=4000)
+    assert report.line[0].uci() == "b7c8" and report.simulations < 1000
 
 def engine_command(model_path: Path | str, *options: str) -> list[str]:
     return [sys.executable, "-m", "engine.uci", str(model_path), *options]

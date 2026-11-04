@@ -454,13 +454,14 @@ impl Rounds<'_> {
                     run.progress.pop_front();
                 }
                 let decided = visits > 0 && f64::from(most - second) > run.simulations_left() / settings.smart_pruning_factor;
+                //a proven result, or every move but one a proven loss: the one left is the move
                 let proven = settings.certainty
                     && if self.searches.concurrent_descents {
-                        self.searches.shared_tree(settings.game)?.is_some_and(|tree| tree.root_decided())
+                        self.searches.shared_tree(settings.game)?.is_some_and(|tree| tree.root_decided() || tree.one_move_left())
                     } else {
                         let state = self.searches.lock()?;
                         let tree = &running_search(&state, settings.game)?.tree;
-                        tree.root_decided()
+                        tree.root_decided() || tree.one_move_left()
                     };
                 //once: a stop smart pruning would make is extended instead when the score has fallen
                 let mut extra = 0.0;

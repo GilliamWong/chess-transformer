@@ -428,7 +428,8 @@ class EngineSearch:
                     now = time.perf_counter()
                     run.progress.append((now, visits))
                     decided = most - second > self.simulations_left(run.simulations, run.deadline, run.progress) / self.smart_pruning_factor
-                    proven = self.certainty and self.searches.decided(GAME)
+                    #a proven result, or every move but one a proven loss: the one left is the move
+                    proven = self.certainty and (self.searches.decided(GAME) or (visits > 0 and self.searches.one_move_left(GAME)))
                     #once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
                     extra = 0.0
                     if decided and not (run.only_move or proven) and run.extension is not None:

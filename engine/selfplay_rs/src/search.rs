@@ -1142,6 +1142,11 @@ impl Tree {
         self.proof_from_moves(self.root).is_some()
     }
 
+    //whether at most one of the root's moves is not a proven loss (it may be unproven); false before the root has moves
+    pub fn one_move_left(&self) -> bool {
+        self.root().has_edges() && self.root().edges().filter(|&edge| !self.proven_lost(self.root, edge)).take(2).count() < 2
+    }
+
     //a kept tree under a new root (Searches' tree reuse; self-play keeps mcts.py's tree as it is): a leaf scored by a rule that held only
     //from the old root comes out of the tree, its visits taken off its ancestors, as lc0 drops a two-fold draw whose first position is no
     //longer in the search, or a tables' result the new root would not probe. Leaves below a proven node stay: no descent reaches them.

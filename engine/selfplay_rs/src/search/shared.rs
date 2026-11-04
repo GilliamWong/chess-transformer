@@ -430,6 +430,12 @@ impl SharedTree {
         self.proof_from_moves(self.root).is_some()
     }
 
+    //whether at most one of the root's moves is not a proven loss (it may be unproven); false before the root has moves
+    pub fn one_move_left(&self) -> bool {
+        let root = self.root();
+        root.has_edges() && root.edges().filter(|&edge| !self.proven_lost(root, edge)).take(2).count() < 2
+    }
+
     //returns the edge and its link (NO_LINK for a list's move without one, a solid slot whether it has a node or not)
     fn select_edge(&self, id: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> (usize, u32) {
         let parent = self.nodes.get(id);

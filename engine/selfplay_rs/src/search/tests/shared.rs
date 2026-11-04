@@ -965,6 +965,26 @@ fn the_proofs_in_a_graph_are_mates() {
 }
 
 #[test]
+fn a_root_has_one_move_left_once_the_others_are_proven_lost() {
+    let proof = |outcome| Proof { outcome, value: 0.0, plies: 1 };
+    //the start position's twenty moves: the first `lost` are proven losses, the next `drawn` proven draws, the rest have no node
+    for (lost, drawn, left) in [(0, 0, false), (18, 0, false), (19, 0, true), (20, 0, true), (18, 1, false), (19, 1, true), (0, 20, false)] {
+        let mut tree = tree_after(START, &[]);
+        let moves = tree.board.legal_moves();
+        assert!(!tree.one_move_left(), "a root without moves");
+        tree.expand(0, &moves, &vec![1.0 / moves.len() as f32; moves.len()]);
+        for (index, edge) in tree.nodes[0].edges().enumerate().take(lost + drawn) {
+            let mut board = tree.board.clone();
+            board.play_unchecked(tree.chess_move(edge).to_move(&board));
+            let (node, _) = tree.child_node(0, edge, NO_LINK, &board);
+            tree.nodes[node].proof = Some(proof(if index < lost { Outcome::Loss } else { Outcome::Draw }));
+        }
+        let shared = SharedTree::from_tree(&tree);
+        assert_eq!((tree.one_move_left(), shared.one_move_left()), (left, left), "{lost} lost, {drawn} drawn");
+    }
+}
+
+#[test]
 fn searches_with_transpositions_on_many_threads_leave_a_consistent_graph() {
     let mut shared = 0;
     search_each_position_on_threads(true, |tree, _| {
