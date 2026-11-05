@@ -37,6 +37,8 @@ REPOSITORY = Path(__file__).parent.parent
 FREE_QUEEN = "4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"
 MATE_IN_ONE = "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1"
 MATE_IN_TWO = "k7/8/2K5/8/8/8/8/7R w - - 0 1"
+#both mate in two
+MATES_IN_TWO = ("c6b6", "c6c7")
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 
 @pytest.fixture(autouse=True)
@@ -1199,7 +1201,7 @@ def test_certainty_proves_a_mate_and_the_search_stops():
     network = CountingNetwork(UniformModel())
     search = EngineSearch(network, 16, settings={"certainty": True})
     proven = search.search(board, simulations=20_000)
-    assert proven.line[0].uci() == "c6b6" and proven.score == 1.0 and proven.simulations < 5_000
+    assert proven.line[0].uci() in MATES_IN_TWO and proven.score == 1.0 and proven.simulations < 5_000
 
     unproven = EngineSearch(cpu_batches(UniformModel()), 16).search(board, simulations=proven.simulations)
     assert unproven.score < 1.0
@@ -1366,6 +1368,9 @@ def advancing_game(model, board: chess.Board, moves: int, way: str, replies: lis
         elif way == "drop":
             search.advance(chess.Board("8/8/8/8/8/8/8/K6k w - - 0 1"))
         reply = chess.Move.from_uci(replies[ply]) if replies else report.line[1] if len(report.line) > 1 else next(iter(board.legal_moves))
+        #a game that went another way than the replies' ends
+        if reply not in board.legal_moves:
+            break
         board.push(reply)
         played.append(reply.uci())
     return reports, played, network.boards, advanced, search
@@ -1734,7 +1739,7 @@ def test_concurrent_descents_prove_a_mate_on_several_networks(settings):
     search = EngineSearch(SlowNetworks(3, 0.003, UniformModel()).networks, 16, concurrent_descents=True, settings=settings)
     proven = search.search(chess.Board(MATE_IN_TWO), simulations=20_000)
 
-    assert proven.line[0].uci() == "c6b6" and proven.score == 1.0 and proven.simulations < 5_000
+    assert proven.line[0].uci() in MATES_IN_TWO and proven.score == 1.0 and proven.simulations < 5_000
 
 def test_concurrent_descents_want_leaves_above_1():
     with pytest.raises(ValueError, match="leaves above 1"):

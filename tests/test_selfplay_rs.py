@@ -16,7 +16,7 @@ from reference_selfplay import final_result, play_game
 
 CPU = torch.device("cpu")
 
-#castling, en passant (one a pin makes illegal), promotions, check, fifty moves, same-coloured bishops, moves already played
+#castling, en passant (one a pin makes illegal), promotions, check, fifty moves, same-coloured bishops, moves already played, a mate
 STARTS = [
     chess.STARTING_FEN,
     "r3k2r/pppq1ppp/2npbn2/2b1p3/2B1P3/2NPBN2/PPPQ1PPP/R3K2R w KQkq - 4 9",
@@ -27,6 +27,7 @@ STARTS = [
     "8/8/4k3/8/8/4K3/8/R7 w - - 96 80",
     "8/2b5/4k3/8/8/2B1K3/8/8 w - - 0 1",
     "6k1/5ppp/8/8/8/8/5PPP/3QR1K1 w - - 0 1",
+    "k7/8/1K6/8/8/8/8/7R w - - 0 1",
 ]
 
 def start_board(fen: str) -> chess.Board:
@@ -186,14 +187,9 @@ def test_rust_searches_are_mcts_search(monkeypatch, carlsen_games, model):
 
 
 #python-chess's order of the moves, which the order of the priors replaced in the children of a node: the same search but for ties
-def test_rust_searches_pick_the_moves_a_search_in_the_order_of_python_chess_picks(monkeypatch, carlsen_games):
-    def finish_in_the_order_of_moves(leaf: mcts.Leaf, priors: dict[chess.Move, float] | None, value: float) -> None:
-        if priors is not None:
-            leaf.path[-1].children = {move: mcts.Node(prior=prior) for move, prior in priors.items()}
-        mcts.backup(leaf.path, value)
-
+#searches of 1000 simulations, whose stored priors tie more often than the network's
+def test_rust_searches_of_game_positions_are_the_python_searches(monkeypatch, carlsen_games):
     monkeypatch.setattr(mcts, "evaluate_many", evaluate_many_in_rust_numbers)
-    monkeypatch.setattr(mcts, "finish", finish_in_the_order_of_moves)
     model = BoardModel()
     positions, found = rust_searches_of_game_positions(model, carlsen_games, 1000)
     for number, board in enumerate(positions):

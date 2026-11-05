@@ -353,6 +353,53 @@ pub fn by_prior<'a>(priors: &[f32], keys: &'a mut [u64; MOST_MOVES]) -> &'a [u64
     keys
 }
 
+//a node's first HEAD_MOVES edges keep 16 bit priors, the rest 8 bit ones (each at most 1/9): the search reads them so stored (mcts.py
+//too). Each is the nearest to the prior, so the head's stay in order and the tail's, but a tail prior may top the head's last
+pub const HEAD_MOVES: usize = 8;
+//the 16 bit format's low end: 2^-31, 5 bits of exponent above 11 of significand
+const HEAD_LOW: u32 = 96 << 11;
+//the 8 bit format's exponents are 2^-18 to 2^-4, above 4 bits of significand
+const TAIL_LOW: u32 = 108;
+const TAIL_HIGH: u32 = TAIL_LOW + 15;
+
+//a prior in [0, 1] rounded to the nearest 16 bit one; 0 for those below 2^-31
+pub fn head_code(prior: f32) -> u16 {
+    let rounded = prior.to_bits().saturating_add(1 << 11) >> 12;
+    rounded.saturating_sub(HEAD_LOW).min(u32::from(u16::MAX)) as u16
+}
+
+//without a branch: the search reads one a move it scores
+#[inline(always)]
+pub fn head_prior(code: u16) -> f32 {
+    f32::from_bits(((u32::from(code) + HEAD_LOW) << 12) & 0u32.wrapping_sub(u32::from(code != 0)))
+}
+
+//a prior past the head rounded to the nearest 8 bit one; 0 for those below 2^-18
+pub fn tail_code(prior: f32) -> u8 {
+    let bits = prior.to_bits().saturating_add(1 << 18);
+    match bits >> 23 {
+        exponent if exponent <= TAIL_LOW => 0,
+        exponent if exponent > TAIL_HIGH => 255,
+        exponent => ((exponent - TAIL_LOW) << 4 | (bits >> 19 & 15)) as u8,
+    }
+}
+
+#[inline(always)]
+pub fn tail_prior(code: u8) -> f32 {
+    f32::from_bits(((u32::from(code >> 4) + TAIL_LOW) << 23 | u32::from(code & 15) << 19) & 0u32.wrapping_sub(u32::from(code != 0)))
+}
+
+//the prior the search keeps for the move of `rank` in by_prior's order
+pub fn stored_prior(rank: usize, prior: f32) -> f32 {
+    if rank < HEAD_MOVES { head_prior(head_code(prior)) } else { tail_prior(tail_code(prior)) }
+}
+
+//whether the places of a node's moves with a node are the first ones of its head and of its tail, as select_edge's picks leave them
+pub fn first_of_head_and_tail(places: &[usize]) -> bool {
+    let head = places.iter().take_while(|&&place| place < HEAD_MOVES).count();
+    places[..head].iter().copied().eq(0..head) && places[head..].iter().copied().eq(HEAD_MOVES..HEAD_MOVES + places.len() - head)
+}
+
 fn node_fits(nodes: usize) -> bool {
     nodes < NO_NODE as usize
 }
@@ -686,28 +733,48 @@ impl Tree {
             }
         };
         let priors = &self.priors[edges.clone()];
+        let heads = priors.len().min(HEAD_MOVES);
         let children = parent.children;
+        //the head's moves, then the tail's: of each one's moves without a node the first has the highest prior. A tail move is looked at
+        //only with a prior above the head's first move without a node (SharedTree::select_edge's reasons). The root with noise has its
+        //priors out of order: every move is looked at
+        let (mut index, mut head_unvisited) = (0, f32::NEG_INFINITY);
         if listed(children) {
             let place_of = |link: u32| if link == NO_LINK { usize::MAX } else { self.links[link as usize].place as usize };
             let (mut next_link, mut next_place) = (children, place_of(children));
-            for (index, &prior) in priors.iter().enumerate() {
-                if index == next_place {
-                    let Link { child, visits, next, .. } = self.links[next_link as usize];
-                    consider(index, next_link, value(index, prior, child, visits));
-                    (next_link, next_place) = (next, place_of(next));
+            while index < priors.len() {
+                if index >= heads && priors[index] <= head_unvisited {
+                    break;
+                }
+                let unvisited = index != next_place;
+                if unvisited {
+                    consider(index, NO_LINK, value(index, priors[index], NO_NODE, 0));
                 } else {
-                    consider(index, NO_LINK, value(index, prior, NO_NODE, 0));
-                    //the first move without a node is the best of those that follow it; noise puts the root's out of order
-                    if !scan.noised {
-                        break;
-                    }
+                    let Link { child, visits, next, .. } = self.links[next_link as usize];
+                    consider(index, next_link, value(index, priors[index], child, visits));
+                    (next_link, next_place) = (next, place_of(next));
+                }
+                if !unvisited || scan.noised {
+                    index += 1;
+                } else if index < heads {
+                    (index, head_unvisited) = (heads, priors[index]);
+                } else {
+                    break;
                 }
             }
         } else {
-            let first = (children & !SOLID) as usize;
-            for (index, (&prior, slot)) in priors.iter().zip(&self.slots[first..first + edges.len()]).enumerate() {
-                consider(index, children + index as u32, value(index, prior, slot.child, slot.visits));
-                if slot.child == NO_NODE && !scan.noised {
+            let slots = &self.slots[(children & !SOLID) as usize..][..priors.len()];
+            while index < priors.len() {
+                if index >= heads && priors[index] <= head_unvisited {
+                    break;
+                }
+                let slot = slots[index];
+                consider(index, children + index as u32, value(index, priors[index], slot.child, slot.visits));
+                if slot.child != NO_NODE || scan.noised {
+                    index += 1;
+                } else if index < heads {
+                    (index, head_unvisited) = (heads, priors[index]);
+                } else {
                     break;
                 }
             }
@@ -1037,13 +1104,13 @@ impl Tree {
         self.logits = priors;
     }
 
-    //the node's moves and their priors, which come in the order of the moves, as edges in the order of by_prior
+    //the node's moves and their priors, which come in the order of the moves, as edges in the order of by_prior, the priors stored
     fn expand(&mut self, node: usize, moves: &MoveList, priors: &[f32]) {
         let first_edge = self.moves.len();
-        for key in by_prior(priors, &mut [0; MOST_MOVES]) {
+        for (rank, key) in by_prior(priors, &mut [0; MOST_MOVES]).iter().enumerate() {
             let place = (key & 255) as usize;
             self.moves.push(PackedMove::new(moves[place]));
-            self.priors.push(priors[place]);
+            self.priors.push(stored_prior(rank, priors[place]));
         }
         self.nodes[node].edges_at = (first_edge as u64) << 8 | (self.moves.len() - first_edge) as u64;
     }

@@ -264,9 +264,10 @@ fn a_shared_answer_that_is_no_number_leaves_equal_priors_or_a_draw_and_is_not_ca
             }
         }
         let root = tree.root();
-        let equal_priors = root.edges().all(|edge| tree.prior(edge) == tree.prior(root.edges().start));
+        let equal_priors =
+            root.edges().enumerate().all(|(rank, edge)| tree.prior(root, edge) == f64::from(equal_prior(rank, root.edges().len())));
         assert_eq!((root.visits(), tree.pending(), tree.reserved_bytes(), equal_priors), (1, 0, 0, equal), "{logit} {value}");
-        assert!(root.edges().all(|edge| tree.prior(edge).is_finite()), "{logit} {value}");
+        assert!(root.edges().all(|edge| tree.prior(root, edge).is_finite()), "{logit} {value}");
         assert_eq!(root.value_sum(), f64::from(1.0 - backed_up), "{logit} {value}");
         assert!(network.cache.get(key, &mut Vec::new()).is_none(), "{logit} {value}: the answer is cached");
     }
@@ -343,10 +344,11 @@ fn walk(tree: &SharedTree, id: usize, board: &Chess, keys: &mut Vec<u64>, settin
         }
         Some(proof) => assert_close(node.value_sum(), f64::from(visits) * proof.value, visits, "a proven node's sum"),
     }
-    let visited = python_sum(children.iter().map(|&(edge, _)| tree.prior(edge))).sqrt();
+    let visited = python_sum(children.iter().map(|&(edge, _)| tree.prior(node, edge))).sqrt();
     assert_eq!(node.visited_policy_sqrt().to_bits(), visited.to_bits(), "visited policy");
-    let priors: f64 = edges.clone().map(|edge| tree.prior(edge)).sum();
-    assert!((priors - 1.0).abs() < 1e-3, "priors add up to {priors}");
+    //off by the stored priors' rounding, the tail's 8 bits most
+    let priors: f64 = edges.clone().map(|edge| tree.prior(node, edge)).sum();
+    assert!((priors - 1.0).abs() < 2e-2, "priors add up to {priors}");
     if let Some(proof) = node.proof().filter(|_| id != tree.root_index()) {
         let mut best = None::<Proof>;
         let mut all_proven = true;

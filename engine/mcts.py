@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 import math
+import struct
 from typing import TYPE_CHECKING
 import chess
 import chess.syzygy
@@ -23,6 +24,8 @@ C_PUCT_BASE = 38739
 FPU_REDUCTION = 0.33 / 2
 ROOT_NOISE_ALPHA = 0.3
 ROOT_NOISE_SHARE = 0.25
+#a node's first HEAD_MOVES moves keep 16 bit priors and the rest 8 bit ones, as the rust search stores them (search.rs's stored_prior)
+HEAD_MOVES = 8
 
 tablebase: chess.syzygy.Tablebase | None = None
 
@@ -123,10 +126,30 @@ def descend(root: Node, board: chess.Board) -> Leaf:
         value = DRAW
     return Leaf(path, value)
 
+def float_of(bits: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+#the prior kept for the move of `rank` in the priors' order: the nearest 16 bit one (5 bits of exponent from 2^-31, 11 of significand)
+#or 8 bit one (exponents 2^-18 to 2^-4, 4 bits of significand)
+def stored_prior(rank: int, prior: float) -> float:
+    bits = struct.unpack("<I", struct.pack("<f", prior))[0]
+    if rank < HEAD_MOVES:
+        code = min(max(((bits + (1 << 11)) >> 12) - (96 << 11), 0), 0xFFFF)
+        return 0.0 if code == 0 else float_of((code + (96 << 11)) << 12)
+    rounded = bits + (1 << 18)
+    exponent = rounded >> 23
+    if exponent <= 108:
+        return 0.0
+    code = 255 if exponent > 123 else (exponent - 108) << 4 | (rounded >> 19 & 15)
+    return float_of(((code >> 4) + 108) << 23 | (code & 15) << 19)
+
+
 def finish(leaf: Leaf, priors: dict[chess.Move, float] | None, value: float) -> None:
     if priors is not None:
         #the highest prior first, equal priors in the order given (python-chess's): the rust search stops at the first move without a node
-        leaf.path[-1].children = {move: Node(prior=prior) for move, prior in sorted(priors.items(), key=lambda item: -item[1])}
+        ordered = sorted(priors.items(), key=lambda item: -item[1])
+        leaf.path[-1].children = {move: Node(prior=stored_prior(rank, prior)) for rank, (move, prior) in enumerate(ordered)}
     backup(leaf.path, value)
 
 

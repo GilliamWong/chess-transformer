@@ -209,16 +209,22 @@ fn line_end(tree: &Tree, line: &[usize]) -> usize {
     line.iter().fold(tree.root_index(), |node, &edge| tree.child_index(node, edge).expect("a line through the tree's nodes"))
 }
 
-//a node's edges are in the order of their priors and its moves with a node are the first ones (a root with noise has them as the noise
-//put them), so that select_edge may stop at the first move without a node: it must pick what a look at every move picks
+//a node's head and tail are each in the order of their priors and its moves with a node are the first ones of each (a root with noise
+//has them as the noise put them), so that select_edge may skip past each one's first move without a node: it must pick what a look at
+//every move picks
 fn assert_by_prior(tree: &Tree) {
     let settings = settings(true);
     for (id, node) in tree.nodes.iter().enumerate() {
         let edges = node.edges();
-        assert!(edges.clone().map(|edge| tree.priors[edge]).is_sorted_by(|before, after| before >= after), "node {id}'s priors");
+        let priors = &tree.priors[edges.clone()];
+        let (head, tail) = priors.split_at(priors.len().min(HEAD_MOVES));
+        assert!(
+            head.is_sorted_by(|before, after| before >= after) && tail.is_sorted_by(|before, after| before >= after),
+            "node {id}'s priors"
+        );
         if id != tree.root || tree.noised_priors.is_empty() {
             let places: Vec<usize> = tree.linked(id).map(|(place, _)| place).collect();
-            assert!(places.iter().copied().eq(0..places.len()), "node {id}'s moves with a node are {places:?}");
+            assert!(first_of_head_and_tail(&places), "node {id}'s moves with a node are {places:?}");
         }
         if edges.is_empty() {
             continue;
@@ -334,6 +340,49 @@ fn advanced(
 }
 
 //mcts.py's constants with the engine's value sharpening
+//16 bit priors are within half a step of 2^-11 of the prior, 8 bit ones of 2^-4, and both rise with it, so a node's head and tail
+//keep by_prior's order
+#[test]
+fn stored_priors_are_close_and_keep_the_order() {
+    let (mut head_before, mut tail_before) = (0.0, 0.0);
+    for step in 1..=200_000u32 {
+        let prior = (f64::from(step) / 200_000.0).powi(6) as f32;
+        let (head, tail) = (head_prior(head_code(prior)), tail_prior(tail_code(prior)));
+        assert!(head >= head_before && tail >= tail_before, "{prior}: the stored priors fall");
+        (head_before, tail_before) = (head, tail);
+        if prior >= 1e-9 {
+            assert!((head - prior).abs() <= prior / 4096.0, "{prior}: 16 bits {head}");
+        }
+        if (4e-6..=1.0 / 9.0).contains(&prior) {
+            assert!((tail - prior).abs() <= prior / 32.0, "{prior}: 8 bits {tail}");
+        }
+    }
+    let mut state = 12_345u64;
+    for _ in 0..2_000 {
+        let count = 2 + (state >> 33) as usize % 60;
+        let mut logits: Vec<f32> = (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                //ties now and then, as equal logits give
+                ((state >> 40) % 64) as f32 / 8.0
+            })
+            .collect();
+        softmax(&mut logits);
+        let stored: Vec<f32> = by_prior(&logits, &mut [0; MOST_MOVES])
+            .iter()
+            .enumerate()
+            .map(|(rank, key)| stored_prior(rank, logits[(key & 255) as usize]))
+            .collect();
+        let (head, tail) = stored.split_at(count.min(HEAD_MOVES));
+        assert!(head.is_sorted_by(|before, after| before >= after) && tail.is_sorted_by(|before, after| before >= after), "{stored:?}");
+    }
+}
+
+//the prior stored for the move of `rank` of `count` equally likely ones
+fn equal_prior(rank: usize, count: usize) -> f32 {
+    stored_prior(rank, 1.0 / count as f32)
+}
+
 fn settings(certainty: bool) -> SearchSettings {
     SearchSettings {
         c_puct: 1.745 / 2.0,
@@ -569,7 +618,7 @@ fn an_answer_that_is_no_number_leaves_equal_priors_or_a_draw_and_is_not_cached()
         };
         tree.finish_leaf(0, answer, ANSWER_WIDTH, &network.move_ids, Some(&mut network.cache), &settings);
         let moves = tree.nodes[0].edges();
-        let equal_priors = moves.clone().all(|edge| tree.priors[edge] == tree.priors[moves.start]);
+        let equal_priors = moves.clone().enumerate().all(|(rank, edge)| tree.priors[edge] == equal_prior(rank, moves.len()));
         assert_eq!((tree.nodes[0].visit_count, equal_priors), (1, equal), "{logit} {value}");
         assert!(moves.clone().all(|edge| tree.priors[edge].is_finite()), "{logit} {value}: priors {:?}", &tree.priors[moves.clone()]);
         assert_eq!(tree.nodes[0].value_sum, f64::from(1.0 - backed_up), "{logit} {value}");

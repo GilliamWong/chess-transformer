@@ -1,4 +1,5 @@
 //what the tests ask of a tree: its arenas as the references and the pools see them, and its reachable part as a Tree
+use super::arena::units;
 use super::*;
 use crate::search::{Node as TreeNode, UNLINKED, link_up};
 use std::collections::{HashMap, HashSet};
@@ -45,7 +46,7 @@ impl SharedTree {
         for id in self.reachable_ids() {
             let node = self.nodes.get(id);
             sizes.nodes += 1;
-            sizes.edges += node.edges().len();
+            sizes.edges += units(node.edges().len());
             match node.children() {
                 Children::List(_) => sizes.links += self.links.linked(node).count(),
                 Children::Solid(_) => sizes.slots += node.edges().len(),
@@ -104,11 +105,15 @@ impl SharedTree {
             if !edges.is_empty() {
                 edge_runs.push((edges.start, edges.len()));
             }
-            //select_edge stops at the first move without a node
-            let priors: Vec<f32> = edges.clone().map(|edge| self.edges.prior(edge)).collect();
-            assert!(priors.is_sorted_by(|before, after| before >= after), "the priors of node {id}");
+            //select_edge stops at the head's first move without a node and the tail's
+            let priors: Vec<f32> = edges.clone().map(|edge| self.edges.prior(edges.clone(), edge)).collect();
+            let (head, tail) = priors.split_at(priors.len().min(HEAD_MOVES));
+            assert!(
+                head.is_sorted_by(|before, after| before >= after) && tail.is_sorted_by(|before, after| before >= after),
+                "the priors of node {id}"
+            );
             let places: Vec<usize> = self.links.linked(node).map(|(place, _)| place).collect();
-            assert!(places.iter().copied().eq(0..places.len()), "node {id}'s moves with a node are {places:?}");
+            assert!(first_of_head_and_tail(&places), "node {id}'s moves with a node are {places:?}");
             match node.children() {
                 Children::List(mut link) => {
                     while link != NO_LINK {
@@ -183,10 +188,7 @@ impl SharedTree {
         for id in 0..self.nodes.len() {
             let (node, other_node) = (self.nodes.get(id), other.nodes.get(id));
             assert_eq!(numbers(node), numbers(other_node), "node {id}");
-            for edge in node.edges() {
-                assert_eq!(self.edges.chess_move(edge).bits(), other.edges.chess_move(edge).bits(), "edge {edge}'s move");
-                assert_eq!(self.edges.prior(edge).to_bits(), other.edges.prior(edge).to_bits(), "edge {edge}'s prior");
-            }
+            assert_eq!(self.edges.run(node.edges()), other.edges.run(node.edges()), "node {id}'s edges");
             match node.children() {
                 Children::List(mut link) => {
                     while link != NO_LINK {
@@ -237,9 +239,9 @@ impl SharedTree {
                 proof: node.proof().filter(|_| number > 0),
                 children: NO_LINK,
             };
-            for edge in edges {
+            for edge in edges.clone() {
                 moves.push(self.edges.chess_move(edge));
-                priors.push(self.edges.prior(edge));
+                priors.push(self.edges.prior(edges.clone(), edge));
             }
             let children = self
                 .links

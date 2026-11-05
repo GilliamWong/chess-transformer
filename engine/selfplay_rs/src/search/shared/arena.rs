@@ -1,5 +1,7 @@
 use crate::rules::PackedMove;
-use crate::search::{MOST_MOVES, NO_LINK, NO_NODE, Outcome, Proof, SOLID, by_prior, listed};
+use crate::search::{
+    HEAD_MOVES, MOST_MOVES, NO_LINK, NO_NODE, Outcome, Proof, SOLID, by_prior, head_code, head_prior, listed, tail_code, tail_prior,
+};
 use shakmaty::Move;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -10,7 +12,8 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, 
 const NODE_CHUNK_BITS: u32 = if cfg!(test) { 6 } else { 16 };
 const NODE_CHUNKS: usize = 1 << 14;
 const EDGE_CHUNK_BITS: u32 = if cfg!(test) { 10 } else { 20 };
-const EDGE_CHUNKS: usize = 1 << 15;
+//2^37 units of 2 bytes, 256 GiB: a node's edges take units(count)
+const EDGE_CHUNKS: usize = 1 << 17;
 //a chunk holds a solid node's slots (218 moves at most); links and slots stay below 1 << 31, which SOLID takes
 const LINK_CHUNK_BITS: u32 = if cfg!(test) { 8 } else { 18 };
 const LINK_CHUNKS: usize = 1 << 13;
@@ -406,7 +409,8 @@ struct FreeRuns {
     held_back: Alone<AtomicBool>,
 }
 
-const PIECE_LENGTHS: usize = 256;
+//above a node's most edge units, units(MOST_MOVES)
+const PIECE_LENGTHS: usize = 512;
 const PIECE_BATCH: usize = 32;
 
 #[derive(Default)]
@@ -966,10 +970,35 @@ impl Iterator for Linked<'_> {
     }
 }
 
+//a node's `count` edges take a run of units(count) units: its moves' PackedMoves in by_prior's order, the head edges' head_codes, then
+//the tail edges' tail_codes two a unit, the first in the low byte
 pub struct Edges {
-    priors: Table<AtomicU32>,
-    moves: Table<AtomicU16>,
+    units: Table<AtomicU16>,
     runs: Runs,
+}
+
+pub const fn units(count: usize) -> usize {
+    let head = if count < HEAD_MOVES { count } else { HEAD_MOVES };
+    count + head + (count - head).div_ceil(2)
+}
+
+//a node's priors: the head's codes, and the tail's two a unit
+pub struct Priors<'a> {
+    pub heads: &'a [AtomicU16],
+    tails: &'a [AtomicU16],
+}
+
+impl Priors<'_> {
+    //the prior of the tail's edge `tail`
+    #[inline(always)]
+    pub fn tail(&self, tail: usize) -> f64 {
+        tail_prior((self.tails[tail / 2].load(Ordering::Relaxed) >> (8 * (tail & 1))) as u8).into()
+    }
+
+    //the prior of the node's edge `index`
+    pub fn get(&self, index: usize) -> f64 {
+        if index < HEAD_MOVES { head_prior(self.heads[index].load(Ordering::Relaxed)).into() } else { self.tail(index - HEAD_MOVES) }
+    }
 }
 
 impl Edges {
@@ -980,39 +1009,34 @@ impl Edges {
     }
 
     pub fn new() -> Edges {
-        Edges {
-            priors: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS),
-            moves: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS),
-            runs: Runs::new(EDGE_CHUNK_BITS, Self::CAPACITY),
-        }
+        Edges { units: Table::new(EDGE_CHUNKS, EDGE_CHUNK_BITS), runs: Runs::new(EDGE_CHUNK_BITS, Self::CAPACITY) }
     }
 
-    //the edges given out so far, the gaps at chunk ends and the runs given back included
+    //the units given out so far, the gaps at chunk ends and the runs given back included
     pub fn len(&self) -> usize {
         self.runs.len()
     }
 
-    //the edges and gaps in use
+    //the units and gaps in use
     pub fn taken(&self) -> usize {
         self.runs.taken()
     }
 
-    //the edges in the runs in use
+    //the units in the runs in use
     #[cfg(test)]
     pub fn used(&self) -> usize {
         self.runs.used()
     }
 
-    //room for a node's `count` edges (at most 255), in one chunk; returns the first
+    //room for a node's `count` edges (at most 218), in one chunk; returns the first
     pub fn alloc(&self, count: usize) -> usize {
-        let first = self.runs.alloc(count);
+        let first = self.runs.alloc(units(count));
         self.make(first);
         first
     }
 
     fn make(&self, first: usize) {
-        self.priors.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU32::new(0)).collect());
-        self.moves.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
+        self.units.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
     }
 
     #[cfg(test)]
@@ -1022,56 +1046,85 @@ impl Edges {
 
     //a dead node's `count` edges from `first`, given back
     pub fn free(&self, first: usize, count: usize) {
-        self.runs.freed.give(first, count);
+        self.runs.freed.give(first, units(count));
     }
 
-    //a hint that the priors from edge `first` are read soon
-    pub fn prefetch(&self, first: usize) {
-        self.priors.prefetch(first);
+    //a hint that the priors of the node's edges `edges` are read soon: they follow its moves
+    pub fn prefetch(&self, edges: Range<usize>) {
+        self.units.prefetch(edges.end);
     }
 
-    pub fn priors(&self, edges: Range<usize>) -> &[AtomicU32] {
+    pub fn priors(&self, edges: Range<usize>) -> Priors<'_> {
         if edges.is_empty() {
-            return &[];
+            return Priors { heads: &[], tails: &[] };
         }
-        self.priors.slice(edges.start, edges.len())
+        let count = edges.len();
+        let (heads, tails) = self.units.slice(edges.start + count, units(count) - count).split_at(count.min(HEAD_MOVES));
+        Priors { heads, tails }
     }
 
-    pub fn prior(&self, edge: usize) -> f32 {
-        f32::from_bits(self.priors.get(edge).load(Ordering::Relaxed))
+    //the prior of the node's edge `edge`
+    pub fn prior(&self, edges: Range<usize>, edge: usize) -> f32 {
+        self.priors(edges.clone()).get(edge - edges.start) as f32
     }
 
     pub fn chess_move(&self, edge: usize) -> PackedMove {
-        PackedMove::from_bits(self.moves.get(edge).load(Ordering::Relaxed))
+        PackedMove::from_bits(self.units.get(edge).load(Ordering::Relaxed))
     }
 
     //a node's moves and priors, which come in the order of the moves, as edges from `first` in the order of by_prior; by the thread
     //that owns the node, before its edges are published
     pub fn write(&self, first: usize, moves: &[Move], priors: &[f32]) {
-        let slots = self.moves.slice(first, moves.len()).iter().zip(self.priors.slice(first, moves.len()));
-        for ((move_slot, prior_slot), key) in slots.zip(by_prior(priors, &mut [0; MOST_MOVES])) {
+        let count = moves.len();
+        let (move_units, prior_units) = self.units.slice(first, units(count)).split_at(count);
+        let (heads, tails) = prior_units.split_at(count.min(HEAD_MOVES));
+        let mut low = 0;
+        for (rank, key) in by_prior(priors, &mut [0; MOST_MOVES]).iter().enumerate() {
             let place = (key & 255) as usize;
-            move_slot.store(PackedMove::new(moves[place]).bits(), Ordering::Relaxed);
-            prior_slot.store(priors[place].to_bits(), Ordering::Relaxed);
+            move_units[rank].store(PackedMove::new(moves[place]).bits(), Ordering::Relaxed);
+            if rank < HEAD_MOVES {
+                heads[rank].store(head_code(priors[place]), Ordering::Relaxed);
+                continue;
+            }
+            //two tail codes a unit: an odd tail's last high byte stays 0
+            let (tail, code) = (rank - HEAD_MOVES, u16::from(tail_code(priors[place])));
+            if tail & 1 == 1 {
+                tails[tail / 2].store(low | code << 8, Ordering::Relaxed);
+            } else if rank + 1 == count {
+                tails[tail / 2].store(code, Ordering::Relaxed);
+            } else {
+                low = code;
+            }
         }
     }
 
-    //for a tree being copied
+    //the edge of `rank` among a node's `count` from `first`: its move and its prior, rounded here (a stored one stays as it is)
     #[cfg(test)]
-    pub fn set(&self, edge: usize, chess_move: PackedMove, prior: f32) {
-        self.moves.get(edge).store(chess_move.bits(), Ordering::Relaxed);
-        self.priors.get(edge).store(prior.to_bits(), Ordering::Relaxed);
+    pub fn set(&self, first: usize, count: usize, rank: usize, chess_move: PackedMove, prior: f32) {
+        self.units.get(first + rank).store(chess_move.bits(), Ordering::Relaxed);
+        if rank < HEAD_MOVES {
+            self.units.get(first + count + rank).store(head_code(prior), Ordering::Relaxed);
+        } else {
+            //the edges come in rank order: the low byte's edge clears the unit, so an odd tail leaves its last high byte 0
+            let tail = rank - HEAD_MOVES;
+            let unit = self.units.get(first + count + HEAD_MOVES + tail / 2);
+            let code = u16::from(tail_code(prior));
+            unit.store(if tail & 1 == 0 { code } else { unit.load(Ordering::Relaxed) | code << 8 }, Ordering::Relaxed);
+        }
     }
 
     //`from`'s edges `edges` written from `first`, for a copy nothing reads yet
     pub fn copy_from(&self, first: usize, from: &Edges, edges: Range<usize>) {
-        let count = edges.len();
-        for (to, from) in self.priors.slice(first, count).iter().zip(from.priors.slice(edges.start, count)) {
+        let count = units(edges.len());
+        for (to, from) in self.units.slice(first, count).iter().zip(from.units.slice(edges.start, count)) {
             to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
         }
-        for (to, from) in self.moves.slice(first, count).iter().zip(from.moves.slice(edges.start, count)) {
-            to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
+    }
+
+    //the units of the node's edges, for an audit
+    #[cfg(test)]
+    pub fn run(&self, edges: Range<usize>) -> Vec<u16> {
+        self.units.slice(edges.start, units(edges.len())).iter().map(|unit| unit.load(Ordering::Relaxed)).collect()
     }
 }
 
@@ -1097,8 +1150,9 @@ impl Layout {
         if edges == 0 {
             return (0, NO_LINK);
         }
-        let first_edge = run_start(self.edges, edges, EDGE_CHUNK_BITS);
-        (self.edges, self.edges_in_runs) = (first_edge + edges, self.edges_in_runs + edges);
+        let room = units(edges);
+        let first_edge = run_start(self.edges, room, EDGE_CHUNK_BITS);
+        (self.edges, self.edges_in_runs) = (first_edge + room, self.edges_in_runs + room);
         if solid {
             let first_slot = run_start(self.slots, edges, LINK_CHUNK_BITS);
             (self.slots, self.slots_in_runs) = (first_slot + edges, self.slots_in_runs + edges);
@@ -1109,7 +1163,7 @@ impl Layout {
         (first_edge, first_link)
     }
 
-    //the edges, links and slots given out so far
+    //the edge units, links and slots given out so far
     pub fn room(&self) -> (usize, usize, usize) {
         (self.edges, self.links, self.slots)
     }
@@ -1365,7 +1419,6 @@ mod tests {
                 for edge in first..first + count {
                     assert!(!std::mem::replace(&mut taken[edge], true), "edge {edge} given out twice");
                 }
-                assert_eq!(edges.priors(first..first + count).len(), count);
             }
         }
     }

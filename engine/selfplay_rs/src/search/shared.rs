@@ -17,7 +17,7 @@ mod reuse;
 #[cfg(test)]
 mod audit;
 
-use arena::{Alone, Children, Edges, Link, Links, Node, Nodes, Slot};
+use arena::{Alone, Children, Edges, Link, Links, Node, Nodes, Slot, units};
 pub use cache::SharedCache;
 use reclaim::Garbage;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -46,12 +46,13 @@ impl Hold<'_> {
 }
 
 const NODE_BYTES: usize = size_of::<Node>();
-const EDGE_BYTES: usize = size_of::<f32>() + size_of::<PackedMove>();
+//an edge store's unit (arena::Edges)
+const EDGE_BYTES: usize = size_of::<u16>();
 const LINK_BYTES: usize = size_of::<Link>();
 const SLOT_BYTES: usize = size_of::<Slot>();
 const TABLE_ENTRY_BYTES: usize = 32;
 const DESCENT_NODE_BYTES: usize = NODE_BYTES + LINK_BYTES;
-pub const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + MOST_MOVES * EDGE_BYTES;
+pub const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + units(MOST_MOVES) * EDGE_BYTES;
 
 const SOLID_BATCH: usize = 32;
 
@@ -287,7 +288,7 @@ impl SharedTree {
 
     //the bytes that descents in progress and waiting leaves may still allocate: the most a leaf's moves take
     pub fn reserved_bytes(&self) -> usize {
-        self.reserved.load(Ordering::Acquire) + self.pending() * MOST_MOVES * EDGE_BYTES
+        self.reserved.load(Ordering::Acquire) + self.pending() * units(MOST_MOVES) * EDGE_BYTES
     }
 
     pub fn hold(&self) -> Hold<'_> {
@@ -387,7 +388,7 @@ impl SharedTree {
                 Some(proof) if proof.outcome != Outcome::Draw => proof_rank(&proof),
                 _ => (Outcome::Draw, 0),
             };
-            (proven, visits, mean_score, f64::from(self.edges.prior(edge)))
+            (proven, visits, mean_score, f64::from(self.edges.prior(parent.edges(), edge)))
         };
         let mut edges = parent.edges();
         let mut best = edges.next().expect("a searched node has children");
@@ -462,12 +463,36 @@ impl SharedTree {
         let parent = self.nodes.get(id);
         let edges = parent.edges();
         let scan = self.scan(parent, settings);
-        let value = |prior: &AtomicU32, child: u32, own_visits: &AtomicU32| self.move_value(&scan, repeats, prior, child, own_visits);
+        let value = |prior: f64, child: u32, own_visits: &AtomicU32| self.move_value(&scan, repeats, prior, child, own_visits);
         let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
         let priors = self.edges.priors(edges.clone());
+        let heads = priors.heads.len();
+        //the head's moves, then the tail's: of each one's moves without a node the first has the highest prior. A tail move is looked at
+        //only with a prior above the head's first move without a node: moves without one score alike but for their priors, and a tail
+        //move got its node so (the head's first prior without a node only falls)
+        let mut head_unvisited = f64::NEG_INFINITY;
         match parent.children() {
             Children::Solid(first) => {
-                for (index, (prior, slot)) in priors.iter().zip(self.links.solid_slots(first, edges.len())).enumerate() {
+                let slots = self.links.solid_slots(first, edges.len());
+                for (index, (code, slot)) in priors.heads.iter().zip(slots).enumerate() {
+                    let (prior, child) = (f64::from(head_prior(code.load(Ordering::Relaxed))), slot.child());
+                    if let Some((u, node)) = value(prior, child, slot.visits())
+                        && u > best_u
+                    {
+                        (best, best_u, best_link) = (index, u, first + index as u32);
+                        self.prefetch_children(node);
+                    }
+                    if child == NO_NODE {
+                        head_unvisited = prior;
+                        break;
+                    }
+                }
+                for index in heads..edges.len() {
+                    let prior = priors.tail(index - heads);
+                    if prior <= head_unvisited {
+                        break;
+                    }
+                    let slot = &slots[index];
                     let child = slot.child();
                     if let Some((u, node)) = value(prior, child, slot.visits())
                         && u > best_u
@@ -475,7 +500,6 @@ impl SharedTree {
                         (best, best_u, best_link) = (index, u, first + index as u32);
                         self.prefetch_children(node);
                     }
-                    //the first move without a node is the best of those that follow it: their priors are no higher
                     if child == NO_NODE {
                         break;
                     }
@@ -485,8 +509,16 @@ impl SharedTree {
             Children::List(head) => {
                 let unvisited = AtomicU32::new(0);
                 let place_of = |link: u32| if link == NO_LINK { usize::MAX } else { self.links.get(link).place() };
-                let (mut next_link, mut next_place) = (head, place_of(head));
-                for (index, prior) in priors.iter().enumerate() {
+                let (mut next_link, mut next_place, mut index) = (head, place_of(head), 0);
+                while index < edges.len() {
+                    let prior = if index < heads {
+                        f64::from(head_prior(priors.heads[index].load(Ordering::Relaxed)))
+                    } else {
+                        priors.tail(index - heads)
+                    };
+                    if index >= heads && prior <= head_unvisited {
+                        break;
+                    }
                     let (link, found) = if index == next_place {
                         let record = self.links.get(next_link);
                         let found = (next_link, value(prior, record.child(), record.visits()));
@@ -502,7 +534,11 @@ impl SharedTree {
                         (best, best_u, best_link) = (index, u, link);
                         self.prefetch_children(child);
                     }
-                    if link == NO_LINK {
+                    if link != NO_LINK {
+                        index += 1;
+                    } else if index < heads {
+                        (index, head_unvisited) = (heads, prior);
+                    } else {
                         break;
                     }
                 }
@@ -517,7 +553,7 @@ impl SharedTree {
         if let Some(child) = child {
             let edges = child.edges();
             if !edges.is_empty() {
-                self.edges.prefetch(edges.start);
+                self.edges.prefetch(edges);
                 self.links.prefetch(child.children());
             }
         }
@@ -544,11 +580,10 @@ impl SharedTree {
         &self,
         scan: &Scan,
         repeats: Option<&Repeats>,
-        prior: &AtomicU32,
+        prior: f64,
         child: u32,
         own_visits: &AtomicU32,
     ) -> Option<(f64, Option<&Node>)> {
-        let prior = f64::from(f32::from_bits(prior.load(Ordering::Relaxed)));
         if child == NO_NODE {
             //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
             return Some((scan.first_play_urgency + (scan.c_puct * prior * scan.sqrt_children_visits), None));
@@ -833,7 +868,7 @@ impl SharedTree {
         loop {
             let priors = self.edges.priors(node.edges());
             let visited = self.links.linked(node).filter(|&(_, link)| self.link_visits(link) > 0);
-            let sum = python_sum(visited.map(|(place, _)| f64::from(f32::from_bits(priors[place].load(Ordering::Relaxed)))));
+            let sum = python_sum(visited.map(|(place, _)| priors.get(place)));
             jitter();
             node.set_visited_policy_sqrt(sum.sqrt());
             let now = node.refreshes();
@@ -1228,9 +1263,9 @@ impl SharedTree {
                 copy.set_proof(proof);
             }
             if node.has_edges() {
-                let first = edges.alloc(node.edges().len());
-                for (index, edge) in node.edges().enumerate() {
-                    edges.set(first + index, tree.moves[edge], tree.priors[edge]);
+                let (first, count) = (edges.alloc(node.edges().len()), node.edges().len());
+                for (rank, edge) in node.edges().enumerate() {
+                    edges.set(first, count, rank, tree.moves[edge], tree.priors[edge]);
                 }
                 let children = tree.linked(id).map(|(place, link)| (place, tree.link_child(link), tree.own_visits(link)));
                 set_links(&links, copy, node.edges().len(), node.visit_count >= SOLID_TREE_THRESHOLD, children);
@@ -1283,7 +1318,7 @@ impl SharedTree {
                 NO_LINK => (NO_NODE, &unvisited),
                 link => (self.links.child(link), self.links.visits(link)),
             };
-            let prior = &AtomicU32::new(self.edges.prior(edge).to_bits());
+            let prior = f64::from(self.edges.prior(parent.edges(), edge));
             if let Some((u, _)) = self.move_value(&scan, None, prior, child, visits)
                 && u > best.1
             {
@@ -1306,8 +1341,8 @@ impl SharedTree {
         })
     }
 
-    pub fn prior(&self, edge: usize) -> f64 {
-        f64::from(self.edges.prior(edge))
+    pub fn prior(&self, parent: &Node, edge: usize) -> f64 {
+        f64::from(self.edges.prior(parent.edges(), edge))
     }
 
     pub fn root_index(&self) -> usize {
@@ -1332,9 +1367,10 @@ impl SharedTree {
         let (mut moves, mut priors) = (Vec::new(), Vec::new());
         for &(_, id) in &expanded {
             first_edge[id] = moves.len();
-            for edge in self.nodes.get(id).edges() {
+            let edges = self.nodes.get(id).edges();
+            for edge in edges.clone() {
                 moves.push(self.edges.chess_move(edge));
-                priors.push(self.edges.prior(edge));
+                priors.push(self.edges.prior(edges.clone(), edge));
             }
         }
         let graph = self.graph.as_ref().map(|_| {
