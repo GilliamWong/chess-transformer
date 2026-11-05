@@ -17,6 +17,8 @@ const JOBS_A_THREAD: usize = 4;
 //a compaction takes at most this share of its search's time, judged by its walk: the whole takes up to COMPACTION_PER_WALK times as long
 const COMPACTION_SHARE: f64 = 0.1;
 const COMPACTION_PER_WALK: f64 = 5.0;
+//the old arenas and the copy beside them stay within this many halves of the memory limit
+const COMPACTION_PEAK_HALVES: usize = 3;
 
 //with transpositions the walk keeps of each old node its number in the copy, else the least position of a parent that claims it
 //(CLAIMED set), else nothing: complemented, in an array that starts zeroed, so that fetch_max keeps the least
@@ -48,8 +50,9 @@ struct Plan<'a> {
 impl SharedTree {
     //what the root reaches copied into new arenas in breadth first order on `threads` threads: compacted()'s tree, its nodes, edges,
     //links and slots numbered as there. None, the tree left as it was, when its walk says the whole would take more than
-    //COMPACTION_SHARE of a search of `seconds`. For a tree no thread works in; the old arenas stay with it
-    pub fn compact(&self, threads: usize, seconds: Option<f64>) -> Option<SharedTree> {
+    //COMPACTION_SHARE of a search of `seconds`, or the copy beside the old arenas would pass COMPACTION_PEAK_HALVES halves of
+    //`memory_limit` (bytes, usize::MAX for none). For a tree no thread works in; the old arenas stay with it
+    pub fn compact(&self, threads: usize, seconds: Option<f64>, memory_limit: usize) -> Option<SharedTree> {
         assert_eq!(self.pending(), 0, "a tree to compact has nothing waiting");
         let began = std::time::Instant::now();
         let numbers = self.graph.as_ref().map(|_| zeroed(self.nodes.len()));
@@ -71,6 +74,11 @@ impl SharedTree {
                 start
             })
             .collect();
+        if memory_limit != usize::MAX
+            && self.held_bytes() + self.copy_bytes(order.len(), &layout) > memory_limit / 2 * COMPACTION_PEAK_HALVES
+        {
+            return None;
+        }
         let fresh = Fresh::new(order.len(), &layout);
         in_parallel(threads, fresh.chunks(), |chunk| fresh.make_chunk(chunk));
         let graph = self.graph.as_ref().map(|_| {
@@ -95,6 +103,18 @@ impl SharedTree {
             solid_batch: self.solid_batch,
             ..SharedTree::with_arenas(self.board.clone(), self.keys.clone(), 0, nodes, edges, links, graph)
         })
+    }
+
+    //the bytes the old arenas and table hold until they are freed
+    fn held_bytes(&self) -> usize {
+        self.footprint_bytes() + self.graph.as_ref().map_or(0, |graph| graph.entries.load(Ordering::Relaxed) * TABLE_ENTRY_BYTES)
+    }
+
+    //the bytes of a copy of `nodes` laid out as `layout`, its table included
+    fn copy_bytes(&self, nodes: usize, layout: &Layout) -> usize {
+        let (edge_units, links, slots) = layout.room();
+        let table = self.graph.as_ref().map_or(0, |_| nodes * TABLE_ENTRY_BYTES);
+        nodes * NODE_BYTES + edge_units * EDGE_BYTES + links * LINK_BYTES + slots * SLOT_BYTES + table
     }
 
     //the nodes the root reaches in breadth first order, a node that several moves lead to at the first, and their shapes; with

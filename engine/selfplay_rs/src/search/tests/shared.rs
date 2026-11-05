@@ -1336,7 +1336,7 @@ fn play_a_game(
             }
         }
         if compact && tree.gives_out_freed_room(limit) {
-            let compacted = tree.compact(4, None).expect("a compaction without a time");
+            let compacted = tree.compact(4, None, usize::MAX).expect("a compaction without a time");
             check_drained(&compacted);
             assert!(
                 !compacted.gives_out_freed_room(limit),
@@ -1413,9 +1413,13 @@ fn compacting_on_threads_makes_compacteds_tree() {
                 for moved in [false, true] {
                     let expected = tree.compacted();
                     for threads in [1, 2, 5, 16] {
-                        let copy = tree.compact(threads, None).expect("a compaction without a time");
+                        let copy = tree.compact(threads, None, usize::MAX).expect("a compaction without a time");
                         copy.assert_same_arenas(&expected);
                         check_drained(&copy);
+                        //the old arenas and the copy within 3/2 of the memory limit
+                        let both = tree.footprint_bytes() + copy.footprint_bytes();
+                        assert!(tree.compact(threads, None, both / 2).is_none(), "a compaction past the memory limit");
+                        assert!(tree.compact(threads, None, 2 * both).is_some(), "a compaction within the memory limit");
                     }
                     shared_nodes += check_after_search(&expected, transpositions, true, &settings);
                     proven += proven_nodes(&expected.to_reachable_tree());
@@ -1428,7 +1432,7 @@ fn compacting_on_threads_makes_compacteds_tree() {
                     tree.drop_stale_leaves(&settings, None);
                 }
                 if turn % 2 == 1 {
-                    tree = tree.compact(3, None).expect("a compaction without a time");
+                    tree = tree.compact(3, None, usize::MAX).expect("a compaction without a time");
                 }
             }
         }
@@ -1447,9 +1451,9 @@ fn a_compaction_too_long_for_its_search_leaves_the_tree_as_it_was() {
         tree.move_root(&[best_edge(&tree).expect("a move")]);
         let expected = tree.compacted();
         for seconds in [None, Some(1e9)] {
-            tree.compact(4, seconds).expect("time enough").assert_same_arenas(&expected);
+            tree.compact(4, seconds, usize::MAX).expect("time enough").assert_same_arenas(&expected);
         }
-        assert!(tree.compact(4, Some(0.0)).is_none(), "a compaction with no time");
+        assert!(tree.compact(4, Some(0.0), usize::MAX).is_none(), "a compaction with no time");
         tree.check_refs();
         tree.compacted().assert_same_arenas(&expected);
         let target = tree.root().visits() + 2_000;

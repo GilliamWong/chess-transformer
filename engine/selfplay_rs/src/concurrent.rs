@@ -293,7 +293,7 @@ impl Searches {
             _ => tree.drop_stale_leaves(settings, tables),
         }
         if tree.gives_out_freed_room(self.memory_limit)
-            && let Some(compacted) = tree.compact(compaction_threads(), seconds)
+            && let Some(compacted) = tree.compact(compaction_threads(), seconds, self.memory_limit)
         {
             drop_later(tree);
             return Some(compacted);

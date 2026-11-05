@@ -28,7 +28,7 @@ fn bench_compact_copy() {
         for turn in 0..thread_counts.len() {
             let threads = thread_counts[(turn + repeat) % thread_counts.len()];
             let began = Instant::now();
-            let copy = tree.compact(threads, None).expect("a compaction without a time");
+            let copy = tree.compact(threads, None, usize::MAX).expect("a compaction without a time");
             let seconds = began.elapsed().as_secs_f64();
             println!(
                 "COMPACT_COPY\trepeat {repeat}\tthreads {threads}\tseconds {seconds:.4}\tkept_mb {:.1}\tkept_nodes {}\told_footprint_mb {:.1}",
@@ -82,7 +82,7 @@ fn bench_compact_game() {
                     tree.move_root(&edges);
                     gives_out = tree.gives_out_freed_room(drivers.memory_limit);
                     if arm == 1 && gives_out {
-                        let copy = tree.compact(threads, None).expect("a compaction without a time");
+                        let copy = tree.compact(threads, None, usize::MAX).expect("a compaction without a time");
                         crate::drop_later(tree);
                         (tree, compacted) = (copy, true);
                     } else if gc == 0 {

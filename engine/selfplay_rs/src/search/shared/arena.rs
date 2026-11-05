@@ -1108,6 +1108,11 @@ impl Layout {
         self.links += links;
         (first_edge, first_link)
     }
+
+    //the edges, links and slots given out so far
+    pub fn room(&self) -> (usize, usize, usize) {
+        (self.edges, self.links, self.slots)
+    }
 }
 
 //a copy's arenas, its nodes and the room of its Layout given out from their starts; each chunk is made by one make_chunk
