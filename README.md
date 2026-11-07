@@ -51,3 +51,6 @@ the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clon
 `engine/linux/tcec.json` is a tournament entry for TCEC's GPU server (2x EPYC 9175F, 8x RTX 5090, driver 570, at most
 320 GiB of RAM for an engine, both engines on the one machine): `RamLimitMb` 180000, `CachePositions` 50000000,
 `AdvanceThreads` 0 (no work on the opponent's time) and `MoveOverhead` 200, with `SyzygyPath` set to the box's 7 piece tables.
+Its `SearchSettings` are Leela's TCEC search constants (CPuct 2.897, CPuctFactor 3.973, CPuctBase 45669, FpuValue 0.984)
+on our 0-1 score scale (halved) and our value's steepness (x1.16 BT4's): `c_puct=1.68,c_puct_factor=2.30,c_puct_base=45669,fpu_reduction=0.571`.
+Everywhere else the engine keeps its own defaults.

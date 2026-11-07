@@ -9,7 +9,8 @@
       {"name": "RamLimitMb", "value": 180000},
       {"name": "CachePositions", "value": 50000000},
       {"name": "AdvanceThreads", "value": 0},
-      {"name": "MoveOverhead", "value": 200}
+      {"name": "MoveOverhead", "value": 200},
+      {"name": "SearchSettings", "value": "c_puct=1.68,c_puct_factor=2.30,c_puct_base=45669,fpu_reduction=0.571"}
     ]
   }
 ]
