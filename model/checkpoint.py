@@ -22,6 +22,10 @@ def latest_checkpoint() -> Path:
 def save_checkpoint(model: ChessTransformer, model_settings: dict, checkpoint_path: Path) -> None:
     torch.save({"model_settings": model_settings, "state_dict": model.state_dict()}, checkpoint_path)
 
+#the value sharpness the engine's search serves the checkpoint at, None if it records none (the engine's default then)
+def served_value_sharpness(checkpoint_path: Path) -> float | None:
+    return torch.load(checkpoint_path, map_location="cpu", mmap=True).get("value_sharpness")
+
 #the model is in training mode
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> tuple[ChessTransformer, dict]:
     checkpoint = torch.load(checkpoint_path, map_location=device)

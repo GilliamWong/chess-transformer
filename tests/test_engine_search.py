@@ -1093,6 +1093,8 @@ def fake_engine_network(built: list | None = None):
 
 def run_uci_main(monkeypatch, *options: str, stdin: str = "isready\nquit\n") -> None:
     monkeypatch.setattr(sys, "argv", ["uci.py", "unused.pt", "--gpu", *options])
+    #run as __main__, uci imports anew: its checkpoint is not there to read
+    monkeypatch.setattr("model.checkpoint.served_value_sharpness", lambda checkpoint_path: None)
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
     runpy.run_module("engine.uci", run_name="__main__")
 
@@ -1109,17 +1111,28 @@ def test_the_engine_takes_a_precision(monkeypatch, model_path):
     assert refused[0].returncode == 2 and "--precision needs --gpu" in refused[0].stderr
     assert refused[1].returncode == 2 and "--fp16-blocks needs --gpu and the int8 network" in refused[1].stderr
 
-def test_the_engine_takes_gpus(monkeypatch, tmp_path):
+def test_the_engine_takes_gpus(monkeypatch, model_path):
     built = []
     monkeypatch.setattr(uci, "engine_networks", lambda checkpoint, leaves, precision, fp16_blocks, devices, blocking_wait:
                         [built.append((fp16_blocks, device, blocking_wait)) or cpu_batches(BoardModel()) for device in devices])
-    uci.load_player(tmp_path / "model.pt", True, 4, False, {"smart_pruning": False}, "int8", 1, [1])
-    search = uci.load_player(tmp_path / "model.pt", True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 2])
+    uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [1])
+    search = uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 2])
     refused = [run_engine("unused.pt", *options, "--gpus", "0,1") for options in (["--leaves", "4"], ["--gpu", "--leaves", "1"])]
 
     assert built == [(1, 1, False), (1, 0, True), (1, 2, True)] and len(search.networks) == 2 and search.concurrent_descents
     assert search.network_cpus == engine_search.thread_cpus(2) != [] and search.search(chess.Board(), simulations=200).simulations >= 200
     assert all(run.returncode == 2 and "--gpus needs --gpu" in run.stderr for run in refused)
+
+#a checkpoint recording the value sharpness it is served at sets the engine's default; one the engine is told wins over it
+def test_the_engine_serves_a_checkpoint_at_its_own_value_sharpness(monkeypatch, model_path):
+    monkeypatch.setattr(uci, "engine_network", fake_engine_network([]))
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"value_sharpness": 3.0})
+    default = uci.load_player(model_path, True, 4, False, {}, "int8", 1)
+    torch.save({**torch.load(model_path), "value_sharpness": 1.25}, model_path)
+    served = uci.load_player(model_path, True, 4, False, {}, "int8", 1)
+    told = uci.load_player(model_path, True, 4, False, {"settings": {"value_sharpness": 2.0}}, "int8", 1)
+
+    assert (default.value_sharpness, served.value_sharpness, told.value_sharpness) == (3.0, 1.25, 2.0)
 
 @uci_as_main
 def test_the_engine_plays_in_int8_unless_told_otherwise(monkeypatch):

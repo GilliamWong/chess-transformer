@@ -12,7 +12,7 @@ import traceback
 import chess
 import torch
 from engine.inference import cpu_batches
-from model.checkpoint import latest_checkpoint, load_model
+from model.checkpoint import latest_checkpoint, load_model, served_value_sharpness
 from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_BLOCKS, ENGINE_PRECISION, GC_THREADS, LEAVES, PRECISIONS,
                                   SMART_PRUNING_FACTOR, UNLIMITED, EngineSearch, SearchReport, engine_network, engine_networks,
                                   engine_search_settings, parse_changes, score_to_centipawns)
@@ -196,8 +196,12 @@ def load_player(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, 
                 precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> EngineSearch:
     if not gpu:
         return EngineSearch(cpu_batches(load_model(checkpoint_path, torch.device("cpu"))), 1, use_tablebase=tablebase, **search_options)
+    #the checkpoint's own value sharpness replaces the engine's default; one given by the command line or SearchSettings wins over both
+    sharpness = served_value_sharpness(checkpoint_path)
+    if sharpness is not None:
+        search_options = {**search_options, "settings": {"value_sharpness": sharpness, **search_options.get("settings", {})}}
     #on several gpus the networks wait asleep (inference.GraphedBatches' blocking_wait) where each thread would spin a core
-    network = engine_network(checkpoint_path, leaves, precision, fp16_blocks) if gpus is None else (
+    network =engine_network(checkpoint_path, leaves, precision, fp16_blocks) if gpus is None else (
         engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, len(gpus) > 1))
     return EngineSearch(network, leaves, use_tablebase=tablebase, **search_options)
 
