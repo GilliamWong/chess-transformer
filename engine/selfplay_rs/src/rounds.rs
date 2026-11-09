@@ -197,6 +197,7 @@ pub(crate) struct LoopSettings {
     certainty: bool,
     rounds_at_once: bool,
     speed_rounds: usize,
+    speed_wait_seconds: f64,
     round_times_kept: usize,
     fall_start_cp: f64,
     fall_full_cp: f64,
@@ -219,6 +220,7 @@ struct Run {
     starved: Option<u64>,
     next_round: u64,
     progress: VecDeque<(f64, u32)>,
+    first_check: Option<(f64, u32)>,
     root: RootNumbers,
     round_times: VecDeque<f64>,
     round_seconds: f64,
@@ -241,17 +243,20 @@ impl Run {
         self.stopping = true;
         self.report = report;
     }
+}
 
-    fn simulations_left(&self) -> f64 {
-        let (&(then, visits_then), &(now, visits_now)) =
-            (self.progress.front().expect("progress"), self.progress.back().expect("a round's progress"));
-        let mut left = self.simulations.map_or(f64::INFINITY, |simulations| f64::from(simulations) - f64::from(visits_now));
-        if let Some(deadline) = self.deadline {
-            let speed = if now > then { (f64::from(visits_now) - f64::from(visits_then)) / (now - then) } else { f64::INFINITY };
-            left = left.min((deadline - now) * speed);
-        }
-        left
+//the simulations a search has left, as engine_search.py's simulations_left: with a deadline, the time left at the speed since `since`
+//(time, root visits), once `wait` seconds have passed since it
+fn simulations_left(simulations: Option<u32>, deadline: Option<f64>, since: (f64, u32), current: (f64, u32), wait: f64) -> f64 {
+    let ((then, visits_then), (now, visits_now)) = (since, current);
+    let mut left = simulations.map_or(f64::INFINITY, |simulations| f64::from(simulations) - f64::from(visits_now));
+    if let Some(deadline) = deadline
+        && now - then >= wait
+    {
+        let speed = if now > then { (f64::from(visits_now) - f64::from(visits_then)) / (now - then) } else { f64::INFINITY };
+        left = left.min((deadline - now) * speed);
     }
+    left
 }
 
 struct Shared {
@@ -453,7 +458,11 @@ impl Rounds<'_> {
                 while run.progress.len() > settings.speed_rounds {
                     run.progress.pop_front();
                 }
-                let decided = visits > 0 && f64::from(most - second) > run.simulations_left() / settings.smart_pruning_factor;
+                let first_check = *run.first_check.get_or_insert((now, visits));
+                //the last rounds of several networks span less time the more there are, down to a burst of rounds without leaves
+                let (since, wait) = if self.networks == 1 { (run.progress[0], 0.0) } else { (first_check, settings.speed_wait_seconds) };
+                let left = simulations_left(run.simulations, run.deadline, since, (now, visits), wait);
+                let decided = visits > 0 && f64::from(most - second) > left / settings.smart_pruning_factor;
                 //a proven result, or every move but one a proven loss: the one left is the move
                 let proven = settings.certainty
                     && if self.searches.concurrent_descents {
@@ -594,6 +603,7 @@ pub(crate) fn start_loop(
             starved: None,
             next_round: 0,
             progress: VecDeque::new(),
+            first_check: None,
             root,
             round_times,
             round_seconds,
@@ -637,4 +647,43 @@ pub(crate) fn start_loop(
         })
         .collect();
     Ok(RoundLoop { shared, game, threads, _searches: searches, _networks: objects })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    //the check (from 1, one every 1/64 s, 29 at most) at which smart pruning stops a search whose root has visits(check) and leads by `lead`,
+    //its speed taken as the loop takes it: over the last 8 checks on one network, since the first check after 0.2 s on several
+    //(engine_search.py's SPEED_ROUNDS and SPEED_WAIT_SECONDS; test_engine_search.py's paced searches are these)
+    fn stopping_check(networks: usize, simulations: Option<u32>, deadline: f64, visits: impl Fn(u32) -> u32, lead: u32) -> Option<u32> {
+        let (mut progress, mut first_check) = (VecDeque::new(), None);
+        (1..30).find(|&check| {
+            let current = (f64::from(check) / 64.0, visits(check));
+            progress.push_back(current);
+            if progress.len() > 8 {
+                progress.pop_front();
+            }
+            let first_check = *first_check.get_or_insert(current);
+            let (since, wait) = if networks == 1 { (progress[0], 0.0) } else { (first_check, 0.2) };
+            f64::from(lead) > simulations_left(simulations, Some(deadline), since, current, wait)
+        })
+    }
+
+    #[test]
+    fn checks_without_new_visits_stop_a_search_on_one_network_only() {
+        let stalled = |check: u32| 1000 + 100 * check.min(20);
+        assert_eq!(stopping_check(1, None, 10.0, stalled, 50), Some(27));
+        assert_eq!(stopping_check(3, None, 10.0, stalled, 50), None);
+    }
+
+    #[test]
+    fn a_decided_search_on_several_networks_stops_once_its_first_moments_are_past() {
+        let steady = |check: u32| 10_000 + 100 * check;
+        assert_eq!(stopping_check(1, None, 1.0, steady, 6300), Some(2));
+        assert_eq!(stopping_check(3, None, 1.0, steady, 6300), Some(14));
+        for networks in [1, 3] {
+            assert_eq!(stopping_check(networks, Some(12_000), 1.0, steady, 6300), Some(1), "a simulations limit counts at once");
+        }
+    }
 }

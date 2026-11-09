@@ -1051,6 +1051,45 @@ def test_a_root_with_one_move_not_lost_stops_at_the_first_answers(monkeypatch, s
     search.search(chess.Board(), simulations=1000)
     assert search.searches.stopped_at == stopped_at
 
+#ScriptedSearches whose k-th round's finish moves the clock on 1/64 s and leaves the root at root(k): the rounds of several networks
+#finish one at a time under the run's lock, so their checks see the same times and visits as one network's
+class PacedSearches(ScriptedSearches):
+    def __init__(self, now: list[float], root):
+        super().__init__(*root(0))
+        self.now, self.script = now, root
+
+    def finish_with_root(self, answers, round=None, root_of=None):
+        self.now[0] += 1 / 64
+        self.root = self.script(self.finishes + 1)
+        return super().finish_with_root(answers, round, root_of)
+
+def paced_search(monkeypatch, networks: int, root, **limits) -> float | None:
+    now = [0.0]
+    monkeypatch.setattr(engine_search.time, "perf_counter", lambda: now[0])
+    network = [ImmediateBatches(answers_of_0_6) for _ in range(networks)]
+    search = EngineSearch(network if networks > 1 else network[0], 16, grow_leaves=0)
+    search.searches = PacedSearches(now, root)
+    search.search(chess.Board(), **limits)
+    return search.searches.stopped_at
+
+#a lead of 50 on a root that gains 100 visits a round, then none after 20 rounds, with 10 s to go: the last 8 rounds' speed falls to 0
+#and stops one network's search at the 27th round; several networks take the whole search's speed, and the lead is far short of it
+@pytest.mark.parametrize("networks, stopped_at", [(1, 27 / 64), (3, None)])
+def test_rounds_without_new_visits_stop_a_search_on_one_network_only(monkeypatch, networks, stopped_at):
+    def stalled(round: int) -> tuple[int, int, int]:
+        visits = 1000 + 100 * min(round, 20)
+        return visits, visits // 2 + 25, visits // 2 - 25
+    assert paced_search(monkeypatch, networks, stalled, seconds=10.0) == stopped_at
+
+#a lead of 6300 on a root that gains 6,400 visits a second with 1 s given is decided from the second round on; several networks wait
+#SPEED_WAIT_SECONDS after their first check (the 14th round, 13/64 s on), unless the simulations left are fewer than the lead
+@pytest.mark.parametrize("networks, simulations, stopped_at", [(1, None, 2 / 64), (3, None, 14 / 64), (1, 12_000, 1 / 64), (3, 12_000, 1 / 64)])
+def test_a_decided_search_on_several_networks_stops_once_its_first_moments_are_past(monkeypatch, networks, simulations, stopped_at):
+    def steady(round: int) -> tuple[int, int, int]:
+        visits = 10_000 + 100 * round
+        return visits, visits - 1000, visits - 7300
+    assert paced_search(monkeypatch, networks, steady, seconds=1.0, simulations=simulations) == stopped_at
+
 #the king has three moves, two of which lose to a mate in one
 THREE_MOVES_TWO_LOST = "8/1K2r3/3r4/5P2/8/4k3/8/5Q2 w - - 0 1"
 

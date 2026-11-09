@@ -36,6 +36,8 @@ SMART_PRUNING_FACTOR = 1.0
 FALL_START_CP = 10
 FALL_FULL_CP = 30
 SPEED_ROUNDS = 8
+#on several networks smart pruning takes the speed since its first check, and the time left counts only from this long after it
+SPEED_WAIT_SECONDS = 0.2
 INFO_SECONDS = 1.0
 RUST_WAIT_SECONDS = 0.005
 CACHE_POSITIONS = 5_000_000
@@ -177,6 +179,7 @@ class SearchRun:
         self.starved = None
         self.next_round = 0
         self.progress: deque = deque(maxlen=SPEED_ROUNDS) #(time, root visits) after the last rounds
+        self.first_check = None #(time, root visits) at smart pruning's first check
         #Searches.root_visits' numbers as the newest descend or finish left them, so that no thread asks for them
         self.root = root
         self.reused = root[0] #the visits of a kept tree, which this search did not make
@@ -340,9 +343,9 @@ class EngineSearch:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
                     collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF, smart_pruning=self.smart_pruning,
                     smart_pruning_factor=self.smart_pruning_factor, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
-                    speed_rounds=SPEED_ROUNDS, round_times_kept=ROUND_TIMES, fall_start_cp=float(FALL_START_CP), fall_full_cp=float(FALL_FULL_CP),
-                    max_reported_score=MAX_REPORTED_SCORE, expected_score_per_centipawn=EXPECTED_SCORE_PER_CENTIPAWN,
-                    value_sharpness=self.value_sharpness)
+                    speed_rounds=SPEED_ROUNDS, speed_wait_seconds=SPEED_WAIT_SECONDS, round_times_kept=ROUND_TIMES,
+                    fall_start_cp=float(FALL_START_CP), fall_full_cp=float(FALL_FULL_CP), max_reported_score=MAX_REPORTED_SCORE,
+                    expected_score_per_centipawn=EXPECTED_SCORE_PER_CENTIPAWN, value_sharpness=self.value_sharpness)
 
     #the search's rounds on one network until the report is in and the network's rounds are back: what to do next is decided under run's lock,
     #and the rounds are gathered, run and finished outside it
@@ -428,7 +431,12 @@ class EngineSearch:
                     visits, most, second = run.root
                     now = time.perf_counter()
                     run.progress.append((now, visits))
-                    decided = most - second > self.simulations_left(run.simulations, run.deadline, run.progress) / self.smart_pruning_factor
+                    if run.first_check is None:
+                        run.first_check = (now, visits)
+                    #the last rounds of several networks span less time the more there are, down to a burst of rounds without leaves
+                    since, wait = (run.progress[0], 0.0) if len(self.networks) == 1 else (run.first_check, SPEED_WAIT_SECONDS)
+                    left = self.simulations_left(run.simulations, run.deadline, since, (now, visits), wait)
+                    decided = most - second > left / self.smart_pruning_factor
                     #a proven result, or every move but one a proven loss: the one left is the move
                     proven = self.certainty and (self.searches.decided(GAME) or (visits > 0 and self.searches.one_move_left(GAME)))
                     #once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
@@ -460,12 +468,13 @@ class EngineSearch:
         return count, rounds
 
     #the simulations the search has left: those waiting for the network count as left, so a move is only decided if they could not change it either.
-    #With a deadline, the time left at the speed of the last rounds
+    #With a deadline, the time left at the speed since `since` (time, root visits), once `wait` seconds have passed since it
     @staticmethod
-    def simulations_left(simulations: int | None, deadline: float | None, progress: deque) -> float:
-        (then, visits_then), (now, visits_now) = progress[0], progress[-1]
+    def simulations_left(simulations: int | None, deadline: float | None, since: tuple[float, int], current: tuple[float, int],
+                         wait: float) -> float:
+        (then, visits_then), (now, visits_now) = since, current
         left = math.inf if simulations is None else simulations - visits_now
-        if deadline is not None:
+        if deadline is not None and now - then >= wait:
             speed = (visits_now - visits_then) / (now - then) if now > then else math.inf
             left = min(left, (deadline - now) * speed)
         return left
