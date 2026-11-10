@@ -92,8 +92,11 @@ def parse_gpus(text: str) -> list[int]:
         raise ValueError(f"{text} is not a list of different cuda devices")
     return devices
 
-#argparse shows an ArgumentTypeError's message but not a ValueError's
+#argparse shows an ArgumentTypeError's message but not a ValueError's. "all" with no cuda device is no devices here, not an error: the engine
+#still answers uci (a tournament's build asks its name where the gpus are not given to it) and fails when it is to load
 def gpus_argument(text: str) -> list[int]:
+    if text == "all" and not torch.cuda.device_count():
+        return []
     try:
         return parse_gpus(text)
     except ValueError as error:
@@ -552,6 +555,8 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
     planned: dict[str, chess.Move] = {} #the position the last search expected after its move and the reply (its epd), and its move there
 
     def load() -> EngineSearch:
+        if options.gpus is not None and not options.gpus:
+            raise RuntimeError("--gpus all found no cuda device")
         use_tablebase, set_options = options.search()
         return load_player(checkpoint_path, gpu, options.leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
                            options.gpus)

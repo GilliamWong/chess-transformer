@@ -1162,6 +1162,19 @@ def test_the_engine_takes_search_settings(model_path):
         found.append((played.info["pv"], played.info["score"], played.info["nodes"]))
     assert found[0][2] == found[1][2] == 400 and found[0][:2] != found[1][:2]
 
+#a tournament's build asks the engine its name where it has no gpu (the CCC's runs the image without them and waits for "id name")
+def test_the_engine_answers_uci_where_all_the_gpus_are_none():
+    def answer(commands: str) -> subprocess.CompletedProcess:
+        return subprocess.run(engine_command("unused.pt", "--gpu", "--gpus", "all", "--fit-memory"), cwd=REPOSITORY, capture_output=True, text=True,
+                              input=commands, env=dict(os.environ, CUDA_VISIBLE_DEVICES="-1"), timeout=120)
+    named = answer("uci\nquit\n")
+    assert named.returncode == 0, named.stderr
+    lines = named.stdout.splitlines()
+    assert lines[0].startswith("id name Fry ") and lines[-1] == "uciok"
+    #it cannot search there: isready ends it with the reason
+    loading = answer("isready\n")
+    assert loading.returncode != 0 and "--gpus all found no cuda device" in loading.stderr and "readyok" not in loading.stdout
+
 #records (precision, fp16 blocks, blocking wait) of each network built
 def fake_engine_network(built: list | None = None):
     def engine_network(checkpoint, leaves, precision, fp16_blocks, device=None, blocking_wait=False):
