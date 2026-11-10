@@ -65,7 +65,7 @@ def down_inputs(hidden: int) -> int:
 def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residual_ptr, original_ptr, residual_scale_ptr, input_scale_ptr, out_ptr,
                        M, N, K, HAS_BIAS: tl.constexpr, HAS_RESIDUAL: tl.constexpr, GATED: tl.constexpr, MIX: tl.constexpr,
                        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr,
-                       PDL: tl.constexpr):
+                       PARTS: tl.constexpr, PDL: tl.constexpr):
     dependent_launch_wait(PDL)
     pid = tl.program_id(0)
     grid_m, grid_n = tl.cdiv(M, BLOCK_M), tl.cdiv(N, BLOCK_N)
@@ -76,17 +76,18 @@ def int8_linear_kernel(x_ptr, x_scale_ptr, w_ptr, w_scale_ptr, bias_ptr, residua
     pid_n = pid % in_group // group_rows
     rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    depth = tl.arange(0, BLOCK_K)
+    depth = tl.arange(0, BLOCK_K // PARTS)
     row_ok, col_ok = rows < M, cols < N
     x_ptrs = x_ptr + (rows % M)[:, None] * K + depth[None, :]
     w_ptrs = w_ptr + (cols % N)[None, :] * K + depth[:, None]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     for _ in range(0, K, BLOCK_K):
-        x = tl.load(x_ptrs)
-        acc = tl.dot(x, tl.load(w_ptrs), acc, out_dtype=tl.int32)
-        if GATED:
-            up = tl.dot(x, tl.load(w_ptrs + N * K), up, out_dtype=tl.int32)
+        for part in tl.static_range(PARTS):
+            x = tl.load(x_ptrs + part * (BLOCK_K // PARTS))
+            acc = tl.dot(x, tl.load(w_ptrs + part * (BLOCK_K // PARTS)), acc, out_dtype=tl.int32)
+            if GATED:
+                up = tl.dot(x, tl.load(w_ptrs + part * (BLOCK_K // PARTS) + N * K), up, out_dtype=tl.int32)
         x_ptrs += BLOCK_K
         w_ptrs += BLOCK_K
 
@@ -116,9 +117,11 @@ def launch_int8_linear(x: torch.Tensor, x_scale: torch.Tensor, weight: torch.Ten
     residual_ = residual.contiguous() if residual is not None else out
     mix_ = (original.contiguous(), residual_scale, input_scale) if mix else (out, out, out)
     grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n),)
+    #on sm_8x Triton prefetches a loop's lone dot by unpacking its int8 operands byte by byte; two dots a step keep it off
+    parts = 2 if torch.cuda.get_device_capability(x.device)[0] == 8 and not gated else 1
     int8_linear_kernel[grid](x, x_scale, weight, weight_scale, bias_, residual_, *mix_, out, M, N, K, HAS_BIAS=bias is not None,
                              HAS_RESIDUAL=residual is not None, GATED=gated, MIX=mix, BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
-                             GROUP_M=GROUP_M, num_warps=warps, num_stages=stages, **({"maxnreg": registers[0]} if registers else {}),
+                             GROUP_M=GROUP_M, PARTS=parts, num_warps=warps, num_stages=stages, **({"maxnreg": registers[0]} if registers else {}),
                              **dependent_launch(x.device))
     return out
 

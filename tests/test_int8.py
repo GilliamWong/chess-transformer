@@ -90,6 +90,20 @@ def test_int8_linear_is_the_dequantised_matmul(matmul, boards):
         assert torch.allclose(out.reshape(-1, width).double(), expected, atol=1e-3, rtol=2e-3), tile
 
 
+#sm_8x's two dots a step add the same int32 sums as one: the A100 gives every other gpu's bits
+@gpu
+@pytest.mark.parametrize("matmul", ["projection", "down", "mixing down"])
+def test_two_dots_a_step_change_no_bits(matmul, monkeypatch):
+    x, x_scale, weight, weight_scale, bias, residual, gated, mix = int8_operands(matmul, 140)
+    monkeypatch.setattr(int8_blocks, "dependent_launch", lambda device: {"PDL": False, "launch_pdl": False})
+    found = []
+    for capability in ((8, 0), (12, 0)):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None, capability=capability: capability)
+        found.append(launch_int8_linear(x, x_scale, weight, weight_scale, bias, residual, gated, *(mix or (None, None, None)), (64, 64, 128, 4, 3)))
+
+    assert torch.equal(*found)
+
+
 def int8_operands(matmul: str, rows: int) -> tuple:
     torch.manual_seed(rows)
     width = 196
