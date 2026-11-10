@@ -117,7 +117,9 @@ def thread_cpus(count: int, topology: tuple | None = None) -> list[int]:
     return cpus[:count] if count <= len(cpus) else []
 
 
-LEAN_CAPABILITIES = {(12, 0)}
+LEAN_CAPABILITIES = {(8, 0), (12, 0)}
+#the gpus where one network's rounds also run in Searches' own loop: the python loop's cost a round shows in their short rounds
+ALONE_IN_RUST_CAPABILITIES = {(8, 0)}
 
 
 #the network as cuda graphs for a round's leaves, from one to max_batch, on the current gpu
@@ -164,6 +166,13 @@ def lean_lanes() -> bool:
     return torch.cuda.get_device_capability() in LEAN_CAPABILITIES
 
 
+#whether a network searching alone has its rounds in Searches' own loop by default: lean lanes on a gpu of ALONE_IN_RUST_CAPABILITIES
+def alone_in_rust(network) -> bool:
+    lanes = getattr(network, "lanes", None)
+    device = getattr(lanes[0], "device", None) if lanes else None
+    return getattr(network, "lean", False) and device is not None and torch.cuda.get_device_capability(device) in ALONE_IN_RUST_CAPABILITIES
+
+
 #what the threads driving a search's networks share, behind changed's lock; changed is notified as a round comes back or the search stops
 class SearchRun:
     def __init__(self, simulations: int | None, deadline: float | None, extension: tuple[int, float] | None, only_move: bool,
@@ -204,7 +213,7 @@ class EngineSearch:
     #memory_limit_mb: 0 for none (the tree's arenas may hold up to a quarter more: freed room no node fits); gc_threads: those that free a moved tree's dead rest;
     #rust_rounds: the rounds in Searches' own loop (rounds.rs), a thread a network and no python between them, the python loop's search exactly;
     #concurrent_descents: the networks' threads descend, finish and back up in the tree at once (search/shared.rs); pin_threads: the networks' threads each on a cpu
-    #of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes, so only on sm_120's)
+    #of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes; for one, alone_in_rust)
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
@@ -216,9 +225,9 @@ class EngineSearch:
         if several and not batched:
             raise ValueError("one leaf a round is mcts.py's search, which runs on one network")
         lean = all(getattr(network, "lean", False) for network in self.networks)
-        self.rust_rounds = lean and several if rust_rounds is None else rust_rounds
+        self.rust_rounds = lean and (several or alone_in_rust(self.networks[0])) if rust_rounds is None else rust_rounds
         if self.rust_rounds and not lean:
-            raise ValueError("Searches' own round loop runs on networks of lean lanes (engine_network's on sm_120)")
+            raise ValueError("Searches' own round loop runs on networks of lean lanes (engine_network's on the gpus of LEAN_CAPABILITIES)")
         self.concurrent_descents = several if concurrent_descents is None else concurrent_descents
         if self.concurrent_descents and not batched:
             raise ValueError("concurrent descents need leaves above 1: one leaf a round is mcts.py's search")

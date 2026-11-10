@@ -249,6 +249,17 @@ def test_rust_rounds_run_on_lean_lanes_only():
         with pytest.raises(ValueError, match="lean lanes"):
             EngineSearch(networks, 16, rust_rounds=True)
 
+class Lane:
+    device = 0
+
+@pytest.mark.parametrize("capability, rust", [((8, 0), True), ((12, 0), False), ((8, 6), False)])
+def test_one_network_rounds_in_rust_on_the_gpus_listed(monkeypatch, capability, rust):
+    monkeypatch.setattr(engine_search.torch.cuda, "get_device_capability", lambda device=None: capability)
+    lean, whole = Laned(cpu_batches(BoardModel()), [Lane(), Lane()]), Laned(cpu_batches(BoardModel()), [Lane(), Lane()])
+    lean.lean = True
+    assert EngineSearch(lean, 16).rust_rounds == rust
+    assert not EngineSearch(lean, 16, rust_rounds=False).rust_rounds and not EngineSearch(whole, 16).rust_rounds
+
 @gpu
 def test_rust_rounds_drive_every_network():
     networks = [lean_network(True), lean_network(True)]
@@ -440,7 +451,7 @@ def test_threads_are_pinned_by_default_on_several_networks():
     assert EngineSearch(one, 16).network_cpus == EngineSearch(three, 16, pin_threads=False).network_cpus == []
     assert EngineSearch(one, 16, pin_threads=True).network_cpus == engine_search.thread_cpus(1)
 
-@pytest.mark.parametrize("capability, lean", [((12, 0), True), ((8, 0), False), ((8, 6), False), ((9, 0), False)])
+@pytest.mark.parametrize("capability, lean", [((12, 0), True), ((8, 0), True), ((8, 6), False), ((9, 0), False)])
 def test_lean_lanes_by_capability(monkeypatch, capability, lean):
     monkeypatch.setattr(engine_search.torch.cuda, "get_device_capability", lambda device=None: capability)
     assert engine_search.lean_lanes() == lean
