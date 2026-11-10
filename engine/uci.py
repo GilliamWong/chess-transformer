@@ -1,5 +1,6 @@
 import argparse
 from collections.abc import Iterable
+from contextlib import suppress
 import os
 from pathlib import Path
 import queue
@@ -24,6 +25,51 @@ ENGINE_NAME = "Fry"
 REPOSITORY = Path(__file__).resolve().parent.parent
 
 MOVE_OVERHEAD_SECONDS = 0.02
+
+#--fit-memory sizes the cache and the tree's limit to the machine. A tournament's machine runs two engines: each takes MEMORY_SHARE of
+#its memory, which leaves a fifth to the system and the tables' page cache (of TCEC's 768 GiB, 307: an engine may use 320 there)
+MEMORY_SHARE = 0.4
+#the cache's most positions (a game's searches gained nothing past it) and the most of the engine's memory it takes
+FITTED_CACHE_POSITIONS = 200_000_000
+FITTED_CACHE_SHARE = 0.2
+#a cached position's bytes: room for 40 priors, and a 25 byte entry in a table at least 7/16 full
+CACHE_POSITION_BYTES = 220
+#what the process holds besides the cache and the tree, in MB: python and torch, and each gpu's context and buffers
+PROCESS_MB, PROCESS_MB_A_GPU = 4000, 1500
+#a tree at its limit with the copy a kept tree is made into beside it, in limits: on several gpus the compaction stops at half a
+#limit more, one gpu's tree is copied whole
+TREE_PEAK_SEVERAL_GPUS, TREE_PEAK_ONE_GPU = 1.5, 2.0
+#a machine too small for this much tree is not fitted: it keeps the defaults
+LEAST_FITTED_TREE_MB = 1000
+CONTAINER_LIMIT_FILES = ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+#the least of memory_bytes and the limits in limit_files (a container's): a file that is not there or says "max" sets none
+def memory_within_limits(memory_bytes: int, limit_files: Iterable[str]) -> int:
+    for limit_file in limit_files:
+        with suppress(OSError, ValueError):
+            memory_bytes = min(memory_bytes, int(Path(limit_file).read_text()))
+    return memory_bytes
+
+#the memory this process may use, in MB: the machine's, or its container's limit if that is less. None where it cannot be read (windows)
+def machine_memory_mb() -> int | None:
+    try:
+        memory_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        return None
+    return memory_within_limits(memory_bytes, CONTAINER_LIMIT_FILES) // 1_000_000
+
+#(CachePositions, RamLimitMb) for an engine on `gpus` gpus of a machine with memory_mb of memory, None for a machine too small. The
+#engine takes MEMORY_SHARE of it: the cache is cache_positions if given, else what helps of FITTED_CACHE_SHARE of that; the tree's limit
+#is what the rest allows its peak
+def fitted_memory(memory_mb: int, gpus: int, cache_positions: int | None = None) -> tuple[int, int] | None:
+    engine_mb = MEMORY_SHARE * memory_mb
+    if cache_positions is None:
+        fitting = int(FITTED_CACHE_SHARE * engine_mb * 1_000_000 / CACHE_POSITION_BYTES)
+        cache_positions = min(FITTED_CACHE_POSITIONS, fitting // 1_000_000 * 1_000_000)
+    cache_mb = cache_positions * CACHE_POSITION_BYTES / 1_000_000
+    peak = TREE_PEAK_SEVERAL_GPUS if gpus > 1 else TREE_PEAK_ONE_GPU
+    tree_mb = int((engine_mb - cache_mb - PROCESS_MB - PROCESS_MB_A_GPU * gpus) / peak) // 1000 * 1000
+    return (cache_positions, tree_mb) if tree_mb >= LEAST_FITTED_TREE_MB else None
 
 def engine_version() -> str:
     version = re.search(r'^version = "([^"]+)"', (REPOSITORY / "pyproject.toml").read_text(), re.MULTILINE).group(1)
@@ -315,18 +361,20 @@ def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
     return " ".join(arguments[1:value_at]), " ".join(arguments[value_at + 1:])
 
 #the uci options, the command line's choices their defaults (<empty> goes back to the command line's). SyzygyPath: folders of tables, os.pathsep
-#between them. SearchSettings: --search-settings' "name=value,..." as changes over the command line's
+#between them. SearchSettings: --search-settings' "name=value,..." as changes over the command line's. memory_mb: the machine's memory
+#(--fit-memory), which CachePositions and RamLimitMb are fitted to until they are set
 class Options:
     def __init__(self, tablebase: bool, tablebase_pieces: int, gpu: bool = False, gpus: list[int] | None = None, leaves: int = LEAVES,
-                 search_options: dict | None = None, clock_options: dict | None = None):
+                 search_options: dict | None = None, clock_options: dict | None = None, memory_mb: int | None = None):
         search_options, clock_options = search_options or {}, clock_options or {}
         self.tablebase, self.default_pieces = tablebase, tablebase_pieces
         self.syzygy_path: str | None = None #None for the command line's tables
         self.tablebase_pieces = tablebase_pieces
         self.probe_limit: int | None = None #None for SyzygyProbeLimit's default
         self.move_overhead_seconds = MOVE_OVERHEAD_SECONDS
-        self.cache_positions = CACHE_POSITIONS
-        self.ram_limit_mb = 0
+        self.memory_mb = memory_mb
+        self.cache_positions: int | None = None #None for memory()'s
+        self.ram_limit_mb: int | None = None
         self.advance_threads = ADVANCE_THREADS
         self.gc_threads = GC_THREADS
         self.gpu, self.command_line_gpus, self.gpus, self.leaves = gpu, gpus, gpus, leaves
@@ -341,9 +389,17 @@ class Options:
         names = ["SyzygyPath", *SPIN_OPTIONS, "GPUs", *DECIMAL_OPTIONS, "SearchSettings"]
         return [name for name in names if self.gpu or name not in GPU_OPTIONS]
 
+    #(CachePositions, RamLimitMb) on `gpus`: each as it was set, else fitted to the machine's memory (the tree's limit to a set cache
+    #too), else the engine's defaults
+    def memory(self, gpus: list[int] | None, cache_positions: int | None, ram_limit_mb: int | None) -> tuple[int, int]:
+        fitted = fitted_memory(self.memory_mb, len(gpus) if gpus else 1, cache_positions) if self.memory_mb is not None else None
+        fitted_cache, fitted_limit = fitted if fitted is not None else (CACHE_POSITIONS, 0)
+        return fitted_cache if cache_positions is None else cache_positions, fitted_limit if ram_limit_mb is None else ram_limit_mb
+
     def lines(self) -> list[str]:
-        defaults = {"SyzygyProbeLimit": MOST_PIECES, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": CACHE_POSITIONS,
-                    "RamLimitMb": 0, "AdvanceThreads": ADVANCE_THREADS, "GcThreads": GC_THREADS, "Leaves": self.leaves, "SmartPruningFactor": self.command_line_factor,
+        cache_positions, ram_limit_mb = self.memory(self.command_line_gpus, None, None)
+        defaults = {"SyzygyProbeLimit": MOST_PIECES, "MoveOverhead": round(MOVE_OVERHEAD_SECONDS * 1000), "CachePositions": cache_positions,
+                    "RamLimitMb": ram_limit_mb, "AdvanceThreads": ADVANCE_THREADS, "GcThreads": GC_THREADS, "Leaves": self.leaves, "SmartPruningFactor": self.command_line_factor,
                     "FirstMoveBonus": self.first_move_bonus, "BookPlyBonus": self.book_ply_bonus,
                     "GPUs": ",".join(map(str, self.command_line_gpus)) if self.command_line_gpus else "<empty>"}
         lines = []
@@ -464,8 +520,9 @@ class Options:
 
     #(whether the search uses tables, the search options)
     def search(self) -> tuple[bool, dict]:
-        options = {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": self.cache_positions,
-                   "memory_limit_mb": self.ram_limit_mb, "advance_threads": self.advance_threads, "gc_threads": self.gc_threads}
+        cache_positions, ram_limit_mb = self.memory(self.gpus, self.cache_positions, self.ram_limit_mb)
+        options = {"tablebase_pieces": self.tablebase_pieces, "syzygy_path": self.syzygy_path, "cache_positions": cache_positions,
+                   "memory_limit_mb": ram_limit_mb, "advance_threads": self.advance_threads, "gc_threads": self.gc_threads}
         if self.settings is not None:
             options["settings"] = {**self.command_line_settings, **self.settings}
         if self.smart_pruning_factor == 0:
@@ -480,11 +537,12 @@ class Options:
 
 def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = False, leaves: int = LEAVES,
          tablebase: bool = False, search_options: dict | None = None, precision: str = ENGINE_PRECISION, fp16_blocks: int = ENGINE_FP16_BLOCKS,
-         clock_options: dict | None = None, infinite_until_stop: bool = False, gpus: list[int] | None = None):
+         clock_options: dict | None = None, infinite_until_stop: bool = False, gpus: list[int] | None = None, fit_memory: bool = False):
     torch.set_num_threads(1) #so that engines running side by side don't fight over cores
     search_options = search_options or {}
     clock_options = clock_options or {}
-    options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES), gpu, gpus, leaves, search_options, clock_options)
+    options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES), gpu, gpus, leaves, search_options, clock_options,
+                      machine_memory_mb() if fit_memory else None)
     player = None
     board = chess.Board()
     clock = Clock(**options.clock())
@@ -630,6 +688,9 @@ if __name__ == "__main__":
     parser.add_argument("--infinite-until-stop", action="store_true",
                         help="go infinite searches until stop, as UCI and analysis guis ask; without it it runs --simulations, which "
                              "cutechess-cli's tc=inf games need")
+    parser.add_argument("--fit-memory", action="store_true",
+                        help="CachePositions and RamLimitMb default to what fits the machine's memory (fitted_memory): the engine takes "
+                             "two fifths of it, as on a tournament's machine, which the other engine shares")
     arguments = parser.parse_args()
     if arguments.tablebase_pieces != TABLEBASE_PIECES and not arguments.tablebase:
         parser.error("--tablebase-pieces needs --tablebase")
@@ -646,6 +707,7 @@ if __name__ == "__main__":
     main(Path(arguments.checkpoint) if arguments.checkpoint else latest_checkpoint(),
          simulations=arguments.simulations, gpu=arguments.gpu, leaves=arguments.leaves, tablebase=arguments.tablebase,
          precision=arguments.precision or ENGINE_PRECISION, infinite_until_stop=arguments.infinite_until_stop, gpus=arguments.gpus,
+         fit_memory=arguments.fit_memory,
          fp16_blocks=ENGINE_FP16_BLOCKS if arguments.fp16_blocks is None else arguments.fp16_blocks,
          search_options={"smart_pruning": arguments.smart_pruning, "tablebase_pieces": arguments.tablebase_pieces,
                          "settings": parse_changes(arguments.search_settings, engine_search_settings(arguments.tablebase)),

@@ -32,13 +32,18 @@ and builds in one step.
 eight, so give the GUI that long to answer `isready`. The kernels are picked from the GPU's model at start-up;
 `engine/linux/tcec.json` and `engine/linux/ccc.json` hold the options for TCEC's and the CCC's machines.
 
+`engine.sh` fits `CachePositions` and `RamLimitMb` to the machine: the engine takes two fifths of its memory (of a
+container's limit, if it has one), which leaves room for a tournament's other engine and the tables. The cache gets up
+to 200 million positions and the tree's limit is what the rest allows, counting the copy made when a tree is kept. On
+TCEC's 768 GiB machine that is a 179 GB tree. Setting either option overrides it.
+
 | Option | Default | Description |
 |---|---|---|
 | `SyzygyPath` | `<empty>` | Syzygy table folders, separated by `:` |
 | `SyzygyProbeLimit` | 7 | Most pieces to probe the tables for (5-7) |
 | `MoveOverhead` | 20 | Milliseconds kept back each move for GUI lag |
-| `CachePositions` | 5000000 | Network evaluations cached by position |
-| `RamLimitMb` | 0 | Memory limit for the search tree in MB (0 for none) |
+| `CachePositions` | fitted | Network evaluations cached by position (5000000 without `engine.sh`) |
+| `RamLimitMb` | fitted | Memory limit for the search tree in MB, 0 for none (0 without `engine.sh`) |
 | `AdvanceThreads` | 4 | Threads that update the kept tree on the opponent's time (0 for none) |
 | `GcThreads` | 2 | Threads that free the discarded tree after a move |
 | `Leaves` | 64 | Positions evaluated at once on each GPU |

@@ -32,7 +32,8 @@ from engine.tablebase import SYZYGY_DIR, TABLEBASE_PIECES
 from engine import engine_search
 from engine.engine_search import EngineSearch, SearchReport, engine_search_settings, parse_changes
 from engine import uci
-from engine.uci import MOST_EXTENSION, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock, Options
+from engine.uci import (CACHE_POSITION_BYTES, FITTED_CACHE_POSITIONS, MOST_EXTENSION, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock, Options,
+                        fitted_memory, memory_within_limits)
 
 REPOSITORY = Path(__file__).parent.parent
 FREE_QUEEN = "4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"
@@ -1393,14 +1394,69 @@ def test_search_settings_that_are_not_numbers_are_refused():
     assert options.settings is None
 
 
+#a competition's file as its gui reads it: TCEC's a list of engines with their options as names and values, the CCC's one engine with its
+#options a table
+def competition_options(competition: Path) -> dict[str, str]:
+    file = json.loads(competition.read_text())
+    if isinstance(file, list):
+        return {option["name"]: str(option["value"]) for option in file[0]["options"]}
+    return file["options"]
+
 #a competition's gui sends its file's options as setoptions: a misspelt name or a value out of range is refused there. SyzygyPath's is a placeholder
 @pytest.mark.parametrize("competition", sorted((Path(__file__).parent.parent / "engine" / "linux").glob("*.json")), ids=lambda path: path.name)
 def test_a_competitions_options_are_ones_the_engine_takes(competition):
     options = Options(False, TABLEBASE_PIECES, gpu=True)
-    for option in json.loads(competition.read_text())[0]["options"]:
-        assert option["name"] in options.names()
-        if option["name"] != "SyzygyPath":
-            assert options.set(option["name"], str(option["value"]), built=False) is None
+    set_options = competition_options(competition)
+    assert "SyzygyPath" in set_options
+    for name, value in set_options.items():
+        assert name in options.names()
+        if name != "SyzygyPath":
+            assert options.set(name, value, built=False) is None
+
+
+GIB_MB = 2**30 / 1_000_000
+
+#TCEC's machine has 768 GiB and lets an engine use 320: the fitted cache, the tree at its peak and the rest of the process take the
+#engine's two fifths and no more
+def test_fitted_memory_fills_the_engines_share_of_the_machine():
+    cache_positions, tree_mb = fitted_memory(int(768 * GIB_MB), 8)
+    assert cache_positions == FITTED_CACHE_POSITIONS
+    used_mb = tree_mb * 1.5 + cache_positions * CACHE_POSITION_BYTES / 1_000_000 + 4000 + 8 * 1500
+    assert 0.39 * 768 * GIB_MB < used_mb <= 0.4 * 768 * GIB_MB < 320 * GIB_MB
+    #one gpu's tree is copied whole when it is kept, so the same memory allows it a lower limit; a small machine's cache is its share
+    one_gpu_cache, one_gpu_tree_mb = fitted_memory(int(64 * GIB_MB), 1)
+    assert one_gpu_cache * CACHE_POSITION_BYTES / 1_000_000 <= 0.2 * 0.4 * 64 * GIB_MB
+    assert 0.38 * 64 * GIB_MB < one_gpu_tree_mb * 2 + one_gpu_cache * CACHE_POSITION_BYTES / 1_000_000 + 5500 <= 0.4 * 64 * GIB_MB
+    assert fitted_memory(int(64 * GIB_MB), 2)[1] > one_gpu_tree_mb
+    #a cache that was set leaves the tree the rest
+    assert fitted_memory(int(64 * GIB_MB), 1, cache_positions=1_000_000) == (1_000_000, 10_000)
+    assert fitted_memory(16_000, 1) is None
+
+def test_a_containers_limit_counts_as_the_machines_memory(tmp_path):
+    (tmp_path / "limit").write_text("2000000000\n")
+    (tmp_path / "none").write_text("max\n")
+    files = [str(tmp_path / name) for name in ("none", "missing", "limit")]
+    assert memory_within_limits(64_000_000_000, files) == 2_000_000_000
+    assert memory_within_limits(1_000_000_000, files) == 1_000_000_000
+    assert memory_within_limits(64_000_000_000, files[:2]) == 64_000_000_000
+
+#--fit-memory's sizes are the options' defaults: the gui is shown them, and an option it sets wins
+def test_options_fit_the_machines_memory_until_they_are_set():
+    plain = Options(False, TABLEBASE_PIECES, gpu=True).search()[1]
+    assert (plain["cache_positions"], plain["memory_limit_mb"]) == (engine_search.CACHE_POSITIONS, 0)
+    memory_mb = int(768 * GIB_MB)
+    options = Options(False, TABLEBASE_PIECES, gpu=True, gpus=list(range(8)), memory_mb=memory_mb)
+    cache_positions, tree_mb = fitted_memory(memory_mb, 8)
+    assert (options.search()[1]["cache_positions"], options.search()[1]["memory_limit_mb"]) == (cache_positions, tree_mb)
+    assert f"option name CachePositions type spin default {cache_positions} " in "\n".join(options.lines())
+    assert f"option name RamLimitMb type spin default {tree_mb} " in "\n".join(options.lines())
+    assert options.set("CachePositions", "50000000", built=False) is None
+    assert options.search()[1]["cache_positions"] == 50_000_000 and options.search()[1]["memory_limit_mb"] > tree_mb
+    assert options.set("RamLimitMb", "0", built=False) is None
+    assert options.search()[1]["memory_limit_mb"] == 0
+    #a machine too small to fit keeps the defaults
+    small = Options(False, TABLEBASE_PIECES, gpu=True, memory_mb=16_000).search()[1]
+    assert (small["cache_positions"], small["memory_limit_mb"]) == (engine_search.CACHE_POSITIONS, 0)
 
 
 #answers come back late once, as on a cuda graph's first capture or a gpu shared with another engine: on the on_collect'th collect
