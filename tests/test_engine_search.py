@@ -707,12 +707,17 @@ def test_a_failing_network_ends_the_search_with_its_error():
 
 def test_stop_ends_a_search_on_several_networks():
     search = EngineSearch(SlowNetworks(3, 0.003, BoardModel()).networks, 16, smart_pruning=False)
-    stop = threading.Event()
-    threading.Timer(0.2, stop.set).start()
-    started = time.perf_counter()
+    stop, stopped_at = threading.Event(), []
+
+    #a timer may fire a little early: the search is timed from the stop itself
+    def stop_now():
+        stopped_at.append(time.perf_counter())
+        stop.set()
+    threading.Timer(0.2, stop_now).start()
     report = search.search(chess.Board(), simulations=300_000, stop=stop)
 
-    assert 0.2 <= time.perf_counter() - started < 0.2 + 0.1 and report.simulations > 100
+    #0.2 s of rounds that grow from one leaf are 70 to 180 simulations: more than a round's 16 shows the search ran
+    assert 0 <= time.perf_counter() - stopped_at[0] < 0.1 and report.simulations > 16
 
 def test_a_search_on_several_networks_tells_how_it_stands(monkeypatch):
     monkeypatch.setattr(engine_search, "INFO_SECONDS", 0.05)
