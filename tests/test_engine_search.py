@@ -1210,7 +1210,7 @@ def test_the_gui_is_told_what_was_loaded(monkeypatch, tablebase, model_path):
 
     uci.load_player(model_path, True, 4, True, {"memory_limit_mb": 64, "cache_positions": 1000}, "int8", 1)
 
-    assert sent == ["info string Fry on one gpu; tables of up to 5 pieces, moves played from them up to 5; tree limit 64 MB; cache 1000 positions"]
+    assert sent == ["info string Fry on one gpu; 145 wdl and 145 dtz tables, used up to 5 pieces; tree limit 64 MB; cache 1000 positions"]
 
 #a checkpoint recording the value sharpness it is served at sets the engine's default; one the engine is told wins over it
 def test_the_engine_serves_a_checkpoint_at_its_own_value_sharpness(monkeypatch, model_path):
@@ -1726,7 +1726,7 @@ def test_a_syzygy_path_reaches_the_search(monkeypatch, tablebase, tmp_path, mode
     assert gui.sent_at("bestmove", seconds=30) is not None
     assert gui.lines_sent("bestmove") == ["bestmove h1h8"] and gui.last_info("nodes") == 0
     #the refused path, then what the player was built with
-    assert [line.split("; ")[1] for line in gui.lines_sent("info string")[1:]] == ["tables of up to 5 pieces, moves played from them up to 5"]
+    assert [line.split("; ")[1] for line in gui.lines_sent("info string")[1:]] == ["145 wdl and 145 dtz tables, used up to 5 pieces"]
     gui.close()
 
 def test_a_bad_position_leaves_the_last_one(monkeypatch):

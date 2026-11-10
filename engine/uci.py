@@ -17,7 +17,8 @@ from engine.engine_search import (ADVANCE_THREADS, CACHE_POSITIONS, ENGINE_FP16_
                                   SMART_PRUNING_FACTOR, UNLIMITED, EngineSearch, SearchReport, engine_network, engine_networks,
                                   engine_search_settings, parse_changes, score_to_centipawns)
 from engine.mcts import SIMULATIONS
-from engine.tablebase import MOST_PIECES, TABLE_SETS, TABLEBASE_PIECES, complete_pieces, open_tablebase, open_tablebase_path
+from engine.tablebase import (MOST_PIECES, TABLE_SETS, TABLEBASE_PIECES, found_tables, most_pieces, open_tablebase, open_tablebase_path, path_folders,
+                              tablebase_path)
 
 ENGINE_NAME = "Fry"
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -214,7 +215,11 @@ def working_networks(checkpoint_path: Path, leaves: int, precision: str, fp16_bl
 #tells the gui what the player searches with, for its log: a wrong SyzygyPath or a missing gpu shows here
 def tell_loaded(player: EngineSearch, where: str, search_options: dict) -> EngineSearch:
     pieces, limit = search_options.get("tablebase_pieces", TABLEBASE_PIECES), search_options.get("memory_limit_mb", 0)
-    tables = "no tables" if player.tablebase is None else f"tables of up to {pieces} pieces, moves played from them up to {player.ranked_pieces}"
+    if player.tablebase is None:
+        tables = "no tables"
+    else:
+        found = found_tables(path_folders(search_options.get("syzygy_path") or tablebase_path(pieces)))
+        tables = f"{len(found['rtbw'])} wdl and {len(found['rtbz'])} dtz tables, used up to {pieces} pieces"
     send(f"info string {ENGINE_NAME} on {where}; {tables}; {f'tree limit {limit} MB' if limit else 'no tree limit'}; "
          f"cache {search_options.get('cache_positions', CACHE_POSITIONS)} positions")
     return player
@@ -430,17 +435,17 @@ class Options:
         return None
 
     #the tables of `path` (None for the command line's) up to `limit` (None for the default). A SyzygyPath gives the most pieces it holds up to
-    #the limit, at least TABLEBASE_PIECES; the command line's take the limit or --tablebase-pieces. What to tell the gui, None if nothing
+    #the limit; the command line's take the limit or --tablebase-pieces. What to tell the gui, None if nothing
     def set_tables(self, path: str | None, limit: int | None) -> str | None:
         if path is None:
             pieces = self.default_pieces if limit is None else limit
         else:
             try:
-                pieces = complete_pieces(path, MOST_PIECES if limit is None else limit)
+                pieces = most_pieces(path, MOST_PIECES if limit is None else limit)
             except OSError as error:
                 return f"{error}: the tables stay as they were"
-            if pieces < TABLEBASE_PIECES:
-                return f"{path} does not hold every table of up to {TABLEBASE_PIECES} pieces: the tables stay as they were"
+            if not pieces:
+                return f"{path} holds no tables: the tables stay as they were"
         problem = self.tables_problem(path, pieces)
         if problem is None:
             self.syzygy_path, self.tablebase_pieces, self.probe_limit = path, pieces, limit
@@ -450,7 +455,7 @@ class Options:
     def tables_problem(self, path: str | None, pieces: int) -> str | None:
         try:
             if path is not None:
-                open_tablebase_path(path, pieces)[0].close()
+                open_tablebase_path(path).close()
             elif self.tablebase:
                 open_tablebase(pieces).close()
         except (OSError, ValueError) as error:

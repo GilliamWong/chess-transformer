@@ -16,7 +16,7 @@ from model.encoding import EXPECTED_SCORE_PER_CENTIPAWN, TOKENS_PER_BOARD
 from engine.selfplay import ANSWER_WIDTH, SIMULATIONS_PER_LEAF, rust_search_settings
 from engine.inference import ExactSizeCompiled, GraphedBatches, chunk_positions, fp16_model, int8_model, small_graph_sizes
 from engine.cuda_runtime import cuda_runtime
-from engine.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces, wdl_score
+from engine.tablebase import TABLEBASE_PIECES, covers, open_tablebase, open_tablebase_path, ranked_moves, wdl_score
 
 LEAVES = 64
 #descents that may end on a leaf already waiting before a round stops gathering
@@ -238,13 +238,14 @@ class EngineSearch:
                                              advance_threads=advance_threads, gc_threads=gc_threads, concurrent_descents=self.concurrent_descents)
         #reports give the score on the network's own scale, before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
-        #the root takes the tables' move up to the size they can rank; a bigger one they cover is searched
+        #a root the tables cover takes their move if they rank it, else it is searched
+        self.tablebase_pieces = tablebase_pieces
         if not use_tablebase:
-            self.tablebase, self.ranked_pieces = None, 0
+            self.tablebase = None
         elif syzygy_path is None:
-            self.tablebase, self.ranked_pieces = open_tablebase(tablebase_pieces), ranked_pieces(tablebase_pieces)
+            self.tablebase = open_tablebase(tablebase_pieces)
         else:
-            self.tablebase, self.ranked_pieces = open_tablebase_path(syzygy_path, tablebase_pieces)
+            self.tablebase = open_tablebase_path(syzygy_path)
         self.certainty = search_settings.get("certainty", False)
         self.round_times: deque = deque([FIRST_ROUND_SECONDS], maxlen=ROUND_TIMES)
         self.round_seconds = FIRST_ROUND_SECONDS
@@ -272,7 +273,7 @@ class EngineSearch:
         if simulations is None and seconds is None and stop is None:
             raise ValueError("a search needs a number of simulations, a time or a stop")
         started = time.perf_counter()
-        if self.tablebase is not None and covers(board, self.ranked_pieces):
+        if self.tablebase is not None and covers(board, self.tablebase_pieces):
             #a root the tables have not ranked in their share of the search's time is searched in the rest of it
             ranked = ranked_moves(self.tablebase, board, None if seconds is None else started + TABLE_MOVE_SHARE * seconds)
             if ranked is not None:

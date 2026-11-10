@@ -219,12 +219,20 @@ pub struct Tables {
 }
 
 impl Tables {
-    //folders as a SyzygyPath (engine.tablebase.tablebase_path): ';' between them on windows, ':' elsewhere
+    //folders as a SyzygyPath (engine.tablebase.tablebase_path): ';' between them on windows, ':' elsewhere. Only the wdl tables; a link to nothing is skipped
     pub fn open(folders: &str, pieces: usize) -> std::io::Result<Tables> {
         //SAFETY: the files stay unchanged while mapped; a failed page read ends the process rather than erroring
         let mut tablebase = Tablebase::with_filesystem(Arc::new(unsafe { MmapFilesystem::new() }.with_advise_random(true)));
         for folder in std::env::split_paths(folders) {
-            tablebase.add_directory(folder)?;
+            for entry in std::fs::read_dir(folder)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|extension| extension == "rtbw") {
+                    match tablebase.add_file(&path) {
+                        Err(error) if matches!(error.kind(), std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotFound) => {}
+                        added => added?,
+                    }
+                }
+            }
         }
         Ok(Tables { tablebase, pieces, failures: AtomicUsize::new(0) })
     }

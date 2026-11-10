@@ -17,7 +17,8 @@ from engine.inference import cpu_batches
 from reference_selfplay import final_result
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
 from engine.engine_search import EngineSearch
-from engine.tablebase import TABLE_SETS, TABLEBASE_PIECES, TableSet, complete_pieces, covers, open_tablebase, open_tablebase_path, ranked_moves, ranked_pieces
+from engine.tablebase import (SYZYGY_DIR, TABLE_SETS, TABLEBASE_PIECES, TableSet, covers, found_tables, most_pieces, open_tablebase, open_tablebase_path,
+                              path_folders, ranked_moves)
 from engine.uci import Options
 
 CPU = torch.device("cpu")
@@ -110,24 +111,16 @@ def fake_table_sets(folder: Path, monkeypatch, tables: dict[int, tuple[int, int]
     return table_sets
 
 #all wdl tables and the 3-5 piece dtz ones are required; the 6 piece dtz ones may all be left out (then searched, not ranked), not partly
-@pytest.mark.parametrize("five, six, ranked", [((3, 3), (3, 3), 6), ((3, 3), (3, 0), 5), ((3, 3), (2, 3), None),
-                                               ((3, 3), (3, 1), None), ((3, 0), (3, 3), None)])
-def test_which_tables_open(tmp_path, monkeypatch, five, six, ranked):
+@pytest.mark.parametrize("five, six, opens", [((3, 3), (3, 3), True), ((3, 3), (3, 0), True), ((3, 3), (2, 3), False),
+                                              ((3, 3), (3, 1), False), ((3, 0), (3, 3), False)])
+def test_which_tables_open(tmp_path, monkeypatch, five, six, opens):
     fake_table_sets(tmp_path, monkeypatch, {5: five, 6: six})
 
-    if ranked is None:
+    if opens:
+        open_tablebase(6).close()
+    else:
         with pytest.raises(FileNotFoundError):
             open_tablebase(6)
-    else:
-        open_tablebase(6).close()
-        assert ranked_pieces(6) == ranked
-
-#ranking probes the dtz tables of every size up to the root's: they must run unbroken from 5 pieces, not just exist at some larger size
-def test_the_dtz_tables_rank_only_up_to_the_first_size_without_them(tmp_path, monkeypatch):
-    fake_table_sets(tmp_path, monkeypatch, {5: (3, 3), 6: (3, 0), 7: (3, 3)})
-
-    open_tablebase(7).close()
-    assert ranked_pieces(7) == 5
 
 def fake_syzygy_path(folder: Path, left_out: tuple[str, ...] = (), pieces: int = 6) -> str:
     names = list(chess.syzygy.tablenames(piece_count=pieces))
@@ -147,18 +140,37 @@ def tables_of(pieces: int) -> list[str]:
 
 SEVEN_PIECE_TABLES = tables_of(7)
 
-#the most pieces a SyzygyPath holds up to the limit, as stockfish counts them; above 5 pieces the dtz tables may all be left out (searched, not ranked)
-@pytest.mark.parametrize("left_out, limit, pieces", [((), 7, 7), ((), 6, 6), ((f"{SEVEN_PIECE_TABLES[0]}.rtbw",), 7, 6),
-                                                     (tuple(f"{name}.rtbz" for name in SEVEN_PIECE_TABLES), 7, 7), (("KQRvKR.rtbz",), 7, 4)])
+#the most pieces a SyzygyPath holds up to the limit, as stockfish counts them
+@pytest.mark.parametrize("left_out, limit, pieces", [((), 7, 7), ((), 6, 6), ((f"{SEVEN_PIECE_TABLES[0]}.rtbw",), 7, 7),
+                                                     (tuple(f"{name}.rtbw" for name in SEVEN_PIECE_TABLES), 7, 6),
+                                                     (tuple(f"{name}.rtbz" for name in SEVEN_PIECE_TABLES), 7, 7), (("KQRvKR.rtbz",), 7, 7)])
 def test_a_syzygy_path_gives_the_most_pieces_it_holds(tmp_path, left_out, limit, pieces):
-    assert complete_pieces(fake_syzygy_path(tmp_path, left_out, pieces=7), limit) == pieces
+    assert most_pieces(fake_syzygy_path(tmp_path, left_out, pieces=7), limit) == pieces
 
-#SyzygyProbeLimit defaults to 7 so TCEC's tables need no limit set; a folder missing a table of up to 5 pieces is refused
+#a junction on windows, where symlinks need admin rights
+def dead_link(link: Path) -> None:
+    gone = link.with_name(link.name + ".gone")
+    gone.mkdir()
+    try:
+        os.symlink(gone, link)
+    except OSError:
+        import _winapi
+        _winapi.CreateJunction(str(gone), str(link))
+    gone.rmdir()
+
+def test_a_link_to_nothing_is_no_table(tmp_path):
+    path = fake_syzygy_path(tmp_path, (f"{SEVEN_PIECE_TABLES[0]}.rtbw",), pieces=7)
+    dead_link(Path(path.split(os.pathsep)[-1]) / f"{SEVEN_PIECE_TABLES[0]}.rtbw")
+
+    assert most_pieces(path, 7) == 7
+    assert SEVEN_PIECE_TABLES[0] not in found_tables(path_folders(path))["rtbw"]
+
+#SyzygyProbeLimit defaults to 7 so TCEC's tables need no limit set; a folder without the tables is refused
 def test_the_engine_takes_the_7_piece_tables_it_is_given(tmp_path):
     for name in ("seven", "six", "none"):
         (tmp_path / name).mkdir()
     seven = fake_syzygy_path(tmp_path / "seven", pieces=7)
-    six = fake_syzygy_path(tmp_path / "six", (f"{SEVEN_PIECE_TABLES[0]}.rtbw",), pieces=7)
+    six = fake_syzygy_path(tmp_path / "six", tuple(f"{name}.rtbw" for name in SEVEN_PIECE_TABLES), pieces=7)
     options = Options(False, TABLEBASE_PIECES)
 
     assert "option name SyzygyProbeLimit type spin default 7 min 5 max 7" in options.lines()
@@ -166,43 +178,41 @@ def test_the_engine_takes_the_7_piece_tables_it_is_given(tmp_path):
     assert options.set("SyzygyPath", six, built=False) is None and options.search()[1]["tablebase_pieces"] == 6
     assert options.set("SyzygyProbeLimit", "5", built=False) is None and options.search()[1]["tablebase_pieces"] == 5
     assert options.set("SyzygyPath", seven, built=False) is None and options.search()[1]["tablebase_pieces"] == 5
-    assert options.set("SyzygyPath", str(tmp_path / "none"), built=False).endswith("the tables stay as they were")
+    assert options.set("SyzygyPath", str(tmp_path / "none"), built=False).endswith("holds no tables: the tables stay as they were")
+    assert options.set("SyzygyPath", str(tmp_path / "nowhere"), built=False).endswith("the tables stay as they were")
     assert options.search()[1]["syzygy_path"] == seven
 
-@pytest.mark.parametrize("left_out, ranked", [((), 6), (tuple(f"{name}.rtbz" for name in tables_of(6)), 5),
-                                              (("KRPvKRP.rtbz",), None), (("KRPvKRP.rtbw",), None), (("KQvKR.rtbz",), None)])
-def test_which_tables_open_from_a_syzygy_path(tmp_path, left_out, ranked):
-    path = fake_syzygy_path(tmp_path, left_out)
+def partial_syzygy_path(folder: Path, left_out: tuple[str, ...], dead: tuple[str, ...] = ()) -> str:
+    folder.mkdir()
+    for table in SYZYGY_DIR.glob("*.rtb?"):
+        if table.name in dead:
+            dead_link(folder / table.name)
+        elif table.name not in left_out:
+            os.link(table, folder / table.name)
+    return str(folder)
 
-    if ranked is None:
-        with pytest.raises(FileNotFoundError):
-            open_tablebase_path(path, 6)
-    else:
-        tables, ranked_by_path = open_tablebase_path(path, 6)
-        tables.close()
-        assert ranked_by_path == ranked
+#a root missing a table is searched; the rust search must open past a link to nothing
+@pytest.mark.parametrize("left_out, dead", [(("KRvK.rtbz",), ()), ((), ("KRvK.rtbw",))])
+def test_a_root_missing_a_table_is_searched(tablebase, tmp_path, left_out, dead):
+    path = partial_syzygy_path(tmp_path / "tables", left_out, dead)
+    search = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True, syzygy_path=path)
+    rook, queen = chess.Board("k7/8/1K6/8/8/8/8/7R w - - 0 1"), chess.Board("k7/8/1K6/8/8/8/7Q/8 w - - 0 1")
 
-def test_a_syzygy_path_ranks_only_up_to_the_first_size_without_dtz_tables(tmp_path):
-    path = fake_syzygy_path(tmp_path, tuple(f"{name}.rtbz" for name in tables_of(6)), pieces=7)
-
-    tables, ranked = open_tablebase_path(path, 7)
-    tables.close()
-    assert ranked == 5
+    assert ranked_moves(open_tablebase_path(path), rook) is None and rook.fen() == "k7/8/1K6/8/8/8/8/7R w - - 0 1"
+    assert search.search(rook, simulations=200).simulations > 0
+    assert search.search(queen, simulations=200).simulations == 0
 
 def test_a_syzygy_path_of_5_pieces(tmp_path):
     path = fake_syzygy_path(tmp_path)
 
-    tables, ranked = open_tablebase_path(path.split(os.pathsep)[0], 5)
-    tables.close()
-    assert ranked == 5
+    open_tablebase_path(path.split(os.pathsep)[0]).close()
     with pytest.raises(FileNotFoundError):
-        open_tablebase_path(str(tmp_path / "nowhere"), 5)
+        open_tablebase_path(str(tmp_path / "nowhere"))
 
 def test_the_default_tables_are_the_5_piece_ones(tmp_path, monkeypatch):
     five, six = fake_table_sets(tmp_path, monkeypatch, {5: (3, 3), 6: (0, 0)})
 
     open_tablebase().close()
-    assert ranked_pieces(5) == 5
     settings = rust_search_settings(True)
     assert (settings["tablebase_folder"], settings["tablebase_pieces"]) == (str(five.folder), 5)
     assert rust_search_settings(True, 6)["tablebase_folder"] == os.pathsep.join([str(five.folder), str(six.folder)])
@@ -257,7 +267,7 @@ def test_rust_probes_the_6_piece_tables_when_asked(tablebase6, tablebase_pieces)
     assert line[0] == "d1d5" and root_moves["d1d5"] > simulations / 2
 
 def test_the_engine_takes_the_tables_move_at_6_pieces(tablebase6):
-    if ranked_pieces(6) < 6:
+    if not TABLE_SETS[1].count("rtbz"):
         pytest.skip("the 6 piece dtz tables are not downloaded")
     board = chess.Board(SIX_PIECES)
 
