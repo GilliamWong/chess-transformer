@@ -3,8 +3,7 @@
   "options": {
     "SyzygyPath": "/data/tablebases",
     "AdvanceThreads": "0",
-    "MoveOverhead": "200",
-    "SearchSettings": "c_puct=1.68,c_puct_factor=2.30,c_puct_base=45669,fpu_reduction=0.571"
+    "MoveOverhead": "200"
   },
   "timemargin": 1000
 }

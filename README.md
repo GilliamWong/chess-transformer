@@ -65,7 +65,7 @@ The network `fry-final-117` was trained on:
   [Open Database License](https://opendatacommons.org/licenses/odbl/1-0/) (ODbL); its individual contents are under the
   [Database Contents License](https://opendatacommons.org/licenses/dbcl/1-0/).
 
-The search follows the design of [Leela Chess Zero](https://lczero.org/)'s, and the tournament settings use its search
+The search follows the design of [Leela Chess Zero](https://lczero.org/)'s, and TCEC's settings use its search
 constants. The rules and tablebase probing come from [python-chess](https://github.com/niklasf/python-chess),
 [shakmaty](https://github.com/niklasf/shakmaty) and
 [shakmaty-syzygy](https://github.com/niklasf/shakmaty-syzygy) by Niklas Fiekas.
