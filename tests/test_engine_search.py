@@ -2,6 +2,7 @@ import ctypes
 import gc
 import io
 import itertools
+import json
 import os
 import queue
 import runpy
@@ -1385,6 +1386,16 @@ def test_search_settings_that_are_not_numbers_are_refused():
     for change in ("move_id_table=1", "tablebase_folder=x", "repetitions_for_a_draw=inf", "c_puct=x", "nope=1"):
         assert options.set("SearchSettings", change, built=False).endswith("the search's settings stay as they were")
     assert options.settings is None
+
+
+#a competition's gui sends its file's options as setoptions: a misspelt name or a value out of range is refused there. SyzygyPath's is a placeholder
+@pytest.mark.parametrize("competition", sorted((Path(__file__).parent.parent / "engine" / "linux").glob("*.json")), ids=lambda path: path.name)
+def test_a_competitions_options_are_ones_the_engine_takes(competition):
+    options = Options(False, TABLEBASE_PIECES, gpu=True)
+    for option in json.loads(competition.read_text())[0]["options"]:
+        assert option["name"] in options.names()
+        if option["name"] != "SyzygyPath":
+            assert options.set(option["name"], str(option["value"]), built=False) is None
 
 
 #answers come back late once, as on a cuda graph's first capture or a gpu shared with another engine: on the on_collect'th collect

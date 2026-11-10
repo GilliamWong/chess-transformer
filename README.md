@@ -26,7 +26,9 @@ machine's CPU, downloads the network
 the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clones or pulls and builds in one step.
 
 `engine.sh` is the UCI engine, searching on every GPU the machine has. Its first start takes ~25 s and later starts
-~7 s on one GPU or ~35-40 s on eight, so give the GUI that long to answer `isready`.
+~7 s on one GPU or ~35-40 s on eight, so give the GUI that long to answer `isready`. The kernels are picked from the
+GPU's model at start-up; `engine/linux/tcec.json` and `engine/linux/ccc.json` hold the options for TCEC's and the
+CCC's machines.
 
 | Option | Default | Description |
 |---|---|---|
