@@ -138,7 +138,7 @@ def only_configs(monkeypatch, configs: dict) -> None:
 
 #the entries of every gpu of this compute capability: the multiprocessor count only changes which config is fastest
 def configs_of_this_capability(kind: str) -> list[tuple[int, tuple]]:
-    found = [entry for key, table in int8_cuda.CONFIGS.items() if key[:2] == gpu_key()[:2] for entry in table[kind]]
+    found = [entry for key, table in int8_cuda.CONFIGS.items() if key[:2] == gpu_key()[:2] for entry in table.get(kind, ())]
     if not found:
         pytest.skip("no small-batch CUDA kernels timed on a gpu like this one")
     return found
@@ -469,7 +469,7 @@ def test_the_engines_compile_traces_each_size_once(tmp_path, small_calibration, 
 
 
 #140 rows is 2 boards: the 4-board graph runs Triton beside the CUDA kernels
-@sm_90
+@gpu
 def test_the_int8_model_gives_the_same_bits_with_the_small_batch_cuda_kernels(tmp_path, small_calibration, restore_matmul_flags, monkeypatch):
     _, boards = small_checkpoint(tmp_path)
     boards = boards.numpy().astype("uint8")

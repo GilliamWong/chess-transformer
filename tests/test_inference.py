@@ -608,9 +608,8 @@ def test_tiles_are_picked_by_rows_per_multiprocessor():
     assert [fused_blocks.tile_for(tiles, rows, 170) for rows in (170, 171, 1360, 1361)] == ["a board each", "eight", "eight", "more"]
 
 
-#sm_80 (A100), 86 (A40), 89 (RTX 4090, L40S) and 90 (H100) take one int8 tile per matmul at every size, and all but sm_80 one linear tile
+#sm_86 (A40), 89 (RTX 4090, L40S) and 90 (H100) take one tile per matmul at every size
 @pytest.mark.parametrize("capability, multiprocessors, expected", [
-    ((8, 0), 108, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 32, 64, 4, 3), "down": (128, 64, 128, 4, 3)}),
     ((8, 6), 84, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (64, 128, 128, 4, 3)}),
     ((8, 9), 142, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (128, 64, 128, 4, 3)}),
     ((9, 0), 132, {"projection": (128, 128, 64, 8, 3), "gate_up": (128, 64, 64, 4, 2), "down": (128, 128, 64, 8, 3, 128)})])
@@ -621,8 +620,7 @@ def test_other_gpus_keep_their_tiles_at_every_size(monkeypatch, capability, mult
     device = torch.device("cuda")
 
     for boards in (1, 2, 4, 8, 16, 64, 128):
-        if capability != (8, 0):
-            assert fused_blocks.linear_tile(device, 70 * boards) == (128, 128, 4, 3)
+        assert fused_blocks.linear_tile(device, 70 * boards) == (128, 128, 4, 3)
         assert {matmul: int8_blocks.int8_tile(device, matmul, 70 * boards) for matmul in expected} == expected
 
 

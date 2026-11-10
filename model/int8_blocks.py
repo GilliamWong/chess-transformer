@@ -25,8 +25,10 @@ INT8_TILES = {(12, 0): {"projection": [(2, (32, 64, 64, 4, 4)), (4, (64, 64, 64,
                        "down": [(math.inf, (128, 64, 128, 4, 3))]},
               (8, 6): {"projection": [(math.inf, (128, 64, 128, 4, 3))], "gate_up": [(math.inf, (128, 64, 64, 4, 3))],
                        "down": [(math.inf, (64, 128, 128, 4, 3))]},
-              (8, 0): {"projection": [(math.inf, (128, 64, 128, 4, 3))], "gate_up": [(math.inf, (128, 32, 64, 4, 3))],
-                       "down": [(math.inf, (128, 64, 128, 4, 3))]}}
+              (8, 0): {"projection": [(1, (16, 32, 128, 2, 2)), (2, (32, 64, 128, 2, 3)), (3, (32, 128, 128, 4, 3)), (6, (64, 128, 128, 4, 2)),
+                                      (math.inf, (128, 128, 128, 4, 3))],
+                       "gate_up": [(1, (32, 64, 64, 4, 4)), (2, (32, 64, 64, 4, 3)), (3, (64, 32, 128, 4, 3)), (math.inf, (128, 32, 64, 4, 3))],
+                       "down": [(1, (32, 32, 128, 2, 4)), (2, (16, 128, 128, 4, 4)), (3, (32, 128, 128, 4, 3)), (math.inf, (64, 128, 128, 4, 3))]}}
 NORM_ROWS, NORM_WARPS = 1, 2
 #rotate_quant_kernel's rows a program by compute capability: [(the most rows a multiprocessor's share may be, rows), ...]
 ROTATE_ROWS = {(12, 0): [(4, 2), (math.inf, 8)], (8, 0): [(1.5, 1), (math.inf, 4)]}

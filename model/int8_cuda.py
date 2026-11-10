@@ -72,7 +72,9 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
         *reinterpret_cast<int4*>(partial + i) = make_int4(0, 0, 0, 0);
 
     //what the previous kernel writes (x, residual, original) is read after the wait, the weights before
+#if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
     //rows past M read row M - 1: their sums are never stored
     uint4 xv[CK][MT][2];
     #pragma unroll
@@ -174,8 +176,9 @@ __global__ void __launch_bounds__(WN * WK * 32) small_int8(
 }
 """
 
-#(compute capability, multiprocessors: 70 RTX 5070 Ti, 170 RTX 5090) -> kind -> [(most rows, (MT, NT, WN, WK, CK))]
-CONFIGS = {(12, 0, 70): {"projection": [(70, (5, 4, 1, 12, 1))], "gate_up": [(70, (5, 1, 1, 12, 1))], "down": [(70, (3, 4, 1, 8, 2))]},
+#(compute capability, multiprocessors: 70 RTX 5070 Ti, 170 RTX 5090, 108 A100) -> kind -> [(most rows, (MT, NT, WN, WK, CK))]
+CONFIGS = {(8, 0, 108): {"projection": [(70, (2, 4, 2, 6, 2)), (140, (3, 4, 2, 4, 3))], "down": [(70, (3, 4, 1, 16, 1)), (140, (1, 4, 2, 4, 4))]},
+           (12, 0, 70): {"projection": [(70, (5, 4, 1, 12, 1))], "gate_up": [(70, (5, 1, 1, 12, 1))], "down": [(70, (3, 4, 1, 8, 2))]},
            (12, 0, 170): {"projection": [(140, (3, 4, 1, 12, 1))],
                           "gate_up": [(70, (3, 2, 1, 12, 1)), (140, (3, 2, 2, 6, 2))],
                           "down": [(70, (3, 3, 1, 8, 2)), (140, (3, 4, 1, 8, 2))]}}
@@ -253,7 +256,9 @@ class Kernels:
         wanted = sorted({(config, EPILOGUES[epilogue]) for kind, table in configs.items() for _, config in table
                          for epilogue in (["down", "mixing down"] if kind == "down" else [kind])})
         names = {key: kernel_name(*key) for key in wanted}
-        cubin, lowered = compile_cubin(SOURCE, list(names.values()), torch.cuda.get_device_capability(device))
+        capability = torch.cuda.get_device_capability(device)
+        self.dependent = capability >= (9, 0)
+        cubin, lowered = compile_cubin(SOURCE, list(names.values()), capability)
         with torch.cuda.device(device):
             #makes torch's context current, which the module loads into
             torch.empty(0, device=device)
@@ -271,14 +276,14 @@ class Kernels:
             self.driver.cuGetErrorString(result, ctypes.byref(message))
             raise RuntimeError(f"CUDA driver: {message.value.decode() if message.value else result}")
 
-    #tensors: the kernel's pointer arguments in order (None for unused ones); with programmatic dependent launch
+    #tensors: the kernel's pointer arguments in order (None for unused ones); with programmatic dependent launch from sm_90
     def launch(self, config: tuple, epilogue: int, tensors: list, M: int, N: int, K: int) -> None:
         mt, nt, wn, wk, _ = config
         attribute = (LaunchAttribute * 1)()
         attribute[0].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
         attribute[0].value[0] = 1
         stream = torch.cuda.current_stream(tensors[0].device).cuda_stream
-        launch = LaunchConfig(-(-N // (wn * nt * 8)), -(-M // (mt * 16)), 1, wn * wk * 32, 1, 1, 0, stream, attribute, 1)
+        launch = LaunchConfig(-(-N // (wn * nt * 8)), -(-M // (mt * 16)), 1, wn * wk * 32, 1, 1, 0, stream, attribute, int(self.dependent))
         arguments = [ctypes.c_void_p(tensor.data_ptr() if tensor is not None else 0) for tensor in tensors]
         arguments += [ctypes.c_int(M), ctypes.c_int(N), ctypes.c_int(K)]
         pointers = (ctypes.c_void_p * len(arguments))(*[ctypes.cast(ctypes.byref(argument), ctypes.c_void_p) for argument in arguments])
