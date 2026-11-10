@@ -43,3 +43,22 @@ the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clon
 | `FirstMoveBonus` | 0 | Extra time for the game's first search |
 | `BookPlyBonus` | 0 | Extra first-search time per book ply |
 | `SearchSettings` | `<empty>` | Search constants as `name=value,...`; `value_sharpness` defaults to the network's own |
+
+## Training data and credits
+
+The network `fry-final-117` was trained on:
+
+- positions from the [Lichess Elite Database](https://database.nikonoel.fr/), a selection of the
+  [Lichess database](https://database.lichess.org/) (released under CC0), labelled with moves and evaluations by
+  [Stockfish](https://stockfishchess.org/) and with results from the Syzygy tablebases (Ronald de Man);
+- Leela Chess Zero's self-play games. The network contains information from the
+  [Leela Chess Zero training data](https://storage.lczero.org/files/training_data/), which is made available under the
+  [Open Database License](https://opendatacommons.org/licenses/odbl/1-0/) (ODbL); its individual contents are under the
+  [Database Contents License](https://opendatacommons.org/licenses/dbcl/1-0/).
+
+The search follows the design of [Leela Chess Zero](https://lczero.org/)'s, and the tournament settings use its search
+constants. The rules and tablebase probing come from [python-chess](https://github.com/niklasf/python-chess),
+[shakmaty](https://github.com/niklasf/shakmaty) and
+[shakmaty-syzygy](https://github.com/niklasf/shakmaty-syzygy) by Niklas Fiekas.
+
+Fry is free software under the GNU General Public License, version 3 or later: see [LICENSE](LICENSE).
