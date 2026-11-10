@@ -384,8 +384,10 @@ def test_the_fused_heads_compute_the_models_heads(monkeypatch, boards):
 
 @gpu
 @pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (12, 0)])
-def test_the_fused_ends_only_on_sm_120(monkeypatch, capability):
+def test_the_fused_ends_only_on_sm_120_and_sm_80(monkeypatch, capability):
     from model.fused_blocks import FusedTransformer
+    if capability >= (9, 0) > torch.cuda.get_device_capability():
+        pytest.skip("the kernels of sm_90 and newer wait on dependent launch, which this gpu does not compile")
     torch.manual_seed(0)
     model = ChessTransformer(d_model=64, num_layers=1, n_heads=2, value_bins=16).cuda().eval()
     boards = torch.tensor([encode_board(chess.Board())] * 3).cuda()
@@ -396,9 +398,9 @@ def test_the_fused_ends_only_on_sm_120(monkeypatch, capability):
     with torch.no_grad():
         outputs = fused(boards)
 
-    is_sm_120 = capability == (12, 0)
-    assert fused.fused_heads == fused.input_embedding.from_boards == is_sm_120
-    assert isinstance(outputs, torch.Tensor) == is_sm_120
+    fused_ends = capability in ((12, 0), (8, 0))
+    assert fused.fused_heads == fused.input_embedding.from_boards == fused_ends
+    assert isinstance(outputs, torch.Tensor) == fused_ends
     assert torch.allclose(answer_rows(outputs), expected, atol=1e-2)
 
 
@@ -568,7 +570,7 @@ def test_extra_rows_leave_every_row_the_same(monkeypatch, gated, accumulate_fp32
 
     outs = []
     for extra in (0, 16, 32, 64):
-        monkeypatch.setattr(fused_blocks, "linear_extra_rows", lambda M, rows, column_tiles, multiprocessors, extra=extra: extra)
+        monkeypatch.setattr(fused_blocks, "linear_extra_rows", lambda M, rows, column_tiles, multiprocessors, most=64, extra=extra: extra)
         outs.append(fused_blocks.linear(x, weight, bias, None, gated, accumulate_fp32))
 
     assert all(torch.equal(out, outs[0]) for out in outs[1:])
@@ -606,7 +608,7 @@ def test_tiles_are_picked_by_rows_per_multiprocessor():
     assert [fused_blocks.tile_for(tiles, rows, 170) for rows in (170, 171, 1360, 1361)] == ["a board each", "eight", "eight", "more"]
 
 
-#sm_80 (A100), 86 (A40), 89 (RTX 4090, L40S) and 90 (H100) take one tile per matmul at every size
+#sm_80 (A100), 86 (A40), 89 (RTX 4090, L40S) and 90 (H100) take one int8 tile per matmul at every size, and all but sm_80 one linear tile
 @pytest.mark.parametrize("capability, multiprocessors, expected", [
     ((8, 0), 108, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 32, 64, 4, 3), "down": (128, 64, 128, 4, 3)}),
     ((8, 6), 84, {"projection": (128, 64, 128, 4, 3), "gate_up": (128, 64, 64, 4, 3), "down": (64, 128, 128, 4, 3)}),
@@ -619,8 +621,17 @@ def test_other_gpus_keep_their_tiles_at_every_size(monkeypatch, capability, mult
     device = torch.device("cuda")
 
     for boards in (1, 2, 4, 8, 16, 64, 128):
-        assert fused_blocks.linear_tile(device, 70 * boards) == (128, 128, 4, 3)
+        if capability != (8, 0):
+            assert fused_blocks.linear_tile(device, 70 * boards) == (128, 128, 4, 3)
         assert {matmul: int8_blocks.int8_tile(device, matmul, 70 * boards) for matmul in expected} == expected
+
+
+#a tile's most extra rows bound the choice: the A100's combine at 48 boards ran at half its rate with the 64 that would save its second wave
+def test_a_tile_takes_at_most_its_extra_rows():
+    from model import fused_blocks
+    assert fused_blocks.linear_extra_rows(48 * 70, 128, 6, 108) == 64
+    assert fused_blocks.linear_extra_rows(48 * 70, 128, 6, 108, 16) == 0
+    assert fused_blocks.linear_extra_rows(64 * 70, 128, 16, 108, 16) == 16
 
 
 @gpu

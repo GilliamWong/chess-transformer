@@ -256,15 +256,15 @@ def test_rotate_quant_rows_change_no_bits(monkeypatch):
     assert all(torch.equal(integers, found[0][0]) and torch.equal(scale, found[0][1]) for integers, scale in found[1:])
 
 
-#sm_120 takes fewer rows a program up to 4 rows a multiprocessor; the untimed gpus (A100, A40, L40S) take 8 at any batch
-@pytest.mark.parametrize("capability", [(8, 0), (8, 6), (8, 9), (12, 0)])
-def test_rotate_rows_by_compute_capability(monkeypatch, capability):
+#sm_120 takes fewer rows a program up to 4 rows a multiprocessor, sm_80 up to 1.5; the untimed gpus (A40, L40S) take 8 at any batch
+@pytest.mark.parametrize("capability, expected", [((8, 0), [1, 4, 4, 4]), ((8, 6), [8, 8, 8, 8]), ((8, 9), [8, 8, 8, 8]), ((12, 0), [2, 2, 8, 8])])
+def test_rotate_rows_by_compute_capability(monkeypatch, capability, expected):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device=None: SimpleNamespace(multi_processor_count=70))
 
     rows = [int8_blocks.rotate_rows(torch.device("cuda"), boards * 70) for boards in (1, 4, 8, 64)]
 
-    assert rows == ([2, 2, 8, 8] if capability == (12, 0) else [8, 8, 8, 8])
+    assert rows == expected
 
 
 SMALL_SETTINGS = {"d_model": 128, "num_layers": 3, "n_heads": 4, "kv_heads": 2, "qk_ratio": [0.25, 0.5, 0.75], "mlp_hidden": 320, "value_bins": 16}

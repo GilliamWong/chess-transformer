@@ -179,9 +179,10 @@ def _(projected, templates, q_gain, k_gain, heads, kv_heads, dq, dv, templates_c
 
 #a gated matmul's tile columns are those of the gate and of up together, so half as many outputs
 LINEAR_DEPTH, GROUP_M = 32, 8
-#linear's tiles (rows, columns, warps, stages) by compute capability, as tile_for takes them; any tile gives the same bits
+#linear's tiles (rows, columns, warps, stages[, the most extra rows]) by compute capability, as tile_for takes them; any tile gives the same bits
 UNTIMED_LINEAR_TILES = [(math.inf, (128, 128, 4, 3))]
-LINEAR_TILES = {(12, 0): [(2, (32, 64, 4, 5)), (8, (64, 64, 4, 4)), (12, (64, 128, 4, 3))] + UNTIMED_LINEAR_TILES}
+LINEAR_TILES = {(12, 0): [(2, (32, 64, 4, 5)), (8, (64, 64, 4, 4)), (12, (64, 128, 4, 3))] + UNTIMED_LINEAR_TILES,
+                (8, 0): [(3, (32, 64, 2, 5, 0)), (8, (64, 64, 4, 6, 0)), (22, (128, 128, 4, 4, 0)), (math.inf, (128, 128, 4, 3, 16))]}
 EXTRA_ROW_COST = 1.5
 
 
@@ -196,11 +197,11 @@ def linear_tile(device: torch.device, M: int) -> tuple[int, ...]:
     return tile_for(tiles, M, torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-def linear_extra_rows(M: int, rows: int, column_tiles: int, multiprocessors: int) -> int:
+def linear_extra_rows(M: int, rows: int, column_tiles: int, multiprocessors: int, most: int = 64) -> int:
     def cost(extra: int) -> float:
         waves = triton.cdiv(triton.cdiv(M, rows + extra) * column_tiles, multiprocessors)
         return waves * (rows + EXTRA_ROW_COST * extra)
-    return min((0, 16, 32, 64), key=cost)
+    return min((extra for extra in (0, 16, 32, 64) if extra <= most), key=cost)
 
 
 #MIX stores the next block's input: the stream as stored (rounded), mixed with the input embedding (original) as TransformerBlock mixes it
@@ -280,7 +281,7 @@ def linear_kernel(x_ptr, w_ptr, bias_ptr, residual_ptr, original_ptr, residual_s
 def launch_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, residual: torch.Tensor | None, gated: bool,
                   accumulate_fp32: bool, original: torch.Tensor | None, residual_scale: torch.Tensor | None, input_scale: torch.Tensor | None,
                   tile: tuple[int, ...]) -> torch.Tensor:
-    rows, columns, warps, stages = tile
+    rows, columns, warps, stages, *most_extra = tile
     K, width = weight.shape
     N = width // 2 if gated else width
     if K % LINEAR_DEPTH != 0:
@@ -290,7 +291,7 @@ def launch_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | No
     acc_type = tl.float16 if x.dtype == torch.float16 and not accumulate_fp32 else tl.float32
     M = x.numel() // K
     columns = columns // 2 if gated else columns
-    extra = linear_extra_rows(M, rows, triton.cdiv(N, columns), torch.cuda.get_device_properties(x.device).multi_processor_count)
+    extra = linear_extra_rows(M, rows, triton.cdiv(N, columns), torch.cuda.get_device_properties(x.device).multi_processor_count, *most_extra)
     #the pointers of unused inputs are never read
     bias_ = bias if bias is not None else weight
     residual_ = residual.contiguous() if residual is not None else out
@@ -410,8 +411,8 @@ def _(boards, rows, embed, position, table):
     return table.new_empty(*boards.shape, table.shape[1])
 
 
-#the gpus (sm_120) that take board_embedding_kernel and the fused heads; others keep input_embedding_kernel and head_weights' matmuls
-FUSED_ENDS_CAPABILITIES = {(12, 0)}
+#the gpus (sm_120, sm_80) that take board_embedding_kernel and the fused heads; others keep input_embedding_kernel and head_weights' matmuls
+FUSED_ENDS_CAPABILITIES = {(12, 0), (8, 0)}
 
 
 def fused_ends(device: torch.device) -> bool:
