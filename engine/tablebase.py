@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import threading
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -189,11 +190,13 @@ class TablebaseMove:
     def rank(self) -> tuple[int, int]:
         return (-self.wdl, self.plies_to_zeroing if self.wdl > 0 else -self.plies_to_zeroing if self.wdl < 0 else 0)
 
-#best first; ties keep the order of the legal moves
-def ranked_moves(tablebase: chess.syzygy.Tablebase, board: chess.Board) -> list[TablebaseMove]:
+#best first; ties keep the order of the legal moves. None if the probes are not done by `deadline` (time.perf_counter's): tables on a slow disk
+def ranked_moves(tablebase: chess.syzygy.Tablebase, board: chess.Board, deadline: float | None = None) -> list[TablebaseMove] | None:
     moves = []
     clock = board.halfmove_clock
     for move in list(board.legal_moves):
+        if deadline is not None and time.perf_counter() >= deadline:
+            return None
         zeroing = board.is_zeroing(move)
         board.push(move)
         #the tables answer for the opponent, hence the minus

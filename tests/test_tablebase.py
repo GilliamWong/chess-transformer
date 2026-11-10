@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import shutil
+import time
 
 import chess
 import chess.syzygy
@@ -8,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from engine import mcts
+from engine import engine_search, mcts
 import selfplay_rs
 from model.encoding import TOKENS_PER_BOARD
 from fake_models import UniformModel
@@ -54,6 +55,19 @@ def test_the_report_scores_a_win_the_halfmove_clock_makes_a_draw_as_a_draw(table
     assert search.search(board, simulations=10).score == 1.0
     board.halfmove_clock = 90
     assert search.search(board, simulations=10).score == 0.5
+
+
+#tables that take longer than their share of the search's time (a slow disk) leave the root to the search
+def test_a_root_the_tables_rank_too_slowly_is_searched(tablebase, monkeypatch):
+    board = chess.Board("6K1/1B5N/8/8/8/8/8/3k4 w - - 0 1")
+    search = EngineSearch(cpu_batches(UniformModel()), 16, use_tablebase=True)
+
+    assert ranked_moves(tablebase, board, time.perf_counter()) is None
+    assert ranked_moves(tablebase, board, time.perf_counter() + 60) == ranked_moves(tablebase, board)
+    assert search.search(board, seconds=0.5).simulations == 0
+    monkeypatch.setattr(engine_search, "TABLE_MOVE_SHARE", 0.0)
+    report = search.search(board, seconds=0.5)
+    assert report.simulations > 0 and report.line[0] in board.legal_moves
 
 
 def test_the_search_scores_the_positions_the_tables_cover(tablebase, monkeypatch):

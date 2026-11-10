@@ -38,6 +38,8 @@ FALL_FULL_CP = 30
 SPEED_ROUNDS = 8
 #on several networks smart pruning takes the speed since its first check, and the time left counts only from this long after it
 SPEED_WAIT_SECONDS = 0.2
+#of a search's time, what the tables may take to rank the root's moves (tablebase.ranked_moves) before the root is searched instead
+TABLE_MOVE_SHARE = 0.5
 INFO_SECONDS = 1.0
 RUST_WAIT_SECONDS = 0.005
 CACHE_POSITIONS = 5_000_000
@@ -271,8 +273,10 @@ class EngineSearch:
             raise ValueError("a search needs a number of simulations, a time or a stop")
         started = time.perf_counter()
         if self.tablebase is not None and covers(board, self.ranked_pieces):
-            best = ranked_moves(self.tablebase, board)[0]
-            return SearchReport(wdl_score(best.wdl), [best.move], 0, [])
+            #a root the tables have not ranked in their share of the search's time is searched in the rest of it
+            ranked = ranked_moves(self.tablebase, board, None if seconds is None else started + TABLE_MOVE_SHARE * seconds)
+            if ranked is not None:
+                return SearchReport(wdl_score(ranked[0].wdl), [ranked[0].move], 0, [])
 
         #the seconds let a kept tree's compaction (at the memory limit) give way to a short search
         self.searches.start(GAME, board.root().fen(), [move.uci() for move in board.move_stack], UNLIMITED if simulations is None else simulations, seconds)

@@ -191,19 +191,51 @@ def advance_after(player, board: chess.Board, move: chess.Move) -> None:
         played.push(move)
         player.advance(played)
 
+#engine_networks on the gpus that work, and those: a gpu whose network cannot be built is left out and the gui told, unless none can be built
+def working_networks(checkpoint_path: Path, leaves: int, precision: str, fp16_blocks: int, gpus: list[int]) -> tuple[list, list[int]]:
+    #on several gpus the networks wait asleep (inference.GraphedBatches' blocking_wait) where each thread would spin a core
+    try:
+        return engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, len(gpus) > 1), gpus
+    except Exception as error:
+        if len(gpus) == 1:
+            raise
+        failed = error
+    networks, working = [], []
+    for device in gpus:
+        try:
+            networks += engine_networks(checkpoint_path, leaves, precision, fp16_blocks, [device], True)
+            working.append(device)
+        except Exception as error:
+            send(f"info string gpu {device} failed ({error!r}): searching without it")
+    if not networks:
+        raise failed
+    return networks, working
+
+#tells the gui what the player searches with, for its log: a wrong SyzygyPath or a missing gpu shows here
+def tell_loaded(player: EngineSearch, where: str, search_options: dict) -> EngineSearch:
+    pieces, limit = search_options.get("tablebase_pieces", TABLEBASE_PIECES), search_options.get("memory_limit_mb", 0)
+    tables = "no tables" if player.tablebase is None else f"tables of up to {pieces} pieces, moves played from them up to {player.ranked_pieces}"
+    send(f"info string {ENGINE_NAME} on {where}; {tables}; {f'tree limit {limit} MB' if limit else 'no tree limit'}; "
+         f"cache {search_options.get('cache_positions', CACHE_POSITIONS)} positions")
+    return player
+
 #search_options are EngineSearch's keyword arguments
 def load_player(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, search_options: dict,
                 precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> EngineSearch:
     if not gpu:
-        return EngineSearch(cpu_batches(load_model(checkpoint_path, torch.device("cpu"))), 1, use_tablebase=tablebase, **search_options)
+        player = EngineSearch(cpu_batches(load_model(checkpoint_path, torch.device("cpu"))), 1, use_tablebase=tablebase, **search_options)
+        return tell_loaded(player, "the cpu", search_options)
     #the checkpoint's own value sharpness replaces the engine's default; one given by the command line or SearchSettings wins over both
     sharpness = served_value_sharpness(checkpoint_path)
     if sharpness is not None:
         search_options = {**search_options, "settings": {"value_sharpness": sharpness, **search_options.get("settings", {})}}
-    #on several gpus the networks wait asleep (inference.GraphedBatches' blocking_wait) where each thread would spin a core
-    network =engine_network(checkpoint_path, leaves, precision, fp16_blocks) if gpus is None else (
-        engine_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus, len(gpus) > 1))
-    return EngineSearch(network, leaves, use_tablebase=tablebase, **search_options)
+    if gpus is None:
+        network, where = engine_network(checkpoint_path, leaves, precision, fp16_blocks), "one gpu"
+    else:
+        network, working = working_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus)
+        count = f"{len(working)}" if len(working) == len(gpus) else f"{len(working)} of {len(gpus)}"
+        where = f"{count} gpus ({','.join(map(str, working))})"
+    return tell_loaded(EngineSearch(network, leaves, use_tablebase=tablebase, **search_options), where, search_options)
 
 
 #a go as the reader saw it, received when it came (the gui times the move from then). stop is set by stop, quit and the input's end (for a go
@@ -452,7 +484,9 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
     board = chess.Board()
     clock = Clock(**options.clock())
     commands = Commands(sys.stdin, infinite_until_stop)
-    newest: list[chess.Move] = [] #the move of the newest info line of the search under way, which answers if the search fails
+    #the move that answers if the search under way fails: its newest info line's, until then the one the last search planned for this position
+    newest: list[chess.Move] = []
+    planned: dict[str, chess.Move] = {} #the position the last search expected after its move and the reply (its epd), and its move there
 
     def load() -> EngineSearch:
         use_tablebase, set_options = options.search()
@@ -466,6 +500,9 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
         if not any(board.legal_moves):
             send("info string the game is over, there is no move to play")
             return None
+        plan = planned.get(board.epd())
+        if plan is not None and plan in board.legal_moves:
+            newest.append(plan)
         if player is None:
             player = load()
         for number in go_numbers(go.arguments)[1]:
@@ -480,13 +517,19 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
         report = player.search(board, nodes, seconds, clock.extension, go.stop, running)
         clock.searched(time.perf_counter() - go.received, score_to_centipawns(report.score))
         move = report.line[0]
+        planned.clear()
+        if len(report.line) >= 3:
+            expected = board.copy(stack=False)
+            expected.push(move)
+            expected.push(report.line[1])
+            planned[expected.epd()] = report.line[2]
         send(info_line(report, time.perf_counter() - go.received))
         if go.until_stop:
             go.stop.wait()
         return move
 
-    #a search that fails still answers, with its newest info line's move or else the first legal move; the gui is told, stderr has the traceback. The
-    #player is built again for the next go, as its search may be left half done
+    #a search that fails still answers, with its newest info line's move, else the last search's planned one, else the first legal move; the gui is
+    #told, stderr has the traceback. The player is built again for the next go, as its search may be left half done
     def fallback_move(error: BaseException) -> chess.Move:
         nonlocal player
         traceback.print_exception(error)

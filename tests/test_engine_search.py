@@ -826,6 +826,28 @@ def test_a_failed_search_still_answers_with_a_legal_move(monkeypatch, capsys, er
     assert len(searches) == 3 and len(built) == 2
     assert type(error).__name__ in capsys.readouterr().err
 
+#a search that fails before its first info line plays what the last search planned, if the reply was the one that search expected
+@pytest.mark.parametrize("reply, planned", [("e7e5", True), ("c7c5", False)])
+def test_a_search_that_fails_at_once_plays_the_last_searchs_plan(monkeypatch, capsys, reply, planned):
+    line = [chess.Move.from_uci(move) for move in ("e2e4", "e7e5", "g1f3")]
+
+    class PlanningPlayer(FailingPlayer):
+        def search(self, board, nodes, seconds, extension, stop=None, info=None):
+            if self.searches:
+                return super().search(board, nodes, seconds, extension, stop, info)
+            self.searches.append((board.fen(), nodes, seconds, extension))
+            return SearchReport(0.5, line, 1, [])
+
+    after = chess.Board()
+    for move in ("e2e4", reply):
+        after.push_uci(move)
+    script = ["position startpos", "go nodes 10", f"position startpos moves e2e4 {reply}", "go nodes 10", "quit"]
+    _, sent, _ = run_uci(monkeypatch, script, PlanningPlayer({1}, RuntimeError("the gpu fell over")))
+
+    answer = "g1f3" if planned else next(iter(after.legal_moves)).uci()
+    assert [line for line in sent if line.startswith("bestmove")] == ["bestmove e2e4", f"bestmove {answer}"] and answer in sent[-2]
+    capsys.readouterr()
+
 def test_a_search_is_not_answered_for_an_exit(monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         run_uci(monkeypatch, ["position startpos", "go nodes 10", "quit"], FailingPlayer({0}, KeyboardInterrupt()))
@@ -1161,6 +1183,34 @@ def test_the_engine_takes_gpus(monkeypatch, model_path):
     assert built == [(1, 1, False), (1, 0, True), (1, 2, True)] and len(search.networks) == 2 and search.concurrent_descents
     assert search.network_cpus == engine_search.thread_cpus(2) != [] and search.search(chess.Board(), simulations=200).simulations >= 200
     assert all(run.returncode == 2 and "--gpus needs --gpu" in run.stderr for run in refused)
+
+#a gpu whose network cannot be built is left out and the gui told, also in the line that says what was loaded; with none left the failure is raised
+def test_a_gpu_that_fails_is_left_out(monkeypatch, model_path):
+    def engine_networks(checkpoint, leaves, precision, fp16_blocks, devices, blocking_wait):
+        if set(devices) & {1, 3}:
+            raise RuntimeError("the gpu fell over")
+        return [cpu_batches(BoardModel()) for _ in devices]
+    sent = []
+    monkeypatch.setattr(uci, "engine_networks", engine_networks)
+    monkeypatch.setattr(uci, "send", sent.append)
+
+    search = uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 1, 2])
+
+    assert len(search.networks) == 2 and search.search(chess.Board(), simulations=200).simulations >= 200
+    assert sent == ["info string gpu 1 failed (RuntimeError('the gpu fell over')): searching without it",
+                    f"info string Fry on 2 of 3 gpus (0,2); no tables; no tree limit; cache {engine_search.CACHE_POSITIONS} positions"]
+    for devices in ([1], [1, 3]):
+        with pytest.raises(RuntimeError, match="fell over"):
+            uci.load_player(model_path, True, 4, False, {}, "int8", 1, devices)
+
+def test_the_gui_is_told_what_was_loaded(monkeypatch, tablebase, model_path):
+    sent = []
+    monkeypatch.setattr(uci, "engine_network", fake_engine_network())
+    monkeypatch.setattr(uci, "send", sent.append)
+
+    uci.load_player(model_path, True, 4, True, {"memory_limit_mb": 64, "cache_positions": 1000}, "int8", 1)
+
+    assert sent == ["info string Fry on one gpu; tables of up to 5 pieces, moves played from them up to 5; tree limit 64 MB; cache 1000 positions"]
 
 #a checkpoint recording the value sharpness it is served at sets the engine's default; one the engine is told wins over it
 def test_the_engine_serves_a_checkpoint_at_its_own_value_sharpness(monkeypatch, model_path):
@@ -1674,7 +1724,9 @@ def test_a_syzygy_path_reaches_the_search(monkeypatch, tablebase, tmp_path, mode
     gui.tell("position fen k7/8/1K6/8/8/8/8/7R w - - 0 1")
     gui.tell("go nodes 50")
     assert gui.sent_at("bestmove", seconds=30) is not None
-    assert gui.lines_sent("bestmove") == ["bestmove h1h8"] and gui.last_info("nodes") == 0 and len(gui.lines_sent("info string")) == 1
+    assert gui.lines_sent("bestmove") == ["bestmove h1h8"] and gui.last_info("nodes") == 0
+    #the refused path, then what the player was built with
+    assert [line.split("; ")[1] for line in gui.lines_sent("info string")[1:]] == ["tables of up to 5 pieces, moves played from them up to 5"]
     gui.close()
 
 def test_a_bad_position_leaves_the_last_one(monkeypatch):
