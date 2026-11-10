@@ -22,13 +22,15 @@ chess-transformer/engine/linux/engine.sh
 runs on driver 570; `TORCH_CUDA=cu130` for CUDA 13.0 on drivers from 580) with the Rust search compiled for the
 machine's CPU, downloads the network
 [`fry-final-117`](https://github.com/GilliamWong/chess-transformer/releases/tag/fry-final-117) (453 MB, SHA-256
-`fed2722da0085ef3299eeb72e9f06712a9426b38503aa8889bcf87affc5c0bed`) into `weights/` and prepares its int8 weights on
-the GPU. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clones or pulls and builds in one step.
+`fed2722da0085ef3299eeb72e9f06712a9426b38503aa8889bcf87affc5c0bed`) into `weights/` and prepares what a start would
+otherwise make first: the network's int8 weights and the engine's compiled GPU code. With the GPU it makes them by
+starting the engine once; without one (an image's build, as `engine/linux/fry.Dockerfile` for the CCC) it downloads
+the ones published for this code. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clones or pulls
+and builds in one step.
 
-`engine.sh` is the UCI engine, searching on every GPU the machine has. Its first start takes ~25 s and later starts
-~7 s on one GPU or ~35-40 s on eight, so give the GUI that long to answer `isready`. The kernels are picked from the
-GPU's model at start-up; `engine/linux/tcec.json` and `engine/linux/ccc.json` hold the options for TCEC's and the
-CCC's machines.
+`engine.sh` is the UCI engine, searching on every GPU the machine has. A start takes ~7 s on one GPU or ~35-40 s on
+eight, so give the GUI that long to answer `isready`. The kernels are picked from the GPU's model at start-up;
+`engine/linux/tcec.json` and `engine/linux/ccc.json` hold the options for TCEC's and the CCC's machines.
 
 | Option | Default | Description |
 |---|---|---|

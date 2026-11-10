@@ -1,16 +1,12 @@
-[
-  {
-    "name": "Fry",
-    "command": "./engine/linux/engine.sh",
-    "workingDirectory": "chess-transformer",
-    "protocol": "uci",
-    "options": [
-      {"name": "SyzygyPath", "value": "/path/to/syzygy"},
-      {"name": "RamLimitMb", "value": 100000},
-      {"name": "CachePositions", "value": 200000000},
-      {"name": "AdvanceThreads", "value": 0},
-      {"name": "MoveOverhead", "value": 200},
-      {"name": "SearchSettings", "value": "c_puct=1.68,c_puct_factor=2.30,c_puct_base=45669,fpu_reduction=0.571"}
-    ]
-  }
-]
+{
+  "command": "/data/engines/fry.sh",
+  "options": {
+    "SyzygyPath": "/data/tablebases",
+    "RamLimitMb": "100000",
+    "CachePositions": "200000000",
+    "AdvanceThreads": "0",
+    "MoveOverhead": "200",
+    "SearchSettings": "c_puct=1.68,c_puct_factor=2.30,c_puct_base=45669,fpu_reduction=0.571"
+  },
+  "timemargin": 1000
+}

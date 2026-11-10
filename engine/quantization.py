@@ -222,9 +222,15 @@ if __name__ == "__main__":
     from engine.engine_search import ENGINE_FP16_BLOCKS
     parser = argparse.ArgumentParser(description="the int8 weights of a checkpoint, computed and cached")
     parser.add_argument("checkpoint", type=Path)
+    parser.add_argument("--path", action="store_true", help="print the cached file's path and stop: nothing is computed, and no gpu is needed")
     arguments = parser.parse_args()
-    weights = int8_weights(arguments.checkpoint, ENGINE_FP16_BLOCKS)
     path = cached_weights_path(arguments.checkpoint, ENGINE_FP16_BLOCKS)
+    if arguments.path:
+        if path is None:
+            raise SystemExit("the int8 weights have no cached file: there is no home folder")
+        print(path)
+        raise SystemExit
+    weights = int8_weights(arguments.checkpoint, ENGINE_FP16_BLOCKS)
     if path is None or not path.exists():
         raise SystemExit("the int8 weights could not be cached, which is what this is for: the engine would compute them at its first isready")
     print(path)
