@@ -3,6 +3,7 @@ import math
 import sys
 import threading
 import warnings
+from dataclasses import dataclass
 
 import torch
 
@@ -92,8 +93,8 @@ DEV void make_bias(const BiasOperands& operands, u16* to_bias, int warp, int g, 
     }
 }
 
-//out[b, token, head * DV + :] for the 8 heads from blockIdx.x * 8 of position blockIdx.y
-template <int DQ>
+//out[b, token, head * DV + :] for the 8 heads from blockIdx.x * 8 of position blockIdx.y, in the PHASES_PER_CTA phases from blockIdx.z's
+template <int DQ, int PHASES_PER_CTA>
 __global__ void __launch_bounds__(THREADS, @CTAS_PER_MULTIPROCESSOR@) template_attention_cuda(
     const u16* __restrict__ projected, const u32* __restrict__ templates, const u16* __restrict__ q_gain,
     const u16* __restrict__ k_gain, u16* __restrict__ out, float eps, float scale)
@@ -115,8 +116,12 @@ __global__ void __launch_bounds__(THREADS, @CTAS_PER_MULTIPROCESSOR@) template_a
             q_gains[block][e] = half_to_float(q_gain[block * 8 + 2 * t + e]);
             k_gains[block][e] = half_to_float(k_gain[block * 8 + 2 * t + e]);
         }
+#if __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
     const u16* board = projected + (size_t)b * TOKENS * WIDTH;
+    const int first_phase = PHASES_PER_CTA < PHASES ? blockIdx.z * PHASES_PER_CTA : 0;
+    const int end_phase = PHASES_PER_CTA < PHASES ? min(PHASES, first_phase + PHASES_PER_CTA) : PHASES;
 
     #pragma unroll
     for (int round = 0; round < GROUPS * KEYS * 4 / THREADS; round++) {
@@ -138,9 +143,10 @@ __global__ void __launch_bounds__(THREADS, @CTAS_PER_MULTIPROCESSOR@) template_a
             raw_keys[n][block] = key < TOKENS ? *reinterpret_cast<const u32*>(board + key * WIDTH + Row<DQ>::K + kv * DQ + block * 8 + 2 * t) : 0u;
         }
     u32 raw_queries[BLOCKS][2];
-    load_queries<DQ>(board, head, 0, g, t, raw_queries);
+    load_queries<DQ>(board, head, first_phase * SLAB, g, t, raw_queries);
     BiasOperands operands;
-    load_bias_operands<DQ>(operands, board, templates, 0, warp, g, t);
+    if (first_phase < PHASES - 1)
+        load_bias_operands<DQ>(operands, board, templates, first_phase, warp, g, t);
 
     u32 keys[KEY_TILES][BLOCKS];
     #pragma unroll
@@ -160,18 +166,20 @@ __global__ void __launch_bounds__(THREADS, @CTAS_PER_MULTIPROCESSOR@) template_a
             keys[n][block] = pack(x[block][0] * inverse * k_gains[block][0], x[block][1] * inverse * k_gains[block][1]);
     }
 
-    //the first barrier makes every thread's copies visible
+    //the first barrier makes every thread's copies visible: a slab's, or this one for a CTA of the metadata alone
     asm volatile("cp.async.wait_all;" ::: "memory");
+    if (PHASES_PER_CTA < PHASES && first_phase == PHASES - 1)
+        __syncthreads();
 
     #pragma unroll 1
-    for (int phase = 0; phase < PHASES; phase++) {
+    for (int phase = first_phase; phase < end_phase; phase++) {
         const bool metadata = phase == PHASES - 1;
         if (!metadata) {
             make_bias(operands, bias, warp, g, t);
             __syncthreads();
         }
         u32 next_queries[BLOCKS][2];
-        if (!metadata) {
+        if (phase + 1 < end_phase) {
             load_queries<DQ>(board, head, phase + 1 < PHASES - 1 ? (phase + 1) * SLAB : SQUARES, g, t, next_queries);
             if (phase + 1 < PHASES - 1)
                 load_bias_operands<DQ>(operands, board, templates, phase + 1, warp, g, t);
@@ -304,38 +312,58 @@ for name, value in {"HB": HEADS_PER_CTA, "KEYS": KEYS, "VALUE_ROW": VALUE_ROW, "
 THREADS = HEADS_PER_CTA * 32
 #fp16 bytes: a key/value head's values for each 2 query heads, and a slab of bias for each
 SHARED_BYTES = 2 * (HEADS_PER_CTA // 2 * KEYS * VALUE_ROW + HEADS_PER_CTA * BIAS_ROWS * BIAS_ROW)
+#a position's phases: its 4 slabs of squares, then its metadata
+PHASES = 5
+ALL_PHASES = ((math.inf, PHASES),)
 
-#(compute capability, multiprocessors) -> (fewest positions the kernel takes, share of the CTA slots its last wave must fill:
-#a few CTAs past a wave take as long as another)
-TIMED = {(12, 0, 70): (36, 0.55), (12, 0, 170): (32, 0.0)}
+
+#fewest_positions: the fewest the kernel takes; least_fill: the share of the CTA slots its last wave must fill (a few CTAs past a wave take
+#as long as another); phases: ((most positions, phases a CTA takes), ...), the first the positions fit
+@dataclass(frozen=True)
+class Gate:
+    fewest_positions: int
+    least_fill: float
+    phases: tuple[tuple[float, int], ...] = ALL_PHASES
+
+
+#(compute capability, multiprocessors) -> the gpu's gate. A100: a lone batch is faster from 1 position (two lanes from 24)
+TIMED = {(12, 0, 70): Gate(36, 0.55), (12, 0, 170): Gate(32, 0.0),
+         (8, 0, 108): Gate(1, 0.0, ((8, 1), (16, 2), (32, 3), (math.inf, PHASES)))}
 CTAS_PER_POSITION = 24 // HEADS_PER_CTA
 DQS = (8, 16, 24)
 ENABLED = True
 CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8
 
 
-def kernel_name(dq: int) -> str:
-    return f"template_attention_cuda<{dq}>"
+def kernel_name(dq: int, per_cta: int) -> str:
+    return f"template_attention_cuda<{dq}, {per_cta}>"
+
+
+def phases_per_cta(phases: tuple[tuple[float, int], ...], positions: int) -> int:
+    return next(per_cta for most, per_cta in phases if positions <= most)
 
 
 class Kernels:
-    def __init__(self, device: torch.device, fewest_positions: int, least_fill: float):
-        self.fewest_positions, self.least_fill = fewest_positions, least_fill
+    def __init__(self, device: torch.device, gate: Gate):
+        self.fewest_positions, self.least_fill, self.phases = gate.fewest_positions, gate.least_fill, gate.phases
         self.slots = CTAS_PER_MULTIPROCESSOR * torch.cuda.get_device_properties(device).multi_processor_count
+        #programmatic dependent launch: sm_90 and newer
+        self.dependent = torch.cuda.get_device_capability(device) >= (9, 0)
         self.driver = ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
         self.driver.cuLaunchKernelEx.argtypes = [ctypes.POINTER(int8_cuda.LaunchConfig), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-        cubin, lowered = int8_cuda.compile_cubin(SOURCE, [kernel_name(dq) for dq in DQS], torch.cuda.get_device_capability(device))
+        variants = [(dq, per_cta) for dq in DQS for per_cta in sorted({per_cta for _, per_cta in gate.phases})]
+        cubin, lowered = int8_cuda.compile_cubin(SOURCE, [kernel_name(*variant) for variant in variants], torch.cuda.get_device_capability(device))
         with torch.cuda.device(device):
             #makes torch's context current, which the module loads into
             torch.empty(0, device=device)
             module = ctypes.c_void_p()
             self.check(self.driver.cuModuleLoadData(ctypes.byref(module), cubin))
         self.functions = {}
-        for dq in DQS:
+        for variant in variants:
             function = ctypes.c_void_p()
-            self.check(self.driver.cuModuleGetFunction(ctypes.byref(function), module, lowered[kernel_name(dq)].encode()))
+            self.check(self.driver.cuModuleGetFunction(ctypes.byref(function), module, lowered[kernel_name(*variant)].encode()))
             self.check(self.driver.cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, SHARED_BYTES))
-            self.functions[dq] = function
+            self.functions[variant] = function
 
     def check(self, result: int) -> None:
         if result != 0:
@@ -344,7 +372,7 @@ class Kernels:
             raise RuntimeError(f"CUDA driver: {message.value.decode() if message.value else result}")
 
     def takes(self, positions: int) -> bool:
-        ctas = CTAS_PER_POSITION * positions
+        ctas = CTAS_PER_POSITION * positions * -(-PHASES // phases_per_cta(self.phases, positions))
         waves = -(-ctas // self.slots)
         return positions >= self.fewest_positions and ctas >= self.least_fill * waves * self.slots
 
@@ -354,11 +382,13 @@ class Kernels:
         attribute[0].id = int8_cuda.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
         attribute[0].value[0] = 1
         stream = torch.cuda.current_stream(projected.device).cuda_stream
-        launch = int8_cuda.LaunchConfig(CTAS_PER_POSITION, projected.shape[0], 1, THREADS, 1, 1, SHARED_BYTES, stream, attribute, 1)
+        per_cta = phases_per_cta(self.phases, projected.shape[0])
+        launch = int8_cuda.LaunchConfig(CTAS_PER_POSITION, projected.shape[0], -(-PHASES // per_cta), THREADS, 1, 1, SHARED_BYTES, stream,
+                                        attribute if self.dependent else None, int(self.dependent))
         arguments = [ctypes.c_void_p(tensor.data_ptr()) for tensor in (projected, templates, q_gain, k_gain, out)]
         arguments += [ctypes.c_float(eps), ctypes.c_float(1 / math.sqrt(dq))]
         pointers = (ctypes.c_void_p * len(arguments))(*[ctypes.cast(ctypes.byref(argument), ctypes.c_void_p) for argument in arguments])
-        self.check(self.driver.cuLaunchKernelEx(ctypes.byref(launch), self.functions[dq], pointers, None))
+        self.check(self.driver.cuLaunchKernelEx(ctypes.byref(launch), self.functions[dq, per_cta], pointers, None))
 
 
 KERNELS: dict[int, Kernels | None] = {}
@@ -371,7 +401,7 @@ def kernels(device: torch.device) -> Kernels | None:
         timed = TIMED.get((*torch.cuda.get_device_capability(index), torch.cuda.get_device_properties(index).multi_processor_count))
         if timed is not None:
             try:
-                KERNELS[index] = Kernels(torch.device("cuda", index), *timed)
+                KERNELS[index] = Kernels(torch.device("cuda", index), timed)
             except (OSError, RuntimeError, AttributeError) as error:
                 warnings.warn(f"the CUDA template attention is off, the Triton kernels run instead: {error}")
     return KERNELS[index]
