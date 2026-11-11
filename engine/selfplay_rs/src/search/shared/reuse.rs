@@ -30,9 +30,11 @@ impl SharedTree {
         self.release_retired_lists();
     }
 
-    //takes out the leaves scored by a rule that held only from the old root (Tree::drop_stale_leaves); nothing with transpositions
+    //takes out the leaves scored by a rule that held only from the old root (Tree::drop_stale_leaves); with transpositions none, and
+    //the nodes the game has since made a draw are proven
     pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) {
         if self.graph.is_some() {
+            self.prove_the_games_third_times(settings);
             return;
         }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
@@ -41,6 +43,20 @@ impl SharedTree {
         self.find_stale_leaves(&mut vec![self.root], &mut Vec::new(), &mut keys, settings, tables, root_covered, &mut stale);
         for path in stale {
             self.take_out(&path);
+        }
+    }
+
+    //Tree::prove_the_games_third_times; the nodes the root no longer reaches are those not freed yet
+    fn prove_the_games_third_times(&mut self, settings: &SearchSettings) {
+        let Some(graph) = &self.graph else { return };
+        let halfmoves = self.board.halfmoves();
+        let node_of = |entry: u64| graph.shard(entry).lock().expect("a table shard").get(&entry).copied();
+        let nodes_of = |key| (halfmoves + 1..FIFTY_MOVE_PLIES).filter_map(move |count| node_of(graph_key(key, count)));
+        let thirds: Vec<u32> = one_short_of_threefold(&self.keys, halfmoves).into_iter().flat_map(nodes_of).collect();
+        for id in thirds {
+            //prove keeps a proof the node has, and the rules' draw comes before it
+            self.nodes.get(id as usize).clear_proof();
+            self.prove(&[id as usize], Proof { outcome: Outcome::Draw, value: 1.0 - settings.draw, plies: 0 });
         }
     }
 
@@ -189,6 +205,7 @@ impl SharedTree {
     //the walk's order
     pub fn drop_stale_candidates(&mut self, line: &[u16], candidates: &[Vec<u16>], settings: &SearchSettings, tables: Option<&Tables>) {
         if self.graph.is_some() {
+            self.prove_the_games_third_times(settings);
             return;
         }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));

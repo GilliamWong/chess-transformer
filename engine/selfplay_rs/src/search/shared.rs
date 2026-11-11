@@ -593,15 +593,23 @@ impl SharedTree {
             return None;
         }
         let (visits, in_flight) = child.counts();
-        let q = if repeats.is_some_and(|repeats| repeats.repeats(child.key(), child.halfmoves())) {
+        let repeat = repeats.is_some_and(|repeats| repeats.repeats(child.key(), child.halfmoves()));
+        let q = if repeat {
             1.0 - scan.draw
         } else if visits > 0 {
             child.mean_score(visits)
         } else {
             scan.first_play_urgency
         };
-        //with transpositions a move's own visits, its node's mean (every path's)
-        let own = if scan.transpositions { own_visits.load(Ordering::Acquire) } else { visits };
+        //with transpositions a move's own visits, its node's mean (every path's); a move with visits whose node has none had them
+        //all as repeats of a path, and where it is no repeat it is a move not played yet (Tree::move_value)
+        let own = if !scan.transpositions {
+            visits
+        } else if repeat || visits > 0 {
+            own_visits.load(Ordering::Acquire)
+        } else {
+            0
+        };
         Some((q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + own + in_flight))), Some(child)))
     }
 

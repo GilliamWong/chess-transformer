@@ -28,6 +28,11 @@ class BoardModel(nn.Module):
     def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return boards.float() @ self.weights / 100, value_logits(PIECE_VALUES[boards[:, :NUM_SQUARES].long()].sum(dim=1))
 
+#every move the same prior, the score BoardModel's
+class EvenModel(nn.Module):
+    def forward(self, boards: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.zeros(len(boards), NUM_MOVE_IDS), value_logits(PIECE_VALUES[boards[:, :NUM_SQUARES].long()].sum(dim=1))
+
 class CountingNetwork:
     def __init__(self, model):
         self.network = cpu_batches(model)

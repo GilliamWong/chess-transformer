@@ -23,7 +23,7 @@ import selfplay_rs
 import torch
 from torch import nn
 from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
-from fake_models import BoardModel, CountingNetwork, UniformModel
+from fake_models import BoardModel, CountingNetwork, EvenModel, UniformModel
 from engine.inference import GraphedBatches, ImmediateBatches, cpu_batches, small_graph_sizes
 from model.model import ChessTransformer
 from engine.selfplay import ANSWER_WIDTH, rust_search_settings
@@ -1529,6 +1529,22 @@ def test_stale_draws_come_out_of_a_kept_tree():
     #a search of one simulation reports the kept tree's visits
     assert search.search(board, simulations=1).simulations < 50
 
+#locked pawns with White one up, so that Black wants the draw. The kings step to and fro, and 4...Ke8 makes the position the game's
+#third time. The search at move 2 came to it by other king moves, when the game had had it once, and its node is kept with moves
+def test_a_kept_tree_with_transpositions_knows_the_games_third_time():
+    def player() -> EngineSearch:
+        return EngineSearch(cpu_batches(EvenModel()), 16, smart_pruning=False, settings={"transpositions": True, "certainty": True})
+
+    board, kept = chess.Board("4k3/8/8/1p1p1p1p/1P1P1P1P/1P6/8/4K3 w - - 0 1"), player()
+    for king, other_king in [("e1d1", "e8d8"), ("d1e1", "d8e8"), ("e1d1", "e8d8")]:
+        board.push_uci(king)
+        board.push_uci(other_king)
+        kept.search(board, simulations=20_000)
+    board.push_uci("d1e1")
+    for search in (kept, player()):
+        report = search.search(board, simulations=4_000)
+        assert (report.line[0], report.score) == (chess.Move.from_uci("d8e8"), 0.5)
+
 def test_a_root_the_last_search_never_expanded_is_searched():
     search = EngineSearch(cpu_batches(LikesMoves(KNIGHTS_OUT_AND_BACK, 8.0)), 16, smart_pruning=False, grow_leaves=0)
     board = chess.Board()
@@ -2032,7 +2048,9 @@ def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
     for way in ("plain", "advance", "drop"):
         reports, replies, boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, way, **graph)
         concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True, gc_threads=0, **graph)
-        assert concurrent[0] == reports and concurrent[2] == boards and concurrent[3] == advanced
+        #a plain tree that was advanced keeps the nodes the reply left behind until its next advance, and a transposition comes to them
+        #again; the concurrent tree has freed them (no gc threads). The two search alike only until one does
+        assert concurrent[3] == advanced and (way == "advance" or (concurrent[0], concurrent[2]) == (reports, boards))
     assert advancing_game(BoardModel(), middlegame.copy(), 1, "plain")[0] != reports[:1]
 
     model = shuffling_model()

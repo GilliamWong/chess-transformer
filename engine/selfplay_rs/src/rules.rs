@@ -13,6 +13,8 @@ const CASTLING_TOKEN_OFFSET: u8 = 15;
 const EN_PASSANT_TOKEN_OFFSET: u8 = 17;
 const PIECE_TYPES: u8 = 6;
 const THREEFOLD: usize = 3;
+//the count of plies since a capture or pawn move at which the fifty-move rule ends the game
+pub const FIFTY_MOVE_PLIES: u32 = 100;
 
 //python-chess's _transposition_key as a zobrist hash: en passant only counts when the capture is legal
 pub fn position_key(board: &Chess) -> u64 {
@@ -212,6 +214,17 @@ fn repetitions(keys: &[u64], halfmoves: u32) -> usize {
     since_zeroing(keys, halfmoves).iter().filter(|&key| key == current).count()
 }
 
+//the positions whose next time is the game's third, each once: those it has had twice since the last capture or pawn move. keys end
+//with the board's own
+pub fn one_short_of_threefold(keys: &[u64], halfmoves: u32) -> Vec<u64> {
+    let recent = since_zeroing(keys, halfmoves);
+    let times = |key: &u64| recent.iter().filter(|&earlier| earlier == key).count();
+    let mut short: Vec<u64> = recent.iter().copied().filter(|key| times(key) >= THREEFOLD - 1).collect();
+    short.sort_unstable();
+    short.dedup();
+    short
+}
+
 pub struct Tables {
     tablebase: Tablebase<Chess>,
     pieces: usize,
@@ -272,7 +285,7 @@ pub fn game_result(board: &Chess, keys: &[u64], legal_moves: &MoveList, draw: f6
     if legal_moves.is_empty() {
         return Some(if board.is_check() { 0.0 } else { draw });
     }
-    if board.is_insufficient_material() || board.halfmoves() >= 100 || repetitions(keys, board.halfmoves()) >= THREEFOLD {
+    if board.is_insufficient_material() || board.halfmoves() >= FIFTY_MOVE_PLIES || repetitions(keys, board.halfmoves()) >= THREEFOLD {
         return Some(draw);
     }
     tables.filter(|tables| tables.covers(board)).and_then(|tables| tables.search_score(board, draw))
@@ -293,7 +306,7 @@ pub fn final_result(
     }
     let halfmoves = board.halfmoves();
     //the fifty move rule, and a draw the side to move can claim with its move (can_claim_fifty_moves)
-    let fifty_moves = halfmoves >= 100
+    let fifty_moves = halfmoves >= FIFTY_MOVE_PLIES
         || (halfmoves >= 99
             && legal_moves.iter().any(|&chess_move| !chess_move.is_zeroing() && !after(board, chess_move).legal_moves().is_empty()));
     if board.is_insufficient_material()

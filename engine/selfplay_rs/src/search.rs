@@ -1,5 +1,8 @@
 //mcts.py's search operation for operation: a round of one leaf is exactly mcts.py's
-use crate::rules::{MoveIds, PackedMove, Tables, encode_board, game_result, position_key, sort_moves_in_python_order};
+use crate::rules::{
+    FIFTY_MOVE_PLIES, MoveIds, PackedMove, Tables, encode_board, game_result, one_short_of_threefold, position_key,
+    sort_moves_in_python_order,
+};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Gamma};
 use shakmaty::{Chess, Color, Move, MoveList, Position};
@@ -829,7 +832,10 @@ impl Tree {
         } else {
             scan.first_play_urgency
         };
-        //with transpositions the move's own visits, as its node's count every path's
+        //with transpositions the move's own visits, as its node's count every path's. A move with visits whose node has none had
+        //them all as repeats of a path: where it is no repeat (another path, or a kept tree's new root) it is a move not played yet,
+        //or those visits would keep the search from the position for good
+        let own_visits = if repeat || child.visit_count > 0 { own_visits } else { 0 };
         let started = if scan.transpositions { own_visits } else { child.visit_count } + child.in_flight;
         Some((q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + started))), child.edges_at, child.children))
     }
@@ -1217,9 +1223,12 @@ impl Tree {
     //a kept tree under a new root (Searches' tree reuse; self-play keeps mcts.py's tree as it is): a leaf scored by a rule that held only
     //from the old root comes out of the tree, its visits taken off its ancestors, as lc0 drops a two-fold draw whose first position is no
     //longer in the search, or a tables' result the new root would not probe. Leaves below a proven node stay: no descent reaches them.
-    //With transpositions nothing is taken out: that would miscount a node other paths share
+    //With transpositions nothing is taken out: that would miscount a node other paths share. What a new root changes there is a
+    //node that the game has since made a draw (prove_the_games_third_times); a move that was a repeat of the old root's paths
+    //keeps its visits, which move_value does not count while its node has none
     pub fn drop_stale_leaves(&mut self, settings: &SearchSettings, tables: Option<&Tables>) {
         if self.graph.is_some() {
+            self.prove_the_games_third_times(settings);
             return;
         }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
@@ -1227,6 +1236,22 @@ impl Tree {
         self.find_stale_leaves(&mut vec![self.root], &mut Vec::new(), settings, tables, root_covered, &mut stale);
         for path in stale {
             self.take_out(&path);
+        }
+    }
+
+    //with transpositions a kept node may by now be its position's third time in the game, though the search that gave it moves came
+    //to it by other moves, when the game had had the position once. No descent scores a node with moves again, so under a new root
+    //every such node is proven the draw, as gather proves a leaf: the rules' draw comes before any proof the node had. Its parents
+    //take the draw with their next visits, as after prove: a new root proves it as soon as the game has had the position twice,
+    //while the node is still deep in the tree and few of their visits came through it. The position's nodes are those at the
+    //fifty-move counts above the root's, among them nodes the root no longer reaches, which a later move may come to again
+    fn prove_the_games_third_times(&mut self, settings: &SearchSettings) {
+        let Some(graph) = &self.graph else { return };
+        let halfmoves = self.board.halfmoves();
+        let nodes_of = |key| (halfmoves + 1..FIFTY_MOVE_PLIES).filter_map(move |count| graph.table.get(&graph_key(key, count)).copied());
+        let thirds: Vec<u32> = one_short_of_threefold(&self.keys, halfmoves).into_iter().flat_map(nodes_of).collect();
+        for node in thirds {
+            self.prove(&[node as usize], Proof { outcome: Outcome::Draw, value: 1.0 - settings.draw, plies: 0 });
         }
     }
 
@@ -1367,6 +1392,7 @@ impl Tree {
     //the leaves its walk would find stale, taken out in its order
     pub fn drop_stale_candidates(&mut self, line: &[u16], candidates: &[Vec<u16>], settings: &SearchSettings, tables: Option<&Tables>) {
         if self.graph.is_some() {
+            self.prove_the_games_third_times(settings);
             return;
         }
         let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));

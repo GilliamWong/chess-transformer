@@ -1102,6 +1102,99 @@ fn reusing_a_tree_with_transpositions_keeps_it_whole() {
     assert!(lines >= 15, "{lines} lines");
 }
 
+//the edges of the uci moves down from the root, through nodes the tree has
+fn edges_of_uci(tree: &Tree, line: &[&str]) -> Vec<usize> {
+    let (mut board, mut node) = (tree.board.clone(), tree.root_index());
+    line.iter()
+        .map(|uci| {
+            let played = uci.parse::<UciMove>().expect("a uci move").to_move(&board).expect("a legal move");
+            let edge = tree.nodes[node].edges().find(|&edge| tree.chess_move(edge).to_move(&board) == played).expect("a move of the node");
+            board.play_unchecked(played);
+            node = tree.child_index(node, edge).expect("the line's node");
+            edge
+        })
+        .collect()
+}
+
+//every move the same prior, and White a little better: 0.53 for White to move, 0.47 for Black
+fn finish_leaves_evenly(tree: &mut Tree, id: u64, boards: &[u8], settings: &SearchSettings, network: &mut Network) {
+    for _ in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
+        let (moves, turn) = tree.round_moves(id).next().expect("a waiting leaf");
+        let (logits, value) = (vec![0.0; moves.len()], if turn == Color::White { 0.53 } else { 0.47 });
+        tree.finish_leaf_in_order(id, logits.into_iter(), value, Some(&mut network.cache), settings);
+    }
+}
+
+//the kings step e1-d1-e1 and e8-d8-e8 twice: the position after the fourth pair of moves is the game's third. The search two pairs
+//before comes to that position by other king moves, six plies down, when the game had had it once: no draw then, so it is given
+//moves. The node is kept, and a search that went on through it would take the move to it for more than a draw. A SharedTree's
+//reuse leaves the Tree's tree
+#[test]
+fn a_kept_node_is_a_draw_once_the_game_has_made_its_position_a_third_time() {
+    let settings = graph_settings(true);
+    let shuffle = ["e1d1", "e8d8", "d1e1", "d8e8", "e1d1", "e8d8"];
+    let mut tree = graph_tree_after(LOCKED_PAWNS, &shuffle[..2]);
+    let third_time = graph_key(tree.keys[0], 8);
+    fn node_of(tree: &Tree, entry: u64) -> Option<&Node> {
+        let graph = tree.graph.as_ref().expect("a tree with transpositions");
+        graph.table.get(&entry).map(|&node| &tree.nodes[node as usize])
+    }
+    let has_moves = |tree: &Tree| node_of(tree, third_time).is_some_and(Node::has_edges);
+    let mut simulations = 0;
+    while !has_moves(&tree) && simulations < 400_000 {
+        simulations += 20_000;
+        search_with(finish_leaves_evenly, &mut tree, simulations, usize::MAX, &settings, None, &mut Network::new());
+    }
+    assert!(has_moves(&tree), "the first search never gave the position moves");
+    for pair in [&shuffle[2..4], &shuffle[4..]] {
+        let line = edges_of_uci(&tree, pair);
+        let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+        let mut shared = SharedTree::from_tree(&tree);
+        shared.move_root(&edges_of(&shared, &line_moves));
+        shared.drop_stale_leaves(&settings, None);
+        tree.play_line(&line);
+        tree.drop_stale_leaves(&settings, None);
+        assert_moved_as_compacted(&tree, shared);
+        let proven = node_of(&tree, third_time).is_some_and(|node| matches!(node.proof, Some(Proof { outcome: Outcome::Draw, .. })));
+        assert!(proven, "the game's third time is no proven draw under the new root");
+        let visits = tree.root().visit_count;
+        search_with(finish_leaves_evenly, &mut tree, visits + 20_000, usize::MAX, &settings, None, &mut Network::new());
+    }
+    let mut fresh = graph_tree_after(LOCKED_PAWNS, &shuffle);
+    search_with(finish_leaves_evenly, &mut fresh, 20_000, usize::MAX, &settings, None, &mut Network::new());
+    //White's score after the king's step back, which lets Black make the third time
+    let score_after_the_step = |tree: &Tree| {
+        let step = edges_of_uci(tree, &["d1e1"])[0];
+        tree.child(tree.root_index(), step).expect("the step's node").mean_score()
+    };
+    let (kept, fresh) = (score_after_the_step(&tree), score_after_the_step(&fresh));
+    assert!((kept - fresh).abs() < 0.02, "the step back scores {kept:.3} in the kept tree, {fresh:.3} in a fresh one");
+}
+
+//after 1.Kd1 Kd8 2.Ke1, Black's Ke8 is the root's position again: a draw of that path, which the move's visits count and the
+//position's node does not. Under the root after 1...Kd8 the move repeats nothing on the path. Black, a little worse, has moves
+//that score above one not played yet, so the move is searched only if the repeats' visits are not counted as its own
+#[test]
+fn a_move_visited_only_as_a_paths_repeat_is_a_move_not_played_yet_under_a_new_root() {
+    let settings = SearchSettings { value_sharpness: 1.0, ..graph_settings(true) };
+    let mut tree = graph_tree_after(LOCKED_PAWNS, &["e1d1", "e8d8", "d1e1", "d8e8"]);
+    search_with(finish_leaves_evenly, &mut tree, 20_000, usize::MAX, &settings, None, &mut Network::new());
+    let line = edges_of_uci(&tree, &["e1d1", "e8d8", "d1e1", "d8e8"]);
+    let repeat = tree.link_of(line_end(&tree, &line[..3]), line[3]);
+    let repeats_node = &tree.nodes[tree.link_child(repeat) as usize];
+    assert!(tree.move_visits(repeat) > 10 && repeats_node.visit_count == 0, "the repeat was not searched as its path's draw");
+    tree.play_line(&line[..2]);
+    let line = edges_of_uci(&tree, &["d1e1", "d8e8"]);
+    let before_the_repeat = line_end(&tree, &line[..1]);
+    assert_eq!(tree.select_edge(before_the_repeat, &settings, None).0, line[1]);
+    //a SharedTree's search on comes to the move, and its position is the game's third time
+    let shared = SharedTree::from_tree(&tree);
+    shared_in_flight(&shared, tree.root().visit_count + 5_000, 1, &settings, None, &SharedNetwork::new(), usize::MAX);
+    let searched = shared.to_reachable_tree();
+    let third_time = &searched.nodes[line_end(&searched, &edges_of_uci(&searched, &["d1e1", "d8e8"]))];
+    assert!(matches!(third_time.proof, Some(Proof { outcome: Outcome::Draw, .. })), "the shared search never came to the move");
+}
+
 //the root's most visited move, if the node it leads to has moves to search on
 fn best_edge(tree: &SharedTree) -> Option<usize> {
     let edge = *tree.principal_variation().first()?;
