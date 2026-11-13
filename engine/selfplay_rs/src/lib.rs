@@ -1040,6 +1040,16 @@ impl Searches {
         })
     }
 
+    //the answers the cache has given since the searches were made: each gave a tree a node's moves without the network
+    fn cache_hits(&self, py: Python<'_>) -> PyResult<u64> {
+        py.detach(|| {
+            if self.concurrent_descents {
+                return Ok(self.shared_cache.as_ref().map_or(0, SharedCache::hits));
+            }
+            Ok(self.lock()?.cache.as_ref().map_or(0, Cache::hits))
+        })
+    }
+
     //the gathers that helpers joined, and the leaves the helpers found, since the searches were made
     fn helper_counts(&self) -> (u64, u64) {
         (self.helped[0].load(Ordering::Relaxed), self.helped[1].load(Ordering::Relaxed))

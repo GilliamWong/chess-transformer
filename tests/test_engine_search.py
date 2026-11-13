@@ -2140,3 +2140,15 @@ def test_helpers_join_the_rust_rounds():
     search = EngineSearch(lean_network(True), 16, rust_rounds=True, concurrent_descents=True, smart_pruning=False, grow_leaves=0, descent_helpers=2)
     report = search.search(chess.Board(MATE_IN_ONE), simulations=30_000)
     assert 30_000 <= report.simulations <= 30_000 + 3 and search.searches.helper_counts()[0] > 0
+
+@pytest.mark.parametrize("concurrent_descents", [False, True])
+def test_the_caches_answers_are_counted(concurrent_descents):
+    board = chess.Board()
+    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, concurrent_descents=concurrent_descents)
+    search.search(board, simulations=600)
+    first = search.searches.cache_hits()
+    #a tree made again finds its positions in the cache
+    search.searches.start(1, board.fen(), [], 300, None)
+    search.searches.descend_into(np.empty((16, TOKENS_PER_BOARD), dtype=np.uint8), 16, 16, 300)
+    assert 0 < first < first + 200 < search.searches.cache_hits()
+    assert EngineSearch(cpu_batches(BoardModel()), 16, cache_positions=0, concurrent_descents=concurrent_descents).searches.cache_hits() == 0

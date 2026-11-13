@@ -48,7 +48,7 @@ fn cache_with_room(cache: &Cache, rounds: usize) -> Cache {
         priors.extend_from_slice(&generation.priors);
         Generation { places, priors }
     };
-    Cache { newer: with_room(&cache.newer), older: with_room(&cache.older), generation: cache.generation }
+    Cache { newer: with_room(&cache.newer), older: with_room(&cache.older), generation: cache.generation, hits: AtomicU64::new(0) }
 }
 
 //collisions 0 for as many as leaves

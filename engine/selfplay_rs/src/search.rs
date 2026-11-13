@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::mem::MaybeUninit;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub struct SearchSettings {
     pub c_puct: f64,
@@ -299,15 +299,22 @@ pub struct Cache {
     newer: Generation,
     older: Generation,
     generation: usize, //positions the newer generation holds before it becomes the older
+    hits: AtomicU64,   //the answers it has given since it was made
 }
 
 impl Cache {
     pub fn new(positions: usize) -> Cache {
-        Cache { newer: Generation::default(), older: Generation::default(), generation: positions.div_ceil(2) }
+        Cache { newer: Generation::default(), older: Generation::default(), generation: positions.div_ceil(2), hits: AtomicU64::new(0) }
     }
 
     fn get(&self, key: u64) -> Option<Answer<'_>> {
-        self.newer.get(key).or_else(|| self.older.get(key))
+        let answer = self.newer.get(key).or_else(|| self.older.get(key))?;
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(answer)
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
     }
 
     fn insert(&mut self, key: u64, priors: &[f32], value: f32) {
