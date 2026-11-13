@@ -55,9 +55,10 @@ ADVANCE_THREADS = 4
 GC_THREADS = 2
 #the engine's changes to mcts.py's search, which self-play keeps as it is
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
-#the threads that join rounds' gathers, for each of several networks (EngineSearch's descent_helpers): on two RTX 5090s three a network kept
-#the gpus at their rate where a thread a network alone fell a fifth short in a middlegame of 40M visits and half in an endgame's tree
-HELPERS_A_NETWORK = 3
+#the threads that join rounds' gathers, for each of several networks (EngineSearch's descent_helpers). On two RTX 5090s a thread a network
+#alone fell a fifth short of the gpus' rate in a middlegame of 40M visits and to under half in an endgame of 100M; three helpers a network
+#kept 95% and 80% of it, five 88% in the endgame, eight no more than five
+HELPERS_A_NETWORK = 5
 #a network's thread has its helpers from a round's start once a gather took it this share of a round's time (the gpu then waits for its
 #thread, or runs one round where it could run two), until a gather with them takes less than the second share
 HELP_FROM, HELP_UNTIL = 0.25, 0.1
