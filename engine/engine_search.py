@@ -24,6 +24,9 @@ COLLISIONS = 64
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per this many simulations done or left; 0 for fixed
 GROW_LEAVES = 16
+#a round's simulations for each of its leaves while another round of its network is out (selfplay.SIMULATIONS_PER_LEAF with none out): the gpu is
+#busy either way, so the round looks on for its leaves where most simulations end without the network (a cached answer, a transposition, the tables)
+BUSY_SIMULATIONS_PER_LEAF = 64
 #the most simulations Searches.start takes, for a search with only a deadline or a stop
 UNLIMITED = 2**32 - 1
 GAME = 0
@@ -355,7 +358,8 @@ class EngineSearch:
 
     def rust_round_settings(self) -> dict:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
-                    collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF, smart_pruning=self.smart_pruning,
+                    collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF,
+                    busy_simulations_per_leaf=BUSY_SIMULATIONS_PER_LEAF, smart_pruning=self.smart_pruning,
                     smart_pruning_factor=self.smart_pruning_factor, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
                     speed_rounds=SPEED_ROUNDS, speed_wait_seconds=SPEED_WAIT_SECONDS, round_times_kept=ROUND_TIMES,
                     fall_start_cp=float(FALL_START_CP), fall_full_cp=float(FALL_FULL_CP), max_reported_score=MAX_REPORTED_SCORE,
@@ -396,6 +400,7 @@ class EngineSearch:
                     if run.rounds_out < in_flight and len(rounds) < self.rounds_in_flight and not blocked:
                         name, run.next_round = run.next_round, run.next_round + 1
                         answered = run.rounds_answered
+                        per_leaf = self.simulations_per_leaf(len(rounds), round_times, run.deadline)
                         run.rounds_out += 1
                         run.gathered = True
                     elif not rounds:
@@ -410,7 +415,7 @@ class EngineSearch:
                 lane = network.free_lane() if hasattr(network, "free_lane") else None
                 lean = getattr(lane, "lean", False)
                 boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.rows_array if lean else lane.boards_array
-                written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count, round=name,
+                written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), per_leaf * count, round=name,
                                                            root_of=GAME, legal_columns=lean)
                 if not written:
                     run.starved = answered
@@ -469,6 +474,12 @@ class EngineSearch:
         fall = last - score_to_centipawns(sharpen(self.searches.root_score(GAME), 1 / self.value_sharpness))
         share = min(1.0, max(0.0, (fall - FALL_START_CP) / (FALL_FULL_CP - FALL_START_CP)))
         return share * seconds
+
+    #a round's simulations for each of its leaves, on a network with rounds_out of its rounds out: BUSY_SIMULATIONS_PER_LEAF beside one, unless the
+    #deadline is so near that the round must be launched at once to come back in time (round_times: the rounds' times until then, as rounds_on's)
+    def simulations_per_leaf(self, rounds_out: int, round_times: int, deadline: float | None) -> int:
+        in_time = deadline is None or time.perf_counter() + (round_times + 1) * self.round_seconds < deadline
+        return BUSY_SIMULATIONS_PER_LEAF if rounds_out and in_time else SIMULATIONS_PER_LEAF
 
     #the next round's leaves, and the rounds out at once over all the networks (GROW_LEAVES; at least one); visits: the root's, if known
     def round_leaves(self, simulations: int | None, visits: int | None = None) -> tuple[int, int]:
