@@ -14,13 +14,13 @@ use rules::{
     MOVE_ID_TABLE_LENGTH, MoveIds, PackedMove, TOKENS_PER_BOARD, Tables, encode_board, final_result, game_result,
     legal_moves_in_python_order, position_key,
 };
-use search::{Cache, Round, SearchSettings, SharedCache, SharedTree, Tree};
+use search::{Cache, PendingLeaf, Round, SearchSettings, SharedCache, SharedTree, Together, Tree};
 use shakmaty::fen::Fen;
 use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, Move, Position};
 use shakmaty_syzygy::SyzygyError;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
@@ -402,6 +402,13 @@ struct Searches {
     gc_threads: usize,
     concurrent_descents: bool,
     shared_cache: Option<SharedCache>,
+    //the threads that may join the gather of a round in a shared tree (concurrent.rs's gather_helped), and the cpus they are pinned to:
+    //a helper takes one while it runs, so as many help at once as there are; pin_helpers false: helpers without cpus
+    gather_helpers: usize,
+    helper_cpus: Mutex<Vec<usize>>,
+    pin_helpers: bool,
+    //the gathers that helpers joined, and the leaves the helpers found
+    helped: [AtomicU64; 2],
     state: Mutex<State>,
 }
 
@@ -585,6 +592,7 @@ impl Searches {
         leaves: u32,
         collisions: u32,
         simulations: Option<u32>,
+        alone: Option<u32>,
         round: Option<u64>,
         root_of: Option<u64>,
         lean: bool,
@@ -601,7 +609,7 @@ impl Searches {
         let (mut tokens, mut columns) = (Vec::new(), Vec::new());
         let root = if self.concurrent_descents {
             drop(state);
-            self.shared_descend(leaves, collisions, simulations, round, &mut tokens, lean.then_some(&mut columns))?;
+            self.shared_descend(leaves, collisions, simulations, alone, round, &mut tokens, lean.then_some(&mut columns))?;
             root_of.map(|id| self.shared_root_numbers(id)).transpose()?.flatten()
         } else {
             self.descend_round(&mut state, leaves, collisions, simulations, round, &mut tokens, lean.then_some(&mut columns))?;
@@ -643,10 +651,12 @@ impl Searches {
         leaves: u32,
         collisions: u32,
         simulations: u32,
+        alone: u32,
         round: u64,
         root_of: u64,
     ) -> PyResult<(usize, Option<RootNumbers>)> {
-        let (tokens, columns, root) = self.descend_boards(room, leaves, collisions, Some(simulations), Some(round), Some(root_of), true)?;
+        let (tokens, columns, root) =
+            self.descend_boards(room, leaves, collisions, Some(simulations), Some(alone), Some(round), Some(root_of), true)?;
         //SAFETY: the lane's rows, room boards long, are the loop's until it launches them
         unsafe { rounds::write_lean_rows(rows_host as *mut u8, &tokens, &columns) };
         Ok((tokens.len() / TOKENS_PER_BOARD, root))
@@ -744,7 +754,8 @@ impl Searches {
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false))]
+                        memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false,
+                        gather_helpers=0, helper_cpus=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -765,7 +776,12 @@ impl Searches {
         gc_threads: usize,
         concurrent_descents: bool,
         transpositions: bool,
+        gather_helpers: usize,
+        helper_cpus: Option<Vec<usize>>,
     ) -> PyResult<Searches> {
+        if gather_helpers > 0 && !concurrent_descents {
+            return Err(PyValueError::new_err("helpers join a gather in the tree of concurrent descents only"));
+        }
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
                 "value_sharpness multiplies the value's logit, it must be positive, not {value_sharpness}"
@@ -791,6 +807,10 @@ impl Searches {
             gc_threads,
             concurrent_descents,
             shared_cache: (concurrent_descents && cache_positions > 0).then(|| SharedCache::new(cache_positions)),
+            gather_helpers,
+            pin_helpers: helper_cpus.is_some(),
+            helper_cpus: Mutex::new(helper_cpus.unwrap_or_default()),
+            helped: [AtomicU64::new(0), AtomicU64::new(0)],
             state: Mutex::new(State {
                 searches: Vec::new(),
                 rounds: VecDeque::new(),
@@ -841,7 +861,7 @@ impl Searches {
         let boards = py.detach(|| -> PyResult<Vec<u8>> {
             let mut boards = Vec::new();
             if self.concurrent_descents {
-                self.shared_descend(leaves, collisions, simulations, round, &mut boards, None)?;
+                self.shared_descend(leaves, collisions, simulations, None, round, &mut boards, None)?;
             } else {
                 self.descend_round(&mut *self.lock()?, leaves, collisions, simulations, round, &mut boards, None)?;
             }
@@ -852,8 +872,9 @@ impl Searches {
 
     //descend into `boards` (bytes or int64s, room for `leaves` boards of every search running); returns (the boards written, the numbers
     //of search `root_of` after the round, None for no root_of or a search not running). legal_columns: a lean round, into an array of
-    //bytes in lean rows, whose finish takes LEAN_COLUMNS numbers a board
-    #[pyo3(signature = (boards, leaves=1, collisions=0, simulations=None, *, round=None, root_of=None, legal_columns=false))]
+    //bytes in lean rows, whose finish takes LEAN_COLUMNS numbers a board. alone: the simulations the call makes before the helpers join
+    //it (gather_helpers, in a tree of concurrent descents), None for none to join
+    #[pyo3(signature = (boards, leaves=1, collisions=0, simulations=None, *, round=None, root_of=None, legal_columns=false, alone=None))]
     #[allow(clippy::too_many_arguments)]
     fn descend_into(
         &self,
@@ -865,11 +886,12 @@ impl Searches {
         round: Option<u64>,
         root_of: Option<u64>,
         legal_columns: bool,
+        alone: Option<u32>,
     ) -> PyResult<(usize, Option<RootNumbers>)> {
         let target = BoardsBuffer::get(boards)?;
         let room = target.boards(if legal_columns { LEAN_ROW } else { TOKENS_PER_BOARD });
         let (tokens, columns, root) =
-            py.detach(|| self.descend_boards(room, leaves, collisions, simulations, round, root_of, legal_columns))?;
+            py.detach(|| self.descend_boards(room, leaves, collisions, simulations, alone, round, root_of, legal_columns))?;
         target.write(py, &tokens, legal_columns.then_some(&columns[..]))?;
         Ok((tokens.len() / TOKENS_PER_BOARD, root))
     }
@@ -1016,6 +1038,11 @@ impl Searches {
             }
             Ok(())
         })
+    }
+
+    //the gathers that helpers joined, and the leaves the helpers found, since the searches were made
+    fn helper_counts(&self) -> (u64, u64) {
+        (self.helped[0].load(Ordering::Relaxed), self.helped[1].load(Ordering::Relaxed))
     }
 
     fn decided(&self, py: Python<'_>, id: u64) -> PyResult<bool> {

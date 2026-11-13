@@ -1065,7 +1065,7 @@ class ScriptedSearches:
     def start(self, game, fen, moves, simulations, seconds=None):
         pass
 
-    def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None, legal_columns=False):
+    def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None, legal_columns=False, alone=None):
         boards[:count] = 0
         return count, self.root
 
@@ -2106,3 +2106,37 @@ def test_transpositions_on_several_networks():
     board = chess.Board(FREE_QUEEN)
     report = search.search(board, simulations=3000)
     assert 3000 <= report.simulations < 3000 + 3 * 16 * 3 and report.line[0] in board.legal_moves
+
+#topologies as test_the_threads_cpus'
+def test_the_helpers_cpus_follow_the_networks():
+    windows = ([(96 << 20, list(range(16))), (32 << 20, list(range(16, 32)))], [[cpu, cpu + 1] for cpu in range(0, 32, 2)])
+    assert engine_search.helped_cpus(2, 2, windows) == ([0, 2], [4, 6]) and engine_search.helped_cpus(8, 8, windows) == ([*range(0, 16, 2)], [*range(16, 32, 2)])
+    assert engine_search.helped_cpus(3, 0, windows) == ([0, 2, 4], [])
+    #too few for all: the networks keep theirs and there are none for helpers; no topology: none for either
+    assert engine_search.helped_cpus(8, 30, windows) == ([*range(0, 16, 2)], []) and engine_search.helped_cpus(2, 2, ([], [])) == ([], None)
+
+def test_helpers_need_concurrent_descents():
+    with pytest.raises(ValueError, match="concurrent descents"):
+        EngineSearch(cpu_batches(BoardModel()), 16, descent_helpers=2)
+    with pytest.raises(ValueError, match="concurrent descents"):
+        selfplay_rs.Searches(**rust_search_settings(False), gather_helpers=1)
+    assert EngineSearch(cpu_batches(BoardModel()), 16).descent_helpers == 0
+
+@pytest.mark.parametrize("networks, pin_threads", [(1, False), (3, False), (2, True)])
+def test_helpers_join_the_rounds_short_of_leaves(networks, pin_threads):
+    #the mate's node takes most visits and none of them needs the network: every round beside another is short of leaves
+    group = SlowNetworks(networks, 0.002, UniformModel())
+    search = EngineSearch(group.networks, 16, smart_pruning=False, grow_leaves=0, concurrent_descents=True, pin_threads=pin_threads, descent_helpers=2 * networks)
+    report = search.search(chess.Board(MATE_IN_ONE), simulations=30_000)
+    joined, found = search.searches.helper_counts()
+
+    #a helper's descent under way when the search has its simulations adds one, as a network's
+    assert 30_000 <= report.simulations <= 30_000 + 3 * networks and report.line[0].uci() == "e1e8"
+    assert search.descent_helpers == 2 * networks and joined > 0 and found > 0
+    assert (len(search.network_cpus), search.network_cpus[:1]) == ((networks, engine_search.thread_cpus(3 * networks)[:1]) if pin_threads else (0, []))
+
+@gpu
+def test_helpers_join_the_rust_rounds():
+    search = EngineSearch(lean_network(True), 16, rust_rounds=True, concurrent_descents=True, smart_pruning=False, grow_leaves=0, descent_helpers=2)
+    report = search.search(chess.Board(MATE_IN_ONE), simulations=30_000)
+    assert 30_000 <= report.simulations <= 30_000 + 3 and search.searches.helper_counts()[0] > 0

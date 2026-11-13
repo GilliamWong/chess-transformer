@@ -409,6 +409,7 @@ impl Rounds<'_> {
                     count,
                     settings.collisions.min(count),
                     per_leaf * count,
+                    settings.simulations_per_leaf * count,
                     name,
                     settings.game,
                 )?;

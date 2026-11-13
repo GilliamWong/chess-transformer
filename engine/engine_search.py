@@ -55,6 +55,8 @@ ADVANCE_THREADS = 4
 GC_THREADS = 2
 #the engine's changes to mcts.py's search, which self-play keeps as it is
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
+#the threads that join rounds' gathers (EngineSearch's descent_helpers)
+DESCENT_HELPERS = 0
 ROOT_MOVES_REPORTED = 3
 MAX_REPORTED_SCORE = 0.9999 #about 25 pawns
 
@@ -120,6 +122,16 @@ def thread_cpus(count: int, topology: tuple | None = None) -> list[int]:
     by_l3.sort(key=lambda l3: (len(l3[1]) < count, -l3[0]))
     cpus = [core[0] for _, l3 in by_l3 for core in l3] + [cpu for _, l3 in by_l3 for core in l3 for cpu in core[1:]]
     return cpus[:count] if count <= len(cpus) else []
+
+
+#the networks' cpus and their helpers' (thread_cpus for them all, the networks' first); no cpus for the helpers where there are too few for all,
+#and none at all (their list None) where the networks get none either
+def helped_cpus(networks: int, helpers: int, topology: tuple | None = None) -> tuple[list[int], list[int] | None]:
+    cpus = thread_cpus(networks + helpers, topology)
+    if cpus:
+        return cpus[:networks], cpus[networks:]
+    network_cpus = thread_cpus(networks, topology)
+    return network_cpus, [] if network_cpus else None
 
 
 LEAN_CAPABILITIES = {(8, 0), (12, 0)}
@@ -218,12 +230,14 @@ class EngineSearch:
     #memory_limit_mb: 0 for none (the tree's arenas may hold up to a quarter more: freed room no node fits); gc_threads: those that free a moved tree's dead rest;
     #rust_rounds: the rounds in Searches' own loop (rounds.rs), a thread a network and no python between them, the python loop's search exactly;
     #concurrent_descents: the networks' threads descend, finish and back up in the tree at once (search/shared.rs); pin_threads: the networks' threads each on a cpu
-    #of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes; for one, alone_in_rust)
+    #of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes; for one, alone_in_rust);
+    #descent_helpers: the threads that join a round's gather once it has made the simulations of a round with none out and is still short of leaves
+    #(concurrent descents only), shared out among the networks, each on a cpu of its own where the networks' threads are pinned
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, gc_threads: int = GC_THREADS, rust_rounds: bool | None = None,
-                 concurrent_descents: bool | None = None, pin_threads: bool | None = None):
+                 concurrent_descents: bool | None = None, pin_threads: bool | None = None, descent_helpers: int = DESCENT_HELPERS):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched, several = leaves > 1, len(self.networks) > 1
@@ -246,10 +260,15 @@ class EngineSearch:
         self.smart_pruning_factor = smart_pruning_factor
         self.advance_threads = advance_threads
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
+        if descent_helpers and not self.concurrent_descents:
+            raise ValueError("helpers join a round's gather in the tree of concurrent descents only")
         pinned = several if pin_threads is None else pin_threads
-        self.network_cpus = thread_cpus(len(self.networks) if pinned and batched else 0)
+        self.network_cpus, helper_cpus = helped_cpus(len(self.networks), descent_helpers) if pinned and batched else ([], None)
+        #pinned threads' helpers without cpus of their own would start on their networks' (linux): none then
+        self.descent_helpers = descent_helpers if helper_cpus is None or helper_cpus else 0
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
-                                             advance_threads=advance_threads, gc_threads=gc_threads, concurrent_descents=self.concurrent_descents)
+                                             advance_threads=advance_threads, gc_threads=gc_threads, concurrent_descents=self.concurrent_descents,
+                                             gather_helpers=-(-self.descent_helpers // len(self.networks)), helper_cpus=helper_cpus)
         #reports give the score on the network's own scale, before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         #a root the tables cover takes their move if they rank it, else it is searched
@@ -422,7 +441,7 @@ class EngineSearch:
                 boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.rows_array if lean else lane.boards_array
                 gathering_since = time.perf_counter()
                 written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), per_leaf * count, round=name,
-                                                           root_of=GAME, legal_columns=lean)
+                                                           root_of=GAME, legal_columns=lean, alone=SIMULATIONS_PER_LEAF * count)
                 if not written:
                     run.starved = answered
                 launched_at = time.perf_counter()

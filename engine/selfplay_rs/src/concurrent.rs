@@ -1,6 +1,7 @@
 //the state lock is held only to find the searches and to queue or take a round, never around a gather or a finish
 use super::*;
 use search::SharedTree;
+use std::cell::RefCell;
 
 pub(crate) struct SharedSearch {
     id: u64,
@@ -101,6 +102,7 @@ impl Searches {
         leaves: u32,
         collisions: u32,
         simulations: Option<u32>,
+        alone: Option<u32>,
         round: Option<u64>,
         boards: &mut Vec<u8>,
         mut columns: Option<&mut Vec<u16>>,
@@ -132,7 +134,7 @@ impl Searches {
                 visit_limit,
                 memory_limit: self.memory_limit,
             };
-            let queued = tree.gather(&limits, &self.settings, self.tables.as_ref(), self.shared_cache.as_ref(), boards);
+            let queued = self.gather_helped(&tree, &limits, alone, boards);
             if !queued.is_empty() {
                 round_leaves.push((id, queued.len() as u32));
             }
@@ -145,6 +147,53 @@ impl Searches {
         }
         self.lock()?.rounds.push_back(RoundOut { number, name: round, leaves: round_leaves, lean: columns.is_some() });
         Ok(())
+    }
+
+    //SharedTree::gather with the helpers: once the call has made `alone` simulations with the round still short of leaves, up to
+    //gather_helpers threads gather beside it until it ends, each pinned to a cpu of helper_cpus that no other helper has (none left:
+    //no more helpers). Their leaves and boards follow the call's own. None for alone, or all the round's simulations: no helpers
+    fn gather_helped(&self, tree: &SharedTree, round: &Round, alone: Option<u32>, boards: &mut Vec<u8>) -> Vec<PendingLeaf> {
+        let (settings, tables, cache) = (&self.settings, self.tables.as_ref(), self.shared_cache.as_ref());
+        let Some(alone) = alone.filter(|&alone| self.gather_helpers > 0 && alone < round.simulations) else {
+            return tree.gather(round, settings, tables, cache, boards);
+        };
+        let together = Together::default();
+        std::thread::scope(|scope| {
+            let helpers = RefCell::new(Vec::new());
+            let call_for_help = || {
+                for _ in 0..self.gather_helpers {
+                    let cpu = self.helper_cpus.lock().expect("the helpers' cpus").pop();
+                    if self.pin_helpers && cpu.is_none() {
+                        break;
+                    }
+                    let together = &together;
+                    helpers.borrow_mut().push(scope.spawn(move || {
+                        if let Some(cpu) = cpu {
+                            affinity::pin_current(cpu);
+                        }
+                        let mut boards = Vec::new();
+                        let leaves = tree.gather_together(round, together, None, settings, tables, cache, &mut boards);
+                        if let Some(cpu) = cpu {
+                            self.helper_cpus.lock().expect("the helpers' cpus").push(cpu);
+                        }
+                        (leaves, boards)
+                    }));
+                }
+            };
+            let mut queued = tree.gather_together(round, &together, Some((alone, &call_for_help)), settings, tables, cache, boards);
+            together.end();
+            let helpers = helpers.into_inner();
+            if !helpers.is_empty() {
+                self.helped[0].fetch_add(1, Ordering::Relaxed);
+            }
+            for helper in helpers {
+                let (leaves, helper_boards) = helper.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+                self.helped[1].fetch_add(leaves.len() as u64, Ordering::Relaxed);
+                queued.extend(leaves);
+                boards.extend(helper_boards);
+            }
+            queued
+        })
     }
 
     pub(crate) fn shared_finish<N: Number>(&self, answers: &[N], round: Option<u64>) -> PyResult<Vec<SearchReport>> {

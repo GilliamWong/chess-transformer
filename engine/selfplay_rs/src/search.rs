@@ -1940,7 +1940,7 @@ fn each_in_parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -
 }
 
 mod shared;
-pub use shared::{SharedCache, SharedTree};
+pub use shared::{SharedCache, SharedTree, Together};
 
 #[cfg(test)]
 mod tests;
