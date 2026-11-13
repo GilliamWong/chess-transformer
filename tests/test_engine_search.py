@@ -660,7 +660,7 @@ def test_a_search_on_several_networks_keeps_them_all_busy(concurrent_descents):
 
 class RoundsRecorded:
     def __init__(self, searches):
-        self.searches, self.rounds, self.simulations = searches, [], []
+        self.searches, self.rounds, self.simulations, self.alone = searches, [], [], []
 
     def __getattr__(self, name):
         return getattr(self.searches, name)
@@ -669,6 +669,7 @@ class RoundsRecorded:
         written, root = self.searches.descend_into(boards, leaves, collisions, *arguments, **keywords)
         self.rounds.append((leaves, collisions, written))
         self.simulations.append(arguments[0])
+        self.alone.append(keywords.get("alone"))
         return written, root
 
 @pytest.mark.parametrize("concurrent_descents", [False, None])
@@ -2152,3 +2153,20 @@ def test_the_caches_answers_are_counted(concurrent_descents):
     search.searches.descend_into(np.empty((16, TOKENS_PER_BOARD), dtype=np.uint8), 16, 16, 300)
     assert 0 < first < first + 200 < search.searches.cache_hits()
     assert EngineSearch(cpu_batches(BoardModel()), 16, cache_positions=0, concurrent_descents=concurrent_descents).searches.cache_hits() == 0
+
+def test_helpers_join_from_a_rounds_start_while_the_gathers_are_long(monkeypatch):
+    search = EngineSearch(cpu_batches(BoardModel()), 16)
+    search.round_seconds = 0.004
+    #from a gather of a quarter of a round's time, until one of under a tenth
+    assert [search.helped(False, seconds) for seconds in (0.0009, 0.0011)] == [False, True]
+    assert [search.helped(True, seconds) for seconds in (0.0005, 0.0003)] == [True, False]
+
+    def alone_of(share: float) -> set:
+        monkeypatch.setattr(engine_search, "HELP_FROM", share)
+        monkeypatch.setattr(engine_search, "HELP_UNTIL", share)
+        search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, grow_leaves=0)
+        search.searches = recorded = RoundsRecorded(search.searches)
+        search.search(chess.Board(), simulations=600)
+        return set(recorded.alone[1:])
+    #gathers that take no time at all against a round's: every round starts alone; any gather counted as long: none does
+    assert alone_of(1e9) == {3 * 16} and alone_of(-1.0) == {0}

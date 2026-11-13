@@ -194,6 +194,8 @@ pub(crate) struct LoopSettings {
     simulations_per_leaf: u32,
     busy_simulations_per_leaf: u32,
     busy_gather_spare: f64,
+    help_from: f64,
+    help_until: f64,
     smart_pruning: bool,
     smart_pruning_factor: f64,
     certainty: bool,
@@ -347,6 +349,8 @@ impl Rounds<'_> {
         let mut rounds: VecDeque<Launched> = VecDeque::new();
         let mut last_answers: Option<f64> = None;
         let mut seen: Option<RootNumbers> = None;
+        //whether the thread's helpers join its rounds from their start (engine_search.py's helped)
+        let mut helping = false;
         let room = network.room();
         loop {
             let mut gathering = None;
@@ -409,19 +413,20 @@ impl Rounds<'_> {
                     count,
                     settings.collisions.min(count),
                     per_leaf * count,
-                    settings.simulations_per_leaf * count,
+                    if helping { 0 } else { settings.simulations_per_leaf * count },
                     name,
                     settings.game,
                 )?;
                 seen = root;
                 let launched_at = shared.now();
-                let busy = per_leaf > settings.simulations_per_leaf;
-                if written == 0 || busy {
+                {
                     let mut run = shared.lock()?;
+                    let share = if helping { settings.help_until } else { settings.help_from };
+                    helping = launched_at - gathering_since > share * run.round_seconds;
                     if written == 0 {
                         run.starved = Some(answered);
                     }
-                    if busy {
+                    if per_leaf > settings.simulations_per_leaf {
                         run.busy_gathers.push_back(launched_at - gathering_since);
                         while run.busy_gathers.len() > settings.round_times_kept {
                             run.busy_gathers.pop_front();

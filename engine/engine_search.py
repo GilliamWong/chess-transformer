@@ -57,6 +57,9 @@ GC_THREADS = 2
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
 #the threads that join rounds' gathers (EngineSearch's descent_helpers)
 DESCENT_HELPERS = 0
+#a network's thread has its helpers from a round's start once a gather took it this share of a round's time (the gpu then waits for its
+#thread, or runs one round where it could run two), until a gather with them takes less than the second share
+HELP_FROM, HELP_UNTIL = 0.25, 0.1
 ROOT_MOVES_REPORTED = 3
 MAX_REPORTED_SCORE = 0.9999 #about 25 pawns
 
@@ -383,6 +386,7 @@ class EngineSearch:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
                     collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF,
                     busy_simulations_per_leaf=BUSY_SIMULATIONS_PER_LEAF, busy_gather_spare=float(BUSY_GATHER_SPARE),
+                    help_from=HELP_FROM, help_until=HELP_UNTIL,
                     smart_pruning=self.smart_pruning,
                     smart_pruning_factor=self.smart_pruning_factor, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
                     speed_rounds=SPEED_ROUNDS, speed_wait_seconds=SPEED_WAIT_SECONDS, round_times_kept=ROUND_TIMES,
@@ -394,6 +398,8 @@ class EngineSearch:
     def rounds_on(self, network, run: SearchRun) -> None:
         #launched rounds, oldest first, as (the round's name, the launch or None for a round without leaves, and when it was launched)
         rounds: deque = deque()
+        #whether the thread's helpers join its rounds from their start (helped)
+        helping = False
         last_answers = None
         #the root's numbers after this network's last descend, for run once its lock is held
         seen = None
@@ -441,10 +447,11 @@ class EngineSearch:
                 boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.rows_array if lean else lane.boards_array
                 gathering_since = time.perf_counter()
                 written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), per_leaf * count, round=name,
-                                                           root_of=GAME, legal_columns=lean, alone=SIMULATIONS_PER_LEAF * count)
+                                                           root_of=GAME, legal_columns=lean, alone=0 if helping else SIMULATIONS_PER_LEAF * count)
                 if not written:
                     run.starved = answered
                 launched_at = time.perf_counter()
+                helping = self.helped(helping, launched_at - gathering_since)
                 if per_leaf > SIMULATIONS_PER_LEAF:
                     self.busy_gathers.append(launched_at - gathering_since)
                 launched = None if not written else network.launch(boards[:written]) if lane is None else network.launch_filled(lane, written)
@@ -501,6 +508,10 @@ class EngineSearch:
         fall = last - score_to_centipawns(sharpen(self.searches.root_score(GAME), 1 / self.value_sharpness))
         share = min(1.0, max(0.0, (fall - FALL_START_CP) / (FALL_FULL_CP - FALL_START_CP)))
         return share * seconds
+
+    #whether a thread's helpers join its next round from the start, after a gather of gather_seconds (HELP_FROM, HELP_UNTIL)
+    def helped(self, helping: bool, gather_seconds: float) -> bool:
+        return gather_seconds > (HELP_UNTIL if helping else HELP_FROM) * self.round_seconds
 
     #a round's simulations for each of its leaves, on a network with rounds_out of its rounds out: BUSY_SIMULATIONS_PER_LEAF beside one, unless the
     #deadline is so near that the round must be launched at once to come back in time (round_times: the rounds' times until then, as rounds_on's;
