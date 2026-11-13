@@ -27,6 +27,8 @@ GROW_LEAVES = 16
 #a round's simulations for each of its leaves while another round of its network is out (selfplay.SIMULATIONS_PER_LEAF with none out): the gpu is
 #busy either way, so the round looks on for its leaves where most simulations end without the network (a cached answer, a transposition, the tables)
 BUSY_SIMULATIONS_PER_LEAF = 64
+#near a deadline such a round is taken to gather this many times as long as the longest of the last ROUND_TIMES of them did
+BUSY_GATHER_SPARE = 2
 #the most simulations Searches.start takes, for a search with only a deadline or a stop
 UNLIMITED = 2**32 - 1
 GAME = 0
@@ -260,6 +262,8 @@ class EngineSearch:
             self.tablebase = open_tablebase_path(syzygy_path)
         self.certainty = search_settings.get("certainty", False)
         self.round_times: deque = deque([FIRST_ROUND_SECONDS], maxlen=ROUND_TIMES)
+        #how long the last rounds gathered beside a round out took to gather
+        self.busy_gathers: deque = deque(maxlen=ROUND_TIMES)
         self.round_seconds = FIRST_ROUND_SECONDS
         #the searching thread drives the first network unless the threads are pinned: on linux a pinned thread's new threads (advance's) would start on its one cpu
         self.drives_first = not self.network_cpus
@@ -359,7 +363,8 @@ class EngineSearch:
     def rust_round_settings(self) -> dict:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
                     collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF,
-                    busy_simulations_per_leaf=BUSY_SIMULATIONS_PER_LEAF, smart_pruning=self.smart_pruning,
+                    busy_simulations_per_leaf=BUSY_SIMULATIONS_PER_LEAF, busy_gather_spare=float(BUSY_GATHER_SPARE),
+                    smart_pruning=self.smart_pruning,
                     smart_pruning_factor=self.smart_pruning_factor, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
                     speed_rounds=SPEED_ROUNDS, speed_wait_seconds=SPEED_WAIT_SECONDS, round_times_kept=ROUND_TIMES,
                     fall_start_cp=float(FALL_START_CP), fall_full_cp=float(FALL_FULL_CP), max_reported_score=MAX_REPORTED_SCORE,
@@ -415,11 +420,14 @@ class EngineSearch:
                 lane = network.free_lane() if hasattr(network, "free_lane") else None
                 lean = getattr(lane, "lean", False)
                 boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.rows_array if lean else lane.boards_array
+                gathering_since = time.perf_counter()
                 written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), per_leaf * count, round=name,
                                                            root_of=GAME, legal_columns=lean)
                 if not written:
                     run.starved = answered
                 launched_at = time.perf_counter()
+                if per_leaf > SIMULATIONS_PER_LEAF:
+                    self.busy_gathers.append(launched_at - gathering_since)
                 launched = None if not written else network.launch(boards[:written]) if lane is None else network.launch_filled(lane, written)
                 rounds.append((name, launched, launched_at))
                 continue
@@ -476,9 +484,11 @@ class EngineSearch:
         return share * seconds
 
     #a round's simulations for each of its leaves, on a network with rounds_out of its rounds out: BUSY_SIMULATIONS_PER_LEAF beside one, unless the
-    #deadline is so near that the round must be launched at once to come back in time (round_times: the rounds' times until then, as rounds_on's)
+    #deadline is so near that the round must be launched at once to come back in time (round_times: the rounds' times until then, as rounds_on's;
+    #before any such round has been timed, it is taken to gather for a round's time)
     def simulations_per_leaf(self, rounds_out: int, round_times: int, deadline: float | None) -> int:
-        in_time = deadline is None or time.perf_counter() + (round_times + 1) * self.round_seconds < deadline
+        gather = BUSY_GATHER_SPARE * max(self.busy_gathers, default=self.round_seconds)
+        in_time = deadline is None or time.perf_counter() + gather + round_times * self.round_seconds < deadline
         return BUSY_SIMULATIONS_PER_LEAF if rounds_out and in_time else SIMULATIONS_PER_LEAF
 
     #the next round's leaves, and the rounds out at once over all the networks (GROW_LEAVES; at least one); visits: the root's, if known

@@ -701,8 +701,11 @@ def test_a_round_near_the_deadline_is_launched_as_soon_as_one_with_none_out():
     search.round_seconds = 0.01
     now = time.perf_counter()
     assert search.simulations_per_leaf(1, 1, None) == busy and search.simulations_per_leaf(0, 1, None) == alone
-    #a round gathered now is back two round times on at the latest: its own after the one out
-    assert search.simulations_per_leaf(1, 1, now + 1.0) == busy and search.simulations_per_leaf(1, 1, now + 0.015) == alone
+    #a round gathered now is back a round's time after its gather, taken as twice a round's time while none has been timed
+    assert search.simulations_per_leaf(1, 1, now + 1.0) == busy and search.simulations_per_leaf(1, 1, now + 0.025) == alone
+    #and then as twice the longest of the last ones
+    search.busy_gathers.extend([0.001, 0.1, 0.002])
+    assert search.simulations_per_leaf(1, 1, now + 1.0) == busy and search.simulations_per_leaf(1, 1, now + 0.15) == alone
 
 def test_rounds_fill_where_most_simulations_need_no_network():
     #the mate's node takes most visits and none of them needs the network
