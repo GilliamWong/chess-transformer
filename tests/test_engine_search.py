@@ -644,9 +644,9 @@ class SlowNetwork:
         return self.network.collect(answers)
 
 #the simulations past the search's that a search on several networks may end at: one a thread after the first in concurrent
-#descents (a check and a leaf are not one step, SharedTree::gather)
+#descents (a check and a leaf are not one step, SharedTree::gather), the networks' helpers among the threads
 def overrun(concurrent_descents: bool | None, networks: int = 3) -> int:
-    return 0 if concurrent_descents is False else networks - 1
+    return 0 if concurrent_descents is False else networks * (1 + engine_search.HELPERS_A_NETWORK) - 1
 
 @pytest.mark.parametrize("concurrent_descents", [False, None])
 def test_a_search_on_several_networks_keeps_them_all_busy(concurrent_descents):
@@ -2113,8 +2113,27 @@ def test_the_helpers_cpus_follow_the_networks():
     windows = ([(96 << 20, list(range(16))), (32 << 20, list(range(16, 32)))], [[cpu, cpu + 1] for cpu in range(0, 32, 2)])
     assert engine_search.helped_cpus(2, 2, windows) == ([0, 2], [4, 6]) and engine_search.helped_cpus(8, 8, windows) == ([*range(0, 16, 2)], [*range(16, 32, 2)])
     assert engine_search.helped_cpus(3, 0, windows) == ([0, 2, 4], [])
-    #too few for all: the networks keep theirs and there are none for helpers; no topology: none for either
-    assert engine_search.helped_cpus(8, 30, windows) == ([*range(0, 16, 2)], []) and engine_search.helped_cpus(2, 2, ([], [])) == ([], None)
+    #a physical core each: as many helpers as the networks leave cores; no topology: no cpus for either
+    assert engine_search.helped_cpus(8, 30, windows) == ([*range(0, 16, 2)], [*range(16, 32, 2)])
+    assert engine_search.helped_cpus(16, 3, windows) == ([*range(0, 32, 2)], []) and engine_search.helped_cpus(2, 2, ([], [])) == ([], None)
+
+def test_the_searchs_threads_share_one_socket():
+    #two sockets of 16 cores, a core its own L3, cpu c and c + 32 a core's two
+    cores = [[core, core + 32] for core in range(32)]
+    tcec = ([(32 << 20, core) for core in cores], cores)
+    sockets = [[*range(16), *range(32, 48)], [*range(16, 32), *range(48, 64)]]
+    assert engine_search.helped_cpus(8, 24, tcec, sockets) == ([*range(8)], [*range(8, 16)])
+    #of equal sockets the first
+    assert engine_search.helped_cpus(8, 24, tcec, sockets[::-1]) == ([*range(16, 24)], [*range(24, 32)])
+    #the socket with more of the cores the process may use
+    assert engine_search.helped_cpus(2, 4, (tcec[0][12:], cores[12:]), [[*range(12, 16)], [*range(16, 32)]]) == ([16, 17], [18, 19, 20, 21])
+    #sockets unknown, one socket, or more networks than a socket has cores: every core
+    for unknown in ([], [sockets[0] + sockets[1]]):
+        assert engine_search.helped_cpus(8, 24, tcec, unknown) == ([*range(8)], [*range(8, 32)])
+    assert engine_search.helped_cpus(20, 24, tcec, sockets) == ([*range(20)], [*range(20, 32)])
+    #sockets whose cpus are numbered in turn
+    turns = [[core, core + 8] for core in range(8)]
+    assert engine_search.helped_cpus(2, 6, ([(32 << 20, core) for core in turns], turns), [[0, 2, 4, 6, 8, 10, 12, 14], [1, 3, 5, 7, 9, 11, 13, 15]]) == ([0, 2], [4, 6])
 
 def test_helpers_need_concurrent_descents():
     with pytest.raises(ValueError, match="concurrent descents"):
@@ -2122,6 +2141,13 @@ def test_helpers_need_concurrent_descents():
     with pytest.raises(ValueError, match="concurrent descents"):
         selfplay_rs.Searches(**rust_search_settings(False), gather_helpers=1)
     assert EngineSearch(cpu_batches(BoardModel()), 16).descent_helpers == 0
+
+def test_several_networks_have_helpers_as_far_as_the_cores_go():
+    three = [cpu_batches(BoardModel()) for _ in range(3)]
+    cores = len(selfplay_rs.cpu_topology()[1])
+    assert EngineSearch(three, 16).descent_helpers == max(0, min(3 * engine_search.HELPERS_A_NETWORK, cores - 3))
+    assert EngineSearch(three, 16, pin_threads=False).descent_helpers == 3 * engine_search.HELPERS_A_NETWORK
+    assert EngineSearch(three, 16, concurrent_descents=False).descent_helpers == 0 and EngineSearch(three, 16, descent_helpers=0).descent_helpers == 0
 
 @pytest.mark.parametrize("networks, pin_threads", [(1, False), (3, False), (2, True)])
 def test_helpers_join_the_rounds_short_of_leaves(networks, pin_threads):

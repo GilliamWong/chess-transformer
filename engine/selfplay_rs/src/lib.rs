@@ -1094,6 +1094,12 @@ fn cpu_topology() -> Option<(Vec<(u64, Vec<usize>)>, Vec<Vec<usize>>)> {
     affinity::topology().map(|topology| (topology.l3s, topology.cores))
 }
 
+//each socket's cpus among those this process may run on; None where the os does not say
+#[pyfunction]
+fn cpu_sockets() -> Option<Vec<Vec<usize>>> {
+    affinity::sockets()
+}
+
 #[pyfunction]
 fn pin_thread(cpu: usize) -> bool {
     affinity::pin_current(cpu)
@@ -1106,6 +1112,7 @@ fn selfplay_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(softmax, module)?)?;
     module.add_class::<rounds::RoundLoop>()?;
     module.add_function(wrap_pyfunction!(cpu_topology, module)?)?;
+    module.add_function(wrap_pyfunction!(cpu_sockets, module)?)?;
     module.add_function(wrap_pyfunction!(pin_thread, module)?)?;
     module.add("LEAN_COLUMNS", LEAN_COLUMNS)?;
     module.add("LEAN_ROW", LEAN_ROW)?;

@@ -55,8 +55,9 @@ ADVANCE_THREADS = 4
 GC_THREADS = 2
 #the engine's changes to mcts.py's search, which self-play keeps as it is
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
-#the threads that join rounds' gathers (EngineSearch's descent_helpers)
-DESCENT_HELPERS = 0
+#the threads that join rounds' gathers, for each of several networks (EngineSearch's descent_helpers): on two RTX 5090s three a network kept
+#the gpus at their rate where a thread a network alone fell a fifth short in a middlegame of 40M visits and half in an endgame's tree
+HELPERS_A_NETWORK = 3
 #a network's thread has its helpers from a round's start once a gather took it this share of a round's time (the gpu then waits for its
 #thread, or runs one round where it could run two), until a gather with them takes less than the second share
 HELP_FROM, HELP_UNTIL = 0.25, 0.1
@@ -127,14 +128,28 @@ def thread_cpus(count: int, topology: tuple | None = None) -> list[int]:
     return cpus[:count] if count <= len(cpus) else []
 
 
-#the networks' cpus and their helpers' (thread_cpus for them all, the networks' first); no cpus for the helpers where there are too few for all,
-#and none at all (their list None) where the networks get none either
-def helped_cpus(networks: int, helpers: int, topology: tuple | None = None) -> tuple[list[int], list[int] | None]:
-    cpus = thread_cpus(networks + helpers, topology)
-    if cpus:
-        return cpus[:networks], cpus[networks:]
-    network_cpus = thread_cpus(networks, topology)
-    return network_cpus, [] if network_cpus else None
+#the topology of one socket of several (each one's cpus, selfplay_rs.cpu_sockets'): the one with the most cores, the first of equals. A tree's
+#memory lies with the socket whose threads made it and a thread on another reaches it slowly: on two Xeon 6530s, half the networks' threads on
+#the second socket searched a quarter slower. The whole topology where no socket has a core for each of `threads`
+def on_one_socket(topology: tuple, sockets: list[list[int]], threads: int) -> tuple:
+    l3s, cores = topology
+    by_socket = [[core for core in cores if core[0] in socket] for socket in map(set, sockets)]
+    most = max(by_socket, key=len, default=[])
+    if len(sockets) < 2 or len(most) < threads:
+        return topology
+    kept = {cpu for core in most for cpu in core}
+    return [(size, [cpu for cpu in cpus if cpu in kept]) for size, cpus in l3s if kept.intersection(cpus)], most
+
+
+#the networks' cpus and their helpers' (thread_cpus for them all, the networks' first), on one socket (on_one_socket): a physical core each, so
+#as many helpers as the cores the networks leave there; no cpus at all (the helpers' list None) where the networks get none either
+def helped_cpus(networks: int, helpers: int, topology: tuple | None = None, sockets: list[list[int]] | None = None) -> tuple[list[int], list[int] | None]:
+    topology = topology if topology is not None else selfplay_rs.cpu_topology()
+    if topology is None:
+        return [], None
+    topology = on_one_socket(topology, sockets if sockets is not None else selfplay_rs.cpu_sockets() or [], networks)
+    cpus = thread_cpus(networks + max(0, min(helpers, len(topology[1]) - networks)), topology)
+    return (cpus[:networks], cpus[networks:]) if cpus else ([], None)
 
 
 LEAN_CAPABILITIES = {(8, 0), (12, 0)}
@@ -234,13 +249,14 @@ class EngineSearch:
     #rust_rounds: the rounds in Searches' own loop (rounds.rs), a thread a network and no python between them, the python loop's search exactly;
     #concurrent_descents: the networks' threads descend, finish and back up in the tree at once (search/shared.rs); pin_threads: the networks' threads each on a cpu
     #of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes; for one, alone_in_rust);
-    #descent_helpers: the threads that join a round's gather once it has made the simulations of a round with none out and is still short of leaves
-    #(concurrent descents only), shared out among the networks, each on a cpu of its own where the networks' threads are pinned
+    #descent_helpers: the threads that join the gathers of a network whose own thread takes long over them or is short of leaves (concurrent
+    #descents only), shared out among the networks, each on a core of its own where the networks' threads are pinned and as many as the cores
+    #left allow; None: HELPERS_A_NETWORK for each of several networks, none for one
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, gc_threads: int = GC_THREADS, rust_rounds: bool | None = None,
-                 concurrent_descents: bool | None = None, pin_threads: bool | None = None, descent_helpers: int = DESCENT_HELPERS):
+                 concurrent_descents: bool | None = None, pin_threads: bool | None = None, descent_helpers: int | None = None):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched, several = leaves > 1, len(self.networks) > 1
@@ -263,12 +279,14 @@ class EngineSearch:
         self.smart_pruning_factor = smart_pruning_factor
         self.advance_threads = advance_threads
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
+        if descent_helpers is None:
+            descent_helpers = HELPERS_A_NETWORK * len(self.networks) if several and self.concurrent_descents else 0
         if descent_helpers and not self.concurrent_descents:
             raise ValueError("helpers join a round's gather in the tree of concurrent descents only")
         pinned = several if pin_threads is None else pin_threads
         self.network_cpus, helper_cpus = helped_cpus(len(self.networks), descent_helpers) if pinned and batched else ([], None)
-        #pinned threads' helpers without cpus of their own would start on their networks' (linux): none then
-        self.descent_helpers = descent_helpers if helper_cpus is None or helper_cpus else 0
+        #pinned helpers are as many as have cores of their own
+        self.descent_helpers = descent_helpers if helper_cpus is None else len(helper_cpus)
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
                                              advance_threads=advance_threads, gc_threads=gc_threads, concurrent_descents=self.concurrent_descents,
                                              gather_helpers=-(-self.descent_helpers // len(self.networks)),
