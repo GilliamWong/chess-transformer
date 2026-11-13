@@ -271,7 +271,8 @@ class EngineSearch:
         self.descent_helpers = descent_helpers if helper_cpus is None or helper_cpus else 0
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
                                              advance_threads=advance_threads, gc_threads=gc_threads, concurrent_descents=self.concurrent_descents,
-                                             gather_helpers=-(-self.descent_helpers // len(self.networks)), helper_cpus=helper_cpus)
+                                             gather_helpers=-(-self.descent_helpers // len(self.networks)),
+                                             helper_threads=self.descent_helpers, helper_cpus=helper_cpus)
         #reports give the score on the network's own scale, before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         #a root the tables cover takes their move if they rank it, else it is searched

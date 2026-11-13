@@ -395,18 +395,16 @@ struct Searches {
     settings: SearchSettings,
     move_ids: MoveIds,
     answer_width: usize,
-    tables: Option<Tables>,
+    tables: Option<Arc<Tables>>,
     tree_reuse: bool,
     memory_limit: usize, //bytes a search's tree may take, usize::MAX for no limit
     advance_threads: usize,
     gc_threads: usize,
     concurrent_descents: bool,
-    shared_cache: Option<SharedCache>,
-    //the threads that may join the gather of a round in a shared tree (concurrent.rs's gather_helped), and the cpus they are pinned to:
-    //a helper takes one while it runs, so as many help at once as there are; pin_helpers false: helpers without cpus
+    shared_cache: Option<Arc<SharedCache>>,
+    //the threads that may join the gather of a round in a shared tree (concurrent.rs's Helpers), and how many of them one gather takes
+    helpers: Option<concurrent::Helpers>,
     gather_helpers: usize,
-    helper_cpus: Mutex<Vec<usize>>,
-    pin_helpers: bool,
     //the gathers that helpers joined, and the leaves the helpers found
     helped: [AtomicU64; 2],
     state: Mutex<State>,
@@ -571,7 +569,7 @@ impl Searches {
                 visit_limit: search.simulations,
                 memory_limit: self.memory_limit,
             };
-            let gathered = search.tree.gather(&limits, &self.settings, self.tables.as_ref(), state.cache.as_ref(), boards);
+            let gathered = search.tree.gather(&limits, &self.settings, self.tables.as_deref(), state.cache.as_ref(), boards);
             if gathered > 0 {
                 round_leaves.push((search.id, gathered));
             }
@@ -702,7 +700,7 @@ impl Searches {
             return None;
         }
         let since = &moves[kept.moves.len()..];
-        let (settings, tables) = (&self.settings, self.tables.as_ref());
+        let (settings, tables) = (&self.settings, self.tables.as_deref());
         match kept.tree.ready()? {
             Kept::Searched(mut tree) => {
                 let Some((line, _)) = line_to(&tree, since) else {
@@ -755,7 +753,7 @@ impl Searches {
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
                         memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false,
-                        gather_helpers=0, helper_cpus=None))]
+                        gather_helpers=0, helper_threads=0, helper_cpus=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -777,9 +775,10 @@ impl Searches {
         concurrent_descents: bool,
         transpositions: bool,
         gather_helpers: usize,
+        helper_threads: usize,
         helper_cpus: Option<Vec<usize>>,
     ) -> PyResult<Searches> {
-        if gather_helpers > 0 && !concurrent_descents {
+        if (gather_helpers > 0 || helper_threads > 0) && !concurrent_descents {
             return Err(PyValueError::new_err("helpers join a gather in the tree of concurrent descents only"));
         }
         if value_sharpness <= 0.0 {
@@ -800,16 +799,16 @@ impl Searches {
             },
             move_ids: move_ids(move_id_table)?,
             answer_width,
-            tables: open_tables(tablebase_folder, tablebase_pieces)?,
+            tables: open_tables(tablebase_folder, tablebase_pieces)?.map(Arc::new),
             tree_reuse,
             memory_limit: if memory_limit_mb == 0 { usize::MAX } else { memory_limit_mb.saturating_mul(1_000_000) },
             advance_threads: advance_threads.max(1),
             gc_threads,
             concurrent_descents,
-            shared_cache: (concurrent_descents && cache_positions > 0).then(|| SharedCache::new(cache_positions)),
+            shared_cache: (concurrent_descents && cache_positions > 0).then(|| Arc::new(SharedCache::new(cache_positions))),
+            //each on a cpu of helper_cpus, if those are given
+            helpers: (gather_helpers > 0 && helper_threads > 0).then(|| concurrent::Helpers::new(helper_threads, helper_cpus)),
             gather_helpers,
-            pin_helpers: helper_cpus.is_some(),
-            helper_cpus: Mutex::new(helper_cpus.unwrap_or_default()),
             helped: [AtomicU64::new(0), AtomicU64::new(0)],
             state: Mutex::new(State {
                 searches: Vec::new(),
@@ -1044,7 +1043,7 @@ impl Searches {
     fn cache_hits(&self, py: Python<'_>) -> PyResult<u64> {
         py.detach(|| {
             if self.concurrent_descents {
-                return Ok(self.shared_cache.as_ref().map_or(0, SharedCache::hits));
+                return Ok(self.shared_cache.as_deref().map_or(0, SharedCache::hits));
             }
             Ok(self.lock()?.cache.as_ref().map_or(0, Cache::hits))
         })

@@ -1,7 +1,155 @@
 //the state lock is held only to find the searches and to queue or take a round, never around a gather or a finish
 use super::*;
 use search::SharedTree;
-use std::cell::RefCell;
+use std::sync::Condvar;
+use std::sync::atomic::AtomicUsize;
+use std::time::{Duration, Instant};
+
+//how long a helper goes on looking for a gather to join after its last one before it sleeps: a thread that sleeps is woken too late
+//for a gather of a millisecond or two, and a network whose thread needs help gathers again within that
+const HELPER_AWAKE: Duration = Duration::from_millis(2);
+
+//a round's gather that helpers may join: what SharedTree::gather_together takes, owned, since a helper may hold it past the call
+struct HelpedGather {
+    tree: Arc<SharedTree>,
+    round: Round,
+    together: Together,
+    settings: SearchSettings,
+    tables: Option<Arc<Tables>>,
+    cache: Option<Arc<SharedCache>>,
+    state: Mutex<HelpedState>,
+    left: Condvar, //a helper has left the gather
+}
+
+//the helpers the gather still takes, those gathering, and what the ones done found (leaves and their boards)
+struct HelpedState {
+    wanted: usize,
+    gathering: usize,
+    found: Vec<(Vec<PendingLeaf>, Vec<u8>)>,
+}
+
+impl HelpedGather {
+    fn help(&self) {
+        let mut boards = Vec::new();
+        let (tables, cache) = (self.tables.as_deref(), self.cache.as_deref());
+        let leaves = self.tree.gather_together(&self.round, &self.together, None, &self.settings, tables, cache, &mut boards);
+        let mut state = self.state.lock().expect("a gather's helpers");
+        state.found.push((leaves, boards));
+        state.gathering -= 1;
+        self.left.notify_all();
+    }
+}
+
+//the gathers that want helpers, for the helpers' threads
+struct Wanted {
+    gathers: Mutex<Vec<Arc<HelpedGather>>>,
+    posted: Condvar,
+    //the helpers the gathers want in all, for a helper that looks without the lock
+    helpers: AtomicUsize,
+    closing: AtomicBool,
+}
+
+impl Wanted {
+    fn take(&self) -> Option<Arc<HelpedGather>> {
+        let gathers = self.gathers.lock().expect("the gathers that want helpers");
+        for gather in gathers.iter() {
+            let mut state = gather.state.lock().expect("a gather's helpers");
+            if state.wanted > 0 {
+                state.wanted -= 1;
+                state.gathering += 1;
+                self.helpers.fetch_sub(1, Ordering::AcqRel);
+                return Some(gather.clone());
+            }
+        }
+        None
+    }
+
+    //a helper's thread: gathers wherever one is wanted, stays awake for HELPER_AWAKE after, then sleeps until the next is posted
+    fn help(&self) {
+        let mut last = Instant::now();
+        while !self.closing.load(Ordering::Acquire) {
+            if self.helpers.load(Ordering::Acquire) > 0 {
+                if let Some(gather) = self.take() {
+                    gather.help();
+                    last = Instant::now();
+                }
+            } else if last.elapsed() < HELPER_AWAKE {
+                std::hint::spin_loop();
+            } else {
+                let gathers = self.gathers.lock().expect("the gathers that want helpers");
+                let asleep = |_: &mut Vec<Arc<HelpedGather>>| self.helpers.load(Ordering::Acquire) == 0 && !self.closing.load(Ordering::Acquire);
+                drop(self.posted.wait_while(gathers, asleep).expect("the gathers that want helpers"));
+                last = Instant::now();
+            }
+        }
+    }
+}
+
+//threads that join the gathers posted to them (Searches' gather_helped), each pinned to its cpu of `cpus` if those are given
+pub(crate) struct Helpers {
+    wanted: Arc<Wanted>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl Helpers {
+    pub(crate) fn new(count: usize, cpus: Option<Vec<usize>>) -> Helpers {
+        let wanted = Arc::new(Wanted {
+            gathers: Mutex::new(Vec::new()),
+            posted: Condvar::new(),
+            helpers: AtomicUsize::new(0),
+            closing: AtomicBool::new(false),
+        });
+        let threads = (0..count)
+            .map(|index| {
+                let (wanted, cpu) = (wanted.clone(), cpus.as_ref().and_then(|cpus| cpus.get(index).copied()));
+                std::thread::spawn(move || {
+                    if let Some(cpu) = cpu {
+                        affinity::pin_current(cpu);
+                    }
+                    wanted.help();
+                })
+            })
+            .collect();
+        Helpers { wanted, threads }
+    }
+
+    //the gather takes up to `helpers` of them from now on
+    fn post(&self, gather: &Arc<HelpedGather>, helpers: usize) {
+        let mut gathers = self.wanted.gathers.lock().expect("the gathers that want helpers");
+        gather.state.lock().expect("a gather's helpers").wanted = helpers;
+        gathers.push(gather.clone());
+        self.wanted.helpers.fetch_add(helpers, Ordering::AcqRel);
+        self.wanted.posted.notify_all();
+    }
+
+    //the gather takes no more helpers; returns what its helpers found once the last of them has left
+    fn close(&self, gather: &Arc<HelpedGather>) -> Vec<(Vec<PendingLeaf>, Vec<u8>)> {
+        {
+            let mut gathers = self.wanted.gathers.lock().expect("the gathers that want helpers");
+            let mut state = gather.state.lock().expect("a gather's helpers");
+            if let Some(place) = gathers.iter().position(|posted| Arc::ptr_eq(posted, gather)) {
+                gathers.swap_remove(place);
+                self.wanted.helpers.fetch_sub(state.wanted, Ordering::AcqRel);
+                state.wanted = 0;
+            }
+        }
+        let state = gather.state.lock().expect("a gather's helpers");
+        let mut state = gather.left.wait_while(state, |state| state.gathering > 0).expect("a gather's helpers");
+        std::mem::take(&mut state.found)
+    }
+}
+
+impl Drop for Helpers {
+    fn drop(&mut self) {
+        self.wanted.closing.store(true, Ordering::Release);
+        //with the lock, so that no helper is between its look and its sleep
+        drop(self.wanted.gathers.lock());
+        self.wanted.posted.notify_all();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
 
 pub(crate) struct SharedSearch {
     id: u64,
@@ -150,50 +298,36 @@ impl Searches {
     }
 
     //SharedTree::gather with the helpers: once the call has made `alone` simulations with the round still short of leaves, up to
-    //gather_helpers threads gather beside it until it ends, each pinned to a cpu of helper_cpus that no other helper has (none left:
-    //no more helpers). Their leaves and boards follow the call's own. None for alone, or all the round's simulations: no helpers
-    fn gather_helped(&self, tree: &SharedTree, round: &Round, alone: Option<u32>, boards: &mut Vec<u8>) -> Vec<PendingLeaf> {
-        let (settings, tables, cache) = (&self.settings, self.tables.as_ref(), self.shared_cache.as_ref());
-        let Some(alone) = alone.filter(|&alone| self.gather_helpers > 0 && alone < round.simulations) else {
+    //gather_helpers of them gather beside it until it ends. Their leaves and boards follow the call's own. None for alone, or all the
+    //round's simulations: no helpers
+    fn gather_helped(&self, tree: &Arc<SharedTree>, round: &Round, alone: Option<u32>, boards: &mut Vec<u8>) -> Vec<PendingLeaf> {
+        let (settings, tables, cache) = (&self.settings, self.tables.as_deref(), self.shared_cache.as_deref());
+        let (Some(helpers), Some(alone)) = (&self.helpers, alone.filter(|&alone| alone < round.simulations)) else {
             return tree.gather(round, settings, tables, cache, boards);
         };
-        let together = Together::default();
-        std::thread::scope(|scope| {
-            let helpers = RefCell::new(Vec::new());
-            let call_for_help = || {
-                for _ in 0..self.gather_helpers {
-                    let cpu = self.helper_cpus.lock().expect("the helpers' cpus").pop();
-                    if self.pin_helpers && cpu.is_none() {
-                        break;
-                    }
-                    let together = &together;
-                    helpers.borrow_mut().push(scope.spawn(move || {
-                        if let Some(cpu) = cpu {
-                            affinity::pin_current(cpu);
-                        }
-                        let mut boards = Vec::new();
-                        let leaves = tree.gather_together(round, together, None, settings, tables, cache, &mut boards);
-                        if let Some(cpu) = cpu {
-                            self.helper_cpus.lock().expect("the helpers' cpus").push(cpu);
-                        }
-                        (leaves, boards)
-                    }));
-                }
-            };
-            let mut queued = tree.gather_together(round, &together, Some((alone, &call_for_help)), settings, tables, cache, boards);
-            together.end();
-            let helpers = helpers.into_inner();
-            if !helpers.is_empty() {
-                self.helped[0].fetch_add(1, Ordering::Relaxed);
-            }
-            for helper in helpers {
-                let (leaves, helper_boards) = helper.join().unwrap_or_else(|payload| std::panic::resume_unwind(payload));
-                self.helped[1].fetch_add(leaves.len() as u64, Ordering::Relaxed);
-                queued.extend(leaves);
-                boards.extend(helper_boards);
-            }
-            queued
-        })
+        let gather = Arc::new(HelpedGather {
+            tree: tree.clone(),
+            round: *round,
+            together: Together::default(),
+            settings: self.settings,
+            tables: self.tables.clone(),
+            cache: self.shared_cache.clone(),
+            state: Mutex::new(HelpedState { wanted: 0, gathering: 0, found: Vec::new() }),
+            left: Condvar::new(),
+        });
+        let call_for_help = || helpers.post(&gather, self.gather_helpers);
+        let mut queued = tree.gather_together(round, &gather.together, Some((alone, &call_for_help)), settings, tables, cache, boards);
+        gather.together.end();
+        let found = helpers.close(&gather);
+        if !found.is_empty() {
+            self.helped[0].fetch_add(1, Ordering::Relaxed);
+        }
+        for (leaves, helper_boards) in found {
+            self.helped[1].fetch_add(leaves.len() as u64, Ordering::Relaxed);
+            queued.extend(leaves);
+            boards.extend(helper_boards);
+        }
+        queued
     }
 
     pub(crate) fn shared_finish<N: Number>(&self, answers: &[N], round: Option<u64>) -> PyResult<Vec<SearchReport>> {
@@ -220,7 +354,7 @@ impl Searches {
             assert_eq!(leaves.len(), count as usize, "the round's leaves in the tree");
             for (leaf, answer) in leaves.into_iter().zip(rows.by_ref()) {
                 hold.give_way();
-                let (cache, settings) = (self.shared_cache.as_ref(), &self.settings);
+                let (cache, settings) = (self.shared_cache.as_deref(), &self.settings);
                 if out.lean {
                     //the legal moves' logits in the leaf's move order, then the score
                     logits.clear();
@@ -322,7 +456,7 @@ impl Searches {
             return None;
         }
         let since = &moves[kept.moves.len()..];
-        let (settings, tables) = (&self.settings, self.tables.as_ref());
+        let (settings, tables) = (&self.settings, self.tables.as_deref());
         //the walk's candidates of an advance, the inner None if it was stopped: without an advance, no walk was made
         let (tree, candidates) = match kept.tree.ready()? {
             Kept::Searched(tree) => (tree, None),

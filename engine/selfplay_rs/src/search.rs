@@ -12,6 +12,7 @@ use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+#[derive(Clone, Copy)]
 pub struct SearchSettings {
     pub c_puct: f64,
     pub c_puct_factor: f64,
@@ -338,6 +339,7 @@ impl Cache {
 
 //a round (lc0's minibatch): leaves to gather for the network, simulations in all (those finished at once too), and descents that may
 //end on a leaf already waiting (collisions). Waiting simulations count as visits in the exploration term
+#[derive(Clone, Copy)]
 pub struct Round {
     pub id: u64, //its leaves wait under it until finish_leaf takes them; rounds may come back in any order
     pub leaves: u32,
