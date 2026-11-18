@@ -168,12 +168,21 @@ def parse_position(arguments: list[str]) -> chess.Board:
 
     return board
 
+#score_to_centipawns' centipawns from which the engine won half its games with an engine of its strength, and lost half from as many
+#behind (473 games with lc0's BT4 at 60+0.6, the score of each move against its game's result)
+EVEN_WIN_CENTIPAWNS = 250
+
+#the gui's centipawns: 100 are a position won half the time, as Stockfish and lc0 show theirs (a gui sets them beside the opponent's, and
+#adjudicates on both). The clock's falling scores stay score_to_centipawns'
+def shown_centipawns(score: float) -> int:
+    return round(score_to_centipawns(score) * 100 / EVEN_WIN_CENTIPAWNS)
+
 #depth is the length of the expected line: cutechess keeps score, depth and time in the pgn. As lc0's, nodes are the root's visits, those of a kept tree
 #included, and nps the speed of this search's own
 def info_line(report: SearchReport, seconds: float) -> str:
     nps = round((report.simulations - report.reused) / max(seconds, 1e-3))
     return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {nps} "
-            f"score cp {score_to_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
+            f"score cp {shown_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
 
 #a new game needs a new Clock
 class Clock:

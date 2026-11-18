@@ -3,6 +3,7 @@ import gc
 import io
 import itertools
 import json
+import math
 import os
 import queue
 import runpy
@@ -22,7 +23,7 @@ import pytest
 import selfplay_rs
 import torch
 from torch import nn
-from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
+from model.encoding import EXPECTED_SCORE_PER_CENTIPAWN, TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import BoardModel, CountingNetwork, EvenModel, UniformModel
 from engine.inference import GraphedBatches, ImmediateBatches, cpu_batches, small_graph_sizes
 from model.model import ChessTransformer
@@ -866,6 +867,27 @@ def test_go_leaves_out_numbers_that_are_not_whole(monkeypatch):
     assert given == [(800, None), (30, None), (800, None)] and len([line for line in sent if line.startswith("bestmove")]) == 3
     told = [line for line in sent if line.startswith("info string")]
     assert told == [f"info string go's {number} is not a whole number: left out" for number in ("nodes x", "movetime 1.5", "wtime 1000.5")]
+
+class WinningPlayer(RecordingPlayer):
+    def search(self, board, nodes, seconds, extension, stop=None, info=None):
+        super().search(board, nodes, seconds, extension)
+        return SearchReport(0.8, [next(iter(board.legal_moves))], 1, [])
+
+#the gui is shown centipawns of which 100 are a position won half the time, and a won one ten pawns; the clock's falling scores keep the
+#search's own centipawns
+def test_the_gui_is_shown_centipawns_of_an_even_chance_to_win(monkeypatch):
+    def shown(line: str) -> int:
+        words = line.split()
+        return int(words[words.index("cp") + 1])
+
+    even = 1 / (1 + math.exp(-EXPECTED_SCORE_PER_CENTIPAWN * uci.EVEN_WIN_CENTIPAWNS))
+    line = [chess.Move.from_uci("e2e4")]
+    assert [shown(uci.info_line(SearchReport(score, line, 1, []), 1.0)) for score in (0.5, even, 1 - even)] == [0, 100, -100]
+    assert shown(uci.info_line(SearchReport(1.0, line, 1, []), 1.0)) >= 1000
+
+    searches, sent, _ = run_uci(monkeypatch, ["position startpos", "go " + " ".join(CLOCK_60), "go " + " ".join(CLOCK_60), "quit"], WinningPlayer())
+    own = engine_search.score_to_centipawns(0.8)
+    assert searches[1][3][0] == own and shown(next(line for line in sent if line.startswith("info depth"))) == round(own * 100 / uci.EVEN_WIN_CENTIPAWNS) != own
 
 #nodes are the root's visits, as lc0's (a kept tree's included); nps is the speed of this search's own
 def test_info_nps_counts_only_the_visits_this_search_made():
