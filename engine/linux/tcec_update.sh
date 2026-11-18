@@ -22,8 +22,9 @@ if (
     "$FRY_FOLDER/engine/linux/build.sh"
     printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$FRY_FOLDER/engine/linux/engine.sh" > "$PWD/fry.sh"
     chmod +x "$PWD/fry.sh"
-    #another user reads and runs all of it
+    #another user reads and runs all of it, and adds to the caches what a start of theirs still compiles
     chmod -R a+rX "$PWD/fry.sh" "$FRY_FOLDER"
+    chmod -R a+w "$FRY_FOLDER/caches/triton" "$FRY_FOLDER/caches/compiler"
 ); then
     EXE=$PWD/fry.sh
     NET=$FRY_FOLDER/weights/fry-final-117.pt
