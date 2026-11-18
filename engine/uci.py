@@ -1,6 +1,7 @@
 import argparse
 from collections.abc import Iterable
 from contextlib import suppress
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import queue
@@ -168,12 +169,21 @@ def parse_position(arguments: list[str]) -> chess.Board:
 
     return board
 
+#score_to_centipawns' centipawns from which the engine won half its games with an engine of its strength, and lost half from as many
+#behind (473 games with lc0's BT4 at 60+0.6, the score of each move against its game's result)
+EVEN_WIN_CENTIPAWNS = 250
+
+#the gui's centipawns: 100 are a position won half the time, as Stockfish and lc0 show theirs (a gui sets them beside the opponent's, and
+#adjudicates on both). The clock's falling scores stay score_to_centipawns'
+def shown_centipawns(score: float) -> int:
+    return round(score_to_centipawns(score) * 100 / EVEN_WIN_CENTIPAWNS)
+
 #depth is the length of the expected line: cutechess keeps score, depth and time in the pgn. As lc0's, nodes are the root's visits, those of a kept tree
 #included, and nps the speed of this search's own
 def info_line(report: SearchReport, seconds: float) -> str:
     nps = round((report.simulations - report.reused) / max(seconds, 1e-3))
     return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {nps} "
-            f"score cp {score_to_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
+            f"score cp {shown_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
 
 #a new game needs a new Clock
 class Clock:
@@ -273,23 +283,32 @@ def tell_loaded(player: EngineSearch, where: str, search_options: dict) -> Engin
          f"cache {search_options.get('cache_positions', CACHE_POSITIONS)} positions")
     return player
 
-#search_options are EngineSearch's keyword arguments
-def load_player(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, search_options: dict,
-                precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> EngineSearch:
+#what a load leaves the searches built on it: the network (one, or a list of several gpus'), its leaves a round, where it runs for the
+#gui's log, and the value sharpness the checkpoint is served at (None for the engine's)
+@dataclass
+class Networks:
+    network: object
+    leaves: int
+    where: str
+    value_sharpness: float | None = None
+
+def load_networks(checkpoint_path: Path, gpu: bool, leaves: int, precision: str, fp16_blocks: int, gpus: list[int] | None = None) -> Networks:
     if not gpu:
-        player = EngineSearch(cpu_batches(load_model(checkpoint_path, torch.device("cpu"))), 1, use_tablebase=tablebase, **search_options)
-        return tell_loaded(player, "the cpu", search_options)
-    #the checkpoint's own value sharpness replaces the engine's default; one given by the command line or SearchSettings wins over both
+        return Networks(cpu_batches(load_model(checkpoint_path, torch.device("cpu"))), 1, "the cpu")
     sharpness = served_value_sharpness(checkpoint_path)
-    if sharpness is not None:
-        search_options = {**search_options, "settings": {"value_sharpness": sharpness, **search_options.get("settings", {})}}
     if gpus is None:
-        network, where = engine_network(checkpoint_path, leaves, precision, fp16_blocks), "one gpu"
-    else:
-        network, working = working_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus)
-        count = f"{len(working)}" if len(working) == len(gpus) else f"{len(working)} of {len(gpus)}"
-        where = f"{count} gpus ({','.join(map(str, working))})"
-    return tell_loaded(EngineSearch(network, leaves, use_tablebase=tablebase, **search_options), where, search_options)
+        return Networks(engine_network(checkpoint_path, leaves, precision, fp16_blocks), leaves, "one gpu", sharpness)
+    network, working = working_networks(checkpoint_path, leaves, precision, fp16_blocks, gpus)
+    count = f"{len(working)}" if len(working) == len(gpus) else f"{len(working)} of {len(gpus)}"
+    return Networks(network, leaves, f"{count} gpus ({','.join(map(str, working))})", sharpness)
+
+#a search on a load's networks, the gui told of it; search_options are EngineSearch's keyword arguments
+def build_player(networks: Networks, tablebase: bool, search_options: dict) -> EngineSearch:
+    #the checkpoint's own value sharpness replaces the engine's default; one given by the command line or SearchSettings wins over both
+    if networks.value_sharpness is not None:
+        search_options = {**search_options, "settings": {"value_sharpness": networks.value_sharpness, **search_options.get("settings", {})}}
+    player = EngineSearch(networks.network, networks.leaves, use_tablebase=tablebase, **search_options)
+    return tell_loaded(player, networks.where, search_options)
 
 
 #a go as the reader saw it, received when it came (the gui times the move from then). stop is set by stop, quit and the input's end (for a go
@@ -355,8 +374,6 @@ SPIN_OPTIONS = {"SyzygyProbeLimit": (min(table_set.pieces for table_set in TABLE
 #setoption's decimal options, as strings since uci has no decimal type, (lowest, highest); SmartPruningFactor 0 is no smart pruning
 DECIMAL_OPTIONS = {"SmartPruningFactor": (0.0, 100.0), "FirstMoveBonus": (0.0, 100.0), "BookPlyBonus": (0.0, 100.0)}
 GPU_OPTIONS = ("GPUs", "Leaves", "SmartPruningFactor")
-BUILD_OPTIONS = ("SyzygyPath", "SyzygyProbeLimit", "CachePositions", "RamLimitMb", "AdvanceThreads", "GcThreads", "GPUs", "Leaves", "SearchSettings",
-                 "SmartPruningFactor")
 
 #setoption's "name <name> value <value>", each of any number of words (a path may hold spaces)
 def option_name_and_value(arguments: list[str]) -> tuple[str, str]:
@@ -417,13 +434,11 @@ class Options:
         return lines
 
     #applies a setoption: what to tell the gui (an info string), None if nothing. A value the search could not take leaves the option as it was
-    def set(self, name: str, value: str, built: bool) -> str | None:
+    def set(self, name: str, value: str) -> str | None:
         names = self.names()
         name = next((known for known in names if known.lower() == name.lower()), name)
         if name not in names:
             return f"no option {name}"
-        if built and name in BUILD_OPTIONS:
-            return f"{name} takes effect when the engine restarts: the search is built"
         if name == "SyzygyPath":
             path = os.pathsep.join(filter(None, value.split(os.pathsep))) if value != "<empty>" else ""
             return self.set_tables(path or None, self.probe_limit)
@@ -547,6 +562,8 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
     options = Options(tablebase, search_options.get("tablebase_pieces", TABLEBASE_PIECES), gpu, gpus, leaves, search_options, clock_options,
                       machine_memory_mb() if fit_memory else None)
     player = None
+    networks = None #a load's, kept while the search is built again for other options
+    loaded_for = built_with = None #the options the networks were loaded for, and those the player was built with
     board = chess.Board()
     clock = Clock(**options.clock())
     commands = Commands(sys.stdin, infinite_until_stop)
@@ -554,16 +571,28 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
     newest: list[chess.Move] = []
     planned: dict[str, chess.Move] = {} #the position the last search expected after its move and the reply (its epd), and its move there
 
-    def load() -> EngineSearch:
+    #the player for the options as they stand. One set after the load builds the search again, with a new tree and cache (fastchess sends
+    #its options after the first isready): on the networks already loaded unless it is Leaves or GPUs, which they are loaded for
+    def ready() -> EngineSearch:
+        nonlocal player, networks, loaded_for, built_with
         if options.gpus is not None and not options.gpus:
             raise RuntimeError("--gpus all found no cuda device")
-        use_tablebase, set_options = options.search()
-        return load_player(checkpoint_path, gpu, options.leaves, use_tablebase, {**search_options, **set_options}, precision, fp16_blocks,
-                           options.gpus)
+        load_options, build_options = (options.leaves, options.gpus), options.search()
+        if player is not None and (loaded_for, built_with) == (load_options, build_options):
+            return player
+        #the old search's tree and cache are freed before the new one's are made, and so the old networks
+        player = None
+        if networks is None or loaded_for != load_options:
+            networks = None
+            networks = load_networks(checkpoint_path, gpu, options.leaves, precision, fp16_blocks, options.gpus)
+            loaded_for = load_options
+        use_tablebase, set_options = build_options
+        player = build_player(networks, use_tablebase, {**search_options, **set_options})
+        built_with = build_options
+        return player
 
     #go's move, None in a game that is over. A go until stop returns once told to stop, also when its search ended by itself, as UCI asks
     def move_for(go: Go) -> chess.Move | None:
-        nonlocal player
         newest.clear()
         if not any(board.legal_moves):
             send("info string the game is over, there is no move to play")
@@ -571,8 +600,7 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
         plan = planned.get(board.epd())
         if plan is not None and plan in board.legal_moves:
             newest.append(plan)
-        if player is None:
-            player = load()
+        searching = ready()
         for number in go_numbers(go.arguments)[1]:
             send(f"info string go's {number} is not a whole number: left out")
         nodes, seconds = clock.limits(go.arguments, board, simulations)
@@ -582,7 +610,7 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
         def running(report: SearchReport) -> None:
             newest[:] = report.line[:1]
             send(info_line(report, time.perf_counter() - go.received))
-        report = player.search(board, nodes, seconds, clock.extension, go.stop, running)
+        report = searching.search(board, nodes, seconds, clock.extension, go.stop, running)
         clock.searched(time.perf_counter() - go.received, score_to_centipawns(report.score))
         move = report.line[0]
         planned.clear()
@@ -597,13 +625,13 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
         return move
 
     #a search that fails still answers, with its newest info line's move, else the last search's planned one, else the first legal move; the gui is
-    #told, stderr has the traceback. The player is built again for the next go, as its search may be left half done
+    #told, stderr has the traceback. The networks are loaded and the player built again for the next go, as its search may be left half done
     def fallback_move(error: BaseException) -> chess.Move:
-        nonlocal player
+        nonlocal player, networks
         traceback.print_exception(error)
         move = newest[0] if newest else next(iter(board.legal_moves))
         send(f"info string the search failed ({error!r}): playing {move.uci()}")
-        player = None
+        player = networks = None
         return move
 
     while (received := commands.next()) is not None:
@@ -618,12 +646,11 @@ def main(checkpoint_path: Path, simulations: int = SIMULATIONS, gpu: bool = Fals
 
         elif command == "isready":
             #loaded here, not at startup, so "uci" is answered at once
-            if player is None:
-                player = load()
+            ready()
             send("readyok")
 
         elif command == "setoption":
-            told = options.set(*option_name_and_value(arguments), built=player is not None)
+            told = options.set(*option_name_and_value(arguments))
             for name, value in options.clock().items():
                 setattr(clock, name, value)
             if told is not None:

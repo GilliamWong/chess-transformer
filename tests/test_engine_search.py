@@ -3,6 +3,7 @@ import gc
 import io
 import itertools
 import json
+import math
 import os
 import queue
 import runpy
@@ -22,7 +23,7 @@ import pytest
 import selfplay_rs
 import torch
 from torch import nn
-from model.encoding import TOKENS_PER_BOARD, encode_move_to_id
+from model.encoding import EXPECTED_SCORE_PER_CENTIPAWN, TOKENS_PER_BOARD, encode_move_to_id
 from fake_models import BoardModel, CountingNetwork, EvenModel, UniformModel
 from engine.inference import GraphedBatches, ImmediateBatches, cpu_batches, small_graph_sizes
 from model.model import ChessTransformer
@@ -839,10 +840,12 @@ class FailingPlayer(RecordingPlayer):
             raise self.error
         return SearchReport(0.5, [list(board.legal_moves)[-1]], 1, [])
 
-#uci.main on the script with a RecordingPlayer (or `player`): its searches (fen, nodes, seconds, extension), the lines sent and load_player's arguments
+#uci.main on the script with a RecordingPlayer (or `player`): its searches (fen, nodes, seconds, extension), the lines sent and build_player's
+#arguments at each build (networks, tablebase, search options), the networks being load_networks' arguments at their load
 def run_uci(monkeypatch, script: list[str], player: RecordingPlayer | None = None, **main_arguments) -> tuple[list, list[str], list]:
     player, sent, built = RecordingPlayer() if player is None else player, [], []
-    monkeypatch.setattr(uci, "load_player", lambda *arguments: built.append(arguments) or player)
+    monkeypatch.setattr(uci, "load_networks", lambda *arguments: arguments)
+    monkeypatch.setattr(uci, "build_player", lambda *arguments: built.append(arguments) or player)
     monkeypatch.setattr(uci, "send", sent.append)
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n".join(script)))
     uci.main(Path("unused.pt"), **main_arguments)
@@ -866,6 +869,27 @@ def test_go_leaves_out_numbers_that_are_not_whole(monkeypatch):
     assert given == [(800, None), (30, None), (800, None)] and len([line for line in sent if line.startswith("bestmove")]) == 3
     told = [line for line in sent if line.startswith("info string")]
     assert told == [f"info string go's {number} is not a whole number: left out" for number in ("nodes x", "movetime 1.5", "wtime 1000.5")]
+
+class WinningPlayer(RecordingPlayer):
+    def search(self, board, nodes, seconds, extension, stop=None, info=None):
+        super().search(board, nodes, seconds, extension)
+        return SearchReport(0.8, [next(iter(board.legal_moves))], 1, [])
+
+#the gui is shown centipawns of which 100 are a position won half the time, and a won one ten pawns; the clock's falling scores keep the
+#search's own centipawns
+def test_the_gui_is_shown_centipawns_of_an_even_chance_to_win(monkeypatch):
+    def shown(line: str) -> int:
+        words = line.split()
+        return int(words[words.index("cp") + 1])
+
+    even = 1 / (1 + math.exp(-EXPECTED_SCORE_PER_CENTIPAWN * uci.EVEN_WIN_CENTIPAWNS))
+    line = [chess.Move.from_uci("e2e4")]
+    assert [shown(uci.info_line(SearchReport(score, line, 1, []), 1.0)) for score in (0.5, even, 1 - even)] == [0, 100, -100]
+    assert shown(uci.info_line(SearchReport(1.0, line, 1, []), 1.0)) >= 1000
+
+    searches, sent, _ = run_uci(monkeypatch, ["position startpos", "go " + " ".join(CLOCK_60), "go " + " ".join(CLOCK_60), "quit"], WinningPlayer())
+    own = engine_search.score_to_centipawns(0.8)
+    assert searches[1][3][0] == own and shown(next(line for line in sent if line.startswith("info depth"))) == round(own * 100 / uci.EVEN_WIN_CENTIPAWNS) != own
 
 #nodes are the root's visits, as lc0's (a kept tree's included); nps is the speed of this search's own
 def test_info_nps_counts_only_the_visits_this_search_made():
@@ -1227,6 +1251,11 @@ def test_the_engine_answers_uci_where_all_the_gpus_are_none():
     loading = answer("isready\n")
     assert loading.returncode != 0 and "--gpus all found no cuda device" in loading.stderr and "readyok" not in loading.stdout
 
+#a load and the search built on it, as uci.main's first isready
+def load_player(checkpoint_path: Path, gpu: bool, leaves: int, tablebase: bool, search_options: dict, precision: str, fp16_blocks: int,
+                gpus: list[int] | None = None) -> EngineSearch:
+    return uci.build_player(uci.load_networks(checkpoint_path, gpu, leaves, precision, fp16_blocks, gpus), tablebase, search_options)
+
 #records (precision, fp16 blocks, blocking wait) of each network built
 def fake_engine_network(built: list | None = None):
     def engine_network(checkpoint, leaves, precision, fp16_blocks, device=None, blocking_wait=False):
@@ -1247,8 +1276,8 @@ uci_as_main = pytest.mark.filterwarnings("ignore:'engine.uci' found in sys.modul
 def test_the_engine_takes_a_precision(monkeypatch, model_path):
     built = []
     monkeypatch.setattr(uci, "engine_network", fake_engine_network(built))
-    search = uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "fp16", 1)
-    uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 0)
+    search = load_player(model_path, True, 4, False, {"smart_pruning": False}, "fp16", 1)
+    load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 0)
     refused = [run_engine(model_path, *options) for options in (["--precision", "fp16"], ["--gpu", "--precision", "fp16", "--fp16-blocks", "0"])]
 
     assert [(precision, fp16_blocks) for precision, fp16_blocks, _ in built] == [("fp16", 1), ("int8", 0)] and search.search(chess.Board(), simulations=20).simulations == 20
@@ -1259,8 +1288,8 @@ def test_the_engine_takes_gpus(monkeypatch, model_path):
     built = []
     monkeypatch.setattr(uci, "engine_networks", lambda checkpoint, leaves, precision, fp16_blocks, devices, blocking_wait:
                         [built.append((fp16_blocks, device, blocking_wait)) or cpu_batches(BoardModel()) for device in devices])
-    uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [1])
-    search = uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 2])
+    load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [1])
+    search = load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 2])
     refused = [run_engine("unused.pt", *options, "--gpus", "0,1") for options in (["--leaves", "4"], ["--gpu", "--leaves", "1"])]
 
     assert built == [(1, 1, False), (1, 0, True), (1, 2, True)] and len(search.networks) == 2 and search.concurrent_descents
@@ -1277,21 +1306,21 @@ def test_a_gpu_that_fails_is_left_out(monkeypatch, model_path):
     monkeypatch.setattr(uci, "engine_networks", engine_networks)
     monkeypatch.setattr(uci, "send", sent.append)
 
-    search = uci.load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 1, 2])
+    search = load_player(model_path, True, 4, False, {"smart_pruning": False}, "int8", 1, [0, 1, 2])
 
     assert len(search.networks) == 2 and search.search(chess.Board(), simulations=200).simulations >= 200
     assert sent == ["info string gpu 1 failed (RuntimeError('the gpu fell over')): searching without it",
                     f"info string Fry on 2 of 3 gpus (0,2); no tables; no tree limit; cache {engine_search.CACHE_POSITIONS} positions"]
     for devices in ([1], [1, 3]):
         with pytest.raises(RuntimeError, match="fell over"):
-            uci.load_player(model_path, True, 4, False, {}, "int8", 1, devices)
+            load_player(model_path, True, 4, False, {}, "int8", 1, devices)
 
 def test_the_gui_is_told_what_was_loaded(monkeypatch, tablebase, model_path):
     sent = []
     monkeypatch.setattr(uci, "engine_network", fake_engine_network())
     monkeypatch.setattr(uci, "send", sent.append)
 
-    uci.load_player(model_path, True, 4, True, {"memory_limit_mb": 64, "cache_positions": 1000}, "int8", 1)
+    load_player(model_path, True, 4, True, {"memory_limit_mb": 64, "cache_positions": 1000}, "int8", 1)
 
     assert sent == ["info string Fry on one gpu; 145 wdl and 145 dtz tables, used up to 5 pieces; tree limit 64 MB; cache 1000 positions"]
 
@@ -1299,10 +1328,10 @@ def test_the_gui_is_told_what_was_loaded(monkeypatch, tablebase, model_path):
 def test_the_engine_serves_a_checkpoint_at_its_own_value_sharpness(monkeypatch, model_path):
     monkeypatch.setattr(uci, "engine_network", fake_engine_network([]))
     monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", {"value_sharpness": 3.0})
-    default = uci.load_player(model_path, True, 4, False, {}, "int8", 1)
+    default = load_player(model_path, True, 4, False, {}, "int8", 1)
     torch.save({**torch.load(model_path), "value_sharpness": 1.25}, model_path)
-    served = uci.load_player(model_path, True, 4, False, {}, "int8", 1)
-    told = uci.load_player(model_path, True, 4, False, {"settings": {"value_sharpness": 2.0}}, "int8", 1)
+    served = load_player(model_path, True, 4, False, {}, "int8", 1)
+    told = load_player(model_path, True, 4, False, {"settings": {"value_sharpness": 2.0}}, "int8", 1)
 
     assert (default.value_sharpness, served.value_sharpness, told.value_sharpness) == (3.0, 1.25, 2.0)
 
@@ -1455,7 +1484,7 @@ def test_search_settings_that_are_not_numbers_are_refused():
             parse_changes(change, settings)
     options = Options(False, TABLEBASE_PIECES)
     for change in ("move_id_table=1", "tablebase_folder=x", "repetitions_for_a_draw=inf", "c_puct=x", "nope=1"):
-        assert options.set("SearchSettings", change, built=False).endswith("the search's settings stay as they were")
+        assert options.set("SearchSettings", change).endswith("the search's settings stay as they were")
     assert options.settings is None
 
 
@@ -1476,7 +1505,7 @@ def test_a_competitions_options_are_ones_the_engine_takes(competition):
     for name, value in set_options.items():
         assert name in options.names()
         if name != "SyzygyPath":
-            assert options.set(name, value, built=False) is None
+            assert options.set(name, value) is None
 
 
 GIB_MB = 2**30 / 1_000_000
@@ -1515,9 +1544,9 @@ def test_options_fit_the_machines_memory_until_they_are_set():
     assert (options.search()[1]["cache_positions"], options.search()[1]["memory_limit_mb"]) == (cache_positions, tree_mb)
     assert f"option name CachePositions type spin default {cache_positions} " in "\n".join(options.lines())
     assert f"option name RamLimitMb type spin default {tree_mb} " in "\n".join(options.lines())
-    assert options.set("CachePositions", "50000000", built=False) is None
+    assert options.set("CachePositions", "50000000") is None
     assert options.search()[1]["cache_positions"] == 50_000_000 and options.search()[1]["memory_limit_mb"] > tree_mb
-    assert options.set("RamLimitMb", "0", built=False) is None
+    assert options.set("RamLimitMb", "0") is None
     assert options.search()[1]["memory_limit_mb"] == 0
     #a machine too small to fit keeps the defaults
     small = Options(False, TABLEBASE_PIECES, gpu=True, memory_mb=16_000).search()[1]
@@ -1681,7 +1710,7 @@ def test_a_search_ends_at_its_memory_limit():
     assert 100 < reports[1][4] < 3000
 
 
-#Searches must be used on the thread that made it, so load_player makes its player with make_player (unless None) on the engine's thread
+#Searches must be used on the thread that made it, so build_player makes its player with make_player (unless None) on the engine's thread
 class Gui:
     def __init__(self, monkeypatch, make_player, checkpoint: Path = Path("unused.pt"), **main_arguments):
         self.lines: queue.Queue = queue.Queue()
@@ -1690,7 +1719,8 @@ class Gui:
         monkeypatch.setattr(sys, "stdin", iter(self.lines.get, None))
         monkeypatch.setattr(uci, "send", lambda line: self.sent.append((time.perf_counter(), line)))
         if make_player is not None:
-            monkeypatch.setattr(uci, "load_player", lambda *arguments: make_player())
+            monkeypatch.setattr(uci, "load_networks", lambda *arguments: None)
+            monkeypatch.setattr(uci, "build_player", lambda *arguments: make_player())
         self.engine = threading.Thread(target=self.run, args=(checkpoint,), kwargs=main_arguments, daemon=True)
         self.engine.start()
 
@@ -1814,28 +1844,31 @@ def test_go_ponder_is_an_ordinary_go(monkeypatch):
                                                                          (None, pytest.approx(0.5 - MOVE_OVERHEAD_SECONDS))]
     assert len([line for line in sent if line.startswith("bestmove")]) == 2
 
-#MoveOverhead reaches the next go's time; an option set once the search is built, or to a value it could not take, stays as it was and the gui is told why
+#MoveOverhead reaches the next go's time; an option set once the search is built builds it again on the networks loaded (fastchess sends its
+#options after the first isready); one set to a value it could not take stays as it was and the gui is told why
 def test_the_options_reach_the_search(monkeypatch):
     script = ["uci", "setoption name cachepositions value 1000", "setoption name RamLimitMb value 64", "setoption name SyzygyProbeLimit value 6",
               "setoption name AdvanceThreads value 12", "setoption name AdvanceThreads value 257", "setoption name GcThreads value 6", "setoption name GcThreads value 65",
               "setoption name MoveOverhead value 500", "setoption name MoveOverhead value -1", "setoption name SyzygyProbeLimit value 8",
-              "setoption name Hash value 16", "isready", "setoption name CachePositions value 5", "go movetime 1000",
+              "setoption name Hash value 16", "ucinewgame", "isready", "setoption name CachePositions value 5", "setoption name AdvanceThreads value 0",
+              "setoption name RamLimitMb value 64", "isready", "isready", "go movetime 1000",
               "setoption name MoveOverhead value 100", "go movetime 1000", "ucinewgame", "go movetime 1000", "quit"]
     searches, sent, built = run_uci(monkeypatch, script, search_options={"smart_pruning": False})
 
     assert [line.split()[2] for line in sent if line.startswith("option name")] == ["SyzygyPath", "SyzygyProbeLimit", "MoveOverhead", "CachePositions",
                                                                                      "RamLimitMb", "AdvanceThreads", "GcThreads", "FirstMoveBonus",
                                                                                      "BookPlyBonus", "SearchSettings"]
-    assert len(built) == 1 and built[0][3] is False
-    assert built[0][4] == {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64,
-                           "advance_threads": 12, "gc_threads": 6}
+    first = {"smart_pruning": False, "tablebase_pieces": 6, "syzygy_path": None, "cache_positions": 1000, "memory_limit_mb": 64,
+             "advance_threads": 12, "gc_threads": 6}
+    assert [(tablebase, options) for _, tablebase, options in built] == [(False, first), (False, {**first, "cache_positions": 5, "advance_threads": 0})]
+    assert built[0][0] is built[1][0]
     assert [seconds for _, _, seconds, _ in searches] == [pytest.approx(0.5), pytest.approx(0.9), pytest.approx(0.9)]
     told = [line for line in sent if line.startswith("info string")]
-    assert len(told) == 6 and "AdvanceThreads" in told[0] and "GcThreads" in told[1] and "-1" in told[2] and "8" in told[3] and "Hash" in told[4]
-    assert "CachePositions" in told[5]
+    assert len(told) == 5 and "AdvanceThreads" in told[0] and "GcThreads" in told[1] and "-1" in told[2] and "8" in told[3] and "Hash" in told[4]
     assert "option name GcThreads type spin default 2 min 0 max 64" in sent
 
-#values the engine could not take (a device that is not there, one leaf on several gpus, an unknown setting) leave the options as they were
+#values the engine could not take (a device that is not there, an unknown setting) leave the options as they were; Leaves set once the
+#networks are loaded loads them again
 def test_the_competition_options_reach_the_search(monkeypatch):
     script = ["uci", "setoption name GPUs value 0,1,2", "setoption name GPUs value 0,7", "setoption name Leaves value 32",
               "setoption name SmartPruningFactor value 0", "setoption name SearchSettings value fpu_reduction=0.3",
@@ -1848,13 +1881,13 @@ def test_the_competition_options_reach_the_search(monkeypatch):
     names = [line.split()[2] for line in sent if line.startswith("option name")]
     assert names[7:] == ["Leaves", "GPUs", "SmartPruningFactor", "FirstMoveBonus", "BookPlyBonus", "SearchSettings"]
     assert "option name GPUs type string default 0" in sent
-    (_, _, leaves, _, options, _, _, gpus), = built
-    assert (leaves, gpus) == (32, [0, 1, 2])
-    assert options["smart_pruning"] is False and options["settings"] == {"c_puct": 0.7, "fpu_reduction": 0.3}
+    (loaded, _, options), (loaded_again, _, options_again) = built
+    assert (loaded[2], loaded[5]) == (32, [0, 1, 2]) and (loaded_again[2], loaded_again[5]) == (16, [0, 1, 2])
+    assert options["smart_pruning"] is False and options["settings"] == {"c_puct": 0.7, "fpu_reduction": 0.3} and options_again == options
     first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
     assert [seconds for _, _, seconds, _ in searches] == [first, first]
     told = [line for line in sent if line.startswith("info string")]
-    assert len(told) == 4 and "device 7" in told[0] and "nope" in told[1] and "BookPlyBonus" in told[2] and "Leaves" in told[3]
+    assert len(told) == 3 and "device 7" in told[0] and "nope" in told[1] and "BookPlyBonus" in told[2]
 
 def test_the_search_takes_its_cache_size_memory_limit_advance_and_gc_threads(monkeypatch):
     made = []
@@ -1891,6 +1924,28 @@ def test_a_syzygy_path_reaches_the_search(monkeypatch, tablebase, tmp_path, mode
     assert gui.lines_sent("bestmove") == ["bestmove h1h8"] and gui.last_info("nodes") == 0
     #the refused path, then what the player was built with
     assert [line.split("; ")[1] for line in gui.lines_sent("info string")[1:]] == ["145 wdl and 145 dtz tables, used up to 5 pieces"]
+    gui.close()
+
+#fastchess's order (the CCC's): ucinewgame and isready, which loads, then the options, then isready again. The search is built again
+#with the tables, on the networks of the one load
+def test_a_syzygy_path_sent_after_the_load_reaches_the_search(monkeypatch, tablebase, model_path):
+    loads = []
+    load_networks = uci.load_networks
+    monkeypatch.setattr(uci, "load_networks", lambda *arguments: loads.append(arguments) or load_networks(*arguments))
+    gui = Gui(monkeypatch, None, model_path)
+    gui.tell("ucinewgame")
+    gui.tell("isready")
+    assert gui.sent_at("readyok", seconds=30) is not None
+    gui.tell(f"setoption name SyzygyPath value {SYZYGY_DIR}")
+    gui.tell("setoption name AdvanceThreads value 0")
+    asked = gui.tell("isready")
+    assert gui.sent_at("readyok", since=asked, seconds=30) is not None
+    gui.tell("position fen k7/8/1K6/8/8/8/8/7R w - - 0 1")
+    gui.tell("go nodes 50")
+    assert gui.sent_at("bestmove", seconds=30) is not None
+    assert gui.lines_sent("bestmove") == ["bestmove h1h8"] and gui.last_info("nodes") == 0
+    assert [line.split("; ")[1] for line in gui.lines_sent("info string")] == ["no tables", "145 wdl and 145 dtz tables, used up to 5 pieces"]
+    assert len(loads) == 1
     gui.close()
 
 def test_a_bad_position_leaves_the_last_one(monkeypatch):

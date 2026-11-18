@@ -174,12 +174,12 @@ def test_the_engine_takes_the_7_piece_tables_it_is_given(tmp_path):
     options = Options(False, TABLEBASE_PIECES)
 
     assert "option name SyzygyProbeLimit type spin default 7 min 5 max 7" in options.lines()
-    assert options.set("SyzygyPath", seven, built=False) is None and options.search()[1]["tablebase_pieces"] == 7
-    assert options.set("SyzygyPath", six, built=False) is None and options.search()[1]["tablebase_pieces"] == 6
-    assert options.set("SyzygyProbeLimit", "5", built=False) is None and options.search()[1]["tablebase_pieces"] == 5
-    assert options.set("SyzygyPath", seven, built=False) is None and options.search()[1]["tablebase_pieces"] == 5
-    assert options.set("SyzygyPath", str(tmp_path / "none"), built=False).endswith("holds no tables: the tables stay as they were")
-    assert options.set("SyzygyPath", str(tmp_path / "nowhere"), built=False).endswith("the tables stay as they were")
+    assert options.set("SyzygyPath", seven) is None and options.search()[1]["tablebase_pieces"] == 7
+    assert options.set("SyzygyPath", six) is None and options.search()[1]["tablebase_pieces"] == 6
+    assert options.set("SyzygyProbeLimit", "5") is None and options.search()[1]["tablebase_pieces"] == 5
+    assert options.set("SyzygyPath", seven) is None and options.search()[1]["tablebase_pieces"] == 5
+    assert options.set("SyzygyPath", str(tmp_path / "none")).endswith("holds no tables: the tables stay as they were")
+    assert options.set("SyzygyPath", str(tmp_path / "nowhere")).endswith("the tables stay as they were")
     assert options.search()[1]["syzygy_path"] == seven
 
 def partial_syzygy_path(folder: Path, left_out: tuple[str, ...], dead: tuple[str, ...] = ()) -> str:
