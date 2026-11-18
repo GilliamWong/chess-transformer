@@ -26,7 +26,9 @@ machine's CPU, downloads the network
 otherwise make first: the network's int8 weights and the engine's compiled GPU code. With the GPU it makes them by
 starting the engine once; without one (an image's build, as `engine/linux/fry.Dockerfile` for the CCC) it downloads
 the ones published for this code. Run it again after a `git pull`. `engine/linux/update.sh [folder]` clones or pulls
-and builds in one step.
+and builds in one step. `engine/linux/tcec_update.sh` is TCEC's update script: in an empty folder it builds the tagged
+code, keeps everything a start reads under that folder (so the engine runs under another user than the builder, from
+a link) and sets `EXE` and `NET`.
 
 `engine.sh` is the UCI engine, searching on every GPU the machine has. A start takes ~7 s on one GPU or ~35-40 s on
 eight, so give the GUI that long to answer `isready`. The kernels are picked from the GPU's model at start-up;

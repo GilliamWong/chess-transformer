@@ -556,8 +556,18 @@ def test_without_a_home_folder_nothing_is_cached(monkeypatch):
     def no_home():
         raise RuntimeError("Could not determine home directory.")
     monkeypatch.setattr(Path, "home", no_home)
+    monkeypatch.delenv(quantization.CACHE_VARIABLE, raising=False)
 
     assert quantization.cache_folder() is None
+
+#a build run by another user than the builder keeps the cache beside the code: the home folder is then not asked
+def test_a_named_cache_folder_is_used_whatever_the_home_folder(monkeypatch, tmp_path):
+    def no_home():
+        raise RuntimeError("Could not determine home directory.")
+    monkeypatch.setattr(Path, "home", no_home)
+    monkeypatch.setenv(quantization.CACHE_VARIABLE, str(tmp_path / "int8"))
+
+    assert quantization.cache_folder() == tmp_path / "int8"
 
 #the build runs this to fill the cache, so a cache it cannot write must fail it
 @gpu
