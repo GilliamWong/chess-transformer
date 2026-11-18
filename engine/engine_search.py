@@ -24,6 +24,11 @@ COLLISIONS = 64
 ROUNDS_IN_FLIGHT = 2
 #a round takes a leaf per this many simulations done or left; 0 for fixed
 GROW_LEAVES = 16
+#a round's simulations for each of its leaves while another round of its network is out (selfplay.SIMULATIONS_PER_LEAF with none out): the gpu is
+#busy either way, so the round looks on for its leaves where most simulations end without the network (a cached answer, a transposition, the tables)
+BUSY_SIMULATIONS_PER_LEAF = 64
+#near a deadline such a round is taken to gather this many times as long as the longest of the last ROUND_TIMES of them did
+BUSY_GATHER_SPARE = 2
 #the most simulations Searches.start takes, for a search with only a deadline or a stop
 UNLIMITED = 2**32 - 1
 GAME = 0
@@ -50,6 +55,13 @@ ADVANCE_THREADS = 4
 GC_THREADS = 2
 #the engine's changes to mcts.py's search, which self-play keeps as it is
 ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
+#the threads that join rounds' gathers, for each of several networks (EngineSearch's descent_helpers). On two RTX 5090s a thread a network
+#alone fell a fifth short of the gpus' rate in a middlegame of 40M visits and to under half in an endgame of 100M; three helpers a network
+#kept 95% and 80% of it, five 88% in the endgame, eight no more than five
+HELPERS_A_NETWORK = 5
+#a network's thread has its helpers from a round's start once a gather took it this share of a round's time (the gpu then waits for its
+#thread, or runs one round where it could run two), until a gather with them takes less than the second share
+HELP_FROM, HELP_UNTIL = 0.25, 0.1
 ROOT_MOVES_REPORTED = 3
 MAX_REPORTED_SCORE = 0.9999 #about 25 pawns
 
@@ -117,7 +129,35 @@ def thread_cpus(count: int, topology: tuple | None = None) -> list[int]:
     return cpus[:count] if count <= len(cpus) else []
 
 
+#the topology of one socket of several (each one's cpus, selfplay_rs.cpu_sockets'): the one with the most cores, the first of equals. A tree's
+#memory lies with the socket whose threads made it and a thread on another reaches it slowly: on two Xeon 6530s, half the networks' threads on
+#the second socket searched a quarter slower. The whole topology where no socket has a core for each of `threads`
+def on_one_socket(topology: tuple, sockets: list[list[int]], threads: int) -> tuple:
+    l3s, cores = topology
+    by_socket = [[core for core in cores if core[0] in socket] for socket in map(set, sockets)]
+    most = max(by_socket, key=len, default=[])
+    if len(sockets) < 2 or len(most) < threads:
+        return topology
+    kept = {cpu for core in most for cpu in core}
+    return [(size, [cpu for cpu in cpus if cpu in kept]) for size, cpus in l3s if kept.intersection(cpus)], most
+
+
+#the networks' cpus and their helpers' (thread_cpus for them all, the networks' first), on one socket (on_one_socket): a physical core each, so
+#as many helpers as the cores the networks leave there; no cpus at all (the helpers' list None) where the networks get none either
+def helped_cpus(networks: int, helpers: int, topology: tuple | None = None, sockets: list[list[int]] | None = None) -> tuple[list[int], list[int] | None]:
+    topology = topology if topology is not None else selfplay_rs.cpu_topology()
+    if topology is None:
+        return [], None
+    topology = on_one_socket(topology, sockets if sockets is not None else selfplay_rs.cpu_sockets() or [], networks)
+    cpus = thread_cpus(networks + max(0, min(helpers, len(topology[1]) - networks)), topology)
+    return (cpus[:networks], cpus[networks:]) if cpus else ([], None)
+
+
 LEAN_CAPABILITIES = {(8, 0), (12, 0)}
+#the gpus whose networks torch's compiler is not used on. On two A100s the search ran 43.9k nodes a second without it and 44.1k with it,
+#and it cost every start 12 s, or 36 s where its cache held nothing: the CCC starts the engine in a new container each time, and its 52 s
+#stood against the 60 s that gui gives a start
+UNCOMPILED_CAPABILITIES = {(8, 0)}
 #the gpus where one network's rounds also run in Searches' own loop: the python loop's cost a round shows in their short rounds
 ALONE_IN_RUST_CAPABILITIES = {(8, 0)}
 
@@ -157,8 +197,11 @@ def network_graphs(model: torch.nn.Module, max_batch: int, blocking_wait: bool =
     lanes = ROUNDS_IN_FLIGHT if max_batch > 1 else 1
     chunk = chunk_positions(model.d_model, lanes)
     sizes = small_graph_sizes(max_batch, chunk)
-    #one board a round (mcts.py's search) never fills the largest graph
-    compiled = ExactSizeCompiled(model, min(sizes[-1], chunk)) if max_batch > 1 else torch.compile(model, dynamic=True)
+    if torch.cuda.get_device_capability() in UNCOMPILED_CAPABILITIES:
+        compiled = model
+    else:
+        #one board a round (mcts.py's search) never fills the largest graph
+        compiled = ExactSizeCompiled(model, min(sizes[-1], chunk)) if max_batch > 1 else torch.compile(model, dynamic=True)
     return GraphedBatches(compiled, sizes, lanes, chunk, blocking_wait, lean_lanes() if lean is None else lean)
 
 
@@ -213,12 +256,15 @@ class EngineSearch:
     #memory_limit_mb: 0 for none (the tree's arenas may hold up to a quarter more: freed room no node fits); gc_threads: those that free a moved tree's dead rest;
     #rust_rounds: the rounds in Searches' own loop (rounds.rs), a thread a network and no python between them, the python loop's search exactly;
     #concurrent_descents: the networks' threads descend, finish and back up in the tree at once (search/shared.rs); pin_threads: the networks' threads each on a cpu
-    #of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes; for one, alone_in_rust)
+    #of thread_cpus'. None for these three: on for several networks (rust_rounds also needs lean lanes; for one, alone_in_rust);
+    #descent_helpers: the threads that join the gathers of a network whose own thread takes long over them or is short of leaves (concurrent
+    #descents only), shared out among the networks, each on a core of its own where the networks' threads are pinned and as many as the cores
+    #left allow; None: HELPERS_A_NETWORK for each of several networks, none for one
     def __init__(self, network, leaves: int = LEAVES, use_tablebase: bool = False, smart_pruning: bool = True,
                  tablebase_pieces: int = TABLEBASE_PIECES, settings: dict | None = None, grow_leaves: int = GROW_LEAVES,
                  smart_pruning_factor: float = SMART_PRUNING_FACTOR, cache_positions: int = CACHE_POSITIONS, syzygy_path: str | None = None,
                  memory_limit_mb: int = 0, advance_threads: int = ADVANCE_THREADS, gc_threads: int = GC_THREADS, rust_rounds: bool | None = None,
-                 concurrent_descents: bool | None = None, pin_threads: bool | None = None):
+                 concurrent_descents: bool | None = None, pin_threads: bool | None = None, descent_helpers: int | None = None):
         self.networks = network if isinstance(network, list) else [network]
         self.leaves = leaves
         batched, several = leaves > 1, len(self.networks) > 1
@@ -241,10 +287,18 @@ class EngineSearch:
         self.smart_pruning_factor = smart_pruning_factor
         self.advance_threads = advance_threads
         search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
+        if descent_helpers is None:
+            descent_helpers = HELPERS_A_NETWORK * len(self.networks) if several and self.concurrent_descents else 0
+        if descent_helpers and not self.concurrent_descents:
+            raise ValueError("helpers join a round's gather in the tree of concurrent descents only")
         pinned = several if pin_threads is None else pin_threads
-        self.network_cpus = thread_cpus(len(self.networks) if pinned and batched else 0)
+        self.network_cpus, helper_cpus = helped_cpus(len(self.networks), descent_helpers) if pinned and batched else ([], None)
+        #pinned helpers are as many as have cores of their own
+        self.descent_helpers = descent_helpers if helper_cpus is None else len(helper_cpus)
         self.searches = selfplay_rs.Searches(**search_settings, tree_reuse=batched, cache_positions=cache_positions, memory_limit_mb=memory_limit_mb,
-                                             advance_threads=advance_threads, gc_threads=gc_threads, concurrent_descents=self.concurrent_descents)
+                                             advance_threads=advance_threads, gc_threads=gc_threads, concurrent_descents=self.concurrent_descents,
+                                             gather_helpers=-(-self.descent_helpers // len(self.networks)),
+                                             helper_threads=self.descent_helpers, helper_cpus=helper_cpus)
         #reports give the score on the network's own scale, before sharpening
         self.value_sharpness = search_settings.get("value_sharpness", 1.0)
         #a root the tables cover takes their move if they rank it, else it is searched
@@ -257,6 +311,8 @@ class EngineSearch:
             self.tablebase = open_tablebase_path(syzygy_path)
         self.certainty = search_settings.get("certainty", False)
         self.round_times: deque = deque([FIRST_ROUND_SECONDS], maxlen=ROUND_TIMES)
+        #how long the last rounds gathered beside a round out took to gather
+        self.busy_gathers: deque = deque(maxlen=ROUND_TIMES)
         self.round_seconds = FIRST_ROUND_SECONDS
         #the searching thread drives the first network unless the threads are pinned: on linux a pinned thread's new threads (advance's) would start on its one cpu
         self.drives_first = not self.network_cpus
@@ -355,7 +411,10 @@ class EngineSearch:
 
     def rust_round_settings(self) -> dict:
         return dict(game=GAME, leaves=self.leaves, rounds_in_flight=self.rounds_in_flight, grow_leaves=self.grow_leaves,
-                    collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF, smart_pruning=self.smart_pruning,
+                    collisions=self.collisions, simulations_per_leaf=SIMULATIONS_PER_LEAF,
+                    busy_simulations_per_leaf=BUSY_SIMULATIONS_PER_LEAF, busy_gather_spare=float(BUSY_GATHER_SPARE),
+                    help_from=HELP_FROM, help_until=HELP_UNTIL,
+                    smart_pruning=self.smart_pruning,
                     smart_pruning_factor=self.smart_pruning_factor, certainty=self.certainty, rounds_at_once=self.rounds_at_once,
                     speed_rounds=SPEED_ROUNDS, speed_wait_seconds=SPEED_WAIT_SECONDS, round_times_kept=ROUND_TIMES,
                     fall_start_cp=float(FALL_START_CP), fall_full_cp=float(FALL_FULL_CP), max_reported_score=MAX_REPORTED_SCORE,
@@ -366,6 +425,8 @@ class EngineSearch:
     def rounds_on(self, network, run: SearchRun) -> None:
         #launched rounds, oldest first, as (the round's name, the launch or None for a round without leaves, and when it was launched)
         rounds: deque = deque()
+        #whether the thread's helpers join its rounds from their start (helped)
+        helping = False
         last_answers = None
         #the root's numbers after this network's last descend, for run once its lock is held
         seen = None
@@ -396,6 +457,7 @@ class EngineSearch:
                     if run.rounds_out < in_flight and len(rounds) < self.rounds_in_flight and not blocked:
                         name, run.next_round = run.next_round, run.next_round + 1
                         answered = run.rounds_answered
+                        per_leaf = self.simulations_per_leaf(len(rounds), round_times, run.deadline)
                         run.rounds_out += 1
                         run.gathered = True
                     elif not rounds:
@@ -410,11 +472,15 @@ class EngineSearch:
                 lane = network.free_lane() if hasattr(network, "free_lane") else None
                 lean = getattr(lane, "lean", False)
                 boards = np.empty((count, TOKENS_PER_BOARD), dtype=np.uint8) if lane is None else lane.rows_array if lean else lane.boards_array
-                written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), SIMULATIONS_PER_LEAF * count, round=name,
-                                                           root_of=GAME, legal_columns=lean)
+                gathering_since = time.perf_counter()
+                written, seen = self.searches.descend_into(boards, count, min(self.collisions, count), per_leaf * count, round=name,
+                                                           root_of=GAME, legal_columns=lean, alone=0 if helping else SIMULATIONS_PER_LEAF * count)
                 if not written:
                     run.starved = answered
                 launched_at = time.perf_counter()
+                helping = self.helped(helping, launched_at - gathering_since)
+                if per_leaf > SIMULATIONS_PER_LEAF:
+                    self.busy_gathers.append(launched_at - gathering_since)
                 launched = None if not written else network.launch(boards[:written]) if lane is None else network.launch_filled(lane, written)
                 rounds.append((name, launched, launched_at))
                 continue
@@ -469,6 +535,18 @@ class EngineSearch:
         fall = last - score_to_centipawns(sharpen(self.searches.root_score(GAME), 1 / self.value_sharpness))
         share = min(1.0, max(0.0, (fall - FALL_START_CP) / (FALL_FULL_CP - FALL_START_CP)))
         return share * seconds
+
+    #whether a thread's helpers join its next round from the start, after a gather of gather_seconds (HELP_FROM, HELP_UNTIL)
+    def helped(self, helping: bool, gather_seconds: float) -> bool:
+        return gather_seconds > (HELP_UNTIL if helping else HELP_FROM) * self.round_seconds
+
+    #a round's simulations for each of its leaves, on a network with rounds_out of its rounds out: BUSY_SIMULATIONS_PER_LEAF beside one, unless the
+    #deadline is so near that the round must be launched at once to come back in time (round_times: the rounds' times until then, as rounds_on's;
+    #before any such round has been timed, it is taken to gather for a round's time)
+    def simulations_per_leaf(self, rounds_out: int, round_times: int, deadline: float | None) -> int:
+        gather = BUSY_GATHER_SPARE * max(self.busy_gathers, default=self.round_seconds)
+        in_time = deadline is None or time.perf_counter() + gather + round_times * self.round_seconds < deadline
+        return BUSY_SIMULATIONS_PER_LEAF if rounds_out and in_time else SIMULATIONS_PER_LEAF
 
     #the next round's leaves, and the rounds out at once over all the networks (GROW_LEAVES; at least one); visits: the root's, if known
     def round_leaves(self, simulations: int | None, visits: int | None = None) -> tuple[int, int]:

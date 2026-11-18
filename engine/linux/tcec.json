@@ -1,14 +1,27 @@
 [
-  {
-    "name": "Fry",
-    "command": "./engine/linux/engine.sh",
-    "workingDirectory": "chess-transformer",
-    "protocol": "uci",
-    "options": [
-      {"name": "SyzygyPath", "value": "/path/to/syzygy"},
-      {"name": "AdvanceThreads", "value": 0},
-      {"name": "MoveOverhead", "value": 200},
-      {"name": "SearchSettings", "value": "c_puct=1.68,c_puct_factor=2.30,c_puct_base=45669,fpu_reduction=0.571"}
-    ]
-  }
+    {
+        "command": "./fry.sh",
+        "name": "Fry 0.1.0",
+        "restart": "on",
+        "options": [
+            {
+                "name": "SyzygyPath",
+                "value": "/home/syzygy7"
+            },
+            {
+                "name": "AdvanceThreads",
+                "value": "0"
+            },
+            {
+                "name": "MoveOverhead",
+                "value": "1000"
+            },
+            {
+                "name": "SearchSettings",
+                "value": "c_puct=1.68,c_puct_factor=2.30,c_puct_base=45669,fpu_reduction=0.571"
+            }
+        ],
+        "protocol": "uci",
+        "workingDirectory": "/home/tcec/Engines/Fry/"
+    }
 ]

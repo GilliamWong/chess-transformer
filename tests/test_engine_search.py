@@ -453,6 +453,17 @@ def test_threads_are_pinned_by_default_on_several_networks():
     assert EngineSearch(one, 16).network_cpus == EngineSearch(three, 16, pin_threads=False).network_cpus == []
     assert EngineSearch(one, 16, pin_threads=True).network_cpus == engine_search.thread_cpus(1)
 
+#the gui's limit for a start is nearer than the few nodes a second the compiler might add; elsewhere it stays
+@pytest.mark.parametrize("capability, compiled", [((8, 0), False), ((12, 0), True), ((8, 9), True)])
+def test_torchs_compiler_is_left_out_on_an_a100(monkeypatch, capability, compiled):
+    model = torch.nn.Linear(4, 4)
+    model.d_model = 768
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *device: capability)
+    monkeypatch.setattr(engine_search, "ExactSizeCompiled", lambda model, size: ("compiled", model))
+    monkeypatch.setattr(engine_search, "GraphedBatches", lambda model, *rest: model)
+
+    assert engine_search.network_graphs(model, 64) == (("compiled", model) if compiled else model)
+
 @pytest.mark.parametrize("capability, lean", [((12, 0), True), ((8, 0), True), ((8, 6), False), ((9, 0), False)])
 def test_lean_lanes_by_capability(monkeypatch, capability, lean):
     monkeypatch.setattr(engine_search.torch.cuda, "get_device_capability", lambda device=None: capability)
@@ -644,9 +655,9 @@ class SlowNetwork:
         return self.network.collect(answers)
 
 #the simulations past the search's that a search on several networks may end at: one a thread after the first in concurrent
-#descents (a check and a leaf are not one step, SharedTree::gather)
+#descents (a check and a leaf are not one step, SharedTree::gather), the networks' helpers among the threads
 def overrun(concurrent_descents: bool | None, networks: int = 3) -> int:
-    return 0 if concurrent_descents is False else networks - 1
+    return 0 if concurrent_descents is False else networks * (1 + engine_search.HELPERS_A_NETWORK) - 1
 
 @pytest.mark.parametrize("concurrent_descents", [False, None])
 def test_a_search_on_several_networks_keeps_them_all_busy(concurrent_descents):
@@ -660,7 +671,7 @@ def test_a_search_on_several_networks_keeps_them_all_busy(concurrent_descents):
 
 class RoundsRecorded:
     def __init__(self, searches):
-        self.searches, self.rounds = searches, []
+        self.searches, self.rounds, self.simulations, self.alone = searches, [], [], []
 
     def __getattr__(self, name):
         return getattr(self.searches, name)
@@ -668,6 +679,8 @@ class RoundsRecorded:
     def descend_into(self, boards, leaves, collisions, *arguments, **keywords):
         written, root = self.searches.descend_into(boards, leaves, collisions, *arguments, **keywords)
         self.rounds.append((leaves, collisions, written))
+        self.simulations.append(arguments[0])
+        self.alone.append(keywords.get("alone"))
         return written, root
 
 @pytest.mark.parametrize("concurrent_descents", [False, None])
@@ -679,6 +692,40 @@ def test_a_network_without_leaves_waits_for_the_others(concurrent_descents):
     written = [leaves_written for _, _, leaves_written in recorded.rounds]
     empty = written.count(0)
     assert empty < len(written) - empty, (empty, len(written) - empty)
+
+def test_a_round_beside_a_round_out_takes_more_simulations_for_its_leaves():
+    busy, alone = engine_search.BUSY_SIMULATIONS_PER_LEAF, engine_search.SIMULATIONS_PER_LEAF
+    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, grow_leaves=0)
+    search.searches = recorded = RoundsRecorded(search.searches)
+    search.search(chess.Board(), simulations=2000)
+    #the first round has none out, every later one is gathered beside the one before it
+    assert recorded.simulations[0] == alone * 16 and set(recorded.simulations[1:]) == {busy * 16}
+
+    #rounds that grow with the search go out one at a time
+    growing = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False)
+    growing.searches = recorded = RoundsRecorded(growing.searches)
+    growing.search(chess.Board(), simulations=200)
+    assert all(simulations == alone * leaves for (leaves, _, _), simulations in zip(recorded.rounds, recorded.simulations) if leaves < 16)
+
+def test_a_round_near_the_deadline_is_launched_as_soon_as_one_with_none_out():
+    busy, alone = engine_search.BUSY_SIMULATIONS_PER_LEAF, engine_search.SIMULATIONS_PER_LEAF
+    search = EngineSearch(cpu_batches(BoardModel()), 16)
+    search.round_seconds = 0.01
+    now = time.perf_counter()
+    assert search.simulations_per_leaf(1, 1, None) == busy and search.simulations_per_leaf(0, 1, None) == alone
+    #a round gathered now is back a round's time after its gather, taken as twice a round's time while none has been timed
+    assert search.simulations_per_leaf(1, 1, now + 1.0) == busy and search.simulations_per_leaf(1, 1, now + 0.025) == alone
+    #and then as twice the longest of the last ones
+    search.busy_gathers.extend([0.001, 0.1, 0.002])
+    assert search.simulations_per_leaf(1, 1, now + 1.0) == busy and search.simulations_per_leaf(1, 1, now + 0.15) == alone
+
+def test_rounds_fill_where_most_simulations_need_no_network():
+    #the mate's node takes most visits and none of them needs the network
+    search = EngineSearch(cpu_batches(UniformModel()), 16, smart_pruning=False, grow_leaves=0)
+    search.searches = recorded = RoundsRecorded(search.searches)
+    search.search(chess.Board(MATE_IN_ONE), simulations=20_000)
+    written = [leaves_written for _, _, leaves_written in recorded.rounds[1:-1]]
+    assert sum(written) / len(written) > 12, sum(written) / len(written)
 
 def test_one_network_in_a_list_is_the_search_on_it(carlsen_games):
     board = carlsen_position(carlsen_games, 1, 10)
@@ -693,11 +740,14 @@ def test_a_search_on_several_networks_keeps_to_its_deadline_and_pruning():
     started = time.perf_counter()
     timed = search.search(chess.Board(), seconds=0.3)
     seconds = time.perf_counter() - started
-    mate = EngineSearch(SlowNetworks(3, 0.003, UniformModel()).networks, 16).search(chess.Board(MATE_IN_ONE), simulations=4000)
+    mate = EngineSearch(SlowNetworks(3, 0.003, UniformModel()).networks, 16).search(chess.Board(MATE_IN_ONE), simulations=40_000)
     (best, most), (_, second) = mate.root_moves[:2]
 
     assert timed.simulations > 300 and seconds < 0.3 + 0.1
-    assert best.uci() == "e1e8" and mate.simulations < 2200 and most - second > 4000 - mate.simulations
+    #the mate's visits need no network, so a round beside another takes all its simulations: the networks' rounds under way when the lead is
+    #past half the search bring up to that many each
+    overrun = 4 * 16 * engine_search.BUSY_SIMULATIONS_PER_LEAF
+    assert best.uci() == "e1e8" and mate.simulations < 20_000 + overrun and most - second > 40_000 - mate.simulations
 
 def test_a_failing_network_ends_the_search_with_its_error():
     search = EngineSearch(SlowNetworks(3, 0.003, BoardModel(), failing_collect=5).networks, 16, smart_pruning=False)
@@ -988,7 +1038,9 @@ def test_a_falling_score_runs_the_search_on():
 def test_a_decided_search_stops_early():
     mate = EngineSearch(cpu_batches(UniformModel()), 16).search(chess.Board(MATE_IN_ONE), simulations=4000)
     (best, most), (_, second) = mate.root_moves[:2]
-    assert best.uci() == "e1e8" and mate.simulations < 2200 and most - second > 4000 - mate.simulations
+    #the mate's visits need no network: the round under way when the lead is past half the search takes all its simulations
+    overrun = 16 * engine_search.BUSY_SIMULATIONS_PER_LEAF
+    assert best.uci() == "e1e8" and mate.simulations < 2000 + overrun and most - second > 4000 - mate.simulations
 
     start = EngineSearch(cpu_batches(UniformModel()), 16).search(chess.Board(), simulations=400)
     assert start.simulations == 400
@@ -1025,7 +1077,7 @@ class ScriptedSearches:
     def start(self, game, fen, moves, simulations, seconds=None):
         pass
 
-    def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None, legal_columns=False):
+    def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None, legal_columns=False, alone=None):
         boards[:count] = 0
         return count, self.root
 
@@ -2066,3 +2118,92 @@ def test_transpositions_on_several_networks():
     board = chess.Board(FREE_QUEEN)
     report = search.search(board, simulations=3000)
     assert 3000 <= report.simulations < 3000 + 3 * 16 * 3 and report.line[0] in board.legal_moves
+
+#topologies as test_the_threads_cpus'
+def test_the_helpers_cpus_follow_the_networks():
+    windows = ([(96 << 20, list(range(16))), (32 << 20, list(range(16, 32)))], [[cpu, cpu + 1] for cpu in range(0, 32, 2)])
+    assert engine_search.helped_cpus(2, 2, windows) == ([0, 2], [4, 6]) and engine_search.helped_cpus(8, 8, windows) == ([*range(0, 16, 2)], [*range(16, 32, 2)])
+    assert engine_search.helped_cpus(3, 0, windows) == ([0, 2, 4], [])
+    #a physical core each: as many helpers as the networks leave cores; no topology: no cpus for either
+    assert engine_search.helped_cpus(8, 30, windows) == ([*range(0, 16, 2)], [*range(16, 32, 2)])
+    assert engine_search.helped_cpus(16, 3, windows) == ([*range(0, 32, 2)], []) and engine_search.helped_cpus(2, 2, ([], [])) == ([], None)
+
+def test_the_searchs_threads_share_one_socket():
+    #two sockets of 16 cores, a core its own L3, cpu c and c + 32 a core's two
+    cores = [[core, core + 32] for core in range(32)]
+    tcec = ([(32 << 20, core) for core in cores], cores)
+    sockets = [[*range(16), *range(32, 48)], [*range(16, 32), *range(48, 64)]]
+    assert engine_search.helped_cpus(8, 24, tcec, sockets) == ([*range(8)], [*range(8, 16)])
+    #of equal sockets the first
+    assert engine_search.helped_cpus(8, 24, tcec, sockets[::-1]) == ([*range(16, 24)], [*range(24, 32)])
+    #the socket with more of the cores the process may use
+    assert engine_search.helped_cpus(2, 4, (tcec[0][12:], cores[12:]), [[*range(12, 16)], [*range(16, 32)]]) == ([16, 17], [18, 19, 20, 21])
+    #sockets unknown, one socket, or more networks than a socket has cores: every core
+    for unknown in ([], [sockets[0] + sockets[1]]):
+        assert engine_search.helped_cpus(8, 24, tcec, unknown) == ([*range(8)], [*range(8, 32)])
+    assert engine_search.helped_cpus(20, 24, tcec, sockets) == ([*range(20)], [*range(20, 32)])
+    #sockets whose cpus are numbered in turn
+    turns = [[core, core + 8] for core in range(8)]
+    assert engine_search.helped_cpus(2, 6, ([(32 << 20, core) for core in turns], turns), [[0, 2, 4, 6, 8, 10, 12, 14], [1, 3, 5, 7, 9, 11, 13, 15]]) == ([0, 2], [4, 6])
+
+def test_helpers_need_concurrent_descents():
+    with pytest.raises(ValueError, match="concurrent descents"):
+        EngineSearch(cpu_batches(BoardModel()), 16, descent_helpers=2)
+    with pytest.raises(ValueError, match="concurrent descents"):
+        selfplay_rs.Searches(**rust_search_settings(False), gather_helpers=1)
+    assert EngineSearch(cpu_batches(BoardModel()), 16).descent_helpers == 0
+
+def test_several_networks_have_helpers_as_far_as_the_cores_go():
+    three = [cpu_batches(BoardModel()) for _ in range(3)]
+    cores = len(selfplay_rs.cpu_topology()[1])
+    assert EngineSearch(three, 16).descent_helpers == max(0, min(3 * engine_search.HELPERS_A_NETWORK, cores - 3))
+    assert EngineSearch(three, 16, pin_threads=False).descent_helpers == 3 * engine_search.HELPERS_A_NETWORK
+    assert EngineSearch(three, 16, concurrent_descents=False).descent_helpers == 0 and EngineSearch(three, 16, descent_helpers=0).descent_helpers == 0
+
+@pytest.mark.parametrize("networks, pin_threads", [(1, False), (3, False), (2, True)])
+def test_helpers_join_the_rounds_short_of_leaves(networks, pin_threads):
+    #the mate's node takes most visits and none of them needs the network: every round beside another is short of leaves
+    group = SlowNetworks(networks, 0.002, UniformModel())
+    search = EngineSearch(group.networks, 16, smart_pruning=False, grow_leaves=0, concurrent_descents=True, pin_threads=pin_threads, descent_helpers=2 * networks)
+    report = search.search(chess.Board(MATE_IN_ONE), simulations=30_000)
+    joined, found = search.searches.helper_counts()
+
+    #a helper's descent under way when the search has its simulations adds one, as a network's
+    assert 30_000 <= report.simulations <= 30_000 + 3 * networks and report.line[0].uci() == "e1e8"
+    assert search.descent_helpers == 2 * networks and joined > 0 and found > 0
+    assert (len(search.network_cpus), search.network_cpus[:1]) == ((networks, engine_search.thread_cpus(3 * networks)[:1]) if pin_threads else (0, []))
+
+@gpu
+def test_helpers_join_the_rust_rounds():
+    search = EngineSearch(lean_network(True), 16, rust_rounds=True, concurrent_descents=True, smart_pruning=False, grow_leaves=0, descent_helpers=2)
+    report = search.search(chess.Board(MATE_IN_ONE), simulations=30_000)
+    assert 30_000 <= report.simulations <= 30_000 + 3 and search.searches.helper_counts()[0] > 0
+
+@pytest.mark.parametrize("concurrent_descents", [False, True])
+def test_the_caches_answers_are_counted(concurrent_descents):
+    board = chess.Board()
+    search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, concurrent_descents=concurrent_descents)
+    search.search(board, simulations=600)
+    first = search.searches.cache_hits()
+    #a tree made again finds its positions in the cache
+    search.searches.start(1, board.fen(), [], 300, None)
+    search.searches.descend_into(np.empty((16, TOKENS_PER_BOARD), dtype=np.uint8), 16, 16, 300)
+    assert 0 < first < first + 200 < search.searches.cache_hits()
+    assert EngineSearch(cpu_batches(BoardModel()), 16, cache_positions=0, concurrent_descents=concurrent_descents).searches.cache_hits() == 0
+
+def test_helpers_join_from_a_rounds_start_while_the_gathers_are_long(monkeypatch):
+    search = EngineSearch(cpu_batches(BoardModel()), 16)
+    search.round_seconds = 0.004
+    #from a gather of a quarter of a round's time, until one of under a tenth
+    assert [search.helped(False, seconds) for seconds in (0.0009, 0.0011)] == [False, True]
+    assert [search.helped(True, seconds) for seconds in (0.0005, 0.0003)] == [True, False]
+
+    def alone_of(share: float) -> set:
+        monkeypatch.setattr(engine_search, "HELP_FROM", share)
+        monkeypatch.setattr(engine_search, "HELP_UNTIL", share)
+        search = EngineSearch(cpu_batches(BoardModel()), 16, smart_pruning=False, grow_leaves=0)
+        search.searches = recorded = RoundsRecorded(search.searches)
+        search.search(chess.Board(), simulations=600)
+        return set(recorded.alone[1:])
+    #gathers that take no time at all against a round's: every round starts alone; any gather counted as long: none does
+    assert alone_of(1e9) == {3 * 16} and alone_of(-1.0) == {0}

@@ -192,6 +192,10 @@ pub(crate) struct LoopSettings {
     grow_leaves: u32,
     collisions: u32,
     simulations_per_leaf: u32,
+    busy_simulations_per_leaf: u32,
+    busy_gather_spare: f64,
+    help_from: f64,
+    help_until: f64,
     smart_pruning: bool,
     smart_pruning_factor: f64,
     certainty: bool,
@@ -224,6 +228,8 @@ struct Run {
     root: RootNumbers,
     round_times: VecDeque<f64>,
     round_seconds: f64,
+    //how long the search's last rounds gathered beside a round out took to gather (engine_search.py's busy_gathers)
+    busy_gathers: VecDeque<f64>,
     error: Option<PyErr>,
     running: usize,
     batches: u64,
@@ -343,6 +349,8 @@ impl Rounds<'_> {
         let mut rounds: VecDeque<Launched> = VecDeque::new();
         let mut last_answers: Option<f64> = None;
         let mut seen: Option<RootNumbers> = None;
+        //whether the thread's helpers join its rounds from their start (engine_search.py's helped)
+        let mut helping = false;
         let room = network.room();
         loop {
             let mut gathering = None;
@@ -371,7 +379,14 @@ impl Rounds<'_> {
                     let (count, in_flight) = self.round_leaves(run.simulations, run.root.0);
                     let blocked = run.starved == Some(run.rounds_answered) && run.rounds_out > rounds.len();
                     if run.rounds_out < in_flight && rounds.len() < settings.rounds_in_flight && !blocked {
-                        gathering = Some((run.next_round, count, run.rounds_answered));
+                        //beside a round out the gpu is busy either way: the round looks on for its leaves, unless the deadline is so
+                        //near that it must be launched at once to come back in time (engine_search.py's simulations_per_leaf)
+                        let gather = settings.busy_gather_spare * run.busy_gathers.iter().copied().reduce(f64::max).unwrap_or(run.round_seconds);
+                        let in_time =
+                            run.deadline.is_none_or(|deadline| shared.now() + gather + round_times * run.round_seconds < deadline);
+                        let per_leaf =
+                            if !rounds.is_empty() && in_time { settings.busy_simulations_per_leaf } else { settings.simulations_per_leaf };
+                        gathering = Some((run.next_round, count, per_leaf, run.rounds_answered));
                         run.next_round += 1;
                         run.rounds_out += 1;
                         run.gathered = true;
@@ -386,25 +401,38 @@ impl Rounds<'_> {
                     return Ok(());
                 }
             }
-            if let Some((name, count, answered)) = gathering {
+            if let Some((name, count, per_leaf, answered)) = gathering {
                 if count as usize > room {
                     return Err(PyValueError::new_err(format!("rounds of {count} leaves, past the lanes' {room}")));
                 }
                 let lane = network.free_lane()?;
+                let gathering_since = shared.now();
                 let (written, root) = self.searches.descend_rows(
                     network.lanes[lane].rows_host,
                     room,
                     count,
                     settings.collisions.min(count),
-                    settings.simulations_per_leaf * count,
+                    per_leaf * count,
+                    if helping { 0 } else { settings.simulations_per_leaf * count },
                     name,
                     settings.game,
                 )?;
                 seen = root;
-                if written == 0 {
-                    shared.lock()?.starved = Some(answered);
-                }
                 let launched_at = shared.now();
+                {
+                    let mut run = shared.lock()?;
+                    let share = if helping { settings.help_until } else { settings.help_from };
+                    helping = launched_at - gathering_since > share * run.round_seconds;
+                    if written == 0 {
+                        run.starved = Some(answered);
+                    }
+                    if per_leaf > settings.simulations_per_leaf {
+                        run.busy_gathers.push_back(launched_at - gathering_since);
+                        while run.busy_gathers.len() > settings.round_times_kept {
+                            run.busy_gathers.pop_front();
+                        }
+                    }
+                }
                 let launched = if written > 0 { Some((lane, network.launch(calls, lane, written)?)) } else { None };
                 rounds.push_back((name, launched, written, launched_at));
                 continue;
@@ -607,6 +635,7 @@ pub(crate) fn start_loop(
             root,
             round_times,
             round_seconds,
+            busy_gathers: VecDeque::new(),
             error: None,
             running: built.len(),
             batches: 0,

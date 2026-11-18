@@ -55,6 +55,10 @@ impl SharedCache {
         self.shard(key).insert(key, priors, value);
     }
 
+    pub fn hits(&self) -> u64 {
+        self.shards.iter().map(|shard| shard.lock().expect("a cache shard").hits()).sum()
+    }
+
     pub fn clear(&self) {
         for shard in &self.shards {
             shard.lock().expect("a cache shard").clear();

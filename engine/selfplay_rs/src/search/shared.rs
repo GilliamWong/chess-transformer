@@ -111,12 +111,29 @@ enum Arrival {
     CatchUp,
 }
 
-struct Call {
+struct Call<'a> {
     simulations: u32,
     collisions: usize,
     //the nodes of every collision's path, which are in flight until the call ends
     collided: Vec<usize>,
     leaves: Vec<PendingLeaf>,
+    //for the call that began a round others may help gather: once it has made that many simulations, it calls for them
+    help: Option<(u32, &'a dyn Fn())>,
+}
+
+//what the calls that gather one round together count in all: the round's leaves and simulations are theirs together, and the others
+//stop once the call that began the round has ended it
+#[derive(Default)]
+pub struct Together {
+    leaves: AtomicU32,
+    simulations: AtomicU32,
+    ended: AtomicBool,
+}
+
+impl Together {
+    pub fn end(&self) {
+        self.ended.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Default)]
@@ -1027,10 +1044,27 @@ impl SharedTree {
         cache: Option<&SharedCache>,
         boards: &mut Vec<u8>,
     ) -> Vec<PendingLeaf> {
+        self.gather_together(round, &Together::default(), None, settings, tables, cache, boards)
+    }
+
+    //gather as one of the calls that gather a round together, each into boards of its own; the caller queues all their leaves under
+    //the round, in the order of their boards. help: for the call that began the round, (simulations, call): once it has made that
+    //many itself with the round still short of leaves it calls for the others, and it ends the round (Together::end) when it returns
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_together(
+        &self,
+        round: &Round,
+        together: &Together,
+        help: Option<(u32, &dyn Fn())>,
+        settings: &SearchSettings,
+        tables: Option<&Tables>,
+        cache: Option<&SharedCache>,
+        boards: &mut Vec<u8>,
+    ) -> Vec<PendingLeaf> {
         let mut hold = self.hold();
         let leaves = Vec::with_capacity(LEAVES_AT_ONCE.min(round.leaves as usize));
-        let mut call = Call { simulations: 0, collisions: 0, collided: Vec::new(), leaves };
-        self.gather_in(&mut hold, round, settings, tables, cache, boards, &mut call);
+        let mut call = Call { simulations: 0, collisions: 0, collided: Vec::new(), leaves, help };
+        self.gather_in(&mut hold, round, together, settings, tables, cache, boards, &mut call);
         self.take_off(&call.collided);
         call.leaves
     }
@@ -1040,6 +1074,7 @@ impl SharedTree {
         &'a self,
         hold: &mut Hold<'a>,
         round: &Round,
+        together: &Together,
         settings: &SearchSettings,
         tables: Option<&Tables>,
         cache: Option<&SharedCache>,
@@ -1060,8 +1095,17 @@ impl SharedTree {
             //after: a leaf taken in a closed tree belongs to a search that is gone
             hold.give_way();
             self.solidify_queued(hold);
-            if !(call.leaves.len() < round.leaves as usize && call.simulations < round.simulations && self.has_room(round.visit_limit)) {
+            let short = together.leaves.load(Ordering::Acquire) < round.leaves
+                && together.simulations.load(Ordering::Acquire) < round.simulations
+                && !together.ended.load(Ordering::Acquire);
+            if !(short && self.has_room(round.visit_limit)) {
                 break;
+            }
+            if let Some((alone, call_for_help)) = call.help
+                && call.simulations >= alone
+            {
+                call.help = None;
+                call_for_help();
             }
             let reserved = free_descents == 0;
             if reserved {
@@ -1086,6 +1130,7 @@ impl SharedTree {
                 Arrival::Proven(proof) => {
                     give_back();
                     call.simulations += 1;
+                    together.simulations.fetch_add(1, Ordering::AcqRel);
                     self.back_up(&path, &edges, 1.0 - proof.value);
                     //with transpositions this parent may not have met the proof, made on another path
                     if self.graph.is_some() && settings.certainty && self.proves_parent(&path) {
@@ -1098,6 +1143,7 @@ impl SharedTree {
                 Arrival::Repeat | Arrival::CatchUp => {
                     give_back();
                     call.simulations += 1;
+                    together.simulations.fetch_add(1, Ordering::AcqRel);
                     let shared = self.nodes.get(path.pop().expect("the shared node"));
                     //a mean read while other threads back up through the node may be off by their values: kept a score
                     let value = match arrival {
@@ -1130,6 +1176,7 @@ impl SharedTree {
             //with transpositions a leaf is no repeat inside the search (Tree::gather's)
             let value = game_over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
             call.simulations += 1;
+            together.simulations.fetch_add(1, Ordering::AcqRel);
             if let Some(value) = value {
                 give_back();
                 match game_over {
@@ -1178,6 +1225,13 @@ impl SharedTree {
                     self.back_up(&path, &edges, f64::from(value));
                 }
                 None => {
+                    //the round's last leaf may have gone to another of its calls meanwhile: this one is left for a later round
+                    if together.leaves.fetch_add(1, Ordering::AcqRel) >= round.leaves {
+                        together.leaves.fetch_sub(1, Ordering::AcqRel);
+                        self.take_off(&path);
+                        give_back();
+                        break;
+                    }
                     encode_board(&board, boards);
                     self.waiting.fetch_add(1, Ordering::AcqRel);
                     call.leaves.push(PendingLeaf { path: path.clone(), edges: edges.clone(), key: leaf_key, moves, turn: board.turn() });

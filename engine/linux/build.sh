@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+#before the environment is made: where its python is installed is among them
+source engine/linux/caches.sh
 
 WEIGHTS=weights/fry-final-117.pt
 WEIGHTS_URL=https://github.com/GilliamWong/chess-transformer/releases/download/fry-final-117/fry-final-117.pt
@@ -45,7 +47,6 @@ fi
 #a start reads the network's int8 weights and its compiled code (caches.sh), and makes what is missing first: about a minute on one gpu.
 #With a gpu the build makes both; without one (an image's build) it downloads the ones made for this code
 PREPARED_URL=${PREPARED_URL:-https://github.com/GilliamWong/chess-transformer/releases/download/start-up-caches}
-source engine/linux/caches.sh
 
 #named by what the compiled code depends on besides the gpu: the code, the locked packages, the torch build and the caches' folders,
 #which their entries name
@@ -71,7 +72,8 @@ elif nvidia-smi >/dev/null 2>&1; then
     if [ -n "${PACK_CACHES:-}" ]; then
         int8=$(.venv/bin/python -m engine.quantization "$WEIGHTS" --path)
         compiled=$(compiled_name)
-        mkdir -p "$PACK_CACHES"
+        #a gpu whose network is not compiled leaves torch's compiler no folder
+        mkdir -p "$PACK_CACHES" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
         cp "$int8" "$PACK_CACHES/"
         tar -czf "$PACK_CACHES/$compiled" -C / "${TRITON_CACHE_DIR#/}" "${TORCHINDUCTOR_CACHE_DIR#/}"
     fi

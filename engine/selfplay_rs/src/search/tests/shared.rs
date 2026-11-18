@@ -1,5 +1,7 @@
 use super::*;
-use crate::search::shared::{SharedCache, SharedTree};
+use crate::search::shared::{SharedCache, SharedTree, Together};
+use std::cell::Cell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant};
@@ -1652,4 +1654,62 @@ fn starting_on_a_reused_300k_node_tree_takes_under_20_ms() {
     tree.drain();
     check_drained(&tree);
     assert!(tree.counts.reclaimed.load(Ordering::Relaxed) > 0);
+}
+
+//the calls of a round take its leaves between them: the round's number in all and no leaf twice, their boards in their leaves' order
+#[test]
+fn calls_that_gather_a_round_together_take_its_leaves_between_them() {
+    let network = SharedNetwork::new();
+    crate::search::shared::JITTER.store(true, Ordering::Relaxed);
+    for transpositions in [false, true] {
+        let settings = SearchSettings { transpositions, ..settings(true) };
+        let tree = shared_tree_after(START, OPENING).with_transpositions(transpositions);
+        shared_in_flight(&tree, 3_000, 2, &settings, None, &network, usize::MAX);
+        let mut full = 0;
+        for id in 1_000..1_020 {
+            //collisions enough for each call to go on until the round is full
+            let round = Round { id, leaves: 48, simulations: 100_000, collisions: 10_000, visit_limit: u32::MAX, memory_limit: usize::MAX };
+            let together = Together::default();
+            let gather = || {
+                let mut boards = Vec::new();
+                let leaves = tree.gather_together(&round, &together, None, &settings, None, Some(&network.cache), &mut boards);
+                (leaves, boards)
+            };
+            let calls: Vec<_> = std::thread::scope(|scope| {
+                let calls: Vec<_> = (0..4).map(|_| scope.spawn(gather)).collect();
+                calls.into_iter().map(|call| call.join().expect("a thread")).collect()
+            });
+            let (mut leaves, mut boards) = (Vec::new(), Vec::new());
+            for (call_leaves, call_boards) in calls {
+                leaves.extend(call_leaves);
+                boards.extend(call_boards);
+            }
+            let nodes: HashSet<usize> = leaves.iter().map(|leaf| *leaf.path.last().expect("the leaf's node")).collect();
+            assert!(leaves.len() <= 48 && nodes.len() == leaves.len(), "{} leaves on {} nodes", leaves.len(), nodes.len());
+            assert_eq!((boards.len(), tree.pending()), (leaves.len() * TOKENS_PER_BOARD, leaves.len()));
+            full += usize::from(leaves.len() == 48);
+            tree.queue(id, leaves);
+            finish_round(&tree, id, &boards, &settings, &network);
+        }
+        assert!(full >= 15, "{full} of 20 rounds had all their leaves");
+        assert_eq!(tree.pending(), 0);
+        check_after_search(&tree, transpositions, true, &settings);
+    }
+}
+
+#[test]
+fn a_call_asks_for_help_once_it_has_made_its_simulations_alone() {
+    let (settings, network) = (settings(true), SharedNetwork::new());
+    let round = Round { id: 0, leaves: 8, simulations: 120, collisions: 8, visit_limit: u32::MAX, memory_limit: usize::MAX };
+    let asked = Cell::new(0);
+    let ask = || asked.set(asked.get() + 1);
+    let gathered = |tree: &SharedTree, cache: Option<&SharedCache>| {
+        tree.gather_together(&round, &Together::default(), Some((40, &ask)), &settings, None, cache, &mut Vec::new()).len()
+    };
+    //a fresh tree's root is its one leaf: the call ends on its collisions, short of the simulations it makes alone
+    assert_eq!((gathered(&shared_tree_after(START, &[]), None), asked.get()), (1, 0));
+    //every answer of a tree searched before is in the cache: no leaf, and the call goes on past them
+    shared_in_flight(&shared_tree_after(START, &[]), 20_000, 1, &settings, None, &network, usize::MAX);
+    let again = shared_tree_after(START, &[]);
+    assert_eq!((gathered(&again, Some(&network.cache)), asked.get(), again.root().visits()), (0, 1, 120));
 }

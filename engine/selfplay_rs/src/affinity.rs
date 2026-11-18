@@ -20,6 +20,11 @@ pub fn topology() -> Option<Topology> {
     grouped(os::groups()?, allowed())
 }
 
+//each socket's cpus among those this process may run on, in the sockets' order; None where the os does not say
+pub fn sockets() -> Option<Vec<Vec<usize>>> {
+    os::sockets()
+}
+
 fn grouped(Topology { l3s, cores }: Topology, allowed: &[usize]) -> Option<Topology> {
     let kept = |mut cpus: Vec<usize>| {
         cpus.retain(|cpu| allowed.contains(cpu));
@@ -80,10 +85,28 @@ mod sysfs {
         }
         Some(Topology { l3s, cores })
     }
+
+    pub fn sockets(folder: &Path, cpus: &[usize]) -> Option<Vec<Vec<usize>>> {
+        let mut sockets: Vec<(usize, Vec<usize>)> = Vec::new();
+        for &cpu in cpus {
+            let package = std::fs::read_to_string(folder.join(format!("cpu{cpu}/topology/physical_package_id"))).ok()?;
+            let package = package.trim().parse::<usize>().ok()?;
+            match sockets.iter_mut().find(|(id, _)| *id == package) {
+                Some((_, cpus)) => cpus.push(cpu),
+                None => sockets.push((package, vec![cpu])),
+            }
+        }
+        sockets.sort_by_key(|&(id, _)| id);
+        Some(sockets.into_iter().map(|(_, cpus)| cpus).collect())
+    }
 }
 
 #[cfg(windows)]
 mod os {
+    pub fn sockets() -> Option<Vec<Vec<usize>>> {
+        None
+    }
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetLogicalProcessorInformationEx(relationship: u32, buffer: *mut u8, length: *mut u32) -> i32;
@@ -139,11 +162,19 @@ mod os {
     pub fn groups() -> Option<super::Topology> {
         super::sysfs::groups(std::path::Path::new("/sys/devices/system/cpu"), super::allowed())
     }
+
+    pub fn sockets() -> Option<Vec<Vec<usize>>> {
+        super::sysfs::sockets(std::path::Path::new("/sys/devices/system/cpu"), super::allowed())
+    }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod os {
     pub fn groups() -> Option<super::Topology> {
+        None
+    }
+
+    pub fn sockets() -> Option<Vec<Vec<usize>>> {
         None
     }
 }
@@ -195,6 +226,22 @@ mod tests {
                 std::fs::write(cache.join(name), format!("{text}\n")).expect("the fake sysfs");
             }
         }
+    }
+
+    #[test]
+    fn sysfs_gives_the_sockets() {
+        let root = std::env::temp_dir().join(format!("selfplay_rs_sockets_{}", std::process::id()));
+        for cpu in 0..8 {
+            let folder = root.join(format!("cpu{cpu}/topology"));
+            std::fs::create_dir_all(&folder).expect("the fake sysfs");
+            //numbered as some machines do: the sockets' cpus in turn
+            std::fs::write(folder.join("physical_package_id"), format!("{}\n", cpu % 2)).expect("the fake sysfs");
+        }
+        let all: Vec<usize> = (0..8).collect();
+        assert_eq!(sysfs::sockets(&root, &all), Some(vec![vec![0, 2, 4, 6], vec![1, 3, 5, 7]]));
+        assert_eq!(sysfs::sockets(&root, &[3, 4, 5]), Some(vec![vec![4], vec![3, 5]]));
+        assert_eq!(sysfs::sockets(&root, &[7, 8]), None);
+        std::fs::remove_dir_all(&root).expect("the fake sysfs");
     }
 
     #[test]

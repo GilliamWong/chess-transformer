@@ -22,8 +22,13 @@ Int8Weights = dict[int, dict[str, tuple[torch.Tensor, torch.Tensor]]]
 
 CARLSEN_PGN = Path(__file__).resolve().parent / "Carlsen.pgn"
 
+#the environment variable that names the cache's folder, for a build that keeps what a start reads beside the code (engine/linux/caches.sh)
+CACHE_VARIABLE = "CHESS_TRANSFORMER_INT8_CACHE"
+
 #not the checkpoint's folder: that may be read-only; None without a home folder
 def cache_folder() -> Path | None:
+    if os.environ.get(CACHE_VARIABLE):
+        return Path(os.environ[CACHE_VARIABLE])
     try:
         return Path.home() / ".cache" / "chess_transformer" / "int8"
     except RuntimeError:
