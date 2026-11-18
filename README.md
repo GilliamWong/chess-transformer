@@ -1,5 +1,9 @@
 # Fry
 
+<img src="assets/logo.webp" alt="Fry logo" width="300">
+
+credit to kan from TCEC for our logo. Many thanks!
+
 ## Description
 
 Fry is a chess engine built on a transformer network: a 28-layer model trained on positions labelled by Stockfish and
