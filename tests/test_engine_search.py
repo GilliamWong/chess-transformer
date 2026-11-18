@@ -453,6 +453,17 @@ def test_threads_are_pinned_by_default_on_several_networks():
     assert EngineSearch(one, 16).network_cpus == EngineSearch(three, 16, pin_threads=False).network_cpus == []
     assert EngineSearch(one, 16, pin_threads=True).network_cpus == engine_search.thread_cpus(1)
 
+#the gui's limit for a start is nearer than the few nodes a second the compiler might add; elsewhere it stays
+@pytest.mark.parametrize("capability, compiled", [((8, 0), False), ((12, 0), True), ((8, 9), True)])
+def test_torchs_compiler_is_left_out_on_an_a100(monkeypatch, capability, compiled):
+    model = torch.nn.Linear(4, 4)
+    model.d_model = 768
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *device: capability)
+    monkeypatch.setattr(engine_search, "ExactSizeCompiled", lambda model, size: ("compiled", model))
+    monkeypatch.setattr(engine_search, "GraphedBatches", lambda model, *rest: model)
+
+    assert engine_search.network_graphs(model, 64) == (("compiled", model) if compiled else model)
+
 @pytest.mark.parametrize("capability, lean", [((12, 0), True), ((8, 0), True), ((8, 6), False), ((9, 0), False)])
 def test_lean_lanes_by_capability(monkeypatch, capability, lean):
     monkeypatch.setattr(engine_search.torch.cuda, "get_device_capability", lambda device=None: capability)

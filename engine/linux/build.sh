@@ -72,7 +72,8 @@ elif nvidia-smi >/dev/null 2>&1; then
     if [ -n "${PACK_CACHES:-}" ]; then
         int8=$(.venv/bin/python -m engine.quantization "$WEIGHTS" --path)
         compiled=$(compiled_name)
-        mkdir -p "$PACK_CACHES"
+        #a gpu whose network is not compiled leaves torch's compiler no folder
+        mkdir -p "$PACK_CACHES" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
         cp "$int8" "$PACK_CACHES/"
         tar -czf "$PACK_CACHES/$compiled" -C / "${TRITON_CACHE_DIR#/}" "${TORCHINDUCTOR_CACHE_DIR#/}"
     fi

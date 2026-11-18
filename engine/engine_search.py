@@ -154,6 +154,10 @@ def helped_cpus(networks: int, helpers: int, topology: tuple | None = None, sock
 
 
 LEAN_CAPABILITIES = {(8, 0), (12, 0)}
+#the gpus whose networks torch's compiler is not used on. On two A100s the search ran 43.9k nodes a second without it and 44.1k with it,
+#and it cost every start 12 s, or 36 s where its cache held nothing: the CCC starts the engine in a new container each time, and its 52 s
+#stood against the 60 s that gui gives a start
+UNCOMPILED_CAPABILITIES = {(8, 0)}
 #the gpus where one network's rounds also run in Searches' own loop: the python loop's cost a round shows in their short rounds
 ALONE_IN_RUST_CAPABILITIES = {(8, 0)}
 
@@ -193,8 +197,11 @@ def network_graphs(model: torch.nn.Module, max_batch: int, blocking_wait: bool =
     lanes = ROUNDS_IN_FLIGHT if max_batch > 1 else 1
     chunk = chunk_positions(model.d_model, lanes)
     sizes = small_graph_sizes(max_batch, chunk)
-    #one board a round (mcts.py's search) never fills the largest graph
-    compiled = ExactSizeCompiled(model, min(sizes[-1], chunk)) if max_batch > 1 else torch.compile(model, dynamic=True)
+    if torch.cuda.get_device_capability() in UNCOMPILED_CAPABILITIES:
+        compiled = model
+    else:
+        #one board a round (mcts.py's search) never fills the largest graph
+        compiled = ExactSizeCompiled(model, min(sizes[-1], chunk)) if max_batch > 1 else torch.compile(model, dynamic=True)
     return GraphedBatches(compiled, sizes, lanes, chunk, blocking_wait, lean_lanes() if lean is None else lean)
 
 
