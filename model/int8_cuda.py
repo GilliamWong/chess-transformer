@@ -1,6 +1,13 @@
 #small-batch int8 matmuls as NVRTC kernels, bit-identical to int8_linear's Triton kernel: exact int32 sums in any order, the same fp32 epilogue
+import base64
+from contextlib import suppress
 import ctypes
+import hashlib
+import json
+import os
+from pathlib import Path
 import sys
+import threading
 import warnings
 
 import torch
@@ -214,8 +221,38 @@ def nvrtc_library() -> ctypes.CDLL:
     raise OSError(f"none of {names} loads")
 
 
-#source -> cubin for sm_<capability>, and each name expression's lowered (mangled) name
+#where compile_cubin keeps what NVRTC compiled: a folder in triton's cache, which engine/linux/caches.sh names and the build's start-up
+#files carry. None without a home folder
+def cubin_cache() -> Path | None:
+    try:
+        return Path(os.environ.get("TRITON_CACHE_DIR") or Path.home() / ".triton" / "cache") / "nvrtc"
+    except RuntimeError:
+        return None
+
+
+#source -> cubin for sm_<capability>, and each name expression's lowered (mangled) name; compiled once and then read from cubin_cache.
+#NVRTC takes ~2 s a module on a server's core, and the driver's own cache of it (~/.nv) is not there in a new container: the CCC starts
+#the engine in one for every game, and on two A100s that was 4 of a start's 15 s
 def compile_cubin(source: str, names: list[str], capability: tuple[int, int]) -> tuple[bytes, dict[str, str]]:
+    folder = cubin_cache()
+    key = hashlib.sha256(repr((source, names, capability, torch.version.cuda)).encode()).hexdigest()[:32]
+    path = folder / f"{key}.json" if folder is not None else None
+    if path is not None:
+        with suppress(OSError, ValueError, KeyError):
+            kept = json.loads(path.read_text())
+            return base64.b64decode(kept["cubin"]), kept["lowered"]
+    cubin, lowered = nvrtc_cubin(source, names, capability)
+    if path is not None:
+        #a cache that cannot be written (another user's, a read-only image) costs the next start its compile and nothing else
+        with suppress(OSError):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            partial = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.partial")
+            partial.write_text(json.dumps({"cubin": base64.b64encode(cubin).decode(), "lowered": lowered}))
+            os.replace(partial, path)
+    return cubin, lowered
+
+
+def nvrtc_cubin(source: str, names: list[str], capability: tuple[int, int]) -> tuple[bytes, dict[str, str]]:
     nvrtc = nvrtc_library()
     nvrtc.nvrtcGetErrorString.restype = ctypes.c_char_p
 

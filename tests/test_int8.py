@@ -199,6 +199,31 @@ def test_int8_linear_falls_back_to_triton_when_the_cuda_kernels_do_not_compile(m
     assert torch.equal(out, triton_int8_linear(monkeypatch, "projection", operands))
 
 
+#a start in a new container has no driver cache of NVRTC's work: the file in triton's cache, which the build's start-up files carry, saves it
+def test_a_compiled_kernel_is_read_back_from_its_file(monkeypatch, tmp_path):
+    compiles = []
+
+    def compiling(source, names, capability):
+        compiles.append(names)
+        return b"ELF" + source.encode(), {name: f"_Z{name}" for name in names}
+    monkeypatch.setattr(int8_cuda, "nvrtc_cubin", compiling)
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+
+    first = int8_cuda.compile_cubin("kernel", ["a", "b"], (8, 0))
+    assert int8_cuda.compile_cubin("kernel", ["a", "b"], (8, 0)) == first == (b"ELFkernel", {"a": "_Za", "b": "_Zb"})
+    assert len(compiles) == 1
+    #another source, list of names or gpu is another kernel
+    int8_cuda.compile_cubin("kernel", ["a"], (8, 0))
+    int8_cuda.compile_cubin("other", ["a", "b"], (8, 0))
+    int8_cuda.compile_cubin("kernel", ["a", "b"], (12, 0))
+    assert len(compiles) == 4
+    #a cache that cannot be written leaves the compile to every start
+    (tmp_path / "file").write_text("")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "file"))
+    assert int8_cuda.compile_cubin("kernel", ["a", "b"], (8, 0)) == first
+    assert len(compiles) == 5
+
+
 #sm_80 is the A100; "multiprocessors" keeps this gpu's capability and changes its multiprocessor count
 @gpu
 @pytest.mark.parametrize("untimed", [(8, 0), (8, 6), (8, 9), "multiprocessors"])
