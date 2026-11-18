@@ -12,7 +12,7 @@ RUN apt-get update && \
 #the tag's code, for which the start-up caches are made: build.sh finds no gpu here and downloads them; the build's own tools go
 #once it is done
 ARG CACHE_BUST
-RUN git clone --branch ccc-2026-11-11 https://github.com/GilliamWong/chess-transformer && \
+RUN git clone --branch ccc-2026-11-18 https://github.com/GilliamWong/chess-transformer && \
     cd chess-transformer && \
     engine/linux/build.sh && \
     rm -rf /root/.cache/uv /root/.cargo /root/.rustup
