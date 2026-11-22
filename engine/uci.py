@@ -113,7 +113,11 @@ RESERVE_SECONDS = 1.0
 #a search whose score falls may run on by up to MOST_EXTENSION shares (Clock.share), never past MOST_OF_THE_TIME_LEFT_EXTENDED of the time left
 MOST_EXTENSION = 2.0
 MOST_OF_THE_TIME_LEFT_EXTENDED = 1 / 3
-FIRST_MOVE_BONUS = 0.0
+#the game's first search gets FIRST_MOVE_BONUS shares more, and BOOK_PLY_BONUS more for each ply played before it up to MOST_BOOK_PLIES (lc0's
+#legacy clock: 1.8 and 0.25). It is the one search with no kept tree, and a kept tree is about half of a later search's root visits: at the
+#CCC Leela gave its first search 20 s of 180 and for five moves searched trees 2.6 times the engine's. A multiple of the share, so it follows
+#the time control: 18 s allotted at 3+2 (13 used in its CCC games played again on paper), 6 at 60+0.6
+FIRST_MOVE_BONUS = 2.0
 BOOK_PLY_BONUS = 0.0
 MOST_BOOK_PLIES = 12
 #the game's first searches get EARLY_SHARE times their share. At the CCC (3+2) the engine had spent 48 s by its tenth move after the book
@@ -721,8 +725,8 @@ if __name__ == "__main__":
                         help="with --gpu: smart pruning stops once the most visited move leads by more than the simulations left / "
                              "this, default %(default)s; lc0's 1.33 bets that the second move cannot get all of them")
     parser.add_argument("--first-move-bonus", type=float, default=FIRST_MOVE_BONUS,
-                        help="on a clock: the game's first search gets 1 + this + --book-ply-bonus x its ply (at most "
-                             f"{MOST_BOOK_PLIES}) times its share, default %(default)s; lc0's 1.8")
+                        help="on a clock: the game's first search gets this + --book-ply-bonus x its ply (at most "
+                             f"{MOST_BOOK_PLIES}) shares more than the searches after it, default %(default)s; lc0's 1.8")
     parser.add_argument("--book-ply-bonus", type=float, default=BOOK_PLY_BONUS, help="for --first-move-bonus, default %(default)s; lc0's 0.25")
     parser.add_argument("--search-settings", default="", help="changes to the search's settings (engine_search.py), e.g. c_puct=0.6")
     parser.add_argument("--infinite-until-stop", action="store_true",

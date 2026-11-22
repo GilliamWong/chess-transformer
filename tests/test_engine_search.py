@@ -33,7 +33,7 @@ from engine.tablebase import SYZYGY_DIR, TABLEBASE_PIECES
 from engine import engine_search
 from engine.engine_search import EngineSearch, SearchReport, engine_search_settings, parse_changes
 from engine import uci
-from engine.uci import (CACHE_POSITION_BYTES, EARLY_SEARCHES, EARLY_SHARE, FITTED_CACHE_POSITIONS, MOST_EXTENSION, MOVE_OVERHEAD_SECONDS,
+from engine.uci import (CACHE_POSITION_BYTES, EARLY_SEARCHES, EARLY_SHARE, FIRST_MOVE_BONUS, FITTED_CACHE_POSITIONS, MOST_EXTENSION, MOVE_OVERHEAD_SECONDS,
                         RESERVE_SECONDS, Clock, Options, fitted_memory, memory_within_limits)
 
 REPOSITORY = Path(__file__).parent.parent
@@ -809,7 +809,7 @@ def test_go_limits():
     assert clock.limits(["infinite"], black, 800) == (800, None)
 
     nodes, seconds = clock.limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), black, 800)
-    assert nodes is None and seconds == pytest.approx(Clock().seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 32, EARLY_SHARE))
+    assert nodes is None and seconds == pytest.approx(Clock().seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 32, EARLY_SHARE + FIRST_MOVE_BONUS))
     assert 0.5 < seconds < 30 - RESERVE_SECONDS
 
 
@@ -950,19 +950,20 @@ def board_with_men(men: int) -> chess.Board:
         board.remove_piece_at(square)
     return board
 
-#a clock without the larger share of the game's first searches, for the tests of the rest of its plan
+#a clock without the larger share of the game's first searches or the first one's bonus, for the tests of the rest of its plan
 def plain_clock(**settings) -> Clock:
-    return Clock(early_searches=0, **settings)
+    return Clock(**{"early_searches": 0, "first_move_bonus": 0.0, **settings})
 
-#the game's first searches get EARLY_SHARE times their share (the moves after the book, where the engine lost most at the CCC), the ones
-#after them their own; a search off the clock is not counted
+#the game's first searches get EARLY_SHARE times their share (the moves after the book, where the engine lost most at the CCC) and the first
+#of them FIRST_MOVE_BONUS shares more (it has no kept tree), the ones after them their own; a search off the clock is not counted
 def test_the_games_first_searches_get_more_than_their_share():
     board, clock = chess.Board(), Clock()
     share = plain_clock().limits(CLOCK_60, board, 800)[1]
     clock.limits("movetime 1000".split(), board, 800)
     seconds = [clock.limits(CLOCK_60, board, 800)[1] for _ in range(EARLY_SEARCHES + 2)]
-    assert seconds == [pytest.approx(EARLY_SHARE * share)] * EARLY_SEARCHES + [pytest.approx(share)] * 2
-    assert Clock(early_searches=3, early_share=1.5).limits(CLOCK_60, board, 800)[1] == pytest.approx(1.5 * share)
+    assert seconds == ([pytest.approx((EARLY_SHARE + FIRST_MOVE_BONUS) * share)] + [pytest.approx(EARLY_SHARE * share)] * (EARLY_SEARCHES - 1)
+                       + [pytest.approx(share)] * 2)
+    assert Clock(early_searches=3, early_share=1.5, first_move_bonus=0.0).limits(CLOCK_60, board, 800)[1] == pytest.approx(1.5 * share)
 
 #what a search is given and does not use is banked for the next move; a movetime search is not on the clock, and no move gets the reserve
 def test_unused_time_goes_to_the_next_move():
@@ -1402,8 +1403,8 @@ def test_the_engine_keeps_to_gos_limits(model_path):
         seconds = time.perf_counter() - started
         other = chess.Board(MATE_IN_ONE)
         counted = engine.play(other, chess.engine.Limit(nodes=50), info=chess.engine.INFO_BASIC)
-        #a game of its own ("clock", so ucinewgame), a 10+0.1 clock: ~0.4 s for the first move, ~1.4 s for a 9 man endgame (the game's
-        #first searches, at one and a half times their share)
+        #a game of its own ("clock", so ucinewgame), a 10+0.1 clock: ~0.95 s for the first move (three and a half shares), ~1.4 s for a 9 man
+        #endgame (the game's first searches, at one and a half times their share)
         clock = chess.engine.Limit(white_clock=10, black_clock=10, white_inc=0.1, black_inc=0.1)
         started = time.perf_counter()
         engine.play(board, clock, game="clock")
@@ -1416,7 +1417,7 @@ def test_the_engine_keeps_to_gos_limits(model_path):
 
     assert timed.move in board.legal_moves and timed.info["nodes"] > 10 and 0.3 < seconds < 0.5 + 0.1
     assert counted.info["nodes"] == 50
-    assert first_move < 0.9 and 1.2 < endgame_move < 1.8
+    assert 0.7 < first_move < 1.3 and 1.2 < endgame_move < 1.8
 
 #the report (id, line, score, root moves, visits) of Searches' search of board, one leaf a round
 def searched(searches: selfplay_rs.Searches, board: chess.Board, simulations: int, evaluate, search_id: int = 0):
