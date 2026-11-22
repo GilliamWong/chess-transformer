@@ -54,8 +54,11 @@ ADVANCE_THREADS = 4
 #the threads that free the dead rest of a moved tree beside the next search; 0 for the search's start to free it all, on the engine's own clock
 GC_THREADS = 2
 #the engine's changes to mcts.py's search, which self-play keeps as it is
-#transpositions: one node a position, whose moves keep its mean, and a visit passes through a node other paths made, as lc0's dag search
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
+#transpositions: one node a position, whose moves keep its mean, and a visit passes through a node other paths made, as lc0's dag search.
+#fresh_share (for the round loops, rounds_on and Searches' own): a move's lead stops a search only once the visits the search has made itself
+#are this share of those it is expected to make in all, so that a lead a kept tree brought does not end a search that has hardly looked; 0 for
+#no such wait
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True, "fresh_share": 0.0}
 #the threads that join rounds' gathers, for each of several networks (EngineSearch's descent_helpers). On two RTX 5090s a thread a network
 #alone fell a fifth short of the gpus' rate in a middlegame of 40M visits and to under half in an endgame of 100M; three helpers a network
 #kept 95% and 80% of it, five 88% in the endgame, eight no more than five
@@ -313,6 +316,8 @@ class EngineSearch:
         else:
             self.tablebase = open_tablebase_path(syzygy_path)
         self.certainty = search_settings.get("certainty", False)
+        #smart pruning's wait for a search's own visits (fresh_enough), which Searches' own loop takes from Searches
+        self.fresh_share = search_settings.get("fresh_share", 0.0)
         self.round_times: deque = deque([FIRST_ROUND_SECONDS], maxlen=ROUND_TIMES)
         #how long the last rounds gathered beside a round out took to gather
         self.busy_gathers: deque = deque(maxlen=ROUND_TIMES)
@@ -521,7 +526,8 @@ class EngineSearch:
                     #the last rounds of several networks span less time the more there are, down to a burst of rounds without leaves
                     since, wait = (run.progress[0], 0.0) if len(self.networks) == 1 else (run.first_check, SPEED_WAIT_SECONDS)
                     left = self.simulations_left(run.simulations, run.deadline, since, (now, visits), wait)
-                    decided = most - second > left / self.smart_pruning_factor
+                    #a lead made of a kept tree's visits waits for the search's own (fresh_share)
+                    decided = most - second > left / self.smart_pruning_factor and self.fresh_enough(visits - run.reused, left)
                     #a proven result, or every move but one a proven loss: the one left is the move
                     proven = self.certainty and (self.searches.decided(GAME) or (visits > 0 and self.searches.one_move_left(GAME)))
                     #once: a search smart pruning would stop runs on if its score has fallen, its time left then larger
@@ -575,3 +581,8 @@ class EngineSearch:
             speed = (visits_now - visits_then) / (now - then) if now > then else math.inf
             left = min(left, (deadline - now) * speed)
         return left
+
+    #whether smart pruning may stop a search that has made `fresh` visits itself and has `left` to make (simulations_left's): once those made
+    #are fresh_share of them all, the made and the left. The visits a kept tree brought are in a move's lead but not among these
+    def fresh_enough(self, fresh: int, left: float) -> bool:
+        return self.fresh_share <= 0 or fresh >= self.fresh_share * (fresh + left)

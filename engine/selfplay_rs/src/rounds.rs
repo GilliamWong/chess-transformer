@@ -226,6 +226,8 @@ struct Run {
     progress: VecDeque<(f64, u32)>,
     first_check: Option<(f64, u32)>,
     root: RootNumbers,
+    //the root's visits when the search began, a kept tree's: what the root has gained since are the search's own
+    reused: u32,
     round_times: VecDeque<f64>,
     round_seconds: f64,
     //how long the search's last rounds gathered beside a round out took to gather (engine_search.py's busy_gathers)
@@ -263,6 +265,14 @@ fn simulations_left(simulations: Option<u32>, deadline: Option<f64>, since: (f64
         left = left.min((deadline - now) * speed);
     }
     left
+}
+
+//whether smart pruning may stop a search that has made `fresh` visits itself and has `left` to make (simulations_left's), as
+//engine_search.py's fresh_enough: once those made are `share` of them all, the made and the left (Searches' fresh_share). The
+//visits a kept tree brought are in a move's lead but not among these, so a search that starts decided still looks for itself
+//first. A share of 0 is no wait
+fn fresh_enough(share: f64, fresh: u32, left: f64) -> bool {
+    share <= 0.0 || f64::from(fresh) >= share * (f64::from(fresh) + left)
 }
 
 struct Shared {
@@ -490,7 +500,10 @@ impl Rounds<'_> {
                 //the last rounds of several networks span less time the more there are, down to a burst of rounds without leaves
                 let (since, wait) = if self.networks == 1 { (run.progress[0], 0.0) } else { (first_check, settings.speed_wait_seconds) };
                 let left = simulations_left(run.simulations, run.deadline, since, (now, visits), wait);
-                let decided = visits > 0 && f64::from(most - second) > left / settings.smart_pruning_factor;
+                //a lead made of a kept tree's visits waits for the search's own (fresh_share)
+                let decided = visits > 0
+                    && f64::from(most - second) > left / settings.smart_pruning_factor
+                    && fresh_enough(self.searches.fresh_share, visits.saturating_sub(run.reused), left);
                 //a proven result, or every move but one a proven loss: the one left is the move
                 let proven = settings.certainty
                     && if self.searches.concurrent_descents {
@@ -633,6 +646,7 @@ pub(crate) fn start_loop(
             progress: VecDeque::new(),
             first_check: None,
             root,
+            reused: root.0,
             round_times,
             round_seconds,
             busy_gathers: VecDeque::new(),
@@ -686,6 +700,18 @@ mod tests {
     //its speed taken as the loop takes it: over the last 8 checks on one network, since the first check after 0.2 s on several
     //(engine_search.py's SPEED_ROUNDS and SPEED_WAIT_SECONDS; test_engine_search.py's paced searches are these)
     fn stopping_check(networks: usize, simulations: Option<u32>, deadline: f64, visits: impl Fn(u32) -> u32, lead: u32) -> Option<u32> {
+        stopping_check_after(0.0, networks, simulations, deadline, visits, lead)
+    }
+
+    //stopping_check with Searches' fresh_share, for a search whose tree had visits(0) when it began
+    fn stopping_check_after(
+        fresh_share: f64,
+        networks: usize,
+        simulations: Option<u32>,
+        deadline: f64,
+        visits: impl Fn(u32) -> u32,
+        lead: u32,
+    ) -> Option<u32> {
         let (mut progress, mut first_check) = (VecDeque::new(), None);
         (1..30).find(|&check| {
             let current = (f64::from(check) / 64.0, visits(check));
@@ -695,7 +721,8 @@ mod tests {
             }
             let first_check = *first_check.get_or_insert(current);
             let (since, wait) = if networks == 1 { (progress[0], 0.0) } else { (first_check, 0.2) };
-            f64::from(lead) > simulations_left(simulations, Some(deadline), since, current, wait)
+            let left = simulations_left(simulations, Some(deadline), since, current, wait);
+            f64::from(lead) > left && fresh_enough(fresh_share, visits(check) - visits(0), left)
         })
     }
 
@@ -714,5 +741,29 @@ mod tests {
         for networks in [1, 3] {
             assert_eq!(stopping_check(networks, Some(12_000), 1.0, steady, 6300), Some(1), "a simulations limit counts at once");
         }
+    }
+
+    //that search's lead is its kept tree's, which had 10,000 visits when the search began: with fresh_share the stop waits until
+    //the search's own visits are that share of the 6,400 it is expected to make in its second, or of the 2,000 that 12,000
+    //simulations leave it (test_engine_search.py's test_a_lead_a_kept_tree_brought_waits_for_the_searchs_own_visits)
+    #[test]
+    fn a_lead_a_kept_tree_brought_waits_for_the_searchs_own_visits() {
+        let steady = |check: u32| 10_000 + 100 * check;
+        for (fresh_share, networks, simulations, check) in
+            [(0.1, 1, None, 7), (0.25, 1, None, 16), (0.1, 3, None, 14), (0.25, 3, None, 16), (0.25, 1, Some(12_000), 5), (0.25, 3, Some(12_000), 5)]
+        {
+            let stopped_at = stopping_check_after(fresh_share, networks, simulations, 1.0, steady, 6300);
+            assert_eq!(stopped_at, Some(check), "a share of {fresh_share} on {networks} networks, simulations {simulations:?}");
+        }
+    }
+
+    #[test]
+    fn a_searchs_own_visits_are_enough_once_they_are_their_share_of_all_it_is_expected_to_make() {
+        //the game that showed it: 4,800 visits in the first 0.2 s of some 5 s, at 24,000 a second
+        assert!(!fresh_enough(0.1, 4_800, 4.8 * 24_000.0) && !fresh_enough(0.1, 11_000, 109_000.0) && fresh_enough(0.1, 13_000, 107_000.0));
+        //a search that began without a tree and is decided has made more visits than are left: no share up to a half holds it up
+        assert!(fresh_enough(0.5, 401, 400.0) && !fresh_enough(0.5, 400, 401.0));
+        //no wait without the setting; with it none is enough while the visits left are not known, and all are once none is left
+        assert!(fresh_enough(0.0, 0, f64::INFINITY) && !fresh_enough(0.1, u32::MAX, f64::INFINITY) && fresh_enough(1.0, 1, 0.0));
     }
 }

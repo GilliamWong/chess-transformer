@@ -396,6 +396,9 @@ struct State {
 #[pyclass(frozen)]
 struct Searches {
     settings: SearchSettings,
+    //for the round loops' smart pruning, its own (rounds.rs's fresh_enough) and engine_search.py's: a move's lead stops a search
+    //only once the visits the search has made itself are this share of those it is expected to make in all; 0 for no such wait
+    fresh_share: f64,
     move_ids: MoveIds,
     answer_width: usize,
     tables: Option<Arc<Tables>>,
@@ -765,7 +768,7 @@ impl Searches {
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
                         memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false,
-                        gather_helpers=0, helper_threads=0, helper_cpus=None))]
+                        fresh_share=0.0, gather_helpers=0, helper_threads=0, helper_cpus=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -786,6 +789,7 @@ impl Searches {
         gc_threads: usize,
         concurrent_descents: bool,
         transpositions: bool,
+        fresh_share: f64,
         gather_helpers: usize,
         helper_threads: usize,
         helper_cpus: Option<Vec<usize>>,
@@ -798,6 +802,9 @@ impl Searches {
                 "value_sharpness multiplies the value's logit, it must be positive, not {value_sharpness}"
             )));
         }
+        if !(0.0..=1.0).contains(&fresh_share) {
+            return Err(PyValueError::new_err(format!("fresh_share is a share of a search's visits, from 0 to 1, not {fresh_share}")));
+        }
         Ok(Searches {
             settings: SearchSettings {
                 c_puct,
@@ -809,6 +816,7 @@ impl Searches {
                 certainty,
                 transpositions,
             },
+            fresh_share,
             move_ids: move_ids(move_id_table)?,
             answer_width,
             tables: open_tables(tablebase_folder, tablebase_pieces)?.map(Arc::new),

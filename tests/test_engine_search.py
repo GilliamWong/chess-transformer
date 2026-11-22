@@ -44,7 +44,9 @@ MATE_IN_TWO = "k7/8/2K5/8/8/8/8/7R w - - 0 1"
 MATES_IN_TWO = ("c6b6", "c6c7")
 #a tree with transpositions
 GRAPH = {"transpositions": True}
-gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+#the engine's own settings as it plays with them: the tests search without them (without_engine_settings)
+ENGINES_OWN_SETTINGS = engine_search.ENGINE_SETTINGS
+gpu =pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 
 @pytest.fixture(autouse=True)
 def without_engine_settings(monkeypatch):
@@ -1212,11 +1214,11 @@ class PacedSearches(ScriptedSearches):
         self.root = self.script(self.finishes + 1)
         return super().finish_with_root(answers, round, root_of)
 
-def paced_search(monkeypatch, networks: int, root, **limits) -> float | None:
+def paced_search(monkeypatch, networks: int, root, fresh_share: float = 0.0, **limits) -> float | None:
     now = [0.0]
     monkeypatch.setattr(engine_search.time, "perf_counter", lambda: now[0])
     network = [ImmediateBatches(answers_of_0_6) for _ in range(networks)]
-    search = EngineSearch(network if networks > 1 else network[0], 16, grow_leaves=0)
+    search = EngineSearch(network if networks > 1 else network[0], 16, grow_leaves=0, settings={"fresh_share": fresh_share})
     search.searches = PacedSearches(now, root)
     search.search(chess.Board(), **limits)
     return search.searches.stopped_at
@@ -1238,6 +1240,81 @@ def test_a_decided_search_on_several_networks_stops_once_its_first_moments_are_p
         visits = 10_000 + 100 * round
         return visits, visits - 1000, visits - 7300
     assert paced_search(monkeypatch, networks, steady, seconds=1.0, simulations=simulations) == stopped_at
+
+#a kept tree's lead: the root has 10,000 visits when the search begins, its best move 6,300 ahead, and gains 6,400 a second
+def kept_lead(round: int) -> tuple[int, int, int]:
+    visits = 10_000 + 100 * round
+    return visits, visits - 1000, visits - 7300
+
+#with 1 s given that lead stops the search at its second round (the test above). With fresh_share the stop waits until the visits the search
+#has made itself are that share of those it is expected to make: of the 6,400 of its second a tenth by the 7th round and a quarter by the 16th,
+#which several networks' first moments are past by or not; of the 2,000 that 12,000 simulations leave it, a quarter by the 5th
+@pytest.mark.parametrize("fresh_share, networks, simulations, stopped_at", [
+    (0.1, 1, None, 7 / 64), (0.25, 1, None, 16 / 64), (0.1, 3, None, 14 / 64), (0.25, 3, None, 16 / 64), (0.25, 1, 12_000, 5 / 64), (0.25, 3, 12_000, 5 / 64)])
+def test_a_lead_a_kept_tree_brought_waits_for_the_searchs_own_visits(monkeypatch, fresh_share, networks, simulations, stopped_at):
+    assert paced_search(monkeypatch, networks, kept_lead, fresh_share, seconds=1.0, simulations=simulations) == stopped_at
+
+#the game that showed it: a kept tree of 688,198 visits, 4,800 more in the search's first 0.2 s of some 5 s, the lead far past what was left.
+#A tenth of the search's own visits is about half a second's
+def test_the_wait_for_a_searchs_own_visits_is_a_share_of_those_it_is_expected_to_make():
+    search = EngineSearch(ImmediateBatches(answers_of_0_6), 16, settings={"fresh_share": 0.1})
+    speed, seconds = 4800 / 0.2, 5.0
+    assert not search.fresh_enough(4800, (seconds - 0.2) * speed) and not search.fresh_enough(11_000, (seconds - 0.5) * speed + 1000)
+    assert search.fresh_enough(13_000, (seconds - 0.5) * speed - 1000)
+    #a search that began without a tree and is decided has made more visits than are left: no share up to a half holds it up
+    assert EngineSearch(ImmediateBatches(answers_of_0_6), 16, settings={"fresh_share": 0.5}).fresh_enough(401, 400)
+    #no wait without the setting, and none known while the visits left are not
+    assert EngineSearch(ImmediateBatches(answers_of_0_6), 16).fresh_enough(0, math.inf) and not search.fresh_enough(10**9, math.inf)
+    for share in (-0.1, 1.5):
+        with pytest.raises(ValueError):
+            EngineSearch(ImmediateBatches(answers_of_0_6), 16, settings={"fresh_share": share})
+
+#only a lead waits for the search's own visits: a decided root whose search has made none of its visits runs on, while a proven root, a single
+#legal move and a root with one move not proven lost stop at the first answers as they do without fresh_share
+@pytest.mark.parametrize("fen, root, proven, lone, stopped_at", [
+    (chess.STARTING_FEN, (600, 600, 0), False, False, None), (chess.STARTING_FEN, (600, 300, 290), True, False, 1 / 16),
+    ("k7/8/8/8/8/8/r7/K1q5 w - - 0 1", (600, 300, 290), False, False, 1 / 16), (chess.STARTING_FEN, (600, 300, 290), False, True, 1 / 16)])
+def test_a_proven_or_only_move_search_does_not_wait_for_its_own_visits(monkeypatch, fen, root, proven, lone, stopped_at):
+    now = [0.0]
+    monkeypatch.setattr(engine_search.time, "perf_counter", lambda: now[0])
+    search = EngineSearch(SixteenthsNetwork(now), 16, grow_leaves=0, settings={"certainty": True, "fresh_share": 0.5})
+    search.searches = ScriptedSearches(*root, proven, lone)
+    search.search(chess.Board(fen), simulations=1000)
+    assert search.searches.stopped_at == stopped_at
+
+#a search that begins without a tree is not held up: its lead is made of its own visits, and is decided once they pass the visits left
+def test_a_search_without_a_kept_tree_stops_as_early_with_fresh_share(carlsen_games):
+    stopped_early = 0
+    for game, plies in itertools.product(range(len(carlsen_games)), (10, 19, 28, 37)):
+        board = carlsen_position(carlsen_games, game, plies)
+        plain = EngineSearch(cpu_batches(BoardModel()), 16).search(board, simulations=300)
+        waiting = EngineSearch(cpu_batches(BoardModel()), 16, settings={"fresh_share": 0.5}).search(board, simulations=300)
+        assert (waiting.simulations, waiting.line, waiting.root_moves) == (plain.simulations, plain.line, plain.root_moves), board.fen()
+        stopped_early += plain.simulations < 300
+    assert stopped_early > 5
+
+def python_search_waiting(fresh_share: float) -> EngineSearch:
+    return EngineSearch(cpu_batches(BoardModel()), 16, settings={"fresh_share": fresh_share})
+
+def rust_search_waiting(fresh_share: float) -> EngineSearch:
+    return EngineSearch(lean_network(), 16, rust_rounds=True, settings={"fresh_share": fresh_share})
+
+#a kept tree searched on with fewer simulations than its best move's lead (the queen's capture leads whatever the network): the lead stops
+#the search at its first answers, and with fresh_share only once the search has made its share of the simulations it was given, in either
+#loop. A share of them is never more than them: the search ends by its simulations whatever the share
+@pytest.mark.parametrize("make_search", [python_search_waiting, pytest.param(rust_search_waiting, marks=gpu)])
+def test_a_kept_trees_search_makes_its_share_of_its_simulations_before_a_lead_stops_it(make_search):
+    board, made = chess.Board(FREE_QUEEN), {}
+    for fresh_share in (0.0, 0.5, 1.0):
+        search = make_search(fresh_share)
+        first = search.search(board, simulations=2000)
+        (_, most), (_, second) = first.root_moves[:2]
+        given = most - second - 1
+        assert given > 100, "a lead to speak of"
+        again = search.search(board, simulations=first.simulations + given)
+        assert again.reused == first.simulations and again.simulations <= first.simulations + given
+        made[fresh_share] = (again.simulations - again.reused) / given
+    assert made[0.0] < 0.5 <= made[0.5] < 1 and made[1.0] == 1, made
 
 #the king has three moves, two of which lose to a mate in one
 THREE_MOVES_TWO_LOST = "8/1K2r3/3r4/5P2/8/4k3/8/5Q2 w - - 0 1"
@@ -1520,6 +1597,25 @@ def test_search_settings_that_are_not_numbers_are_refused():
     for change in ("move_id_table=1", "tablebase_folder=x", "repetitions_for_a_draw=inf", "c_puct=x", "nope=1"):
         assert options.set("SearchSettings", change).endswith("the search's settings stay as they were")
     assert options.settings is None
+
+#fresh_share is off as the engine plays, and SearchSettings sets it as it changes any setting: it is Searches', whose own round loop takes
+#it from there as python's does
+def test_fresh_share_is_a_search_setting_that_is_off_until_set(monkeypatch):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", ENGINES_OWN_SETTINGS)
+    assert ENGINES_OWN_SETTINGS["fresh_share"] == 0.0
+    options = Options(False, TABLEBASE_PIECES)
+    assert options.set("SearchSettings", "fresh_share=0.1") is None
+    assert options.settings == {"fresh_share": 0.1} and options.search()[1]["settings"] == options.settings
+
+    made = []
+    searches = selfplay_rs.Searches
+    monkeypatch.setattr(selfplay_rs, "Searches", lambda **settings: made.append(settings) or searches(**settings))
+    as_it_plays = EngineSearch(cpu_batches(BoardModel()), 16)
+    switched_on = EngineSearch(cpu_batches(BoardModel()), 16, settings=options.settings)
+    assert [settings["fresh_share"] for settings in made] == [0.0, 0.1]
+    assert (as_it_plays.fresh_share, switched_on.fresh_share) == (0.0, 0.1)
+    report = switched_on.search(chess.Board(), simulations=200)
+    assert report.simulations <= 200 and report.line[0] in chess.Board().legal_moves
 
 
 #a competition's file as its gui reads it: TCEC's a list of engines with their options as names and values, the CCC's one engine with its
