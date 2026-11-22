@@ -947,7 +947,9 @@ impl SharedTree {
             };
             if let Some(known) = known {
                 let found = self.nodes.get(known as usize);
-                let (mean, repeats) = (held_mean(found, found.visits()), repeat_filter(key, halfmoves));
+                //of a proven node its proven score, as learn_proofs gives a move
+                let mean = found.proof().map_or_else(|| held_mean(found, found.visits()), |proof| proof.value as f32);
+                let repeats = repeat_filter(key, halfmoves);
                 let given = match children {
                     Children::List(_) => {
                         let state = MoveState::new(known, repeats, found.proves_a_loss());
@@ -1052,16 +1054,38 @@ impl SharedTree {
     }
 
     //with transpositions the path's moves (`links`) learn their nodes' proofs, from the path's last node up as far as the nodes
-    //are proven (Tree::learn_proofs): a move whose node is a proven loss for the side that makes it holds that from now on
+    //are proven (Tree::learn_proofs): a move holds its node's proven score from then on, and that its node is a proven loss
+    //for the side that makes it
     fn learn_proofs(&self, path: &[usize], links: &[usize]) {
         for (depth, &link) in links.iter().enumerate().rev() {
             let Some(proof) = self.nodes.get(path[depth + 1]).proof() else { break };
-            if proof.outcome == Outcome::Loss {
-                let slot = self.links.slot(self.current_link(path[depth], link as u32));
-                if !slot.state().lost() {
-                    slot.learn_loss();
-                }
+            let slot = self.links.slot(self.current_link(path[depth], link as u32));
+            self.hold_mean(path[depth], slot, proof.value as f32);
+            if proof.outcome == Outcome::Loss && !slot.state().lost() {
+                slot.learn_loss();
             }
+        }
+    }
+
+    //Tree::hold_mean beside other threads: the move of the node `id` whose slot this is holds `mean` from now on, by a step
+    //of the move as a descent's that passes it (meet): the node takes what the step changed, unless the move holds the mean
+    //already
+    fn hold_mean(&self, id: usize, slot: &Slot, mean: f32) {
+        let word = slot.held();
+        let mut seen = word.load();
+        while seen.1.to_bits() != mean.to_bits() {
+            let (visits, old) = seen;
+            match word.change(seen, (visits, mean)) {
+                Ok(()) => {
+                    let parent = self.nodes.get(id);
+                    if parent.proof().is_none() {
+                        parent.add_value(f64::from(visits) * (f64::from(old) - f64::from(mean)));
+                    }
+                    return;
+                }
+                Err(now) => seen = now,
+            }
+            jitter();
         }
     }
 

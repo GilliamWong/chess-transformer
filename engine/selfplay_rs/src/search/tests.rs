@@ -834,8 +834,9 @@ fn a_graphs_nodes_sum_is_its_own_scores_and_its_moves_visits_at_their_means() {
 #[test]
 fn in_a_graph_proven_nodes_keep_their_scores_and_the_sums_above_them() {
     let network = Network::new();
+    //the mate in two is proven at the root by 3,100 visits
     for (fen, moves, visits) in
-        [(MATE_IN_TWO, &[][..], 2000), (ROOKS, &[][..], 3000), (QUEEN_AND_PAWN, &[][..], 3000), (LOCKED_PAWNS, &[][..], 3000), (START, OPENING, 4000)]
+        [(MATE_IN_TWO, &[][..], 4000), (ROOKS, &[][..], 3000), (QUEEN_AND_PAWN, &[][..], 3000), (LOCKED_PAWNS, &[][..], 3000), (START, OPENING, 4000)]
     {
         let settings = SearchSettings { transpositions: true, ..settings(true) };
         let mut tree = tree_after(fen, moves).with_transpositions(true);

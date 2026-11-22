@@ -870,6 +870,8 @@ fn check_graph(tree: &Tree) -> usize {
             assert_eq!(slot.pending, 0, "a move with simulations waiting through it after the search");
             assert!(slot.visits == 0 || slot.mean != NO_MEAN, "a visited move that holds no mean");
             assert!(!slot.lost || proof.is_some_and(|proof| proof.outcome == Outcome::Loss), "a move that holds an unproven node as lost");
+            //a move that has learnt of the loss holds its score, and is passed over from then on
+            assert!(!slot.lost || proof.is_some_and(|proof| slot.mean == proof.value as f32), "a lost move's mean of {}", slot.mean);
             let filter = repeat_filter(tree.node_keys[child as usize], graph.halfmoves[child as usize]);
             assert_eq!(slot.repeats, filter, "a move's filter of its node's repeats");
             if !std::mem::replace(&mut seen[child as usize], true) {
@@ -1137,6 +1139,38 @@ fn a_descent_to_a_proven_node_proves_its_other_parents_in_a_graph() {
     let (mut tree, _) = proven_after_the_first_of_two_lines();
     tree.gather(&one_round(1_000), &SearchSettings { certainty: false, ..settings }, None, None, &mut Vec::new());
     assert!(tree.nodes[parent].proof.is_none(), "no proofs without certainty");
+}
+
+//a node proven up the path, after the backup went through the move to it, leaves that move the proven score and takes the mean
+//the move held out of the sum above: the descent meets the proven node, backs up, and only then is the node before it proven a
+//loss (a_descent_to_a_proven_node_proves_its_other_parents_in_a_graph). Selection passes that move over from then on, so no
+//later descent would correct it. The move that met the proven node holds its score too. A SharedTree's descent leaves the
+//Tree's tree
+#[test]
+fn a_move_holds_the_proven_score_of_a_node_proven_up_its_path() {
+    let settings = graph_settings(true);
+    let (mut tree, second) = proven_after_the_first_of_two_lines();
+    let (above, parent, met) = (second[1], second[2], second[3]);
+    let link_to = |tree: &Tree, from: usize, to: usize| {
+        tree.linked(from).map(|(_, link)| link).find(|&link| tree.link_child(link) as usize == to).expect("the line's move")
+    };
+    let visits_before = tree.slot(link_to(&tree, above, parent)).visits;
+    assert_eq!(tree.slot(link_to(&tree, above, parent)).mean, 0.5, "the move's mean before the descent");
+    let shared = SharedTree::from_tree(&tree);
+
+    assert_eq!(tree.gather(&one_round(1_000), &settings, None, None, &mut Vec::new()), 0);
+    let proof = tree.nodes[parent].proof.expect("the node proven by the descent");
+    assert_eq!((proof.outcome, proof.value), (Outcome::Loss, 0.0));
+    let to_parent = *tree.slot(link_to(&tree, above, parent));
+    assert!(to_parent.lost && to_parent.visits == visits_before + 1, "the move the descent went by, with its visit");
+    assert_eq!(to_parent.mean, 0.0, "the move to the node proven up the path holds its proven score");
+    //the node above: one visit of its own at 0.5, and the move's visits at the proven score, with none of the mean of before
+    assert_eq!(tree.nodes[above].value_sum, 0.5 + f64::from(to_parent.visits), "the sum above the proven node");
+    let met_proof = tree.nodes[met].proof.expect("the node the descent met");
+    assert_eq!(tree.slot(link_to(&tree, parent, met)).mean, met_proof.value as f32, "the move that met a proven node holds its score");
+
+    assert!(shared.gather(&one_round(1_000), &settings, None, None, &mut Vec::new()).is_empty());
+    assert_same_trees(&tree, &shared.to_tree());
 }
 
 //whether the side to move loses by force within `plies` plies: a checkmate it is in counts, a draw by the fifty-move rule or on material

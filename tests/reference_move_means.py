@@ -46,16 +46,18 @@ The rule, in this file's words:
   such a leaf) proves what it can of its path once it has walked back up it, from the end up and for as long as it can: a node of
   which a move's node is proven won is lost, the sooner the better for the side to move; a node whose every move has a proven node
   has the best of their results, turned round. A proven node's value_sum is its visits times its proven score, from then on: a
-  later walk up through it adds its proven score. The walk up comes first, so the move into a node that the descent proves holds
-  the node's mean from before the proof, and the node it starts from keeps the move's share by that mean.
-- A move is lost once a descent of its own has met its node as a proven loss: it arrived there (stop 2), or it is on the path of a
-  descent whose end proved its node a loss. A move given a node that is a proven loss is lost at once. Another move to the same
-  node is picked by its held mean until its own descent meets the node: one more visit.
+  later walk up through it adds its proven score.
+- A move learns of its node's proof when a descent of its own meets it: it arrived there (stop 2), or it is on the path of a
+  descent whose end proved its node. The walk up comes first, each move taking its node's mean as ever; then the proofs go up the
+  path; then, from the path's end up and for as long as the path's nodes are proven, each move holds its node's proven score
+  instead (its share of the node it starts from changes with it, unless that node is proven), and is lost if the score is a
+  loss's. A move given a node that is proven holds the proven score, and is lost if it is a loss's, at once. Another move to the
+  same node is picked by the mean it holds until its own descent meets the node: one more visit.
 - A new root (the game went on down the tree by a line of moves, played together) keeps the nodes it reaches by its moves and
   theirs and, for this one line, those the root before the line reaches (the held root): a descent that comes to the position of
   one of them finds it with its visits. Every other node is dropped, and a move to its position makes a new node. A new root then
   proves a draw every node it kept whose position the game has had twice by then, and takes the loss off every move to such a
-  node.
+  node; the move keeps the mean it holds until its descent meets the node.
 """
 from __future__ import annotations
 from collections import Counter, deque
@@ -97,6 +99,12 @@ UNLEARNED_LOSS = "a move to a node proven lost weighed by its mean, not having m
 LOSS_LEARNED = "a move met its node's proof of a loss that another move's descent had made"
 EVERY_MOVE_LOST = "a pick where every move is lost"
 LOSS_CLEARED = "a lost move cleared at a new root"
+#a move that learned of its node's proof, by the occasion; and those of them whose held mean was not the proven score already
+ARRIVED_AT_A_PROOF = "a move's descent arrived at its proven node"
+PROVED_ITS_LEAF = "a move's descent proved its node, a leaf where the game is over"
+PROVED_UP_THE_PATH = "a move's node was proven by a descent that went on through it"
+GIVEN_A_PROVEN_NODE = "a move was given a node that is proven"
+PROVEN_SCORE_TAKEN = "a move's held mean changed to its node's proven score"
 HELD_NODE_MET = "a move took or was given a node that only the held root reached"
 NODES_DROPPED = "nodes dropped at a new root"
 
@@ -320,23 +328,32 @@ class Search:
             if known is not None and known.visit_count > 0:
                 link.child, link.given_at_pass, link.mean = known, this_pass, float(np.float32(known.mean()))
                 link.lost = known.proof is not None and known.proof.outcome == LOSS
+                self.counts[GIVEN_A_PROVEN_NODE] += known.proof is not None
                 self.meet(known)
                 passes_of_moves_given.append(this_pass)
         return passes_of_moves_given
 
-    #a descent has ended at a proven node: the nodes above it on its path are proven for as long as their moves' nodes prove them,
-    #never the root; and from the end up, for as long as the path's nodes are proven, the move into a node proven a loss is lost
-    def learn_proofs(self, path: list[tuple[Node, Link]]) -> None:
+    #a descent has ended at a proven node and walked back up: the nodes above it on its path are proven for as long as their
+    #moves' nodes prove them, never the root; then from the end up, for as long as the path's nodes are proven, each move of the
+    #path holds its node's proven score, and is lost if that is a loss's. `at_the_end` is the occasion the last move learns by
+    def learn_proofs(self, path: list[tuple[Node, Link]], at_the_end: str) -> None:
         for parent, _ in reversed(path[1:]):
             proof = proof_from_moves(parent)
             if proof is None:
                 break
             prove(parent, proof)
-        for _, link in reversed(path):
-            if link.child.proof is None:
+        for depth, (parent, link) in reversed(list(enumerate(path))):
+            proof = link.child.proof
+            if proof is None:
                 break
-            if link.child.proof.outcome == LOSS:
-                link.lost = True
+            self.counts[at_the_end if depth == len(path) - 1 else PROVED_UP_THE_PATH] += 1
+            proven_mean = float(np.float32(proof.value))
+            if link.mean != proven_mean:
+                self.counts[PROVEN_SCORE_TAKEN] += 1
+                if parent.proof is None:
+                    parent.value_sum += link.visits * (link.mean - proven_mean)
+                link.mean = proven_mean
+            link.lost = link.lost or proof.outcome == LOSS
 
     #one descent from the root, backed up at once unless it ends at a leaf for the network or at one that waits for it already
     def descend(self) -> Simulation:
@@ -374,7 +391,7 @@ class Search:
                 child.value_sum += child.proof.value
                 self.counts[LOSS_LEARNED] += child.proof.outcome == LOSS and not link.lost
                 back_up(path)
-                self.learn_proofs(path)
+                self.learn_proofs(path, ARRIVED_AT_A_PROOF)
                 return ended_as(PROVEN, visits_before)
             if child.links and link.visits == 0:
                 back_up(path)
@@ -403,7 +420,7 @@ class Search:
         back_up(path)
         if self.certainty and path:
             prove(node, Proof(WIN if value == 0 else DRAWN, 1 - value, 0))
-            self.learn_proofs(path)
+            self.learn_proofs(path, PROVED_ITS_LEAF)
         return ended_as(GAME_OVER, visits_before)
 
     #a simulation waits at `node` through the moves of `path`, or `waits` of -1 takes one off

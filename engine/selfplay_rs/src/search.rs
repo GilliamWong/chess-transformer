@@ -805,7 +805,8 @@ impl Tree {
                 let found = &self.nodes[child as usize];
                 let slot = Slot {
                     child,
-                    mean: found.mean_score() as f32,
+                    //of a proven node its proven score, as learn_proofs gives a move
+                    mean: found.proof.map_or(found.mean_score() as f32, |proof| proof.value as f32),
                     lost: found.proof.is_some_and(|proof| proof.outcome == Outcome::Loss),
                     repeats: repeat_filter(key, halfmove_count(halfmoves)),
                     ..UNVISITED_SLOT
@@ -843,7 +844,11 @@ impl Tree {
     //node since the move last did): the move's visits at the mean it held go out of the parent's sum and at the node's mean now
     //come in. No visit is counted: lc0 stops the descent and spends one on this, once the two are 0.01 of its score apart
     fn take_mean(&mut self, parent: usize, link: u32, node: usize) {
-        let mean = self.nodes[node].mean_score() as f32;
+        self.hold_mean(parent, link, self.nodes[node].mean_score() as f32);
+    }
+
+    //the move `link` of `parent` holds `mean` from now on, the parent's sum as if it always had (take_mean)
+    fn hold_mean(&mut self, parent: usize, link: u32, mean: f32) {
         let Slot { visits, mean: old, .. } = *self.slot(link);
         if self.nodes[parent].proof.is_none() {
             self.nodes[parent].value_sum += f64::from(visits) * (f64::from(old) - f64::from(mean));
@@ -1629,13 +1634,17 @@ impl Tree {
     }
 
     //with transpositions the path's moves (`edges`, their links) learn their nodes' proofs, from the path's last node up as far
-    //as the nodes are proven: a move whose node is a proven loss for the side that makes it holds that from now on, and
-    //selection passes it over without reading the node. A move learns so when a descent meets its node proven, or proves it
+    //as the nodes are proven. A move learns so when a descent meets its node proven, or proves it. From then on it holds the
+    //node's proven score, its parent's sum as if a descent had passed it (hold_mean): a node proven up the path, after the
+    //backup went through the move to it, would else leave the move the mean of before, and a move to a proven loss is never
+    //passed again (lc0 corrects the parents so when a node becomes terminal, its AdjustForTerminal). A move whose node is a
+    //proven loss for the side that makes it holds that too, and selection passes it over without reading the node
     fn learn_proofs(&mut self, path: &[usize], edges: &[usize]) {
         for (depth, &link) in edges.iter().enumerate().rev() {
             let Some(proof) = self.nodes[path[depth + 1]].proof else { break };
+            let link = self.current_link(path[depth], link as u32);
+            self.hold_mean(path[depth], link, proof.value as f32);
             if proof.outcome == Outcome::Loss {
-                let link = self.current_link(path[depth], link as u32);
                 self.slot_mut(link).lost = true;
             }
         }

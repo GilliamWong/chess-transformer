@@ -390,8 +390,12 @@ def test_the_searches_in_rounds_come_to_the_rules_cases():
         assert counts[certainty][reference.STALE_MEAN] >= 1000 and counts[certainty][reference.MEAN_REFRESHED] >= 1000, counts
     assert counts[True][reference.PROVEN] >= 1000 and counts[True][reference.LOST_PASSED_OVER] >= 1000, counts
     #another move to a node proven lost: picked by its mean, and lost once its own descent has met the node
-    assert counts[True][reference.UNLEARNED_LOSS] >= 2 and counts[True][reference.LOSS_LEARNED] >= 10, counts
+    assert counts[True][reference.UNLEARNED_LOSS] >= 5 and counts[True][reference.LOSS_LEARNED] >= 10, counts
     assert counts[True][reference.EVERY_MOVE_LOST] >= 1000, counts
+    #a move that learns of its node's proof, by the occasion, and those of them whose mean the proven score changed
+    for learned, least in ((reference.ARRIVED_AT_A_PROOF, 1000), (reference.PROVED_ITS_LEAF, 500), (reference.PROVED_UP_THE_PATH, 100),
+                           (reference.GIVEN_A_PROVEN_NODE, 10), (reference.PROVEN_SCORE_TAKEN, 100)):
+        assert counts[True][learned] >= least, counts
 
 
 #two moves to one node, which the descent of one of them proves a loss: the other is picked by the mean it holds once more, meets the
@@ -426,7 +430,7 @@ def test_the_other_move_to_a_node_proven_lost_is_picked_once_more_and_then_lost(
     #the mate was found down the first way; the next simulation went down the second into the proven node, and none after it
     assert ended[proved + 1] == (reference.PROVEN, TWO_WAYS[1])
     assert all(line[:3] not in TWO_WAYS for _, line in ended[proved + 2:])
-    assert search.counts[reference.UNLEARNED_LOSS] == 1 and search.counts[reference.LOSS_LEARNED] >= 1
+    assert search.counts[reference.UNLEARNED_LOSS] >= 1 and search.counts[reference.LOSS_LEARNED] >= 1
 
 
 #a lost move that is lost no more at a new root: the game has had its node's position twice by then, and a third time is a draw.
