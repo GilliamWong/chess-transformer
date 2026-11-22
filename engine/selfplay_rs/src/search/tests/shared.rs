@@ -301,11 +301,13 @@ fn one_thread_searches_as_tree_does() {
 }
 
 fn check_tree(tree: &SharedTree, settings: &SearchSettings) {
+    tree.assert_waiting_counts();
     walk(tree, tree.root_index(), &tree.board, &mut tree.keys.clone(), settings, false);
 }
 
 //a tree whose root moved: a leaf taken out as stale has no visit until it is searched again
 fn check_reused_tree(tree: &SharedTree, settings: &SearchSettings) {
+    tree.assert_waiting_counts();
     walk(tree, tree.root_index(), &tree.board, &mut tree.keys.clone(), settings, true);
 }
 
@@ -2049,4 +2051,162 @@ fn a_call_asks_for_help_once_it_has_made_its_simulations_alone() {
     shared_in_flight(&shared_tree_after(START, &[]), 20_000, 1, &settings, None, &network, usize::MAX);
     let again = shared_tree_after(START, &[]);
     assert_eq!((gathered(&again, Some(&network.cache)), asked.get(), again.root().visits()), (0, 1, 120));
+}
+
+//the gathering calls of many threads leave every count of descents in flight exact. With rounds out and no call in progress
+//each node's and each move's count is the leaves that wait (assert_waiting_counts), and there is none once they are back:
+//with and without transpositions, on 8 and 24 threads, far from a memory limit and where the search fills
+//it. The calls send descents down in runs, each counted at a move in one step: a run cut short (by a result, by the round's
+//or the search's end, by the room, by a leaf another call took) or a collision is where a count would be left behind
+#[test]
+fn many_threads_gathers_leave_the_counts_of_the_leaves_that_wait() {
+    crate::search::shared::JITTER.store(true, Ordering::Relaxed);
+    let (mut waited, mut filled) = (0, 0);
+    for transpositions in [false, true] {
+        for (fen, moves) in [(START, OPENING), (KING_AND_ROOK, &[][..])] {
+            for threads in [8, 24] {
+                for memory_limit in [usize::MAX, 3_000_000] {
+                    let settings = SearchSettings { transpositions, ..settings(true) };
+                    let (tree, network) = (shared_tree_for(fen, moves, &settings), SharedNetwork::new());
+                    search_on_threads(&tree, threads, 2_000, 2, 16, &settings, &network, usize::MAX);
+                    tree.assert_waiting_counts();
+                    //every thread gathers rounds and leaves them out, until the search has had its visits or is full
+                    let next_round = AtomicU64::new(1 << 32);
+                    let most_visits = if memory_limit == usize::MAX { 12_000 } else { 1_000_000 };
+                    for _ in 0..200 {
+                        let out: std::sync::Mutex<Vec<(u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+                        std::thread::scope(|scope| {
+                            for _ in 0..threads {
+                                scope.spawn(|| {
+                                    for leaves in [16, 64] {
+                                        let id = next_round.fetch_add(1, Ordering::Relaxed);
+                                        let round = Round { id, leaves, simulations: 64 * leaves, collisions: leaves, visit_limit: most_visits, memory_limit };
+                                        let mut boards = Vec::new();
+                                        tree.queue(id, tree.gather(&round, &settings, None, Some(&network.cache), &mut boards));
+                                        out.lock().expect("the rounds out").push((id, boards));
+                                    }
+                                });
+                            }
+                        });
+                        tree.assert_waiting_counts();
+                        waited += tree.pending();
+                        let out = out.into_inner().expect("the rounds out");
+                        if out.iter().all(|(_, boards)| boards.is_empty()) {
+                            break;
+                        }
+                        for (id, boards) in out {
+                            finish_round(&tree, id, &boards, &settings, &network);
+                        }
+                        assert_eq!(tree.pending(), 0);
+                        tree.assert_waiting_counts();
+                    }
+                    assert!(tree.is_full() || tree.root().visits() >= most_visits, "the search went on to its visits or its room");
+                    //the limit is passed by no more than what no descent reserves: a batch of lists made solid, a slot a move
+                    let unreserved = 2 * crate::search::MOST_MOVES * 16;
+                    assert!(memory_limit == usize::MAX || tree.allocated_bytes() <= memory_limit + unreserved, "{} bytes", tree.allocated_bytes());
+                    filled += usize::from(tree.is_full());
+                    check_after_search(&tree, &settings, false);
+                    if !transpositions {
+                        check_tree(&tree, &settings);
+                    }
+                }
+            }
+        }
+    }
+    assert!(waited > 100_000 && filled >= 6, "{waited} leaves waited when the counts were recounted, {filled} searches filled their room");
+}
+
+thread_local!(static STARTS: Cell<u32> = const { Cell::new(0) });
+thread_local!(static PROVEN_AT_START: Cell<usize> = const { Cell::new(usize::MAX) });
+
+//for WRITER_AT_START: as another thread that had waited for the tree would, proves the node PROVEN_AT_START a draw where the
+//call asks for its second descent, when its walk holds a run in that node and below it
+fn prove_the_node_at_the_second_start(tree: &SharedTree) -> bool {
+    STARTS.set(STARTS.get() + 1);
+    if STARTS.get() != 2 {
+        return false;
+    }
+    let id = PROVEN_AT_START.get();
+    let (visits, in_flight) = tree.node(id).counts();
+    let proof = Proof { outcome: Outcome::Draw, value: 0.5, plies: 0 };
+    tree.node(id).set_proof(proof);
+    tree.node(id).set_counts(visits, in_flight, f64::from(visits) * proof.value);
+    true
+}
+
+//a writer that a call lets in between two descents of a run may prove a node the run is in. Single descents let a writer in
+//only at the root and then stop at the proven node. A walk does the same: the descent it asked for starts at the root again,
+//and none of the run's later descents takes a leaf below the node, where without that the run's did. The root has one move
+//(the pawn's step that parries the queen's check), so the call's whole run goes into that move's node, which is proven where
+//the call asks for its second descent. The call's counts are exact when it is over
+#[test]
+fn a_walk_that_lets_a_writer_in_starts_its_next_descent_at_the_root() {
+    let settings = graph_settings(true);
+    let (tree, network) = (graph_shared_tree_after("rnb1kbnr/pppp1ppp/8/4p3/7q/5P2/PPPPP1PP/RNBQKBNR w KQkq - 1 2", &[]), SharedNetwork::new());
+    shared_in_flight(&tree, 3_000, 1, &settings, None, &network, usize::MAX);
+    assert_eq!(tree.root().edges().len(), 1, "the root's one move");
+    let round = Round { id: 1 << 40, leaves: 32, simulations: 2_048, collisions: 32, visit_limit: u32::MAX, memory_limit: usize::MAX };
+    let proven = tree.child_index(tree.root(), tree.root().edges().start).expect("the move's node");
+    (STARTS.set(0), PROVEN_AT_START.set(proven));
+    crate::search::shared::WRITER_AT_START.set(Some(prove_the_node_at_the_second_start));
+    let mut boards = Vec::new();
+    //without the cache: every leaf waits, as with a real network, and no cached answer sends the walk back to the root
+    let leaves = tree.gather(&round, &settings, None, None, &mut boards);
+    crate::search::shared::WRITER_AT_START.set(None);
+    assert!(STARTS.get() > 2, "{} descents asked for", STARTS.get());
+    assert_eq!(leaves.len(), 1, "leaves taken below the node proven after the first descent");
+    tree.queue(round.id, leaves);
+    tree.assert_waiting_counts();
+    finish_round(&tree, round.id, &boards, &settings, &network);
+    assert_eq!(tree.pending(), 0);
+    tree.assert_waiting_counts();
+    check_after_search(&tree, &settings, false);
+}
+
+//one thread's gather on a shared tree leaves the tree that its single descents leave (gather_by_descents), round by round:
+//in the engine's rounds (up to 64 leaves, 64 simulations a leaf, as beside a round that is out), with two and sixteen rounds
+//out, with and without transpositions and proofs, the lists made solid in batches as the engine makes them.
+//With one_thread_searches_as_tree_does and its kin this holds the shared tree's runs to Tree's, and both to the descents.
+//It would catch a run counted at a move and not taken back, a run one descent too long, a step made at another moment
+#[test]
+fn one_threads_gather_on_a_shared_tree_is_its_single_descents() {
+    let mut rounds = 0;
+    for transpositions in [false, true] {
+        for certainty in [false, true] {
+            for (fen, moves) in POSITIONS {
+                for in_flight in [2, 16] {
+                    let settings = SearchSettings { transpositions, ..settings(certainty) };
+                    let (by_descents, by_runs) = (shared_tree_for(fen, moves, &settings), shared_tree_for(fen, moves, &settings));
+                    let (descents_network, runs_network) = (SharedNetwork::new(), SharedNetwork::new());
+                    let mut out = VecDeque::new();
+                    loop {
+                        let room = by_runs.root().visits() as usize + by_runs.pending() < 5_000 && !by_runs.is_full();
+                        if room && out.len() < in_flight {
+                            let leaves = (by_runs.root().visits() / 16).clamp(1, 64);
+                            let round = Round { id: rounds, leaves, simulations: 64 * leaves, collisions: leaves, visit_limit: 5_000, memory_limit: usize::MAX };
+                            let (mut descents_boards, mut runs_boards) = (Vec::new(), Vec::new());
+                            by_descents.queue(rounds, by_descents.gather_by_descents(&round, &settings, None, Some(&descents_network.cache), &mut descents_boards));
+                            by_runs.queue(rounds, by_runs.gather(&round, &settings, None, Some(&runs_network.cache), &mut runs_boards));
+                            let what = format!("{fen}, transpositions {transpositions}, {in_flight} rounds out, round {rounds}");
+                            assert!(runs_boards == descents_boards, "{what}: the leaves' boards");
+                            //the whole trees at every eighth round, which keeps the test to a few seconds
+                            if rounds % 8 == 0 {
+                                assert_same_trees(&by_descents.to_tree(), &by_runs.to_tree());
+                                by_runs.assert_waiting_counts();
+                            }
+                            out.push_back((rounds, runs_boards));
+                            rounds += 1;
+                            continue;
+                        }
+                        let Some((id, boards)) = out.pop_front() else { break };
+                        finish_round(&by_descents, id, &boards, &settings, &descents_network);
+                        finish_round(&by_runs, id, &boards, &settings, &runs_network);
+                    }
+                    assert_same_trees(&by_descents.to_tree(), &by_runs.to_tree());
+                    by_runs.assert_waiting_counts();
+                }
+            }
+        }
+    }
+    assert!(rounds > 5_000, "{rounds} rounds compared");
 }

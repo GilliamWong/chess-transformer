@@ -817,9 +817,10 @@ impl Slot {
         }
     }
 
-    //one more descent in flight through the move
-    pub fn add_pending(&self) {
-        self.state.fetch_add(1 << PENDING_SHIFT, Ordering::AcqRel);
+    //`descents` more descents in flight through the move, in one step
+    pub fn add_pending(&self, descents: u32) {
+        let before = self.state.fetch_add(u64::from(descents) << PENDING_SHIFT, Ordering::AcqRel);
+        debug_assert!(u64::from(MoveState(before).pending()) + u64::from(descents) < 1 << (64 - PENDING_SHIFT), "a move's descents in flight past their bits");
     }
 
     pub fn take_pending(&self, pending: u32) {

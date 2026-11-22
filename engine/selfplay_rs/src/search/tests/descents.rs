@@ -2,6 +2,13 @@
 //them down in runs. gather must leave the tree this leaves, number for number, and the same boards in the same order
 use super::*;
 
+//why a descent stopped above a node: a repeat on its path, or a move's first visit of a node other paths made, which takes the
+//node's mean without going on (Tree::stops_at)
+enum Stop {
+    Repeat,
+    FirstVisit,
+}
+
 impl Tree {
     pub fn gather_by_descents(
         &mut self,

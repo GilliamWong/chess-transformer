@@ -341,13 +341,6 @@ const TABLE_ENTRY_BYTES: usize = 16;
 //a held root's part is kept by a compact only while the tree's vectors take no more than one part in this many of the memory limit
 const HELD_SHARE: usize = 8;
 
-//why a descent stopped above a node: a repeat on its path, or a move's first visit of a node other paths made, which takes the
-//node's mean without going on (Tree::stops_at)
-enum Stop {
-    Repeat,
-    FirstVisit,
-}
-
 const PRIORS_A_POSITION: usize = 40;
 
 #[derive(Default)]

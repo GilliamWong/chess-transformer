@@ -94,9 +94,40 @@ impl SharedTree {
         }
     }
 
+    //every count of descents in flight is the waiting leaves that count them: a node's of those that wait at it
+    //(in_flight_nodes), a move's of those that wait through it, and none where no leaf waits; for a tree no thread is working
+    //in. It would catch a count that a gathering call left behind or took off twice: a run's descents it did not get to, a
+    //collision's, a leaf's that another call took
+    pub fn assert_waiting_counts(&self) {
+        let (mut at_nodes, mut at_moves): (HashMap<usize, u32>, HashMap<u32, u32>) = Default::default();
+        for leaf in self.pending.lock().expect("the pending leaves").values().flatten() {
+            for &node in self.in_flight_nodes(&leaf.path, true) {
+                *at_nodes.entry(node).or_default() += 1;
+            }
+            for (&node, &link) in leaf.path.iter().zip(&leaf.edges) {
+                *at_moves.entry(self.current_link(node, link as u32)).or_default() += 1;
+            }
+        }
+        let freed: HashSet<u32> = self.nodes.freed().into_iter().collect();
+        let (mut nodes, mut moves) = (0, 0);
+        for id in (0..self.nodes.len()).filter(|&id| !freed.contains(&(id as u32))) {
+            let node = self.nodes.get(id);
+            let waiting = at_nodes.get(&id).copied().unwrap_or(0);
+            assert_eq!(node.counts().1, waiting, "node {id}: the descents in flight at it against the leaves that wait at it");
+            nodes += usize::from(waiting > 0);
+            for (place, link) in self.links.linked(node) {
+                let waiting = at_moves.get(&link).copied().unwrap_or(0);
+                assert_eq!(self.links.slot(link).state().pending(), waiting, "node {id}, move {place}: the descents in flight through it");
+                moves += usize::from(waiting > 0);
+            }
+        }
+        assert_eq!((nodes, moves), (at_nodes.len(), at_moves.len()), "a waiting leaf's node or move is no longer the tree's");
+    }
+
     //every reference is the number of moves that name the node (plus the root's and a held root's), nothing given back is still
     //in use, and no two things share room; for a tree no thread is working in
     pub fn check_refs(&self) {
+        self.assert_waiting_counts();
         let freed_nodes = self.nodes.freed();
         let freed: HashSet<u32> = freed_nodes.iter().copied().collect();
         assert_eq!(freed.len(), freed_nodes.len(), "a node given back twice");
