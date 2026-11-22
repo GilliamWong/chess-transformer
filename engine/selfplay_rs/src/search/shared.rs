@@ -18,7 +18,8 @@
 //it (a node without moves or without visits: arrive), which is what makes one descent the leaf's owner and the others'
 //arrivals collisions. Its backup, or the end of the call whose collision it was, takes it off both: with nothing in progress
 //and no leaf waiting every count is 0.
-//A node keeps a count of the moves (list links and solid slots) that name it, and 1 if it is the root. The thread that makes a
+//A node keeps a count of the moves (list links and solid slots) that name it, and 1 if it is the root or the root held over the
+//last move (reclaim.rs's hold_root). The thread that makes a
 //move's node, or takes it from the table (only a node with a count can be taken), gives the move that count. The thread that
 //drops the last count owns the node's death (a count never rises from 0) and puts it on the garbage, which sweepers and descents
 //short of room free: its table entry, then its children's counts, links, slots and edges, the node last. A descent reaches a
@@ -1265,7 +1266,7 @@ impl SharedTree {
         while limited && self.allocated_bytes() + self.reserved_bytes() > memory_limit {
             if self.reclaim(ASSIST_BATCH) > 0 {
                 self.counts.assists.fetch_add(1, Ordering::Relaxed);
-            } else if !self.idle() {
+            } else if self.room_still_to_free() {
                 std::thread::yield_now();
             } else if self.allocated_bytes() + self.reserved_bytes() > memory_limit {
                 //nothing is left to free, but the last batch's thread may have freed it since the loop's look: the room is looked at again
@@ -1768,7 +1769,7 @@ impl SharedTree {
         let graph = self.graph.as_ref().map(|_| {
             let halfmoves: Vec<u16> = (0..count).map(|id| self.nodes.get(id).halfmoves()).collect();
             let table = (0..count).map(|id| (graph_key(self.nodes.get(id).key(), u32::from(halfmoves[id])), id as u32)).collect();
-            Graph { table, halfmoves }
+            Graph { table, halfmoves, held: None }
         });
         let (mut links, mut slots) = (vec![super::UNLINKED], Vec::new());
         let nodes = (0..count)

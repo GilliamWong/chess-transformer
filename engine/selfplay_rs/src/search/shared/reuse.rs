@@ -2,8 +2,10 @@
 use super::*;
 
 impl SharedTree {
-    //the rest of the tree is left dead for the sweepers; a root is never proven, so the new root's proof is dropped. The line's
-    //last node is the root and keeps a count of its own, which the nodes above it lose with their moves when they are freed
+    //the rest of the tree is left dead for the sweepers, or alive for one move more if the root was held (hold_root): the old root
+    //then keeps its count, and what the line before left held is dead now. A root is never proven, so the new root's proof is
+    //dropped. The line's last node is the root and keeps a count of its own, which the nodes above it lose with their moves when
+    //they are freed
     pub fn move_root(&mut self, line: &[usize]) {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         let old_root = self.root;
@@ -16,7 +18,13 @@ impl SharedTree {
         if !line.is_empty() {
             let root = self.nodes.get(self.root);
             assert!(root.acquire(), "the line's last node is dead");
-            self.drop_reference(old_root);
+            self.release_held();
+            let garbage = self.garbage.get_mut().expect("the garbage");
+            if std::mem::take(&mut garbage.holds_next) {
+                garbage.held = Some(old_root as u32);
+            } else {
+                self.drop_reference(old_root);
+            }
             root.clear_proof();
             *self.full.get_mut() = false;
             //nothing can be freed yet, so the nodes queued still have their lists

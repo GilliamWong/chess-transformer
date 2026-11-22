@@ -447,9 +447,10 @@ impl Searches {
     }
 
     //None while a call of the id's last search still holds the tree. The root is moved down the line, which costs no more than the
-    //line is long; the dead rest of the tree is freed beside the search, or at once with no gc threads. Once the arenas have grown to
-    //the memory limit, what the root reaches is copied out instead, unless that would take much of a search of `seconds`, and the old
-    //arenas are freed on a thread of their own
+    //line is long; the dead rest of the tree is freed beside the search, or at once with no gc threads. With transpositions the rest
+    //is held for a move first (SharedTree::hold_root), and what is freed is the rest that the move before left. Once the arenas
+    //have grown to the memory limit nothing is held, and what the root reaches is copied out instead, unless that would take much
+    //of a search of `seconds`, and the old arenas are freed on a thread of their own
     fn shared_reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String], seconds: Option<f64>) -> Option<SharedTree> {
         let kept = state.shared_kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
@@ -470,6 +471,10 @@ impl Searches {
             drop_later(tree);
             return None;
         };
+        //the rest of the tree is held for the search to find its positions again, unless the arenas are at the memory limit
+        if !line.is_empty() {
+            tree.hold_root(self.memory_limit);
+        }
         tree.move_root(&line);
         match candidates {
             None if line.is_empty() => {}
@@ -483,7 +488,7 @@ impl Searches {
             return Some(compacted);
         }
         if self.gc_threads == 0 {
-            tree.drain();
+            tree.sweep_now();
         }
         Some(tree)
     }

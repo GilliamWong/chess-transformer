@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant};
 
+mod held;
+
 const KING_AND_QUEEN: &str = "8/8/8/4k3/8/8/8/4K2Q w - - 0 1";
 const KINGS_AND_A_BLOCKED_PAWN: &str = "4k3/8/8/3p4/3P4/8/8/4K3 w - - 0 1";
 const KING_AND_ROOK: &str = "8/8/8/4k3/8/8/8/4K2R w - - 0 1";

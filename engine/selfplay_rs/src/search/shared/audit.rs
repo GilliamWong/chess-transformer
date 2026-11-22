@@ -74,10 +74,16 @@ impl SharedTree {
         self.graph.as_ref().map(|graph| graph.entries.load(Ordering::Relaxed))
     }
 
+    //the counts that are no move's: the root's, and a held root's
+    fn own_counts(&self) -> HashMap<usize, u32> {
+        let held = self.garbage.lock().expect("the garbage").held;
+        std::iter::once(self.root).chain(held.map(|held| held as usize)).map(|id| (id, 1)).collect()
+    }
+
     //the references of the nodes from the moves' (links and slots) and the root, for a tree made without the protocol
     pub fn count_references(&self) {
         let freed: HashSet<u32> = self.nodes.freed().into_iter().collect();
-        let mut counts: HashMap<usize, u32> = HashMap::from([(self.root, 1)]);
+        let mut counts = self.own_counts();
         for id in (0..self.nodes.len()).filter(|&id| !freed.contains(&(id as u32))) {
             for (_, link) in self.links.linked(self.nodes.get(id)) {
                 *counts.entry(self.links.child(link) as usize).or_default() += 1;
@@ -88,13 +94,13 @@ impl SharedTree {
         }
     }
 
-    //every reference is the number of moves that name the node (plus the root's), nothing given back is still in use, and no
-    //two things share room; for a tree no thread is working in
+    //every reference is the number of moves that name the node (plus the root's and a held root's), nothing given back is still
+    //in use, and no two things share room; for a tree no thread is working in
     pub fn check_refs(&self) {
         let freed_nodes = self.nodes.freed();
         let freed: HashSet<u32> = freed_nodes.iter().copied().collect();
         assert_eq!(freed.len(), freed_nodes.len(), "a node given back twice");
-        let mut counts: HashMap<usize, u32> = HashMap::from([(self.root, 1)]);
+        let mut counts = self.own_counts();
         let (mut links, mut edge_runs, mut slot_runs) = (HashSet::new(), Vec::new(), Vec::new());
         let alive: Vec<usize> = (0..self.nodes.len()).filter(|&id| !freed.contains(&(id as u32))).collect();
         assert!(!freed.contains(&(self.root as u32)), "the root was freed");
@@ -262,7 +268,7 @@ impl SharedTree {
         }
         let graph = self.graph.as_ref().map(|_| {
             let table = node_keys.iter().zip(&halfmoves).enumerate().map(|(number, (&key, &count))| (graph_key(key, u32::from(count)), number as u32));
-            Graph { table: table.collect(), halfmoves }
+            Graph { table: table.collect(), halfmoves, held: None }
         });
         Tree {
             board: self.board.clone(),

@@ -5,6 +5,8 @@ use std::sync::{Arc, Weak};
 //the nodes a sweeper or drain frees before it looks again, and the garbage it takes at a time
 const SWEEP_BATCH: usize = 256;
 const GARBAGE_TAKEN: usize = 256;
+//a root is held only by a tree that takes no more than one part in this many of the memory limit
+const HOLDING_SHARE: usize = 2;
 
 #[derive(Default)]
 pub struct Garbage {
@@ -14,6 +16,16 @@ pub struct Garbage {
     pub(super) lists: Vec<u32>,
     //threads freeing some, counted under this lock as they take and leave their batch: "none left and none freeing" is one look
     working: usize,
+    //the root the last line was played from, if it was held (hold_root): it has the count it had as the root, and is no garbage yet
+    pub(super) held: Option<u32>,
+    //the root is held when a line is next played from it
+    pub(super) holds_next: bool,
+}
+
+impl Garbage {
+    fn idle(&self) -> bool {
+        self.dead.is_empty() && self.lists.is_empty() && self.working == 0
+    }
 }
 
 //what a batch frees, given back to the pools together
@@ -31,6 +43,34 @@ impl SharedTree {
         }
     }
 
+    //Tree::hold_root, with transpositions and before a line is played from the root: the root keeps its count when the line is
+    //played (move_root), and with it the rest of the tree stays alive and in the table, where it would be dead: a move that comes
+    //to one of its positions takes the node with its visits, as it takes any node other paths made. It is held for one move:
+    //the next line played gives it up (release_held), and so does a descent short of room, sooner. What the search took of the
+    //rest stays, as tree: so under `memory_limit` (bytes, usize::MAX for none) nothing is held by a tree that takes more than
+    //one part in HOLDING_SHARE of it, which leaves the next search the room of that tree again whatever it takes, nor once the
+    //arenas have grown to the limit: the room a move frees is then the search's
+    pub fn hold_root(&mut self, memory_limit: usize) {
+        let fits = memory_limit == usize::MAX || self.allocated_bytes() <= memory_limit / HOLDING_SHARE;
+        let holds = self.graph.is_some() && fits && !self.gives_out_freed_room(memory_limit);
+        self.garbage.get_mut().expect("the garbage").holds_next = holds;
+    }
+
+    //the held root's count dropped: it is dead with what it alone reaches, for the sweepers and descents to free. False if none
+    //was held
+    pub fn release_held(&self) -> bool {
+        self.give_up_held(&mut self.garbage.lock().expect("the garbage"))
+    }
+
+    //release_held under the garbage's lock: the root is held no more and dead in one step, for whoever looks at the garbage
+    fn give_up_held(&self, garbage: &mut Garbage) -> bool {
+        let Some(id) = garbage.held.take() else { return false };
+        if self.nodes.get(id as usize).release() {
+            garbage.dead.push(id);
+        }
+        true
+    }
+
     pub fn has_garbage(&self) -> bool {
         let garbage = self.garbage.lock().expect("the garbage");
         !garbage.dead.is_empty() || !garbage.lists.is_empty()
@@ -38,8 +78,16 @@ impl SharedTree {
 
     //no garbage is left and no thread is freeing any: all that was freed is given back to the pools
     pub(super) fn idle(&self) -> bool {
-        let garbage = self.garbage.lock().expect("the garbage");
-        garbage.dead.is_empty() && garbage.lists.is_empty() && garbage.working == 0
+        self.garbage.lock().expect("the garbage").idle()
+    }
+
+    //for a descent short of room that found no garbage to take: whether some is still to be freed. Garbage is left or a thread
+    //is freeing some; or a root is held, which is given up here for its room. One look under the garbage's lock: in two, a
+    //thread could find the garbage idle before another gave up the held root and no root held after, and call the tree full
+    //beside all that the root kept
+    pub(super) fn room_still_to_free(&self) -> bool {
+        let mut garbage = self.garbage.lock().expect("the garbage");
+        !garbage.idle() || self.give_up_held(&mut garbage)
     }
 
     //a batch of the garbage for the thread that takes it, who then counts as working; none if there is none
@@ -109,13 +157,20 @@ impl SharedTree {
         freed.nodes.push(id);
     }
 
-    //frees all the garbage, and waits for the other threads freeing some
-    pub fn drain(&self) {
+    //frees all the garbage, and waits for the other threads freeing some: what the sweepers would free
+    pub fn sweep_now(&self) {
         while !self.idle() {
             if self.reclaim(SWEEP_BATCH) == 0 {
                 std::thread::yield_now();
             }
         }
+    }
+
+    //frees all that the root does not reach: the garbage, and what a held root kept
+    #[cfg(test)]
+    pub fn drain(&self) {
+        self.release_held();
+        self.sweep_now();
     }
 
     //threads that free the garbage until it is gone or the tree is closed, each leaving as soon as the tree has no other owner

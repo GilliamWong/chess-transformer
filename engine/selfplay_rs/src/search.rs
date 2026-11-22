@@ -317,13 +317,15 @@ pub fn repeat_filter(key: u64, halfmoves: u16) -> u8 {
 struct Graph {
     table: KeyMap<u32>,
     halfmoves: Vec<u16>,
+    //the root a line is about to be played from, if it is held (Tree::hold_root)
+    held: Option<u32>,
 }
 
 impl Graph {
     fn new(root_key: u64, root_halfmoves: u32) -> Graph {
         let mut table = KeyMap::default();
         table.insert(graph_key(root_key, root_halfmoves), 0);
-        Graph { table, halfmoves: vec![halfmove_count(root_halfmoves)] }
+        Graph { table, halfmoves: vec![halfmove_count(root_halfmoves)], held: None }
     }
 
     fn bytes(&self) -> usize {
@@ -333,6 +335,9 @@ impl Graph {
 
 //a table entry's key, node and control byte, in a table at most 7/8 full
 const TABLE_ENTRY_BYTES: usize = 16;
+
+//a held root's part is kept by a compact only while the tree's vectors take no more than one part in this many of the memory limit
+const HELD_SHARE: usize = 8;
 
 //why a descent stopped above a node: a repeat on its path, or a move's first visit of a node other paths made, which takes the
 //node's mean without going on (Tree::stops_at)
@@ -1789,6 +1794,31 @@ impl Tree {
         let _ = std::thread::Builder::new().spawn(move || drop(old));
     }
 
+    //with transpositions, before a line is played from the root: the next compact keeps what this root reaches behind what the new
+    //root does, where it would drop it. A move leaves the new root short of positions the game can still come to, by moves in
+    //another order than the search took: their nodes stay in the table, and a move that comes to one finds it with its visits, as
+    //it finds any node other paths made (lc0 keeps every node its table holds). They are kept for one move: the compact after
+    //the next keeps the root held then, and what only this one reaches goes. A tree at HELD_SHARE of its memory limit keeps none
+    pub fn hold_root(&mut self) {
+        let root = self.root as u32;
+        if let Some(graph) = &mut self.graph {
+            graph.held = Some(root);
+        }
+    }
+
+    //no root is held any more: one held for a compact that was stopped (its abort) would be kept by the next
+    pub fn release_held(&mut self) {
+        if let Some(graph) = &mut self.graph {
+            graph.held = None;
+        }
+    }
+
+    //whether compact keeps the held root's part: without a memory limit, and while the vectors' room is small beside one. The
+    //copy takes no more room than the vectors have, so the next search has several times the tree left to grow in
+    fn keeps_held(&self) -> bool {
+        self.memory_limit == usize::MAX || self.allocated_bytes() <= self.memory_limit / HELD_SHARE
+    }
+
     //plays a line of moves from the root (edges, each of the node the last one leads to) and makes the node it ends on the root where it
     //is; the rest stays in the vectors until compact. The new root's proof (a root is never proven) and the old root's noise are dropped
     pub fn move_root(&mut self, line: &[usize]) {
@@ -1994,9 +2024,12 @@ impl Tree {
         Some(self.replace_vectors(nodes, node_keys, moves, priors, links, slots))
     }
 
-    //a node that several moves lead to is copied once, at the first, and each move is given its new number and its own visits
+    //a node that several moves lead to is copied once, at the first, and each move is given its new number and its own visits.
+    //What a held root reaches (hold_root) and the root does not is copied behind the root's part, whole: a kept node's moves
+    //lead to kept nodes, so its sum is still its own scores and its moves'
     fn compact_graph(&mut self, abort: Option<&AtomicBool>) -> Option<Vectors> {
         let graph = self.graph.as_ref().expect("the graph");
+        let mut held = graph.held.filter(|_| self.keeps_held()).map(|held| held as usize);
         let (node_room, edge_room) = (self.nodes.len(), self.moves.len());
         let mut copied_as = vec![NO_NODE; node_room];
         let mut order = vec![self.root];
@@ -2009,7 +2042,13 @@ impl Tree {
         links.push(UNLINKED);
         let mut children = Vec::new();
         let mut index = 0;
-        while index < order.len() {
+        loop {
+            if index == order.len() {
+                //the root's part is copied: the held root's follows
+                let Some(held) = held.take().filter(|&held| copied_as[held] == NO_NODE) else { break };
+                copied_as[held] = order.len() as u32;
+                order.push(held);
+            }
             if aborted(index, abort) {
                 return None;
             }
@@ -2041,9 +2080,13 @@ impl Tree {
         let mut table = KeyMap::default();
         table.reserve(nodes.len());
         for (node, (&key, &count)) in node_keys.iter().zip(&halfmoves).enumerate() {
+            //a search that starts meanwhile does not wait for the table either, which a held root's part makes longer
+            if aborted(node, abort) {
+                return None;
+            }
             table.insert(graph_key(key, u32::from(count)), node as u32);
         }
-        self.graph = Some(Graph { table, halfmoves });
+        self.graph = Some(Graph { table, halfmoves, held: None });
         self.root = 0;
         Some(self.replace_vectors(nodes, node_keys, moves, priors, links, slots))
     }

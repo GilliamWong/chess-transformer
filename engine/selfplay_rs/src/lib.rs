@@ -697,7 +697,8 @@ impl Searches {
         reports
     }
 
-    fn reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String]) -> Option<Tree> {
+    //`on_the_clock`: the search has a time to keep to
+    fn reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String], on_the_clock: bool) -> Option<Tree> {
         let kept = state.kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
             kept.tree.abandon();
@@ -712,6 +713,13 @@ impl Searches {
                     return None;
                 };
                 if !line.is_empty() {
+                    //this copy is made at the search's start: on a clock it keeps no held root's part, which advance's copy keeps
+                    //while the opponent thinks
+                    if on_the_clock {
+                        tree.release_held();
+                    } else {
+                        tree.hold_root();
+                    }
                     tree.play_line(&line);
                     tree.drop_stale_leaves(settings, tables);
                 }
@@ -845,7 +853,7 @@ impl Searches {
                 return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
             }
             let tree = self
-                .reused_tree(&mut state, id, fen, &moves)
+                .reused_tree(&mut state, id, fen, &moves, seconds.is_some())
                 .unwrap_or_else(|| Tree::new(board, keys).with_transpositions(self.settings.transpositions));
             state.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree, evaluations: 0 });
             Ok(())
@@ -1009,6 +1017,10 @@ impl Searches {
                 drop_later(tree);
                 return Ok(false);
             };
+            //the copy keeps the rest of the tree for a move (Tree::hold_root)
+            if !line.is_empty() {
+                tree.hold_root();
+            }
             tree.move_root(&line);
             let (stops, threads) = (Arc::new(Stops::default()), self.advance_threads);
             let thread_stops = stops.clone();
