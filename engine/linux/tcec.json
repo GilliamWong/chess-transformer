@@ -1,7 +1,7 @@
 [
     {
         "command": "./fry.sh",
-        "name": "Fry 0.1.0",
+        "name": "Fry 0.2.0",
         "restart": "on",
         "options": [
             {
