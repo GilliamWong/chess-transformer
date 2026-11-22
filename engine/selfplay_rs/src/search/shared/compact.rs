@@ -155,6 +155,7 @@ impl SharedTree {
                 found.children.push(child);
             }
             let edges = node.edges().len();
+            //Tree's solid_in_a_copy: slots are a node's that has moves, whatever its visits
             let solid = edges > 0 && node.visits() >= self.solid_threshold;
             found.shapes.push(Shape { links: (found.children.len() - before) as u8, edges: edges as u8, solid });
         }
@@ -175,13 +176,15 @@ impl SharedTree {
                 let child = plan.numbers.map_or(next_child, |numbers| marked(&numbers[self.links.child(link) as usize]));
                 next_child += 1;
                 plan.fresh.nodes.get(child as usize).add_reference();
-                let visits = self.links.visits(link).load(Ordering::Relaxed);
+                //all that the move holds, of the node as the copy numbers it
+                let held = self.links.record(link);
+                let record = MoveRecord { state: held.state.with_child(child), ..held };
                 if shape.solid {
-                    plan.fresh.links.set_solid(children + place as u32, child, visits);
+                    plan.fresh.links.set_solid(children + place as u32, record);
                 } else {
                     let link = children + index as u32;
                     let next = if index + 1 < usize::from(shape.links) { link + 1 } else { NO_LINK };
-                    plan.fresh.links.write(link, child, visits, place, next);
+                    plan.fresh.links.write(link, record, place, next);
                 }
             }
             if let Some(graph) = plan.graph {

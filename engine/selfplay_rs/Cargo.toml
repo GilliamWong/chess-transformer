@@ -17,6 +17,11 @@ rand_distr = "0.6.0"
 shakmaty = "0.30.1"
 shakmaty-syzygy = { version = "0.28.1", features = ["mmap"] }
 
+[features]
+#Searches.audit: the tests' checks of a shared tree (search/shared/audit.rs) on the tree a real search left, for
+#tests/hardware_check.py. It adds a count to every allocation of edges and slots: not for the engine that plays
+audit = []
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

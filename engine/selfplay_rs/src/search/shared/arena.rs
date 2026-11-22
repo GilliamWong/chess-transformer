@@ -1,6 +1,7 @@
 use crate::rules::PackedMove;
 use crate::search::{
-    HEAD_MOVES, MOST_MOVES, NO_LINK, NO_NODE, Outcome, Proof, SOLID, by_prior, head_code, head_prior, listed, tail_code, tail_prior,
+    HEAD_MOVES, MOST_MOVES, NO_LINK, NO_MEAN, NO_NODE, Outcome, Proof, SOLID, by_prior, head_code, head_prior, listed, tail_code,
+    tail_prior,
 };
 use shakmaty::Move;
 use std::collections::{BTreeMap, BTreeSet};
@@ -22,7 +23,13 @@ const IN_FLIGHT: u64 = 1 << 32;
 //a freed node's count in a debug build, for a descent that reaches it to find
 const FREED: u64 = u64::MAX;
 //proof_meta keeps a proof's plies in the bits above its outcome's two
-const PROOF_PLIES_BITS: u32 = 30;
+const PROOF_PLIES_BITS: u32 = 16;
+//proof_meta's bits above, proof or none (SharedTree's link_known_moves, with transpositions): in 8 bits one past the
+//last move that a pass gave a node, in 4 the passes made (KNOWN_PASSES at most), and a bit for the thread that is making one
+const KNOWN_TO_SHIFT: u32 = 2 + PROOF_PLIES_BITS;
+const KNOWN_PASSES_SHIFT: u32 = KNOWN_TO_SHIFT + 8;
+const KNOWN_PASS_BEGUN: u32 = 1 << (KNOWN_PASSES_SHIFT + 4);
+const KNOWN_MOVES: u32 = KNOWN_PASS_BEGUN | 15 << KNOWN_PASSES_SHIFT | 255 << KNOWN_TO_SHIFT;
 
 //a counter that every thread writes, on a line of its own: the fields beside it are read by every descent
 #[repr(align(64))]
@@ -52,7 +59,8 @@ pub struct Node {
     edges_at: AtomicU64, //the first edge above the low 8 bits, the number of edges in them; 0 until expanded
     proof_value: AtomicU64,
     key: AtomicU64,
-    proof_meta: AtomicU32, //0 without a proof, else the plies above the low 2 bits and the outcome in them (1 loss, 2 draw, 3 win)
+    //the low 2 bits 0 without a proof, else the outcome (1 loss, 2 draw, 3 win) with the plies above them; KNOWN_MOVES
+    proof_meta: AtomicU32,
     references: AtomicU32, //the moves (links and slots) that name the node, and 1 for the root; 0 once it is dead: see SharedTree
     refreshes: AtomicU16,  //begun, wrapping
     halfmoves: AtomicU16,  //with transpositions the node's fifty-move count
@@ -146,17 +154,17 @@ impl Node {
     }
 
     //for a node of a tree being copied, before anything else sees it
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn set_references(&self, references: u32) {
         self.references.store(references, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn references(&self) -> u32 {
         self.references.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn is_freed(&self) -> bool {
         self.count.load(Ordering::Relaxed) == FREED
     }
@@ -166,7 +174,12 @@ impl Node {
     }
 
     pub fn add_value(&self, delta: f64) {
-        let _ = self.value_sum.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| Some((f64::from_bits(seen) + delta).to_bits()));
+        self.change_value(|sum| sum + delta);
+    }
+
+    //the sum as `change` makes it of what it was, whatever other threads add to it meanwhile
+    pub fn change_value(&self, change: impl Fn(f64) -> f64) {
+        let _ = self.value_sum.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| Some(change(f64::from_bits(seen)).to_bits()));
     }
 
     pub fn mean_score(&self, visits: u32) -> f64 {
@@ -242,7 +255,8 @@ impl Node {
             2 => Outcome::Draw,
             _ => Outcome::Win,
         };
-        Some(Proof { outcome, value: f64::from_bits(self.proof_value.load(Ordering::Relaxed)), plies: meta >> 2 })
+        let plies = (meta & !KNOWN_MOVES) >> 2;
+        Some(Proof { outcome, value: f64::from_bits(self.proof_value.load(Ordering::Relaxed)), plies })
     }
 
     pub fn proves_a_loss(&self) -> bool {
@@ -257,11 +271,39 @@ impl Node {
         };
         assert!(proof.plies < 1 << PROOF_PLIES_BITS, "a proof of {} plies", proof.plies);
         self.proof_value.store(proof.value.to_bits(), Ordering::Relaxed);
-        self.proof_meta.store(proof.plies << 2 | outcome, Ordering::Release);
+        //no thread links a node's known moves beside its proving: their bits are as they were read
+        let known = self.proof_meta.load(Ordering::Relaxed) & KNOWN_MOVES;
+        self.proof_meta.store(proof.plies << 2 | outcome | known, Ordering::Release);
     }
 
     pub fn clear_proof(&self) {
-        self.proof_meta.store(0, Ordering::Release);
+        self.proof_meta.fetch_and(KNOWN_MOVES, Ordering::AcqRel);
+    }
+
+    //the passes of link_known_moves the node has had
+    pub fn known_passes(&self) -> u32 {
+        self.proof_meta.load(Ordering::Acquire) >> KNOWN_PASSES_SHIFT & 15
+    }
+
+    //the node's next pass is this thread's to make, if the node has had `passes` and no thread is making one: one thread a pass
+    pub fn begin_known_pass(&self, passes: u32) -> bool {
+        let seen = self.proof_meta.load(Ordering::Acquire);
+        seen & KNOWN_PASS_BEGUN == 0
+            && seen >> KNOWN_PASSES_SHIFT & 15 == passes
+            && self.proof_meta.compare_exchange(seen, seen | KNOWN_PASS_BEGUN, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    }
+
+    //one past the last move that a pass gave a node, as the last pass made left it: 0 if none
+    pub fn known_to(&self) -> usize {
+        (self.proof_meta.load(Ordering::Acquire) >> KNOWN_TO_SHIFT & 255) as usize
+    }
+
+    //by the thread that began the pass, once every slot it gives a node has it: the node has had `passes` passes, and a thread
+    //that reads `known_to` reads the slots below it as given
+    pub fn end_known_pass(&self, passes: u32, known_to: usize) {
+        debug_assert!(passes <= 15 && (self.known_to()..256).contains(&known_to), "passes within their bits, known_to no lower");
+        let known = passes << KNOWN_PASSES_SHIFT | (known_to as u32) << KNOWN_TO_SHIFT;
+        let _ = self.proof_meta.fetch_update(Ordering::AcqRel, Ordering::Acquire, |meta| Some(meta & !KNOWN_MOVES | known));
     }
 
     //the node as `from` is, with its edges from `first_edge` and its moves' nodes from `children`, for a copy nothing reads yet; its
@@ -391,7 +433,7 @@ impl Pool {
         self.idle.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     fn held(&self) -> Vec<u32> {
         self.indices.lock().expect("a pool").clone()
     }
@@ -493,7 +535,7 @@ impl FreeRuns {
         Some(first)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     fn held(&self) -> Vec<(usize, usize)> {
         let runs = self.runs.lock().expect("the runs given back");
         let mut held: Vec<(usize, usize)> = runs.by_first.iter().map(|(&first, &length)| (first, length)).collect();
@@ -540,6 +582,11 @@ impl Nodes {
         self.table.get(index)
     }
 
+    //a hint that the node's line is read soon
+    pub fn prefetch(&self, index: usize) {
+        self.table.prefetch(index);
+    }
+
     //a new node with its position's key and a reference; its index is given to others only once it is published
     pub fn push(&self, key: u64) -> usize {
         let index = match self.freed.take() {
@@ -567,7 +614,7 @@ impl Nodes {
         self.freed.give_all(indices);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn freed(&self) -> Vec<u32> {
         self.freed.held()
     }
@@ -598,7 +645,7 @@ fn run_start(at: usize, count: usize, bits: u32) -> usize {
 //runs of elements, each in one chunk: from the runs given back, else from the end of those given out so far
 struct Runs {
     next: Alone<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     skipped: AtomicUsize, //the elements left unused at chunk ends
     freed: FreeRuns,
     bits: u32,
@@ -609,7 +656,7 @@ impl Runs {
     fn new(bits: u32, capacity: usize) -> Runs {
         Runs {
             next: Alone(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "audit"))]
             skipped: AtomicUsize::new(0),
             freed: FreeRuns::new(bits),
             bits,
@@ -620,7 +667,7 @@ impl Runs {
     fn alloc(&self, count: usize) -> usize {
         self.freed.take(count).unwrap_or_else(|| {
             let (first, _skipped) = alloc_run(&self.next, count, self.bits, self.capacity);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "audit"))]
             self.skipped.fetch_add(_skipped, Ordering::Relaxed);
             first
         })
@@ -637,31 +684,204 @@ impl Runs {
     }
 
     //the elements in the runs in use
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     fn used(&self) -> usize {
         self.taken() - self.skipped.load(Ordering::Relaxed)
     }
 }
 
+//a move's visits and its node's mean as the move holds it (NO_MEAN while it holds none), in one word (the visits in its low 32
+//bits, the mean's bits in its high), so that a thread changes the two in one step beside the others (the protocol in shared.rs)
+pub struct MoveMean(AtomicU64);
+
+fn packed((visits, mean): (u32, f32)) -> u64 {
+    u64::from(mean.to_bits()) << 32 | u64::from(visits)
+}
+
+fn unpacked(word: u64) -> (u32, f32) {
+    (word as u32, f32::from_bits((word >> 32) as u32))
+}
+
+impl MoveMean {
+    fn new() -> MoveMean {
+        MoveMean(AtomicU64::new(packed((0, NO_MEAN))))
+    }
+
+    //the visits and the mean
+    pub fn load(&self) -> (u32, f32) {
+        unpacked(self.0.load(Ordering::Acquire))
+    }
+
+    //`now` in place of `seen` (what load or a change that failed gave): Err of what the move holds, if another thread has
+    //changed it since
+    pub fn change(&self, seen: (u32, f32), now: (u32, f32)) -> Result<(), (u32, f32)> {
+        self.0.compare_exchange(packed(seen), packed(now), Ordering::AcqRel, Ordering::Acquire).map(|_| ()).map_err(unpacked)
+    }
+
+    //before the move is published, or with the tree to itself
+    fn set(&self, held: (u32, f32)) {
+        self.0.store(packed(held), Ordering::Relaxed);
+    }
+}
+
+//what a move holds of its node beside its visits and mean, in one word: the node in the low CHILD_BITS bits (all set while
+//the move has none), then a bit for a node that is a proven loss for the side that makes the move, as far as the move has
+//learnt; from REPEATS_SHIFT the node's repeat_filter; and from PENDING_SHIFT up the descents in flight through the move, where
+//a count past its bits would spoil no other field. With the visits and the mean it is all that selection reads of a move with
+//transpositions; without them only the node is used
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MoveState(u64);
+
+const CHILD_BITS: u32 = 30;
+const NO_CHILD: u64 = (1 << CHILD_BITS) - 1;
+const LOST: u64 = 1 << CHILD_BITS;
+const REPEATS_SHIFT: u32 = 32;
+const PENDING_SHIFT: u32 = 40;
+const _: () = assert!(Nodes::CAPACITY as u64 <= NO_CHILD, "a node's index and none's in a move's word");
+
+impl MoveState {
+    const NONE: MoveState = MoveState(NO_CHILD);
+
+    //of a move whose node is `child`, with nothing in flight through it
+    pub fn new(child: u32, repeats: u8, lost: bool) -> MoveState {
+        debug_assert!(u64::from(child) < NO_CHILD, "a node past a move's word");
+        MoveState(u64::from(child) | if lost { LOST } else { 0 } | u64::from(repeats) << REPEATS_SHIFT)
+    }
+
+    //the move's node, NO_NODE for none
+    pub fn child(self) -> u32 {
+        let child = self.0 & NO_CHILD;
+        if child == NO_CHILD { NO_NODE } else { child as u32 }
+    }
+
+    pub fn lost(self) -> bool {
+        self.0 & LOST != 0
+    }
+
+    pub fn repeats(self) -> u8 {
+        (self.0 >> REPEATS_SHIFT) as u8
+    }
+
+    pub fn pending(self) -> u32 {
+        (self.0 >> PENDING_SHIFT) as u32
+    }
+
+    //the same of another node, for a copy that numbers the nodes anew
+    pub fn with_child(self, child: u32) -> MoveState {
+        debug_assert!(u64::from(child) < NO_CHILD, "a node past a move's word");
+        MoveState(self.0 & !NO_CHILD | u64::from(child))
+    }
+
+    //with `pending` descents in flight, for a copy of a tree that has some
+    #[cfg(test)]
+    pub fn with_pending(self, pending: u32) -> MoveState {
+        MoveState(self.0 & ((1 << PENDING_SHIFT) - 1) | u64::from(pending) << PENDING_SHIFT)
+    }
+}
+
+//a move with a node: a solid node has one for each of its moves, whether the move has a node yet or not, and a list's link
+//carries its move's. The node is swapped in once (claim) and never changes
+#[repr(C)]
+pub struct Slot {
+    held: MoveMean,
+    state: AtomicU64,
+}
+
+//a tree's bytes are counted by these
+const _: () = assert!(size_of::<Slot>() == 16 && size_of::<Link>() == 24);
+
+impl Slot {
+    fn new() -> Slot {
+        Slot { held: MoveMean::new(), state: AtomicU64::new(MoveState::NONE.0) }
+    }
+
+    pub fn state(&self) -> MoveState {
+        MoveState(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn child(&self) -> u32 {
+        self.state().child()
+    }
+
+    //the move's visits and the mean it holds
+    pub fn held(&self) -> &MoveMean {
+        &self.held
+    }
+
+    //sets the move's node, with its repeat_filter, if the move has none: Ok(child), else Err(the node it has)
+    pub fn claim(&self, child: u32, repeats: u8) -> Result<u32, u32> {
+        let claimed = MoveState::new(child, repeats, false);
+        match self.state.compare_exchange(MoveState::NONE.0, claimed.0, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(child),
+            Err(now) => Err(MoveState(now).child()),
+        }
+    }
+
+    //`descents` more descents in flight through the move, in one step
+    pub fn add_pending(&self, descents: u32) {
+        let before = self.state.fetch_add(u64::from(descents) << PENDING_SHIFT, Ordering::AcqRel);
+        debug_assert!(u64::from(MoveState(before).pending()) + u64::from(descents) < 1 << (64 - PENDING_SHIFT), "a move's descents in flight past their bits");
+    }
+
+    pub fn take_pending(&self, pending: u32) {
+        let before = self.state.fetch_sub(u64::from(pending) << PENDING_SHIFT, Ordering::AcqRel);
+        debug_assert!(MoveState(before).pending() >= pending, "more descents taken off a move than were in flight through it");
+    }
+
+    //the move's node is a proven loss for the side that makes it
+    pub fn learn_loss(&self) {
+        self.state.fetch_or(LOST, Ordering::AcqRel);
+    }
+
+    fn forget_loss(&self) {
+        self.state.fetch_and(!LOST, Ordering::AcqRel);
+    }
+
+    //before the move is published, or with the tree to itself
+    fn set(&self, record: MoveRecord) {
+        self.held.set((record.visits, record.mean));
+        self.state.store(record.state.0, Ordering::Relaxed);
+    }
+
+    //for a tree no thread works in
+    fn record(&self) -> MoveRecord {
+        let (visits, mean) = self.held.load();
+        MoveRecord { visits, mean, state: self.state() }
+    }
+}
+
+//all that a move with a node holds, for a copy of it
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct MoveRecord {
+    pub visits: u32,
+    pub mean: f32,
+    pub state: MoveState,
+}
+
+impl MoveRecord {
+    //of a move that has `child` as its node and nothing else yet
+    pub fn new(child: u32, repeats: u8) -> MoveRecord {
+        MoveRecord { visits: 0, mean: NO_MEAN, state: MoveState::new(child, repeats, false) }
+    }
+
+    const NONE: MoveRecord = MoveRecord { visits: 0, mean: NO_MEAN, state: MoveState::NONE };
+}
+
 //a list's move with a node; written before it is swapped into its list (release) and read after its predecessor's `next` (acquire)
+#[repr(C)]
 pub struct Link {
-    child: AtomicU32,
-    visits: AtomicU32, //the move's own visits (with transpositions)
+    slot: Slot,
     next: AtomicU32,
     place: AtomicU32, //its place among the node's moves
 }
 
 impl Link {
     fn new() -> Link {
-        Link { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0), next: AtomicU32::new(NO_LINK), place: AtomicU32::new(0) }
+        Link { slot: Slot::new(), next: AtomicU32::new(NO_LINK), place: AtomicU32::new(0) }
     }
 
-    pub fn child(&self) -> u32 {
-        self.child.load(Ordering::Acquire)
-    }
-
-    pub fn visits(&self) -> &AtomicU32 {
-        &self.visits
+    pub fn slot(&self) -> &Slot {
+        &self.slot
     }
 
     pub fn next(&self) -> u32 {
@@ -670,31 +890,6 @@ impl Link {
 
     pub fn place(&self) -> usize {
         self.place.load(Ordering::Relaxed) as usize
-    }
-}
-
-//a solid node's move: its node (NO_NODE until it has one, which is swapped in) and its own visits
-pub struct Slot {
-    child: AtomicU32,
-    visits: AtomicU32,
-}
-
-impl Slot {
-    fn new() -> Slot {
-        Slot { child: AtomicU32::new(NO_NODE), visits: AtomicU32::new(0) }
-    }
-
-    pub fn child(&self) -> u32 {
-        self.child.load(Ordering::Acquire)
-    }
-
-    pub fn visits(&self) -> &AtomicU32 {
-        &self.visits
-    }
-
-    //sets the move's node if it has none: Ok(child), else Err(the node it has)
-    pub fn claim(&self, child: u32) -> Result<u32, u32> {
-        self.child.compare_exchange(NO_NODE, child, Ordering::AcqRel, Ordering::Acquire).map(|_| child)
     }
 }
 
@@ -707,7 +902,12 @@ pub struct Links {
 }
 
 impl Links {
-    const CAPACITY: usize = LINK_CHUNKS << LINK_CHUNK_BITS;
+    pub const CAPACITY: usize = LINK_CHUNKS << LINK_CHUNK_BITS;
+
+    //the links not given out yet (those given back are not counted)
+    pub fn room(&self) -> usize {
+        Self::CAPACITY.saturating_sub(self.len())
+    }
 
     pub fn hold_back(&self, held: bool) {
         self.freed.held_back.store(held, Ordering::Relaxed);
@@ -753,7 +953,7 @@ impl Links {
     }
 
     //the slots in the runs in use
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn slots_used(&self) -> usize {
         self.slot_runs.used()
     }
@@ -767,8 +967,15 @@ impl Links {
         self.table.get(link as usize)
     }
 
+    //a move's slot by its name: a list's link's, or a solid node's
     pub fn slot(&self, link: u32) -> &Slot {
-        self.slots.get((link & !SOLID) as usize)
+        if listed(link) { &self.get(link).slot } else { self.slots.get((link & !SOLID) as usize) }
+    }
+
+    //a slot without a node, for a list's move that has no link
+    pub fn no_slot(&self) -> &'static Slot {
+        static NO_SLOT: Slot = Slot { held: MoveMean(AtomicU64::new(0)), state: AtomicU64::new(MoveState::NONE.0) };
+        &NO_SLOT
     }
 
     //a hint that a node's first link or slot is read soon
@@ -786,15 +993,34 @@ impl Links {
 
     //the move's node: NO_NODE for a solid slot without one
     pub fn child(&self, link: u32) -> u32 {
-        if listed(link) { self.get(link).child() } else { self.slot(link).child() }
+        self.slot(link).child()
     }
 
-    pub fn visits(&self, link: u32) -> &AtomicU32 {
-        if listed(link) { &self.get(link).visits } else { &self.slot(link).visits }
+    //all that the move holds, for a tree no thread works in
+    pub fn record(&self, link: u32) -> MoveRecord {
+        self.slot(link).record()
     }
 
-    //a list link for the move at `place` with its node, not yet in a list
-    pub fn push(&self, child: u32, place: usize) -> u32 {
+    //the moves that hold one of `nodes` as a proven loss learn that it is none any more: every link and slot is looked at,
+    //those given back too (what they hold is written anew when they are given out). With the tree to itself
+    pub fn forget_losses(&self, nodes: &[u32]) {
+        let forget = |slot: &Slot| {
+            let state = slot.state();
+            if state.lost() && nodes.contains(&state.child()) {
+                slot.forget_loss();
+            }
+        };
+        let chunk = 1 << LINK_CHUNK_BITS;
+        for first in (0..self.len()).step_by(chunk) {
+            self.table.slice(first, chunk.min(self.len() - first)).iter().for_each(|link| forget(&link.slot));
+        }
+        for first in (0..self.slots()).step_by(chunk) {
+            self.slots.slice(first, chunk.min(self.slots() - first)).iter().for_each(forget);
+        }
+    }
+
+    //a list link for the move at `place` with what the move holds, not yet in a list
+    pub fn push(&self, record: MoveRecord, place: usize) -> u32 {
         let link = match self.freed.take() {
             Some(freed) => freed as usize,
             None => {
@@ -805,8 +1031,7 @@ impl Links {
             }
         };
         let made = self.table.get(link);
-        made.child.store(child, Ordering::Relaxed);
-        made.visits.store(0, Ordering::Relaxed);
+        made.slot.set(record);
         made.next.store(NO_LINK, Ordering::Relaxed);
         made.place.store(place as u32, Ordering::Relaxed);
         link as u32
@@ -835,10 +1060,7 @@ impl Links {
     pub fn solid(&self, count: usize) -> u32 {
         let first = self.slot_runs.alloc(count);
         self.make_slots(first);
-        for slot in self.slots.slice(first, count) {
-            slot.child.store(NO_NODE, Ordering::Relaxed);
-            slot.visits.store(0, Ordering::Relaxed);
-        }
+        self.slots.slice(first, count).iter().for_each(|slot| slot.set(MoveRecord::NONE));
         first as u32 | SOLID
     }
 
@@ -846,12 +1068,12 @@ impl Links {
         self.slots.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Slot::new()).collect());
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn freed_links(&self) -> Vec<u32> {
         self.freed.held()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn freed_slot_runs(&self) -> Vec<(usize, usize)> {
         self.slot_runs.freed.held()
     }
@@ -908,18 +1130,16 @@ impl Links {
         self.get(link).next.store(next, Ordering::Relaxed);
     }
 
-    //a solid slot's node and visits, before the node is published or with the tree to itself
-    pub fn set_solid(&self, link: u32, child: u32, visits: u32) {
-        let slot = self.slot(link);
-        slot.child.store(child, Ordering::Relaxed);
-        slot.visits.store(visits, Ordering::Relaxed);
+    //what a solid slot's move holds, before the node is published or with the tree to itself
+    pub fn set_solid(&self, link: u32, record: MoveRecord) {
+        debug_assert!(!listed(link), "a link written as a solid slot");
+        self.slot(link).set(record);
     }
 
-    //a list's link of a copy nothing reads yet
-    pub fn write(&self, link: u32, child: u32, visits: u32, place: usize, next: u32) {
+    //a list's link of a copy nothing reads yet, with what its move holds
+    pub fn write(&self, link: u32, record: MoveRecord, place: usize, next: u32) {
         let written = self.get(link);
-        written.child.store(child, Ordering::Relaxed);
-        written.visits.store(visits, Ordering::Relaxed);
+        written.slot.set(record);
         written.place.store(place as u32, Ordering::Relaxed);
         written.next.store(next, Ordering::Relaxed);
     }
@@ -1023,7 +1243,7 @@ impl Edges {
     }
 
     //the units in the runs in use
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn used(&self) -> usize {
         self.runs.used()
     }
@@ -1039,7 +1259,7 @@ impl Edges {
         self.units.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn freed_runs(&self) -> Vec<(usize, usize)> {
         self.runs.freed.held()
     }
@@ -1122,7 +1342,7 @@ impl Edges {
     }
 
     //the units of the node's edges, for an audit
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn run(&self, edges: Range<usize>) -> Vec<u16> {
         self.units.slice(edges.start, units(edges.len())).iter().map(|unit| unit.load(Ordering::Relaxed)).collect()
     }
@@ -1185,7 +1405,7 @@ impl Fresh {
         fresh.edges.runs.next.store(layout.edges, Ordering::Relaxed);
         fresh.links.next.store(layout.links, Ordering::Relaxed);
         fresh.links.slot_runs.next.store(layout.slots, Ordering::Relaxed);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "audit"))]
         {
             fresh.edges.runs.skipped.store(layout.edges - layout.edges_in_runs, Ordering::Relaxed);
             fresh.links.slot_runs.skipped.store(layout.slots - layout.slots_in_runs, Ordering::Relaxed);
@@ -1327,7 +1547,7 @@ mod tests {
                                 &mut held_links,
                                 turn,
                                 || {
-                                    let link = links.push(NO_NODE, 0) as usize;
+                                    let link = links.push(MoveRecord::new(0, 0), 0) as usize;
                                     out_links.take(link, 1, "links");
                                     link
                                 },
@@ -1434,7 +1654,7 @@ mod tests {
                         (0..200usize)
                             .map(|turn| {
                                 let place = (turn * 37 + worker as usize * 11) % 150;
-                                let link = links.push(worker * 1000 + turn as u32, place);
+                                let link = links.push(MoveRecord::new(worker * 1000 + turn as u32, 0), place);
                                 loop {
                                     match links.find(head, place) {
                                         Ok(found) => break (place, links.child(found)),

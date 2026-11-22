@@ -162,7 +162,7 @@ def rust_searches_of_game_positions(model: nn.Module, carlsen_games, simulations
     while len(searches):
         leaves = np.frombuffer(searches.descend(), dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
         answers = np.array([evaluate(leaf[None])[0] for leaf in leaves], dtype=np.float32).reshape(-1, ANSWER_WIDTH)
-        for number, line, score, root_moves, visits in searches.finish(answers):
+        for number, line, score, root_moves, visits, _ in searches.finish(answers):
             found[number] = (line, score, root_moves, visits)
 
     assert len(positions) > 20 and sorted(found) == list(range(len(positions)))

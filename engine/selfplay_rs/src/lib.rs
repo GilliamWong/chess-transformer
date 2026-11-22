@@ -298,6 +298,8 @@ struct Search {
     simulations: u32,
     stopped: bool,
     tree: Tree,
+    //the leaves the search has sent to the network: not those the cache answered, nor the simulations that needed none
+    evaluations: u64,
 }
 
 impl Search {
@@ -311,12 +313,13 @@ impl Search {
         let score = score_of(tree, Some(line[0]));
         let expected_line = line.iter().map(|&edge| uci(tree.chess_move(edge))).collect();
         let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(tree.root_index(), edge)));
-        (self.id, expected_line, score, root_moves.collect(), tree.root().visit_count)
+        (self.id, expected_line, score, root_moves.collect(), tree.root().visit_count, self.evaluations)
     }
 }
 
-//(id, expected line in uci, the chosen move's mean score, root moves by visits, the root's visits)
-type SearchReport = (u64, Vec<String>, f64, Vec<(String, u32)>, u32);
+//(id, expected line in uci, the chosen move's mean score, root moves by visits, the root's visits, the leaves the search sent
+//to the network)
+type SearchReport = (u64, Vec<String>, f64, Vec<(String, u32)>, u32, u64);
 
 //number is the round's id in the trees, name the one the caller gave it; leaves are (search id, count) in board order
 struct RoundOut {
@@ -393,6 +396,9 @@ struct State {
 #[pyclass(frozen)]
 struct Searches {
     settings: SearchSettings,
+    //for the round loops' smart pruning, its own (rounds.rs's fresh_enough) and engine_search.py's: a move's lead stops a search
+    //only once the visits the search has made itself are this share of those it is expected to make in all; 0 for no such wait
+    fresh_share: f64,
     move_ids: MoveIds,
     answer_width: usize,
     tables: Option<Arc<Tables>>,
@@ -570,6 +576,7 @@ impl Searches {
                 memory_limit: self.memory_limit,
             };
             let gathered = search.tree.gather(&limits, &self.settings, self.tables.as_deref(), state.cache.as_ref(), boards);
+            search.evaluations += u64::from(gathered);
             if gathered > 0 {
                 round_leaves.push((search.id, gathered));
             }
@@ -693,7 +700,8 @@ impl Searches {
         reports
     }
 
-    fn reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String]) -> Option<Tree> {
+    //`on_the_clock`: the search has a time to keep to
+    fn reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String], on_the_clock: bool) -> Option<Tree> {
         let kept = state.kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
             kept.tree.abandon();
@@ -708,6 +716,13 @@ impl Searches {
                     return None;
                 };
                 if !line.is_empty() {
+                    //this copy is made at the search's start: on a clock it keeps no held root's part, which advance's copy keeps
+                    //while the opponent thinks
+                    if on_the_clock {
+                        tree.release_held();
+                    } else {
+                        tree.hold_root();
+                    }
                     tree.play_line(&line);
                     tree.drop_stale_leaves(settings, tables);
                 }
@@ -753,7 +768,7 @@ impl Searches {
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
                         memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false,
-                        gather_helpers=0, helper_threads=0, helper_cpus=None))]
+                        fresh_share=0.0, gather_helpers=0, helper_threads=0, helper_cpus=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         move_id_table: Vec<i16>,
@@ -774,6 +789,7 @@ impl Searches {
         gc_threads: usize,
         concurrent_descents: bool,
         transpositions: bool,
+        fresh_share: f64,
         gather_helpers: usize,
         helper_threads: usize,
         helper_cpus: Option<Vec<usize>>,
@@ -786,6 +802,9 @@ impl Searches {
                 "value_sharpness multiplies the value's logit, it must be positive, not {value_sharpness}"
             )));
         }
+        if !(0.0..=1.0).contains(&fresh_share) {
+            return Err(PyValueError::new_err(format!("fresh_share is a share of a search's visits, from 0 to 1, not {fresh_share}")));
+        }
         Ok(Searches {
             settings: SearchSettings {
                 c_puct,
@@ -797,6 +816,7 @@ impl Searches {
                 certainty,
                 transpositions,
             },
+            fresh_share,
             move_ids: move_ids(move_id_table)?,
             answer_width,
             tables: open_tables(tablebase_folder, tablebase_pieces)?.map(Arc::new),
@@ -841,9 +861,9 @@ impl Searches {
                 return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
             }
             let tree = self
-                .reused_tree(&mut state, id, fen, &moves)
+                .reused_tree(&mut state, id, fen, &moves, seconds.is_some())
                 .unwrap_or_else(|| Tree::new(board, keys).with_transpositions(self.settings.transpositions));
-            state.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
+            state.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree, evaluations: 0 });
             Ok(())
         })
     }
@@ -1005,6 +1025,10 @@ impl Searches {
                 drop_later(tree);
                 return Ok(false);
             };
+            //the copy keeps the rest of the tree for a move (Tree::hold_root)
+            if !line.is_empty() {
+                tree.hold_root();
+            }
             tree.move_root(&line);
             let (stops, threads) = (Arc::new(Stops::default()), self.advance_threads);
             let thread_stops = stops.clone();
@@ -1046,6 +1070,40 @@ impl Searches {
                 return Ok(self.shared_cache.as_deref().map_or(0, SharedCache::hits));
             }
             Ok(self.lock()?.cache.as_ref().map_or(0, Cache::hits))
+        })
+    }
+
+    //for a hardware check (tests/hardware_check.py), with concurrent descents: the numbers of the tree of the search `id`,
+    //running or kept: its bytes in use and those of its arenas, the root's visits, the leaves sent to the networks, the
+    //descents that collided, and how often its threads gave way to a writer, had the tree to themselves, made a node another
+    //thread made too, freed nodes, and freed some for want of room
+    fn tree_numbers(&self, py: Python<'_>, id: u64) -> PyResult<HashMap<&'static str, u64>> {
+        py.detach(|| {
+            let tree = self.searched_tree(id)?;
+            let counts = &tree.counts;
+            let count = |count: &AtomicU64| count.load(Ordering::Relaxed);
+            Ok(HashMap::from([
+                ("allocated_bytes", tree.allocated_bytes() as u64),
+                ("footprint_bytes", tree.footprint_bytes() as u64),
+                ("root_visits", u64::from(tree.root().visits())),
+                ("evaluations", tree.evaluations()),
+                ("collisions", count(&counts.collisions)),
+                ("gave_way", count(&counts.gave_way)),
+                ("exclusive", count(&counts.exclusive)),
+                ("orphans", count(&counts.orphans)),
+                ("reclaimed", count(&counts.reclaimed)),
+                ("assists", count(&counts.assists)),
+            ]))
+        })
+    }
+
+    //with the cargo feature `audit`: the tests' checks of the tree that the search `id` left (SharedTree::audit), which panic
+    //with what they find. For a search that has ended, with no thread in its tree. Returns the nodes and moves looked at
+    #[cfg(feature = "audit")]
+    fn audit(&self, py: Python<'_>, id: u64) -> PyResult<(usize, usize)> {
+        py.detach(|| {
+            let tree = self.searched_tree(id)?;
+            Ok(tree.quiet(|| tree.audit()))
         })
     }
 

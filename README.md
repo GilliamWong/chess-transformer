@@ -1,5 +1,9 @@
 # Fry
 
+<img src="assets/logo.webp" alt="Fry logo" width="300">
+
+credit to kan from TCEC for our logo. Many thanks!
+
 ## Description
 
 Fry is a chess engine built on a transformer network: a 28-layer model trained on positions labelled by Stockfish and
@@ -51,7 +55,7 @@ TCEC's 768 GiB machine that is a 179 GB tree. Setting either option overrides it
 | `Leaves` | 64 | Positions evaluated at once on each GPU |
 | `GPUs` | every GPU | `all`, or CUDA device numbers (`0,1,2,3`) |
 | `SmartPruningFactor` | 1 | Stops early once the best move can't change (0 to use all the time) |
-| `FirstMoveBonus` | 0 | Extra time for the game's first search |
+| `FirstMoveBonus` | 2 | Extra time for the game's first search, in shares of a move's time |
 | `BookPlyBonus` | 0 | Extra first-search time per book ply |
 | `SearchSettings` | `<empty>` | Search constants as `name=value,...`; `value_sharpness` defaults to the network's own |
 

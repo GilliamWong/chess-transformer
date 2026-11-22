@@ -201,7 +201,7 @@ impl SharedSearch {
         let score = self.score(Some(line[0]));
         let moves = line.iter().map(|&edge| uci(tree.chess_move(edge)));
         let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(tree.root(), edge)));
-        (self.id, moves.collect(), score, root_moves.collect(), tree.root().visits())
+        (self.id, moves.collect(), score, root_moves.collect(), tree.root().visits(), tree.evaluations())
     }
 }
 
@@ -224,6 +224,16 @@ impl Searches {
         Ok(self.lock()?.shared_search(id).map(|search| search.tree.clone()))
     }
 
+    //the tree of the search `id` while it runs, or as it was kept when it ended, for a look at its numbers
+    pub(crate) fn searched_tree(&self, id: u64) -> PyResult<Arc<SharedTree>> {
+        let state = self.lock()?;
+        let kept = || match state.shared_kept.get(&id) {
+            Some(KeptTree { tree: Kept::Searched(tree), .. }) => Some(tree.clone()),
+            _ => None,
+        };
+        state.shared_search(id).map(|search| search.tree.clone()).or_else(kept).ok_or_else(|| no_search(id))
+    }
+
     pub(crate) fn shared_start(&self, id: u64, fen: &str, moves: Vec<String>, simulations: u32, seconds: Option<f64>) -> PyResult<()> {
         if simulations == 0 {
             return Err(PyValueError::new_err("a search needs at least one simulation"));
@@ -236,9 +246,10 @@ impl Searches {
         if board.legal_moves().is_empty() {
             return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
         }
-        let tree = self
+        let mut tree = self
             .shared_reused_tree(&mut state, id, fen, &moves, seconds)
             .unwrap_or_else(|| SharedTree::new(board, keys).with_transpositions(self.settings.transpositions));
+        tree.begin_search();
         let tree = Arc::new(tree);
         tree.start_sweepers(self.gc_threads);
         state.shared_searches.push(SharedSearch { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
@@ -446,9 +457,10 @@ impl Searches {
     }
 
     //None while a call of the id's last search still holds the tree. The root is moved down the line, which costs no more than the
-    //line is long; the dead rest of the tree is freed beside the search, or at once with no gc threads. Once the arenas have grown to
-    //the memory limit, what the root reaches is copied out instead, unless that would take much of a search of `seconds`, and the old
-    //arenas are freed on a thread of their own
+    //line is long; the dead rest of the tree is freed beside the search, or at once with no gc threads. With transpositions the rest
+    //is held for a move first (SharedTree::hold_root), and what is freed is the rest that the move before left. Once the arenas
+    //have grown to the memory limit nothing is held, and what the root reaches is copied out instead, unless that would take much
+    //of a search of `seconds`, and the old arenas are freed on a thread of their own
     fn shared_reused_tree(&self, state: &mut State, id: u64, fen: &str, moves: &[String], seconds: Option<f64>) -> Option<SharedTree> {
         let kept = state.shared_kept.remove(&id)?;
         if kept.fen != fen || !moves.starts_with(&kept.moves) {
@@ -469,6 +481,10 @@ impl Searches {
             drop_later(tree);
             return None;
         };
+        //the rest of the tree is held for the search to find its positions again, unless the arenas are at the memory limit
+        if !line.is_empty() {
+            tree.hold_root(self.memory_limit);
+        }
         tree.move_root(&line);
         match candidates {
             None if line.is_empty() => {}
@@ -482,7 +498,7 @@ impl Searches {
             return Some(compacted);
         }
         if self.gc_threads == 0 {
-            tree.drain();
+            tree.sweep_now();
         }
         Some(tree)
     }

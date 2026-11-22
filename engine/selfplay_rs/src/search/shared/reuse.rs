@@ -2,8 +2,10 @@
 use super::*;
 
 impl SharedTree {
-    //the rest of the tree is left dead for the sweepers; a root is never proven, so the new root's proof is dropped. The line's
-    //last node is the root and keeps a count of its own, which the nodes above it lose with their moves when they are freed
+    //the rest of the tree is left dead for the sweepers, or alive for one move more if the root was held (hold_root): the old root
+    //then keeps its count, and what the line before left held is dead now. A root is never proven, so the new root's proof is
+    //dropped. The line's last node is the root and keeps a count of its own, which the nodes above it lose with their moves when
+    //they are freed
     pub fn move_root(&mut self, line: &[usize]) {
         assert_eq!(self.pending(), 0, "a move is played once the search's leaves are back");
         let old_root = self.root;
@@ -16,7 +18,13 @@ impl SharedTree {
         if !line.is_empty() {
             let root = self.nodes.get(self.root);
             assert!(root.acquire(), "the line's last node is dead");
-            self.drop_reference(old_root);
+            self.release_held();
+            let garbage = self.garbage.get_mut().expect("the garbage");
+            if std::mem::take(&mut garbage.holds_next) {
+                garbage.held = Some(old_root as u32);
+            } else {
+                self.drop_reference(old_root);
+            }
             root.clear_proof();
             *self.full.get_mut() = false;
             //nothing can be freed yet, so the nodes queued still have their lists
@@ -51,12 +59,19 @@ impl SharedTree {
         let Some(graph) = &self.graph else { return };
         let halfmoves = self.board.halfmoves();
         let node_of = |entry: u64| graph.shard(entry).lock().expect("a table shard").get(&entry).copied();
-        let nodes_of = |key| (halfmoves + 1..FIFTY_MOVE_PLIES).filter_map(move |count| node_of(graph_key(key, count)));
+        //the position's ordinary nodes and its repeat nodes (Tree's)
+        let counts = (halfmoves + 1..FIFTY_MOVE_PLIES).flat_map(|count| [count, count | u32::from(REPEATED)]);
+        let nodes_of = |key| counts.clone().filter_map(move |count| node_of(graph_key(key, count)));
         let thirds: Vec<u32> = one_short_of_threefold(&self.keys, halfmoves).into_iter().flat_map(nodes_of).collect();
+        let no_longer_lost: Vec<u32> = thirds.iter().copied().filter(|&id| self.nodes.get(id as usize).proves_a_loss()).collect();
         for id in thirds {
             //prove keeps a proof the node has, and the rules' draw comes before it
             self.nodes.get(id as usize).clear_proof();
             self.prove(&[id as usize], Proof { outcome: Outcome::Draw, value: 1.0 - settings.draw, plies: 0 });
+        }
+        //the moves that hold one of those nodes as a proven loss are told otherwise (Tree's)
+        if !no_longer_lost.is_empty() {
+            self.links.forget_losses(&no_longer_lost);
         }
     }
 

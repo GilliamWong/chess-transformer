@@ -33,8 +33,8 @@ from engine.tablebase import SYZYGY_DIR, TABLEBASE_PIECES
 from engine import engine_search
 from engine.engine_search import EngineSearch, SearchReport, engine_search_settings, parse_changes
 from engine import uci
-from engine.uci import (CACHE_POSITION_BYTES, FITTED_CACHE_POSITIONS, MOST_EXTENSION, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock, Options,
-                        fitted_memory, memory_within_limits)
+from engine.uci import (CACHE_POSITION_BYTES, EARLY_SEARCHES, EARLY_SHARE, FIRST_MOVE_BONUS, FITTED_CACHE_POSITIONS, MOST_EXTENSION, MOVE_OVERHEAD_SECONDS,
+                        RESERVE_SECONDS, Clock, Options, fitted_memory, memory_within_limits)
 
 REPOSITORY = Path(__file__).parent.parent
 FREE_QUEEN = "4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"
@@ -42,7 +42,11 @@ MATE_IN_ONE = "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1"
 MATE_IN_TWO = "k7/8/2K5/8/8/8/8/7R w - - 0 1"
 #both mate in two
 MATES_IN_TWO = ("c6b6", "c6c7")
-gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
+#a tree with transpositions
+GRAPH = {"transpositions": True}
+#the engine's own settings as it plays with them: the tests search without them (without_engine_settings)
+ENGINES_OWN_SETTINGS = engine_search.ENGINE_SETTINGS
+gpu =pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 
 @pytest.fixture(autouse=True)
 def without_engine_settings(monkeypatch):
@@ -208,7 +212,7 @@ def test_answers_that_are_no_numbers_do_not_spoil_a_search(concurrent_descents):
             answers[::2, -1] = np.nan
             answers[1::3, :-1] = np.inf
         reports = searches.finish(answers)
-    _, line, score, root_moves, visits = reports[0]
+    _, line, score, root_moves, visits, _ = reports[0]
     assert 0 <= score <= 1 and visits == 400 and sum(move_visits for _, move_visits in root_moves) == 399
 
 def test_a_failed_search_settles_its_network():
@@ -517,7 +521,9 @@ def test_the_cache_answers_transpositions_as_the_network_would():
         found[cache_positions] = (reports[0], evaluated)
 
     (without, evaluated_without), (with_cache, evaluated_with_cache) = found[0], found[100_000]
-    assert with_cache == without
+    #the report's last value is the leaves the search sent to the network: the cache's answers are not among them
+    assert with_cache[:-1] == without[:-1]
+    assert (without[-1], with_cache[-1]) == (evaluated_without, evaluated_with_cache)
     assert evaluated_with_cache < 0.9 * evaluated_without
 
 def test_one_leaf_a_round_is_the_exact_search_at_every_move(monkeypatch, carlsen_games):
@@ -533,7 +539,7 @@ def test_one_leaf_a_round_is_the_exact_search_at_every_move(monkeypatch, carlsen
         reports = []
         while not reports:
             reports = exact.finish(evaluate(leaf_boards(exact.descend())))
-        _, line, score, root_moves, visits = reports[0]
+        _, line, score, root_moves, visits, _ = reports[0]
         assert ([played.uci() for played in report.line], report.score, report.simulations) == (line, score, visits)
         assert [(played.uci(), move_visits) for played, move_visits in report.root_moves] == root_moves[:len(report.root_moves)]
         board.push(report.line[0])
@@ -809,7 +815,7 @@ def test_go_limits():
     assert clock.limits(["infinite"], black, 800) == (800, None)
 
     nodes, seconds = clock.limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), black, 800)
-    assert nodes is None and seconds == pytest.approx(Clock().seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 32))
+    assert nodes is None and seconds == pytest.approx(Clock().seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 32, EARLY_SHARE + FIRST_MOVE_BONUS))
     assert 0.5 < seconds < 30 - RESERVE_SECONDS
 
 
@@ -950,18 +956,33 @@ def board_with_men(men: int) -> chess.Board:
         board.remove_piece_at(square)
     return board
 
+#a clock without the larger share of the game's first searches or the first one's bonus, for the tests of the rest of its plan
+def plain_clock(**settings) -> Clock:
+    return Clock(**{"early_searches": 0, "first_move_bonus": 0.0, **settings})
+
+#the game's first searches get EARLY_SHARE times their share (the moves after the book, where the engine lost most at the CCC) and the first
+#of them FIRST_MOVE_BONUS shares more (it has no kept tree), the ones after them their own; a search off the clock is not counted
+def test_the_games_first_searches_get_more_than_their_share():
+    board, clock = chess.Board(), Clock()
+    share = plain_clock().limits(CLOCK_60, board, 800)[1]
+    clock.limits("movetime 1000".split(), board, 800)
+    seconds = [clock.limits(CLOCK_60, board, 800)[1] for _ in range(EARLY_SEARCHES + 2)]
+    assert seconds == ([pytest.approx((EARLY_SHARE + FIRST_MOVE_BONUS) * share)] + [pytest.approx(EARLY_SHARE * share)] * (EARLY_SEARCHES - 1)
+                       + [pytest.approx(share)] * 2)
+    assert Clock(early_searches=3, early_share=1.5, first_move_bonus=0.0).limits(CLOCK_60, board, 800)[1] == pytest.approx(1.5 * share)
+
 #what a search is given and does not use is banked for the next move; a movetime search is not on the clock, and no move gets the reserve
 def test_unused_time_goes_to_the_next_move():
-    clock, board = Clock(), chess.Board()
+    clock, board = plain_clock(), chess.Board()
     _, first = clock.limits("wtime 60000 btime 60000".split(), board, 800)
     clock.searched(first / 2, 0)
     _, second = clock.limits("wtime 59000 btime 60000".split(), board, 800)
-    _, without_saving = Clock().limits("wtime 59000 btime 60000".split(), board, 800)
+    _, without_saving = plain_clock().limits("wtime 59000 btime 60000".split(), board, 800)
     assert second == pytest.approx(clock.share + first / 2) and second > 1.4 * without_saving
 
     clock.searched(second, 0)
     _, third = clock.limits("wtime 58000 btime 60000".split(), board, 800)
-    assert third == pytest.approx(Clock().limits("wtime 58000 btime 60000".split(), board, 800)[1])
+    assert third == pytest.approx(plain_clock().limits("wtime 58000 btime 60000".split(), board, 800)[1])
 
     clock.searched(third / 4, 0)
     clock.limits("movetime 1000".split(), board, 800)
@@ -969,12 +990,13 @@ def test_unused_time_goes_to_the_next_move():
     assert clock.saved == pytest.approx(3 / 4 * third)
     assert clock.limits("wtime 1500 btime 60000".split(), board, 800)[1] == pytest.approx(1.5 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS)
 
-#a 60+0.6 game losing men by the points below, every search taking all it is given
-def test_the_clock_follows_the_material_and_never_runs_out():
+#a 60+0.6 game losing men by the points below, every search taking all it is given: the seconds a move in the opening (26 men or more), the
+#middle game (16 or more) and the last 30 moves, the first ten moves' seconds, the clock at 15 men and the lowest clock
+def clock_through_a_game(clock: Clock) -> tuple[float, float, float, float, float, float]:
     points = [(1, 32), (15, 32), (40, 16), (60, 10), (85, 6), (120, 6)]
     men_at = lambda move: next(round(men + (later_men - men) * (move - start) / (end - start))
                                for (start, men), (end, later_men) in zip(points, points[1:]) if start <= move <= end)
-    clock, left, spent, low, late_middlegame_left = Clock(), 60.0, {}, 60.0, None
+    left, spent, low, late_middlegame_left = 60.0, {}, 60.0, None
     for move in range(1, 121):
         men = men_at(move)
         if men <= 15 and late_middlegame_left is None:
@@ -985,18 +1007,29 @@ def test_the_clock_follows_the_material_and_never_runs_out():
         spent.setdefault("opening" if men >= 26 else "middle game" if men >= 16 else "late", []).append(seconds)
         low = min(low, left)
     opening, middle_game, endgame = (sum(moves) / len(moves) for moves in (spent["opening"], spent["middle game"], spent["late"][-30:]))
+    return opening, middle_game, endgame, sum(spent["opening"][:10]), late_middlegame_left, low
+
+def test_the_clock_follows_the_material_and_never_runs_out():
+    opening, middle_game, endgame, _, late_middlegame_left, low = clock_through_a_game(plain_clock())
     assert middle_game > 1.1 * opening and endgame < 0.7
     assert late_middlegame_left > 12 and low > RESERVE_SECONDS / 2
+
+#the first searches' larger share comes out of the moves after them, not out of the game's end
+def test_the_first_searches_share_leaves_the_clock_its_reserve():
+    _, plain_middle_game, _, plain_first_ten, plain_left, _ = clock_through_a_game(plain_clock())
+    _, middle_game, endgame, first_ten, late_middlegame_left, low = clock_through_a_game(Clock())
+    assert first_ten > 1.4 * plain_first_ten and 0.7 * plain_middle_game < middle_game < plain_middle_game
+    assert endgame < 0.7 and 10 < late_middlegame_left < plain_left and low > RESERVE_SECONDS / 2
 
 def test_a_clocks_plan_and_cap_can_be_set():
     board = chess.Board()
     arguments = "wtime 60000 btime 60000 winc 600 binc 600".split()
-    assert Clock(moves_per_man=1.0).limits(arguments, board, 800)[1] > 1.25 * Clock().limits(arguments, board, 800)[1]
+    assert plain_clock(moves_per_man=1.0).limits(arguments, board, 800)[1] > 1.25 * plain_clock().limits(arguments, board, 800)[1]
     #late in the game the least moves left and the reserve decide the share
     board = board_with_men(4)
     arguments = "wtime 10000 btime 10000 winc 600 binc 600".split()
-    assert Clock(least_moves_left=8, reserve_seconds=0.0).limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS) / 8 + 0.6)
-    assert Clock().limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS) / 10 + 0.6)
+    assert plain_clock(least_moves_left=8, reserve_seconds=0.0).limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS) / 8 + 0.6)
+    assert plain_clock().limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS) / 10 + 0.6)
 
 def test_a_new_game_starts_a_fresh_clock(monkeypatch):
     go = ["position startpos", "go wtime 60000 btime 60000 winc 600 binc 600"]
@@ -1021,15 +1054,17 @@ CLOCK_60 = "wtime 60000 btime 60000 winc 600 binc 600".split()
 @pytest.mark.parametrize("ply, bonus", [(0, 2.8), (1, 3.05), (8, 4.8), (16, 5.8), (40, 5.8)])
 def test_the_games_first_search_gets_lc0s_bonus(arguments, ply, bonus):
     board = board_at_ply(ply)
-    assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(bonus * Clock().limits(arguments, board, 800)[1])
+    assert plain_clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(bonus * plain_clock().limits(arguments, board, 800)[1])
+    #on top of the first searches' own larger share
+    assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx((bonus - 1 + EARLY_SHARE) * plain_clock().limits(arguments, board, 800)[1])
 
 #the bonus goes to the first search on the clock only; what it leaves unused is banked as any search's
 def test_the_first_search_bonus_is_given_once_and_banked():
-    clock, board = Clock(**LC0_FIRST_MOVE), board_at_ply(16)
+    clock, board = plain_clock(**LC0_FIRST_MOVE), board_at_ply(16)
     clock.limits("movetime 1000".split(), board, 800)
     clock.searched(0.98, 0)
     _, first = clock.limits(CLOCK_60, board, 800)
-    plain = Clock()
+    plain = plain_clock()
     _, plain_first = plain.limits(CLOCK_60, board, 800)
     assert first == pytest.approx(5.8 * plain_first) and clock.saved == 0
     assert clock.extension == (0, pytest.approx(MOST_EXTENSION * plain.share))
@@ -1045,7 +1080,7 @@ def test_the_first_search_bonus_is_given_once_and_banked():
 
 def test_the_first_search_bonus_keeps_to_the_reserve_and_the_time_left():
     board, arguments = board_at_ply(16), "wtime 3000 btime 60000 winc 1000 binc 1000".split()
-    assert Clock().limits(arguments, board, 800)[1] < 1.1
+    assert plain_clock().limits(arguments, board, 800)[1] < 1.1
     assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(3 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS)
     assert Clock(reserve_seconds=0.0, **LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(3 - MOVE_OVERHEAD_SECONDS)
 
@@ -1179,11 +1214,11 @@ class PacedSearches(ScriptedSearches):
         self.root = self.script(self.finishes + 1)
         return super().finish_with_root(answers, round, root_of)
 
-def paced_search(monkeypatch, networks: int, root, **limits) -> float | None:
+def paced_search(monkeypatch, networks: int, root, fresh_share: float = 0.0, **limits) -> float | None:
     now = [0.0]
     monkeypatch.setattr(engine_search.time, "perf_counter", lambda: now[0])
     network = [ImmediateBatches(answers_of_0_6) for _ in range(networks)]
-    search = EngineSearch(network if networks > 1 else network[0], 16, grow_leaves=0)
+    search = EngineSearch(network if networks > 1 else network[0], 16, grow_leaves=0, settings={"fresh_share": fresh_share})
     search.searches = PacedSearches(now, root)
     search.search(chess.Board(), **limits)
     return search.searches.stopped_at
@@ -1205,6 +1240,81 @@ def test_a_decided_search_on_several_networks_stops_once_its_first_moments_are_p
         visits = 10_000 + 100 * round
         return visits, visits - 1000, visits - 7300
     assert paced_search(monkeypatch, networks, steady, seconds=1.0, simulations=simulations) == stopped_at
+
+#a kept tree's lead: the root has 10,000 visits when the search begins, its best move 6,300 ahead, and gains 6,400 a second
+def kept_lead(round: int) -> tuple[int, int, int]:
+    visits = 10_000 + 100 * round
+    return visits, visits - 1000, visits - 7300
+
+#with 1 s given that lead stops the search at its second round (the test above). With fresh_share the stop waits until the visits the search
+#has made itself are that share of those it is expected to make: of the 6,400 of its second a tenth by the 7th round and a quarter by the 16th,
+#which several networks' first moments are past by or not; of the 2,000 that 12,000 simulations leave it, a quarter by the 5th
+@pytest.mark.parametrize("fresh_share, networks, simulations, stopped_at", [
+    (0.1, 1, None, 7 / 64), (0.25, 1, None, 16 / 64), (0.1, 3, None, 14 / 64), (0.25, 3, None, 16 / 64), (0.25, 1, 12_000, 5 / 64), (0.25, 3, 12_000, 5 / 64)])
+def test_a_lead_a_kept_tree_brought_waits_for_the_searchs_own_visits(monkeypatch, fresh_share, networks, simulations, stopped_at):
+    assert paced_search(monkeypatch, networks, kept_lead, fresh_share, seconds=1.0, simulations=simulations) == stopped_at
+
+#the game that showed it: a kept tree of 688,198 visits, 4,800 more in the search's first 0.2 s of some 5 s, the lead far past what was left.
+#A tenth of the search's own visits is about half a second's
+def test_the_wait_for_a_searchs_own_visits_is_a_share_of_those_it_is_expected_to_make():
+    search = EngineSearch(ImmediateBatches(answers_of_0_6), 16, settings={"fresh_share": 0.1})
+    speed, seconds = 4800 / 0.2, 5.0
+    assert not search.fresh_enough(4800, (seconds - 0.2) * speed) and not search.fresh_enough(11_000, (seconds - 0.5) * speed + 1000)
+    assert search.fresh_enough(13_000, (seconds - 0.5) * speed - 1000)
+    #a search that began without a tree and is decided has made more visits than are left: no share up to a half holds it up
+    assert EngineSearch(ImmediateBatches(answers_of_0_6), 16, settings={"fresh_share": 0.5}).fresh_enough(401, 400)
+    #no wait without the setting, and none known while the visits left are not
+    assert EngineSearch(ImmediateBatches(answers_of_0_6), 16).fresh_enough(0, math.inf) and not search.fresh_enough(10**9, math.inf)
+    for share in (-0.1, 1.5):
+        with pytest.raises(ValueError):
+            EngineSearch(ImmediateBatches(answers_of_0_6), 16, settings={"fresh_share": share})
+
+#only a lead waits for the search's own visits: a decided root whose search has made none of its visits runs on, while a proven root, a single
+#legal move and a root with one move not proven lost stop at the first answers as they do without fresh_share
+@pytest.mark.parametrize("fen, root, proven, lone, stopped_at", [
+    (chess.STARTING_FEN, (600, 600, 0), False, False, None), (chess.STARTING_FEN, (600, 300, 290), True, False, 1 / 16),
+    ("k7/8/8/8/8/8/r7/K1q5 w - - 0 1", (600, 300, 290), False, False, 1 / 16), (chess.STARTING_FEN, (600, 300, 290), False, True, 1 / 16)])
+def test_a_proven_or_only_move_search_does_not_wait_for_its_own_visits(monkeypatch, fen, root, proven, lone, stopped_at):
+    now = [0.0]
+    monkeypatch.setattr(engine_search.time, "perf_counter", lambda: now[0])
+    search = EngineSearch(SixteenthsNetwork(now), 16, grow_leaves=0, settings={"certainty": True, "fresh_share": 0.5})
+    search.searches = ScriptedSearches(*root, proven, lone)
+    search.search(chess.Board(fen), simulations=1000)
+    assert search.searches.stopped_at == stopped_at
+
+#a search that begins without a tree is not held up: its lead is made of its own visits, and is decided once they pass the visits left
+def test_a_search_without_a_kept_tree_stops_as_early_with_fresh_share(carlsen_games):
+    stopped_early = 0
+    for game, plies in itertools.product(range(len(carlsen_games)), (10, 19, 28, 37)):
+        board = carlsen_position(carlsen_games, game, plies)
+        plain = EngineSearch(cpu_batches(BoardModel()), 16).search(board, simulations=300)
+        waiting = EngineSearch(cpu_batches(BoardModel()), 16, settings={"fresh_share": 0.5}).search(board, simulations=300)
+        assert (waiting.simulations, waiting.line, waiting.root_moves) == (plain.simulations, plain.line, plain.root_moves), board.fen()
+        stopped_early += plain.simulations < 300
+    assert stopped_early > 5
+
+def python_search_waiting(fresh_share: float) -> EngineSearch:
+    return EngineSearch(cpu_batches(BoardModel()), 16, settings={"fresh_share": fresh_share})
+
+def rust_search_waiting(fresh_share: float) -> EngineSearch:
+    return EngineSearch(lean_network(), 16, rust_rounds=True, settings={"fresh_share": fresh_share})
+
+#a kept tree searched on with fewer simulations than its best move's lead (the queen's capture leads whatever the network): the lead stops
+#the search at its first answers, and with fresh_share only once the search has made its share of the simulations it was given, in either
+#loop. A share of them is never more than them: the search ends by its simulations whatever the share
+@pytest.mark.parametrize("make_search", [python_search_waiting, pytest.param(rust_search_waiting, marks=gpu)])
+def test_a_kept_trees_search_makes_its_share_of_its_simulations_before_a_lead_stops_it(make_search):
+    board, made = chess.Board(FREE_QUEEN), {}
+    for fresh_share in (0.0, 0.5, 1.0):
+        search = make_search(fresh_share)
+        first = search.search(board, simulations=2000)
+        (_, most), (_, second) = first.root_moves[:2]
+        given = most - second - 1
+        assert given > 100, "a lead to speak of"
+        again = search.search(board, simulations=first.simulations + given)
+        assert again.reused == first.simulations and again.simulations <= first.simulations + given
+        made[fresh_share] = (again.simulations - again.reused) / given
+    assert made[0.0] < 0.5 <= made[0.5] < 1 and made[1.0] == 1, made
 
 #the king has three moves, two of which lose to a mate in one
 THREE_MOVES_TWO_LOST = "8/1K2r3/3r4/5P2/8/4k3/8/5Q2 w - - 0 1"
@@ -1357,7 +1467,7 @@ def test_the_engine_takes_lc0s_time_options(monkeypatch):
     options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25", "--smart-pruning-factor", "1.33"]
     run_uci_main(monkeypatch, *options, stdin="\n".join(script))
 
-    first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
+    first = pytest.approx(Clock(**LC0_FIRST_MOVE).limits(CLOCK_60, chess.Board(), 800)[1])
     assert given[0] == (first, 1.33) and given[1][0] != first and given[2] == given[0]
     with pytest.raises(SystemExit) as refused:
         run_uci_main(monkeypatch, "--smart-pruning-factor", "0")
@@ -1374,7 +1484,8 @@ def test_the_engine_keeps_to_gos_limits(model_path):
         seconds = time.perf_counter() - started
         other = chess.Board(MATE_IN_ONE)
         counted = engine.play(other, chess.engine.Limit(nodes=50), info=chess.engine.INFO_BASIC)
-        #a game of its own ("clock", so ucinewgame), a 10+0.1 clock: ~0.27 s for the first move, ~1 s for a 9 man endgame
+        #a game of its own ("clock", so ucinewgame), a 10+0.1 clock: ~0.95 s for the first move (three and a half shares), ~1.4 s for a 9 man
+        #endgame (the game's first searches, at one and a half times their share)
         clock = chess.engine.Limit(white_clock=10, black_clock=10, white_inc=0.1, black_inc=0.1)
         started = time.perf_counter()
         engine.play(board, clock, game="clock")
@@ -1387,7 +1498,7 @@ def test_the_engine_keeps_to_gos_limits(model_path):
 
     assert timed.move in board.legal_moves and timed.info["nodes"] > 10 and 0.3 < seconds < 0.5 + 0.1
     assert counted.info["nodes"] == 50
-    assert first_move < 0.5 and 0.8 < endgame_move < 1.3
+    assert 0.7 < first_move < 1.3 and 1.2 < endgame_move < 1.8
 
 #the report (id, line, score, root moves, visits) of Searches' search of board, one leaf a round
 def searched(searches: selfplay_rs.Searches, board: chess.Board, simulations: int, evaluate, search_id: int = 0):
@@ -1486,6 +1597,27 @@ def test_search_settings_that_are_not_numbers_are_refused():
     for change in ("move_id_table=1", "tablebase_folder=x", "repetitions_for_a_draw=inf", "c_puct=x", "nope=1"):
         assert options.set("SearchSettings", change).endswith("the search's settings stay as they were")
     assert options.settings is None
+
+#the engine plays with a fresh_share of a tenth. A competition's other SearchSettings leave it in place (they change the engine's own
+#settings), and SearchSettings changes it or, with 0, takes the wait away: it is Searches', whose own round loop takes it from there as
+#python's does. The search of one leaf a round is mcts.py's, and has no such wait
+def test_fresh_share_is_a_tenth_as_the_engine_plays_until_search_settings_change_it(monkeypatch):
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", ENGINES_OWN_SETTINGS)
+    assert ENGINES_OWN_SETTINGS["fresh_share"] == 0.1
+    made = []
+    searches = selfplay_rs.Searches
+    monkeypatch.setattr(selfplay_rs, "Searches", lambda **settings: made.append(settings) or searches(**settings))
+    found = []
+    for changes in ("c_puct=1.5", "fresh_share=0.25", "fresh_share=0"):
+        options = Options(False, TABLEBASE_PIECES)
+        assert options.set("SearchSettings", changes) is None and options.search()[1]["settings"] == options.settings
+        found.append(EngineSearch(cpu_batches(BoardModel()), 16, settings=options.settings).fresh_share)
+    as_it_plays = EngineSearch(cpu_batches(BoardModel()), 16)
+    assert found == [0.1, 0.25, 0.0] and as_it_plays.fresh_share == 0.1
+    assert [settings["fresh_share"] for settings in made] == [0.1, 0.25, 0.0, 0.1]
+    assert EngineSearch(cpu_batches(BoardModel()), 1).fresh_share == 0.0
+    report = as_it_plays.search(chess.Board(), simulations=200)
+    assert report.simulations <= 200 and report.line[0] in chess.Board().legal_moves
 
 
 #a competition's file as its gui reads it: TCEC's a list of engines with their options as names and values, the CCC's one engine with its
@@ -1614,7 +1746,7 @@ def test_stale_draws_come_out_of_a_kept_tree():
 #third time. The search at move 2 came to it by other king moves, when the game had had it once, and its node is kept with moves
 def test_a_kept_tree_with_transpositions_knows_the_games_third_time():
     def player() -> EngineSearch:
-        return EngineSearch(cpu_batches(EvenModel()), 16, smart_pruning=False, settings={"transpositions": True, "certainty": True})
+        return EngineSearch(cpu_batches(EvenModel()), 16, smart_pruning=False, settings={**GRAPH, "certainty": True})
 
     board, kept = chess.Board("4k3/8/8/1p1p1p1p/1P1P1P1P/1P6/8/4K3 w - - 0 1"), player()
     for king, other_king in [("e1d1", "e8d8"), ("d1e1", "d8e8"), ("e1d1", "e8d8")]:
@@ -1884,7 +2016,7 @@ def test_the_competition_options_reach_the_search(monkeypatch):
     (loaded, _, options), (loaded_again, _, options_again) = built
     assert (loaded[2], loaded[5]) == (32, [0, 1, 2]) and (loaded_again[2], loaded_again[5]) == (16, [0, 1, 2])
     assert options["smart_pruning"] is False and options["settings"] == {"c_puct": 0.7, "fpu_reduction": 0.3} and options_again == options
-    first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
+    first = pytest.approx(Clock(first_move_bonus=1.8).limits(CLOCK_60, chess.Board(), 800)[1])
     assert [seconds for _, _, seconds, _ in searches] == [first, first]
     told = [line for line in sent if line.startswith("info string")]
     assert len(told) == 3 and "device 7" in told[0] and "nope" in told[1] and "BookPlyBonus" in told[2]
@@ -2057,7 +2189,7 @@ def test_a_game_on_several_networks_moves_its_tree_beside_the_gc_threads(gc_thre
         assert search.advance(board)
         board.push(report.line[1])
 
-@pytest.mark.parametrize("settings", [{"certainty": True}, {"certainty": True, "transpositions": True}], ids=["certainty", "certainty_and_transpositions"])
+@pytest.mark.parametrize("settings", [{"certainty": True}, {"certainty": True, **GRAPH}], ids=["certainty", "certainty_and_transpositions"])
 def test_concurrent_descents_prove_a_mate_on_several_networks(settings):
     search = EngineSearch(SlowNetworks(3, 0.003, UniformModel()).networks, 16, concurrent_descents=True, settings=settings)
     proven = search.search(chess.Board(MATE_IN_TWO), simulations=20_000)
@@ -2151,7 +2283,7 @@ def test_concurrent_searches_end_under_stops_at_any_moment():
     assert len(ended) == 40 and sum(ended) > 40 * 20
 
 def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
-    graph = {"settings": {"transpositions": True}}
+    graph = {"settings": GRAPH}
     for way in ("plain", "advance", "drop"):
         reports, replies, boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, way, **graph)
         concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True, gc_threads=0, **graph)
@@ -2162,14 +2294,28 @@ def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
 
     model = shuffling_model()
     for certainty in (False, True):
-        options = {"settings": {"transpositions": True, "certainty": certainty}}
+        options = {"settings": {**GRAPH, "certainty": certainty}}
         plain = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, **options)
         concurrent = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, concurrent_descents=True, gc_threads=0, **options)
         assert concurrent[0] == plain[0] and concurrent[3] == plain[3] == len(SHUFFLES)
 
+#tests/hardware_check.py's check, which a pod runs on its gpus, on stand-in networks: a line of numbers a position, with the tree's own
+#numbers, and its audit where the extension is built with that feature
+def test_the_hardware_check_reports_each_position():
+    import hardware_check
+    group = SlowNetworks(2, 0.002, BoardModel())
+    player = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, settings=GRAPH)
+    lines = []
+    results = hardware_check.check(player, 0.3, out=lines.append)
+    assert [result["position"] for result in results] == ["middlegame", "endgame"] and len(lines) == 2
+    for result, line in zip(results, lines):
+        assert result["evaluations"] > 0 and result["root_visits"] == result["visits"] > 0 and result["allocated_bytes"] > 0
+        assert ("audited_nodes" in result) == hasattr(player.searches, "audit") and result["position"] in line
+        assert ("audit passed" in line) == hasattr(player.searches, "audit")
+
 def test_transpositions_on_several_networks():
     group = SlowNetworks(3, 0.002, BoardModel())
-    search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, settings={"transpositions": True})
+    search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, settings=GRAPH)
     board = chess.Board(FREE_QUEEN)
     report = search.search(board, simulations=3000)
     assert 3000 <= report.simulations < 3000 + 3 * 16 * 3 and report.line[0] in board.legal_moves
