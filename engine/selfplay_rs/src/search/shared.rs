@@ -3,6 +3,16 @@
 //(release); of two threads that put one in for a move, one link is kept. A reader may see a half backed up path, never a torn
 //field. A proof rewrites a node's sum and its ancestors', which cannot happen beside backups, so proving a node with visits
 //holds the gate exclusively.
+//With SearchSettings' move_means a move's visits and the mean it holds are one word (arena's MoveMean, beside the links and
+//slots, which stay as they are without), which a thread changes in one step: a backup to one more visit at the mean its node
+//has now, a descent that passes to that mean alone. The thread whose step it was then counts the visit in the move's link or
+//slot, where the descents read it, and adds to the node the move is a move of what the step changed: the move's visits at
+//1 - its mean after, less those before. So every step is in that node's sum once, whatever the threads' order, and when no
+//descent is in progress and no leaf waits, an unproven node's sum is its own visits' scores and each of its moves' visits at
+//the mean the move holds. A backup counts a node's visit only once the move above it has taken its step, and a move's first
+//visit, which stops the descent above a node that has moves and visits, is a step of the descent itself: of the threads that
+//come to the move together one stops, the node's visits it found are other moves' or the node's own, and a move never has
+//more visits than its node.
 //A node keeps a count of the moves (list links and solid slots) that name it, and 1 if it is the root. The thread that makes a
 //move's node, or takes it from the table (only a node with a count can be taken), gives the move that count. The thread that
 //drops the last count owns the node's death (a count never rises from 0) and puts it on the garbage, which sweepers and descents
@@ -17,7 +27,7 @@ mod reuse;
 #[cfg(test)]
 mod audit;
 
-use arena::{Alone, Children, Edges, Link, Links, Node, Nodes, Slot, units};
+use arena::{Alone, Children, Edges, Link, Links, Node, Nodes, units};
 pub use cache::SharedCache;
 use reclaim::Garbage;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -48,11 +58,9 @@ impl Hold<'_> {
 const NODE_BYTES: usize = size_of::<Node>();
 //an edge store's unit (arena::Edges)
 const EDGE_BYTES: usize = size_of::<u16>();
-const LINK_BYTES: usize = size_of::<Link>();
-const SLOT_BYTES: usize = size_of::<Slot>();
 const TABLE_ENTRY_BYTES: usize = 32;
-const DESCENT_NODE_BYTES: usize = NODE_BYTES + LINK_BYTES;
-pub const DESCENT_BYTES: usize = DESCENT_NODE_BYTES + units(MOST_MOVES) * EDGE_BYTES;
+//the most a descent allocates without move_means: a node, its move's link and a leaf's edges (descent_bytes)
+pub const DESCENT_BYTES: usize = NODE_BYTES + size_of::<Link>() + units(MOST_MOVES) * EDGE_BYTES;
 
 const SOLID_BATCH: usize = 32;
 
@@ -103,10 +111,13 @@ enum Arrival {
     Proven(Proof),
     //a node that waits for the network or is being expanded
     Collision,
-    //a node to evaluate: a new leaf the descent owns, or a game's end or repeat reached again
-    Leaf,
+    //a node to evaluate. Owned: a new leaf, or a node without moves that no other descent is at. Not owned: a node without
+    //moves that has visits, with other descents at it. That is a game's end or repeat reached again, or else a collision: a
+    //node that waits for the network, with move_means one that paths' repeats have visited
+    Leaf { owned: bool },
     //with transpositions, above the node the path's last move leads to (not counted in flight there): a repeat of a
-    //position on the path, or a move with fewer visits than its node
+    //position on the path, or a move that takes its node's mean as a visit (Tree::stops_at). With move_means that visit
+    //is the move's first, and the descent has counted it (meet)
     Repeat,
     CatchUp,
 }
@@ -119,6 +130,19 @@ struct Call<'a> {
     leaves: Vec<PendingLeaf>,
     //for the call that began a round others may help gather: once it has made that many simulations, it calls for them
     help: Option<(u32, &'a dyn Fn())>,
+}
+
+impl Call<'_> {
+    //a descent that ended on a node another one owns stays in flight along its path until the call ends; false once the call
+    //has had the `most` collisions of its round
+    fn collide(&mut self, path: &[usize], most: u32) -> bool {
+        if self.collisions == most as usize {
+            return false;
+        }
+        self.collisions += 1;
+        self.collided.extend_from_slice(path);
+        true
+    }
 }
 
 //what the calls that gather one round together count in all: the round's leaves and simulations are theirs together, and the others
@@ -266,6 +290,19 @@ impl SharedTree {
         self
     }
 
+    //SearchSettings' move_means for a tree with transpositions, from its start: the arena keeps a word for every move
+    pub fn with_move_means(mut self, move_means: bool) -> SharedTree {
+        assert_eq!(self.nodes.len(), 1, "move means from a tree's start");
+        if move_means && self.graph.is_some() {
+            self.links.keep_means();
+        }
+        self
+    }
+
+    fn move_means(&self) -> bool {
+        self.links.keeps_means()
+    }
+
     pub fn root(&self) -> &Node {
         self.nodes.get(self.root)
     }
@@ -283,14 +320,17 @@ impl SharedTree {
         let graph = self.graph.as_ref().map_or(0, |graph| graph.entries.load(Ordering::Relaxed) * TABLE_ENTRY_BYTES);
         self.nodes.used() * NODE_BYTES
             + self.edges.taken() * EDGE_BYTES
-            + self.links.used() * LINK_BYTES
-            + self.links.slots_taken() * SLOT_BYTES
+            + self.links.used() * self.links.link_bytes()
+            + self.links.slots_taken() * self.links.slot_bytes()
             + graph
     }
 
     //the bytes the arenas have been grown to: freed room stays, to be given out again
     pub fn footprint_bytes(&self) -> usize {
-        self.nodes.len() * NODE_BYTES + self.edges.len() * EDGE_BYTES + self.links.len() * LINK_BYTES + self.links.slots() * SLOT_BYTES
+        self.nodes.len() * NODE_BYTES
+            + self.edges.len() * EDGE_BYTES
+            + self.links.len() * self.links.link_bytes()
+            + self.links.slots() * self.links.slot_bytes()
     }
 
     //whether a search gives out the room a move freed, scattered among what the root reaches: under a memory limit, once the arenas have
@@ -722,10 +762,14 @@ impl SharedTree {
 
     fn queue_solid(&self, id: usize, visits_before: u32) {
         if visits_before + 1 == self.solid_threshold && matches!(self.nodes.get(id).children(), Children::List(_)) {
-            let mut queue = self.to_solidify.lock().expect("the solid queue");
-            queue.push(id as u32);
-            self.queued.store(queue.len(), Ordering::Release);
+            self.queue_to_solidify(id);
         }
+    }
+
+    fn queue_to_solidify(&self, id: usize) {
+        let mut queue = self.to_solidify.lock().expect("the solid queue");
+        queue.push(id as u32);
+        self.queued.store(queue.len(), Ordering::Release);
     }
 
     fn solidify_queued<'a>(&'a self, hold: &mut Hold<'a>) {
@@ -747,8 +791,8 @@ impl SharedTree {
         });
     }
 
-    //the node's list copied into one slot a move, each move's count with it; needs the tree to itself. The list stays readable
-    //until the next move: a waiting leaf may name one of its links
+    //the node's list copied into one slot a move, each move's visits and mean with it; needs the tree to itself. The list stays
+    //readable until the next move: a waiting leaf may name one of its links
     fn make_solid(&self, id: usize) {
         let node = self.nodes.get(id);
         let moves = node.edges().len();
@@ -756,8 +800,7 @@ impl SharedTree {
         if moves == 0 {
             return;
         }
-        let children =
-            self.links.linked(node).map(|(place, link)| (place, self.links.child(link), self.links.visits(link).load(Ordering::Relaxed)));
+        let children = self.links.linked(node).map(|(place, link)| (place, self.links.child(link), self.links.count(link)));
         set_links(&self.links, node, moves, true, children);
         if head != NO_LINK {
             self.retired.lock().expect("the retired lists").push(head);
@@ -772,15 +815,52 @@ impl SharedTree {
             return Arrival::Proven(proof);
         }
         if visits == 0 {
-            return if in_flight == 0 { Arrival::Leaf } else { Arrival::Collision };
+            return if in_flight == 0 { Arrival::Leaf { owned: true } } else { Arrival::Collision };
         }
-        if node.has_edges() { Arrival::Inner } else { Arrival::Leaf }
+        if node.has_edges() { Arrival::Inner } else { Arrival::Leaf { owned: in_flight == 0 } }
+    }
+
+    //with move_means, for a descent that came to the expanded, unproven `child` by `link`, a move of the node `id`: Tree's
+    //stops_at and take_mean as one step of the move. A move without visits has its first, at its node's mean, and the descent
+    //stops (true): the node `id` has it in its sum from here, and the backup goes on from that node's visit. A move with
+    //visits takes its node's mean, the node `id` what that changed (unless it holds the mean already), and the descent goes
+    //on. A node whose evaluation is not backed up yet has no mean to take: the descent goes on to it, which is a collision
+    fn meet(&self, id: usize, link: u32, child: &Node) -> bool {
+        if child.visits() == 0 {
+            return false;
+        }
+        let word = self.links.mean(link);
+        let mut seen = word.load();
+        loop {
+            let ((visits, old), mean) = (seen, held_mean(child, child.visits()));
+            let first = visits == 0;
+            if !first && mean.to_bits() == old.to_bits() {
+                return false;
+            }
+            match word.change(seen, (visits + u32::from(first), mean)) {
+                Ok(()) if first => {
+                    self.links.visits(link).fetch_add(1, Ordering::AcqRel);
+                    self.add_move_visit(id, visits, old, mean);
+                    return true;
+                }
+                Ok(()) => {
+                    let parent = self.nodes.get(id);
+                    if parent.proof().is_none() {
+                        parent.add_value(f64::from(visits) * (f64::from(old) - f64::from(mean)));
+                    }
+                    return false;
+                }
+                Err(now) => seen = now,
+            }
+            jitter();
+        }
     }
 
     //one simulation down to a leaf, every node on the way counted in flight; the path ends on the node it reached. With
     //transpositions `edges` gets the links of the moves between the path's nodes, and the descent may stop above a shared
-    //node (a repeat or a transposition visit, as Tree::gather's), that node the path's last but not counted in flight. The moves
-    //are not played on `board` but left in `unplayed`, for where the position is needed
+    //node (a repeat or a transposition visit, as Tree::gather's), that node the path's last but not counted in flight; with
+    //move_means a move it passes takes its node's mean. The moves are not played on `board` but left in `unplayed`, for where
+    //the position is needed
     fn descend(
         &self,
         settings: &SearchSettings,
@@ -810,11 +890,14 @@ impl SharedTree {
                         //more than its move
                         if repeats.repeats(child.key(), child.halfmoves()) {
                             stop = Some(Arrival::Repeat);
-                        } else if child.has_edges()
-                            && child.proof().is_none()
-                            && self.links.visits(link).load(Ordering::Acquire) < child.visits()
-                        {
-                            stop = Some(Arrival::CatchUp);
+                        } else if child.has_edges() && child.proof().is_none() {
+                            let stops = match self.move_means() {
+                                true => self.meet(path[path.len() - 2], link, child),
+                                false => self.links.visits(link).load(Ordering::Acquire) < child.visits(),
+                            };
+                            if stops {
+                                stop = Some(Arrival::CatchUp);
+                            }
                         }
                     }
                     keys.push(child.key());
@@ -839,7 +922,13 @@ impl SharedTree {
         let first = self.edges.alloc(moves.len());
         self.edges.write(first, moves, priors);
         jitter();
-        self.nodes.get(id).publish_edges(first, moves.len());
+        let node = self.nodes.get(id);
+        node.publish_edges(first, moves.len());
+        //with move_means paths' repeats may have given the node a solid one's visits before it had moves: its list is made
+        //solid from its start (Tree::make_solid_once_visited)
+        if self.move_means() && node.visits() >= self.solid_threshold {
+            self.queue_to_solidify(id);
+        }
     }
 
     //with transpositions every move's link (`links`, descend's `edges`) counts the visit, and a node's visited policy is
@@ -847,6 +936,11 @@ impl SharedTree {
     fn back_up(&self, path: &[usize], links: &[usize], value: f64) {
         if self.graph.is_none() {
             return self.backup(path, value);
+        }
+        if self.move_means() {
+            let (&leaf, above) = path.split_last().expect("the root at least");
+            self.add_own_score(leaf, 1.0 - value);
+            return self.back_up_means(above, links, leaf, 1);
         }
         let mut score = 1.0 - value;
         for (depth, &id) in path.iter().enumerate().rev() {
@@ -864,6 +958,68 @@ impl SharedTree {
             }
             score = 1.0 - score;
         }
+    }
+
+    //Tree::count_own_visit's score: a simulation ended at the node, with its score for the side that moved into it. The
+    //visit is back_up_means' to count
+    fn add_own_score(&self, id: usize, score: f64) {
+        let node = self.nodes.get(id);
+        node.add_value(node.proof().map_or(score, |proof| proof.value));
+    }
+
+    //the node's sum after a step of one of its moves to one more visit (the protocol): the move had `visits` at the mean `old`
+    //and has one more at `mean`. The node's visit for it is back_up_means' to count
+    fn add_move_visit(&self, id: usize, visits: u32, old: f32, mean: f32) {
+        let node = self.nodes.get(id);
+        jitter();
+        match node.proof() {
+            //Tree's sum of a proven node is its visits at the proven score, written whole: so it is here unless other
+            //threads' visits are half counted, and with those but for the rounding
+            Some(proof) => {
+                let whole = f64::from(node.visits() + 1) * proof.value;
+                let counted = |sum: f64| if (sum + proof.value - whole).abs() < proof.value / 2.0 { whole } else { sum + proof.value };
+                node.change_value(counted);
+            }
+            //a node's score is for the side that moved into it: one less its move's
+            None => {
+                let (after, before) = (f64::from(visits + 1) * (1.0 - f64::from(mean)), f64::from(visits) * (1.0 - f64::from(old)));
+                node.change_value(|sum| sum + after - before);
+            }
+        }
+        if visits == 0 {
+            self.refresh_visited_policy(id);
+        }
+    }
+
+    //Tree::back_up_means beside other threads' (see the protocol), up from the node `below`: its sum has the simulation's
+    //score or its move's step already, its visit is not counted yet, and the descent counted it in flight `in_flight` times.
+    //`path` are the nodes above it from the root and `links` their moves on the way down, each node in flight once. A move
+    //takes the mean its node has with that visit, and the node counts the visit after; a step is tried again with what the
+    //move then holds, if another thread's came first
+    fn back_up_means(&self, path: &[usize], links: &[usize], below: usize, in_flight: u32) {
+        debug_assert_eq!(path.len(), links.len(), "a move for every node above");
+        let (mut below, mut in_flight) = (below, in_flight);
+        for (&id, &link) in path.iter().zip(links).rev() {
+            let link = self.current_link(id, link as u32);
+            debug_assert_eq!(self.links.child(link) as usize, below, "the path's move to the node below");
+            let (word, child) = (self.links.mean(link), self.nodes.get(below));
+            let mut seen = word.load();
+            let (visits, old, mean) = loop {
+                let ((visits, old), mean) = (seen, held_mean(child, child.visits() + 1));
+                match word.change(seen, (visits + 1, mean)) {
+                    Ok(()) => break (visits, old, mean),
+                    Err(now) => seen = now,
+                }
+                jitter();
+            };
+            jitter();
+            self.links.visits(link).fetch_add(1, Ordering::AcqRel);
+            self.queue_solid(below, child.visit(in_flight));
+            self.add_move_visit(id, visits, old, mean);
+            (below, in_flight) = (id, 1);
+        }
+        jitter();
+        self.queue_solid(below, self.nodes.get(below).visit(in_flight));
     }
 
     //back_up without transpositions: a node's visit is counted by the node, after its value
@@ -970,6 +1126,11 @@ impl SharedTree {
         }
     }
 
+    //the most a descent allocates: DESCENT_BYTES, and with move_means its move's word
+    fn descent_bytes(&self) -> usize {
+        DESCENT_BYTES - size_of::<Link>() + self.links.link_bytes()
+    }
+
     //the descents a call may make without `reserve`: its share of a quarter of the room left (nodes, and bytes under a memory
     //limit), on the thought that at most MOST_CALLS calls are descending. Far from the limit that is more than a call descends
     pub fn free_descents(&self, memory_limit: usize) -> usize {
@@ -978,7 +1139,7 @@ impl SharedTree {
             usize::MAX => usize::MAX,
             _ => memory_limit.saturating_sub(self.allocated_bytes() + self.reserved_bytes()),
         };
-        nodes.min(bytes / DESCENT_BYTES) / (4 * MOST_CALLS)
+        nodes.min(bytes / self.descent_bytes()) / (4 * MOST_CALLS)
     }
 
     //room for a descent's node and its leaf's moves, under the memory limit; true if it is kept for the descent (`release`
@@ -991,7 +1152,7 @@ impl SharedTree {
         if memory_limit == usize::MAX {
             return true;
         }
-        self.reserved.fetch_add(DESCENT_BYTES, Ordering::AcqRel);
+        self.reserved.fetch_add(self.descent_bytes(), Ordering::AcqRel);
         while limited && self.allocated_bytes() + self.reserved_bytes() > memory_limit {
             if self.reclaim(ASSIST_BATCH) > 0 {
                 self.counts.assists.fetch_add(1, Ordering::Relaxed);
@@ -999,7 +1160,7 @@ impl SharedTree {
                 std::thread::yield_now();
             } else if self.allocated_bytes() + self.reserved_bytes() > memory_limit {
                 //nothing is left to free, but the last batch's thread may have freed it since the loop's look: the room is looked at again
-                self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
+                self.reserved.fetch_sub(self.descent_bytes(), Ordering::AcqRel);
                 return false;
             }
         }
@@ -1009,7 +1170,7 @@ impl SharedTree {
     //the room of a descent back, if it reserved some: its node is allocated and its leaf's moves are counted as waiting or allocated
     fn release(&self, memory_limit: usize, reserved: bool) {
         if reserved && memory_limit != usize::MAX {
-            self.reserved.fetch_sub(DESCENT_BYTES, Ordering::AcqRel);
+            self.reserved.fetch_sub(self.descent_bytes(), Ordering::AcqRel);
         }
     }
 
@@ -1125,7 +1286,7 @@ impl SharedTree {
             let arrival = self.descend(settings, &mut board, &mut unplayed, &mut keys, &mut path, &mut edges);
             let give_back = || self.release(round.memory_limit, reserved);
             let node = *path.last().expect("the root at least");
-            match arrival {
+            let owned = match arrival {
                 Arrival::Inner => unreachable!("a descent ends on a leaf"),
                 Arrival::Proven(proof) => {
                     give_back();
@@ -1139,12 +1300,29 @@ impl SharedTree {
                     continue;
                 }
                 //a repeat is a draw for this path, a transposition visit the shared node's mean: the visit is the
-                //move's, the node's numbers stay as they are
+                //move's, and without move_means the node's numbers stay as they are
                 Arrival::Repeat | Arrival::CatchUp => {
                     give_back();
                     call.simulations += 1;
                     together.simulations.fetch_add(1, Ordering::AcqRel);
-                    let shared = self.nodes.get(path.pop().expect("the shared node"));
+                    let shared = path.pop().expect("the shared node");
+                    if self.move_means() {
+                        match arrival {
+                            //a repeat is a visit of the node too, at a draw's score for the side that moved into it
+                            //(Tree::gather's)
+                            Arrival::Repeat => {
+                                self.add_own_score(shared, 1.0 - settings.draw);
+                                self.back_up_means(&path, &edges, shared, 0);
+                            }
+                            //the move's first visit is in its node's sum since the descent stopped (meet)
+                            _ => {
+                                let (&parent, above) = path.split_last().expect("the node the descent stopped below");
+                                self.back_up_means(above, &edges[..above.len()], parent, 1);
+                            }
+                        }
+                        continue;
+                    }
+                    let shared = self.nodes.get(shared);
                     //a mean read while other threads back up through the node may be off by their values: kept a score
                     let value = match arrival {
                         Arrival::Repeat => 1.0 - settings.draw,
@@ -1155,16 +1333,14 @@ impl SharedTree {
                 }
                 Arrival::Collision => {
                     give_back();
-                    if call.collisions == round.collisions as usize {
-                        self.take_off(&path);
-                        break;
+                    if call.collide(&path, round.collisions) {
+                        continue;
                     }
-                    call.collisions += 1;
-                    call.collided.extend_from_slice(&path);
-                    continue;
+                    self.take_off(&path);
+                    break;
                 }
-                Arrival::Leaf => {}
-            }
+                Arrival::Leaf { owned } => owned,
+            };
 
             self.play_path(&mut board, &mut unplayed);
             let mut moves = board.legal_moves();
@@ -1175,6 +1351,15 @@ impl SharedTree {
             let (&leaf_key, path_keys) = keys[root_keys - 1..].split_last().expect("the root's key");
             //with transpositions a leaf is no repeat inside the search (Tree::gather's)
             let value = game_over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
+            //no game's end, and the node is another descent's to evaluate: Tree::gather's collision
+            if value.is_none() && !owned {
+                give_back();
+                if call.collide(&path, round.collisions) {
+                    continue;
+                }
+                self.take_off(&path);
+                break;
+            }
             call.simulations += 1;
             together.simulations.fetch_add(1, Ordering::AcqRel);
             if let Some(value) = value {
@@ -1191,9 +1376,13 @@ impl SharedTree {
                             (Outcome::Draw, 0)
                         };
                         let proof = Proof { outcome, value: 1.0 - result, plies };
-                        if self.nodes.get(node).visits() == 0 {
+                        let leaf = self.nodes.get(node);
+                        //with move_means a path's repeat may visit the leaf beside this, at a draw's score: that is a drawn
+                        //leaf's proven score, and the position right after a capture or pawn move repeats none
+                        let scored_alike = !self.move_means() || outcome == Outcome::Draw || leaf.halfmoves() == 0;
+                        if leaf.visits() == 0 && scored_alike {
                             //a leaf nobody has visited, and nobody can before its proof is seen: it rewrites no sum
-                            self.nodes.get(node).set_proof(proof);
+                            leaf.set_proof(proof);
                             self.back_up(&path, &edges, value);
                             if self.proves_parent(&path) {
                                 self.exclusive(hold, || self.propagate_proofs(&path));
@@ -1281,20 +1470,26 @@ impl SharedTree {
     }
 }
 
-//makes a node's links before it is published, from its moves with a node as (place, node, the move's visits) in order
-fn set_links(links: &Links, node: &Node, moves: usize, solid: bool, children: impl Iterator<Item = (usize, u32, u32)>) {
+//a node's mean over `visits` visits, for a move to hold. Read while other threads back up through the node it may be off by
+//their values: it is kept a score
+fn held_mean(node: &Node, visits: u32) -> f32 {
+    node.mean_score(visits).clamp(0.0, 1.0) as f32
+}
+
+//makes a node's links before it is published, from its moves with a node as (place, node, the move's visits and mean) in order
+fn set_links(links: &Links, node: &Node, moves: usize, solid: bool, children: impl Iterator<Item = (usize, u32, (u32, f32))>) {
     if solid {
         let first = links.solid(moves);
-        for (place, child, move_visits) in children {
-            links.set_solid(first + place as u32, child, move_visits);
+        for (place, child, count) in children {
+            links.set_solid(first + place as u32, child, count);
         }
         node.make_solid(first);
         return;
     }
     let mut last = NO_LINK;
-    for (place, child, move_visits) in children {
+    for (place, child, count) in children {
         let link = links.push(child, place);
-        links.visits(link).store(move_visits, Ordering::Relaxed);
+        links.set_count(link, count);
         if last == NO_LINK {
             node.list_head().store(link, Ordering::Relaxed);
         } else {
@@ -1312,7 +1507,10 @@ impl SharedTree {
 
     pub fn from_tree(tree: &Tree) -> SharedTree {
         assert_eq!(tree.pending(), 0, "a tree to copy has nothing waiting");
-        let (nodes, edges, links) = (Nodes::new(), Edges::new(), Links::new());
+        let (nodes, edges, mut links) = (Nodes::new(), Edges::new(), Links::new());
+        if tree.move_means() {
+            links.keep_means();
+        }
         for (id, node) in tree.nodes.iter().enumerate() {
             assert_eq!(nodes.push(tree.node_keys[id]), id);
             let copy = nodes.get(id);
@@ -1329,8 +1527,9 @@ impl SharedTree {
                 for (rank, edge) in node.edges().enumerate() {
                     edges.set(first, count, rank, tree.moves[edge], tree.priors[edge]);
                 }
-                let children = tree.linked(id).map(|(place, link)| (place, tree.link_child(link), tree.own_visits(link)));
-                set_links(&links, copy, node.edges().len(), node.visit_count >= SOLID_TREE_THRESHOLD, children);
+                let children =
+                    tree.linked(id).map(|(place, link)| (place, tree.link_child(link), (tree.own_visits(link), tree.own_mean(link))));
+                set_links(&links, copy, node.edges().len(), node.solid_in_a_copy(), children);
                 copy.publish_edges(first, node.edges().len());
             }
         }
@@ -1403,6 +1602,13 @@ impl SharedTree {
         })
     }
 
+    //the nodes with moves and the visits of a solid node whose moves with a node are still a list
+    pub fn lists_with_a_solid_nodes_visits(&self) -> usize {
+        let kept_its_list =
+            |node: &&Node| node.has_edges() && node.visits() >= self.solid_threshold && matches!(node.children(), Children::List(_));
+        (0..self.nodes.len()).map(|id| self.nodes.get(id)).filter(kept_its_list).count()
+    }
+
     pub fn prior(&self, parent: &Node, edge: usize) -> f64 {
         f64::from(self.edges.prior(parent.edges(), edge))
     }
@@ -1438,7 +1644,7 @@ impl SharedTree {
         let graph = self.graph.as_ref().map(|_| {
             let halfmoves: Vec<u16> = (0..count).map(|id| self.nodes.get(id).halfmoves()).collect();
             let table = (0..count).map(|id| (graph_key(self.nodes.get(id).key(), u32::from(halfmoves[id])), id as u32)).collect();
-            Graph { table, halfmoves }
+            Graph { table, halfmoves, means: self.move_means() }
         });
         let (mut links, mut slots) = (vec![super::UNLINKED], Vec::new());
         let nodes = (0..count)
@@ -1455,11 +1661,12 @@ impl SharedTree {
                     proof: node.proof(),
                     children: NO_LINK,
                 };
-                let children = self
-                    .links
-                    .linked(node)
-                    .map(|(place, link)| (place, self.links.child(link), self.links.visits(link).load(Ordering::Relaxed)));
-                super::link_up(&mut copy, &mut links, &mut slots, visit_count >= SOLID_TREE_THRESHOLD, children);
+                let children = self.links.linked(node).map(|(place, link)| {
+                    let (visits, mean) = self.links.count(link);
+                    (place, self.links.child(link), visits, mean)
+                });
+                let solid = copy.solid_in_a_copy();
+                super::link_up(&mut copy, &mut links, &mut slots, solid, children);
                 copy
             })
             .collect();

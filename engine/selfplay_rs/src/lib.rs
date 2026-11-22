@@ -152,6 +152,7 @@ impl SelfPlayGames {
                     value_sharpness: 1.0,
                     certainty: false,
                     transpositions: false,
+                    move_means: false,
                 },
                 simulations,
                 sampled_plies,
@@ -752,7 +753,7 @@ impl Searches {
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false,
+                        memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false, move_means=false,
                         gather_helpers=0, helper_threads=0, helper_cpus=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -774,12 +775,16 @@ impl Searches {
         gc_threads: usize,
         concurrent_descents: bool,
         transpositions: bool,
+        move_means: bool,
         gather_helpers: usize,
         helper_threads: usize,
         helper_cpus: Option<Vec<usize>>,
     ) -> PyResult<Searches> {
         if (gather_helpers > 0 || helper_threads > 0) && !concurrent_descents {
             return Err(PyValueError::new_err("helpers join a gather in the tree of concurrent descents only"));
+        }
+        if move_means && !transpositions {
+            return Err(PyValueError::new_err("move_means is a rule for the moves of a tree with transpositions"));
         }
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -796,6 +801,7 @@ impl Searches {
                 value_sharpness,
                 certainty,
                 transpositions,
+                move_means,
             },
             move_ids: move_ids(move_id_table)?,
             answer_width,
@@ -842,7 +848,9 @@ impl Searches {
             }
             let tree = self
                 .reused_tree(&mut state, id, fen, &moves)
-                .unwrap_or_else(|| Tree::new(board, keys).with_transpositions(self.settings.transpositions));
+                .unwrap_or_else(|| {
+                    Tree::new(board, keys).with_transpositions(self.settings.transpositions).with_move_means(self.settings.move_means)
+                });
             state.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
             Ok(())
         })

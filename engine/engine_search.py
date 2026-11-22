@@ -54,7 +54,9 @@ ADVANCE_THREADS = 4
 #the threads that free the dead rest of a moved tree beside the next search; 0 for the search's start to free it all, on the engine's own clock
 GC_THREADS = 2
 #the engine's changes to mcts.py's search, which self-play keeps as it is
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
+#move_means: a move keeps its node's mean and a visit passes through a node other paths made, as lc0's dag search;
+#off while it is measured against the visit-by-visit catch-up
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True, "move_means": False}
 #the threads that join rounds' gathers, for each of several networks (EngineSearch's descent_helpers). On two RTX 5090s a thread a network
 #alone fell a fifth short of the gpus' rate in a middlegame of 40M visits and to under half in an endgame of 100M; three helpers a network
 #kept 95% and 80% of it, five 88% in the endgame, eight no more than five

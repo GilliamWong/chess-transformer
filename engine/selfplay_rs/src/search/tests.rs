@@ -199,10 +199,10 @@ fn assert_same<T: PartialEq + Debug>(what: &str, old: &[T], new: &[T]) {
     }
 }
 
-fn moves_with_nodes(tree: &Tree) -> Vec<Vec<(usize, u32, u32)>> {
-    (0..tree.nodes.len())
-        .map(|node| tree.linked(node).map(|(place, link)| (place, tree.link_child(link), tree.move_visits(link))).collect())
-        .collect()
+//every node's moves with a node: place, node, visits and the bits of the mean the move holds (0 without move_means)
+fn moves_with_nodes(tree: &Tree) -> Vec<Vec<(usize, u32, u32, u32)>> {
+    let move_of = |(place, link): (usize, u32)| (place, tree.link_child(link), tree.move_visits(link), tree.own_mean(link).to_bits());
+    (0..tree.nodes.len()).map(|node| tree.linked(node).map(move_of).collect()).collect()
 }
 
 fn line_end(tree: &Tree, line: &[usize]) -> usize {
@@ -393,6 +393,7 @@ fn settings(certainty: bool) -> SearchSettings {
         value_sharpness: 3.0,
         certainty,
         transpositions: false,
+        move_means: false,
     }
 }
 
@@ -695,5 +696,154 @@ fn a_node_whose_every_move_is_lost_descends_to_its_first_moves_node() {
         let (node, _) = tree.child_node(0, edge, link, &board);
         assert_eq!(node, nodes_of[0], "the first move's own node");
         assert_eq!((tree.links.len(), tree.slots.len(), tree.nodes.len()), (links, slots, nodes), "nothing made for a move with a node");
+    }
+}
+
+//a tree with transpositions whose moves keep their nodes' means (SearchSettings' move_means)
+fn means_tree(fen: &str, moves: &[&str], move_means: bool) -> (Tree, SearchSettings) {
+    let settings = SearchSettings { transpositions: true, move_means, ..settings(false) };
+    (tree_after(fen, moves).with_transpositions(true).with_move_means(move_means), settings)
+}
+
+//search without the cache, so that every expanded node's own score is its position's answer
+fn search_without_cache(tree: &mut Tree, simulations: u32, settings: &SearchSettings, network: &Network) {
+    let mut boards = Vec::new();
+    while tree.root().visit_count < simulations {
+        let round = new_round(tree, 0, simulations, usize::MAX);
+        boards.clear();
+        tree.gather(&round, settings, None, None, &mut boards);
+        for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
+            let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
+            tree.finish_leaf(0, |column| answer(board, seed, column), ANSWER_WIDTH, &network.move_ids, None, settings);
+        }
+    }
+}
+
+//every node the root reaches with its position, each once
+fn nodes_with_boards(tree: &Tree) -> Vec<(usize, Chess)> {
+    let mut seen = vec![false; tree.nodes.len()];
+    let mut found = vec![(tree.root, tree.board.clone())];
+    seen[tree.root] = true;
+    let mut next = 0;
+    while next < found.len() {
+        let (node, board) = found[next].clone();
+        next += 1;
+        for edge in tree.nodes[node].edges() {
+            if let Some(child) = tree.child_index(node, edge).filter(|&child| !seen[child]) {
+                seen[child] = true;
+                let mut after = board.clone();
+                after.play_unchecked(tree.moves[edge].to_move(&board));
+                found.push((child, after));
+            }
+        }
+    }
+    found
+}
+
+//move_means' sums: a node's visits are its own and its moves', its sum its own scores and each move's visits at the mean the move
+//holds. An expanded node's own scores are its position's answer and a draw for each repeat that ended at it. Returns the nodes that
+//several moves lead to
+fn assert_move_means(tree: &Tree, settings: &SearchSettings) -> usize {
+    assert_move_means_of(tree, settings, true)
+}
+
+//assert_move_means, with the root's sum left out unless `root_too`: a kept tree's root that was proven before it was the root has
+//its proof dropped, and the sum the proof wrote is not its moves'
+fn assert_move_means_of(tree: &Tree, settings: &SearchSettings, root_too: bool) -> usize {
+    let mut parents = vec![0u32; tree.nodes.len()];
+    let found = nodes_with_boards(tree);
+    for (node, board) in &found {
+        let state = &tree.nodes[*node];
+        let (mut moves_visits, mut moves_sum) = (0u32, 0.0);
+        for (_, link) in tree.linked(*node) {
+            let (child, visits, mean) = (tree.link_child(link) as usize, tree.own_visits(link), f64::from(tree.own_mean(link)));
+            parents[child] += 1;
+            assert!(visits <= tree.nodes[child].visit_count, "a move has no more visits than its node");
+            assert!(visits == 0 || (0.0..=1.0).contains(&mean), "a visited move's mean is a score, not {mean}");
+            moves_visits += visits;
+            moves_sum += f64::from(visits) * (1.0 - mean);
+        }
+        assert!(state.visit_count >= moves_visits, "a node's visits are its own and its moves'");
+        let own_visits = state.visit_count - moves_visits;
+        if state.has_edges() && state.proof.is_none() && (root_too || *node != tree.root) {
+            assert!(own_visits >= 1, "an expanded node has its evaluation's visit");
+            let mut tokens = Vec::new();
+            encode_board(board, &mut tokens);
+            let seed = tokens.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
+            let value = sharpen(answer(&tokens, seed, ANSWER_WIDTH_LAST), settings.value_sharpness);
+            let own_sum = (1.0 - f64::from(value)) + f64::from(own_visits - 1) * (1.0 - settings.draw);
+            let difference = (state.value_sum - own_sum - moves_sum).abs();
+            assert!(
+                difference <= 1e-6 * f64::from(state.visit_count),
+                "node {node}: sum {} against its own {own_sum} and its moves' {moves_sum} ({} visits, {own_visits} its own)",
+                state.value_sum,
+                state.visit_count
+            );
+        }
+    }
+    parents.iter().filter(|&&count| count > 1).count()
+}
+
+#[test]
+fn with_move_means_a_nodes_sum_is_its_own_scores_and_its_moves_visits_at_their_means() {
+    let network = Network::new();
+    for (fen, moves, visits) in [(START, &[][..], 6000), (START, OPENING, 6000), (LOCKED_PAWNS, &[][..], 3000), (QUEEN_AND_PAWN, &[][..], 3000)] {
+        let (mut tree, settings) = means_tree(fen, moves, true);
+        search_without_cache(&mut tree, visits, &settings, &network);
+        let shared = assert_move_means(&tree, &settings);
+        assert!(shared > 0, "{fen}: a search of {visits} visits shares some nodes");
+        //the tree kept for the next move, then searched on
+        let played = tree.most_visited_edge(tree.root);
+        tree.play(played, true);
+        assert_move_means(&tree, &settings);
+        search_without_cache(&mut tree, visits, &settings, &network);
+        assert_move_means(&tree, &settings);
+    }
+}
+
+//with move_means a visit goes on through a node other paths made, where without it the move first takes the node's mean once for
+//each of the node's visits: the same visits evaluate more positions
+#[test]
+fn with_move_means_the_same_visits_reach_more_positions() {
+    let network = Network::new();
+    let expanded = |move_means: bool| {
+        //kings that can only walk: most positions are reached by many paths
+        let (mut tree, settings) = means_tree(LOCKED_PAWNS, &[], move_means);
+        search_without_cache(&mut tree, 5_000, &settings, &network);
+        tree.nodes.iter().filter(|node| node.has_edges()).count()
+    };
+    let (caught_up, passed) = (expanded(false), expanded(true));
+    assert!(passed > caught_up + caught_up / 20, "{passed} positions evaluated with move means, {caught_up} without");
+}
+
+//with proven results too: a proven node's sum is its visits at its proven score, and the nodes above it hold their sums by the moves'
+//means as any other (assert_move_means), a move to a proven node its proven score once a descent has met it since
+#[test]
+fn with_move_means_proven_nodes_keep_their_scores_and_the_sums_above_them() {
+    let network = Network::new();
+    for (fen, moves, visits) in
+        [(MATE_IN_TWO, &[][..], 2000), (ROOKS, &[][..], 3000), (QUEEN_AND_PAWN, &[][..], 3000), (LOCKED_PAWNS, &[][..], 3000), (START, OPENING, 4000)]
+    {
+        let settings = SearchSettings { transpositions: true, move_means: true, ..settings(true) };
+        let mut tree = tree_after(fen, moves).with_transpositions(true).with_move_means(true);
+        search_without_cache(&mut tree, visits, &settings, &network);
+        assert_move_means(&tree, &settings);
+        let mut proven = 0;
+        for (node, _) in nodes_with_boards(&tree) {
+            let state = &tree.nodes[node];
+            let Some(proof) = state.proof else { continue };
+            proven += 1;
+            let difference = (state.value_sum - f64::from(state.visit_count) * proof.value).abs();
+            assert!(difference <= 1e-9 * f64::from(state.visit_count), "{fen}: a proven node's sum {} for {} visits", state.value_sum, state.visit_count);
+        }
+        if fen == MATE_IN_TWO {
+            assert!(proven > 0, "a mate in two is proven");
+            //the mating move's node is a loss for the side to move there, a win for the root's side: the move's mean says so
+            let best = tree.most_visited_edge(tree.root);
+            let link = tree.link_of(tree.root, best);
+            let child = &tree.nodes[tree.link_child(link) as usize];
+            assert!(child.proof.is_some_and(|proof| proof.outcome == Outcome::Win), "the root's best move is a proven win");
+            assert!(f64::from(tree.own_mean(link)) > 0.99, "and its mean a win's, not {}", tree.own_mean(link));
+        }
     }
 }

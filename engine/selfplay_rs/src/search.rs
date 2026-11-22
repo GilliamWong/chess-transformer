@@ -24,6 +24,10 @@ pub struct SearchSettings {
     pub certainty: bool,
     //one node a position; mcts.py has none
     pub transpositions: bool,
+    //with transpositions: a move keeps its node's mean, taken whenever a descent passes it, and its node's parent the sum of those;
+    //a visit goes on through a node other paths made (lc0's dag search), where without it a move takes its node's mean a visit at
+    //a time until it has the node's visits. A switch while the two are measured against each other
+    pub move_means: bool,
 }
 
 //a proven result, for the side that played into the node
@@ -85,16 +89,19 @@ pub struct Link {
     visits: u32,
     next: u32,
     place: u32,
+    //with SearchSettings' move_means: its node's mean_score when the move was last visited
+    mean: f32,
 }
 
 #[derive(Clone, Copy)]
 pub struct Slot {
     child: u32,
     visits: u32,
+    mean: f32,
 }
 
-const UNVISITED_SLOT: Slot = Slot { child: NO_NODE, visits: 0 };
-const UNLINKED: Link = Link { child: NO_NODE, visits: 0, next: NO_LINK, place: 0 };
+const UNVISITED_SLOT: Slot = Slot { child: NO_NODE, visits: 0, mean: 0.0 };
+const UNLINKED: Link = Link { child: NO_NODE, visits: 0, next: NO_LINK, place: 0, mean: 0.0 };
 
 impl Node {
     fn new() -> Node {
@@ -119,6 +126,12 @@ impl Node {
 
     pub fn mean_score(&self) -> f64 {
         self.value_sum / f64::from(self.visit_count)
+    }
+
+    //whether a copy of the tree gives the node a slot a move. Not for visits alone: with move_means a node may have many (repeats
+    //that ended at it) before it is expanded, and slots are a node's that has moves
+    fn solid_in_a_copy(&self) -> bool {
+        self.visit_count >= SOLID_TREE_THRESHOLD && self.has_edges()
     }
 }
 
@@ -251,13 +264,14 @@ impl<'a> Repeats<'a> {
 struct Graph {
     table: KeyMap<u32>,
     halfmoves: Vec<u16>,
+    means: bool, //SearchSettings' move_means
 }
 
 impl Graph {
     fn new(root_key: u64, root_halfmoves: u32) -> Graph {
         let mut table = KeyMap::default();
         table.insert(graph_key(root_key, root_halfmoves), 0);
-        Graph { table, halfmoves: vec![halfmove_count(root_halfmoves)] }
+        Graph { table, halfmoves: vec![halfmove_count(root_halfmoves)], means: false }
     }
 
     fn bytes(&self) -> usize {
@@ -268,7 +282,8 @@ impl Graph {
 //a table entry's key, node and control byte, in a table at most 7/8 full
 const TABLE_ENTRY_BYTES: usize = 16;
 
-//why a descent stopped above a node: a repeat on its path, or a move with fewer visits than its node (a transposition visit)
+//why a descent stopped above a node: a repeat on its path, or a move that takes its node's mean as a visit without going on (a
+//transposition visit: Tree::stops_at)
 enum Stop {
     Repeat,
     CatchUp,
@@ -502,6 +517,15 @@ impl Tree {
         self
     }
 
+    //SearchSettings' move_means for a tree with transpositions, from its start
+    pub fn with_move_means(mut self, move_means: bool) -> Tree {
+        assert_eq!(self.nodes.len(), 1, "move means from a tree's start");
+        if let Some(graph) = &mut self.graph {
+            graph.means = move_means;
+        }
+        self
+    }
+
     //room for one more simulation: its node, and the moves of every leaf that may be expanded before the next look, within the nodes' u32
     //indices and the memory limit. Under a limit the vectors are grown here (grown_capacity), so that no push grows them past it
     fn make_room(&mut self, memory_limit: usize) -> bool {
@@ -665,8 +689,8 @@ impl Tree {
         self.slots.resize(first + moves, UNVISITED_SLOT);
         let mut link = head;
         while link != NO_LINK {
-            let Link { child, visits, next, place } = self.links[link as usize];
-            self.slots[first + place as usize] = Slot { child, visits };
+            let Link { child, visits, next, place, mean } = self.links[link as usize];
+            self.slots[first + place as usize] = Slot { child, visits, mean };
             link = next;
         }
         self.nodes[node].children = first as u32 | SOLID;
@@ -677,6 +701,41 @@ impl Tree {
             NO_LINK => 0,
             _ if listed(link) => self.links[link as usize].visits,
             _ => self.slots[(link & !SOLID) as usize].visits,
+        }
+    }
+
+    fn own_mean(&self, link: u32) -> f32 {
+        match link {
+            NO_LINK => 0.0,
+            _ if listed(link) => self.links[link as usize].mean,
+            _ => self.slots[(link & !SOLID) as usize].mean,
+        }
+    }
+
+    fn move_means(&self) -> bool {
+        self.graph.as_ref().is_some_and(|graph| graph.means)
+    }
+
+    //whether a descent that came to the expanded `node` by the move `link` stops there, the move's visit taking the node's mean.
+    //Without move_means while the move has fewer visits than the node; with them at the move's first visit only
+    fn stops_at(&self, node: usize, link: u32) -> bool {
+        let visits = self.move_visits(link);
+        if self.move_means() { visits == 0 } else { visits < self.nodes[node].visit_count }
+    }
+
+    //with move_means: the move `link` of `parent` takes its node's mean as a descent passes it (other paths may have visited the
+    //node since the move last did): the move's visits at the mean it held go out of the parent's sum and at the node's mean now
+    //come in. No visit is counted: lc0 stops the descent and spends one on this, once the two are 0.01 of its score apart
+    fn take_mean(&mut self, parent: usize, link: u32, node: usize) {
+        let mean = self.nodes[node].mean_score() as f32;
+        let (visits, old) = (self.own_visits(link), self.own_mean(link));
+        if self.nodes[parent].proof.is_none() {
+            self.nodes[parent].value_sum += f64::from(visits) * (f64::from(old) - f64::from(mean));
+        }
+        if listed(link) {
+            self.links[link as usize].mean = mean;
+        } else {
+            self.slots[(link & !SOLID) as usize].mean = mean;
         }
     }
 
@@ -901,7 +960,7 @@ impl Tree {
         while next != NO_LINK && self.links[next as usize].place < place {
             (previous, next) = (next, self.links[next as usize].next);
         }
-        self.links.push(Link { child, visits: 0, next, place });
+        self.links.push(Link { child, visits: 0, next, place, mean: 0.0 });
         if previous == NO_LINK {
             self.nodes[parent].children = made;
         } else {
@@ -957,11 +1016,12 @@ impl Tree {
                     //a repeat of this path's position, whatever the node is to other paths, or a node that knows more than its move
                     if Repeats::new(&self.keys, root_keys - 1, halfmoves).repeats(self.node_keys[node], graph.halfmoves[node]) {
                         stop = Some(Stop::Repeat);
-                    } else if self.nodes[node].has_edges()
-                        && self.nodes[node].proof.is_none()
-                        && self.move_visits(link) < self.nodes[node].visit_count
-                    {
-                        stop = Some(Stop::CatchUp);
+                    } else if self.nodes[node].has_edges() && self.nodes[node].proof.is_none() {
+                        if self.stops_at(node, link) {
+                            stop = Some(Stop::CatchUp);
+                        } else if self.move_means() {
+                            self.take_mean(path[path.len() - 2], link, node);
+                        }
                     }
                 }
                 self.keys.push(self.node_keys[node]);
@@ -974,6 +1034,16 @@ impl Tree {
             if let Some(stop) = stop {
                 self.keys.truncate(root_keys);
                 simulations += 1;
+                if self.move_means() {
+                    //a repeat is a visit of the node at a draw's score for the side that moved into it (selection's for the move),
+                    //as in lc0: the move's mean is its node's, whatever the path
+                    if matches!(stop, Stop::Repeat) {
+                        self.count_own_visit(node, 1.0 - settings.draw);
+                    }
+                    path.pop();
+                    self.back_up_means(&path, &edges, None, 0);
+                    continue;
+                }
                 let value = match stop {
                     Stop::Repeat => 1.0 - settings.draw,
                     //clamped as SharedTree does: a mean read there beside other backups may be off
@@ -1140,6 +1210,9 @@ impl Tree {
     //between the path's nodes (their links), and one more when the path ends above the node the descent stopped at: each counts the visit
     //and a node's visited policy is refreshed when one of its moves has its first
     fn back_up(&mut self, path: &[usize], edges: &[usize], value: f64, in_flight: u32) {
+        if self.move_means() {
+            return self.back_up_means(path, edges, Some(value), in_flight);
+        }
         let transpositions = self.graph.is_some();
         let mut score = 1.0 - value;
         for (depth, &node) in path.iter().enumerate().rev() {
@@ -1165,6 +1238,59 @@ impl Tree {
                 }
             }
             score = 1.0 - score;
+        }
+    }
+
+    //make_solid for a node with move_means, whose hundredth visit may come before its moves (repeats that ended at it): at the first
+    //visit from then on that finds it with moves
+    fn make_solid_once_visited(&mut self, node: usize) {
+        let state = &self.nodes[node];
+        if state.visit_count >= SOLID_TREE_THRESHOLD && listed(state.children) && state.has_edges() {
+            self.make_solid(node);
+        }
+    }
+
+    //a visit that is the node's own: a simulation that ended at it, with its score for the side that moved into it
+    fn count_own_visit(&mut self, node: usize, score: f64) {
+        let score = self.nodes[node].proof.map_or(score, |proof| proof.value);
+        self.nodes[node].visit_count += 1;
+        self.nodes[node].value_sum += score;
+        self.make_solid_once_visited(node);
+    }
+
+    //back_up with move_means. The path's last node takes the simulation's value if it ended at that node (and not above a node it
+    //stopped at); then, from the bottom up, each move of the path takes its node's new mean and counts the visit, and the node it
+    //is a move of takes the change: the move's visits at its mean before go out of the node's sum and its visits at its mean now
+    //come in. A node's sum is so its own visits' scores and, for each of its moves, the move's visits at the mean the move holds,
+    //and a path just backed up holds its nodes' means exactly (lc0's dag search)
+    fn back_up_means(&mut self, path: &[usize], edges: &[usize], value: Option<f64>, in_flight: u32) {
+        if let Some(value) = value {
+            self.count_own_visit(*path.last().expect("the root at least"), 1.0 - value);
+        }
+        for (depth, &node) in path.iter().enumerate().rev() {
+            self.nodes[node].in_flight -= in_flight;
+            let Some(&link) = edges.get(depth) else { continue };
+            let link = self.current_link(node, link as u32);
+            let mean = self.nodes[self.link_child(link) as usize].mean_score() as f32;
+            let (visits, old) = (self.own_visits(link), self.own_mean(link));
+            let parent = &mut self.nodes[node];
+            parent.visit_count += 1;
+            //a node's score is for the side that moved into it: one less its move's
+            parent.value_sum = match parent.proof {
+                Some(proof) => f64::from(parent.visit_count) * proof.value,
+                None => parent.value_sum + f64::from(visits + 1) * (1.0 - f64::from(mean)) - f64::from(visits) * (1.0 - f64::from(old)),
+            };
+            if listed(link) {
+                let link = &mut self.links[link as usize];
+                (link.visits, link.mean) = (visits + 1, mean);
+            } else {
+                let slot = &mut self.slots[(link & !SOLID) as usize];
+                (slot.visits, slot.mean) = (visits + 1, mean);
+            }
+            if visits == 0 {
+                self.refresh_visited_policy(node);
+            }
+            self.make_solid_once_visited(node);
         }
     }
 
@@ -1583,7 +1709,7 @@ impl Tree {
         //with SOLID_TREE_THRESHOLD visits gets a slot a move, any other a link a move with a node
         let size = chunk_size(order.len(), threads);
         let positions: Vec<Range<usize>> = (0..order.len()).step_by(size).map(|start| start..(start + size).min(order.len())).collect();
-        let solid = |position: usize| tree.nodes[order[position] as usize].visit_count >= SOLID_TREE_THRESHOLD;
+        let solid = |position: usize| tree.nodes[order[position] as usize].solid_in_a_copy();
         let (mut first_edge, mut first_child, mut first_link, mut first_slot) = (0, 1, 1, 0);
         let starts: Vec<[usize; 7]> = positions
             .iter()
@@ -1728,12 +1854,12 @@ impl Tree {
             children.clear();
             for (place, link) in self.linked(old) {
                 let child = self.link_child(link) as usize;
-                children.push((place, nodes.len() as u32, self.own_visits(link)));
+                children.push((place, nodes.len() as u32, self.own_visits(link), self.own_mean(link)));
                 nodes.push(self.nodes[child]);
                 node_keys.push(self.node_keys[child]);
                 old_of.push(child);
             }
-            let solid = self.nodes[old].visit_count >= SOLID_TREE_THRESHOLD;
+            let solid = self.nodes[old].solid_in_a_copy();
             link_up(&mut nodes[index], &mut links, &mut slots, solid, children.iter().copied());
             index += 1;
         }
@@ -1778,9 +1904,9 @@ impl Tree {
                     copied_as[child] = order.len() as u32;
                     order.push(child);
                 }
-                children.push((place, copied_as[child], self.own_visits(link)));
+                children.push((place, copied_as[child], self.own_visits(link), self.own_mean(link)));
             }
-            let solid = node.visit_count >= SOLID_TREE_THRESHOLD;
+            let solid = node.solid_in_a_copy();
             link_up(&mut node, &mut links, &mut slots, solid, children.iter().copied());
             nodes.push(node);
             index += 1;
@@ -1790,7 +1916,8 @@ impl Tree {
         for (node, (&key, &count)) in node_keys.iter().zip(&halfmoves).enumerate() {
             table.insert(graph_key(key, u32::from(count)), node as u32);
         }
-        self.graph = Some(Graph { table, halfmoves });
+        let means = graph.means;
+        self.graph = Some(Graph { table, halfmoves, means });
         self.root = 0;
         Some(self.replace_vectors(nodes, node_keys, moves, priors, links, slots))
     }
@@ -1816,14 +1943,14 @@ impl Tree {
                 stretch.priors[at].write(self.priors[old_edge]);
                 edge += 1;
             }
-            if node.visit_count >= SOLID_TREE_THRESHOLD {
+            if node.solid_in_a_copy() {
                 let first = slot;
                 for at in first..first + edges.len() {
                     stretch.slots[at - stretch.first_slot].write(UNVISITED_SLOT);
                 }
                 for (place, old_link) in self.linked(old) {
                     stretch.slots[first + place - stretch.first_slot]
-                        .write(Slot { child: child as u32, visits: self.own_visits(old_link) });
+                        .write(Slot { child: child as u32, visits: self.own_visits(old_link), mean: self.own_mean(old_link) });
                     child += 1;
                 }
                 node.children = first as u32 | SOLID;
@@ -1835,7 +1962,13 @@ impl Tree {
                     if previous.is_none() {
                         node.children = link as u32;
                     }
-                    let next = Link { child: child as u32, visits: self.own_visits(old_link), next: NO_LINK, place: place as u32 };
+                    let next = Link {
+                        child: child as u32,
+                        visits: self.own_visits(old_link),
+                        next: NO_LINK,
+                        place: place as u32,
+                        mean: self.own_mean(old_link),
+                    };
                     if let Some((at, mut written)) = previous.replace((link, next)) {
                         written.next = link as u32;
                         stretch.links[at - stretch.first_link].write(written);
@@ -1855,25 +1988,31 @@ impl Tree {
 }
 
 //adds a node's moves with a node, as (place, node, own visits), to the links or slots of a tree being made
-fn link_up(node: &mut Node, links: &mut Vec<Link>, slots: &mut Vec<Slot>, solid: bool, children: impl Iterator<Item = (usize, u32, u32)>) {
+fn link_up(
+    node: &mut Node,
+    links: &mut Vec<Link>,
+    slots: &mut Vec<Slot>,
+    solid: bool,
+    children: impl Iterator<Item = (usize, u32, u32, f32)>,
+) {
     if solid {
         let first = slots.len();
         slots.resize(first + node.edges().len(), UNVISITED_SLOT);
-        for (place, child, visits) in children {
-            slots[first + place] = Slot { child, visits };
+        for (place, child, visits, mean) in children {
+            slots[first + place] = Slot { child, visits, mean };
         }
         node.children = first as u32 | SOLID;
         return;
     }
     node.children = NO_LINK;
-    for (place, child, visits) in children {
+    for (place, child, visits, mean) in children {
         let link = links.len() as u32;
         if node.children == NO_LINK {
             node.children = link;
         } else {
             links[link as usize - 1].next = link;
         }
-        links.push(Link { child, visits, next: NO_LINK, place: place as u32 });
+        links.push(Link { child, visits, next: NO_LINK, place: place as u32, mean });
     }
 }
 

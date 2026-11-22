@@ -79,7 +79,7 @@ impl SharedTree {
         {
             return None;
         }
-        let fresh = Fresh::new(order.len(), &layout);
+        let fresh = Fresh::new(order.len(), &layout, self.move_means());
         in_parallel(threads, fresh.chunks(), |chunk| fresh.make_chunk(chunk));
         let graph = self.graph.as_ref().map(|_| {
             let graph = SharedGraph::new();
@@ -114,7 +114,7 @@ impl SharedTree {
     fn copy_bytes(&self, nodes: usize, layout: &Layout) -> usize {
         let (edge_units, links, slots) = layout.room();
         let table = self.graph.as_ref().map_or(0, |_| nodes * TABLE_ENTRY_BYTES);
-        nodes * NODE_BYTES + edge_units * EDGE_BYTES + links * LINK_BYTES + slots * SLOT_BYTES + table
+        nodes * NODE_BYTES + edge_units * EDGE_BYTES + links * self.links.link_bytes() + slots * self.links.slot_bytes() + table
     }
 
     //the nodes the root reaches in breadth first order, a node that several moves lead to at the first, and their shapes; with
@@ -155,6 +155,7 @@ impl SharedTree {
                 found.children.push(child);
             }
             let edges = node.edges().len();
+            //Tree's solid_in_a_copy: slots are a node's that has moves, whatever its visits
             let solid = edges > 0 && node.visits() >= self.solid_threshold;
             found.shapes.push(Shape { links: (found.children.len() - before) as u8, edges: edges as u8, solid });
         }
@@ -175,13 +176,14 @@ impl SharedTree {
                 let child = plan.numbers.map_or(next_child, |numbers| marked(&numbers[self.links.child(link) as usize]));
                 next_child += 1;
                 plan.fresh.nodes.get(child as usize).add_reference();
-                let visits = self.links.visits(link).load(Ordering::Relaxed);
+                //the move's visits and the mean it holds
+                let count = self.links.count(link);
                 if shape.solid {
-                    plan.fresh.links.set_solid(children + place as u32, child, visits);
+                    plan.fresh.links.set_solid(children + place as u32, child, count);
                 } else {
                     let link = children + index as u32;
                     let next = if index + 1 < usize::from(shape.links) { link + 1 } else { NO_LINK };
-                    plan.fresh.links.write(link, child, visits, place, next);
+                    plan.fresh.links.write(link, child, count, place, next);
                 }
             }
             if let Some(graph) = plan.graph {

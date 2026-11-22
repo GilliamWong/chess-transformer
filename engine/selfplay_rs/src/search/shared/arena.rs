@@ -166,7 +166,12 @@ impl Node {
     }
 
     pub fn add_value(&self, delta: f64) {
-        let _ = self.value_sum.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| Some((f64::from_bits(seen) + delta).to_bits()));
+        self.change_value(|sum| sum + delta);
+    }
+
+    //the sum as `change` makes it of what it was, whatever other threads add to it meanwhile
+    pub fn change_value(&self, change: impl Fn(f64) -> f64) {
+        let _ = self.value_sum.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seen| Some(change(f64::from_bits(seen)).to_bits()));
     }
 
     pub fn mean_score(&self, visits: u32) -> f64 {
@@ -698,12 +703,49 @@ impl Slot {
     }
 }
 
+//with SearchSettings' move_means: a move's visits and its node's mean as the move holds it, in one word (the visits in its low
+//32 bits, the mean's bits in its high), so that a thread changes the two in one step beside the others. The move's own count of
+//its visits (its link's or slot's), which the descents read, follows each step
+#[derive(Default)]
+pub struct MoveMean(AtomicU64);
+
+fn packed((visits, mean): (u32, f32)) -> u64 {
+    u64::from(mean.to_bits()) << 32 | u64::from(visits)
+}
+
+fn unpacked(word: u64) -> (u32, f32) {
+    (word as u32, f32::from_bits((word >> 32) as u32))
+}
+
+impl MoveMean {
+    //the visits and the mean
+    pub fn load(&self) -> (u32, f32) {
+        unpacked(self.0.load(Ordering::Acquire))
+    }
+
+    //`now` in place of `seen` (what load or a change that failed gave): Err of what the move holds, if another thread has
+    //changed it since
+    pub fn change(&self, seen: (u32, f32), now: (u32, f32)) -> Result<(), (u32, f32)> {
+        self.0.compare_exchange(packed(seen), packed(now), Ordering::AcqRel, Ordering::Acquire).map(|_| ()).map_err(unpacked)
+    }
+
+    //before the move is published, or with the tree to itself
+    fn set(&self, held: (u32, f32)) {
+        self.0.store(packed(held), Ordering::Relaxed);
+    }
+}
+
 pub struct Links {
     table: Table<Link>,
     next: Alone<AtomicUsize>,
     freed: Pool,
     slots: Table<Slot>,
     slot_runs: Runs,
+    //with move_means (keeps_means) a word for every link and for every slot, at its index: the links and slots are as they are
+    //without, and no chunk of words is made
+    means: Table<MoveMean>,
+    slot_means: Table<MoveMean>,
+    keeps_means: bool,
 }
 
 impl Links {
@@ -729,7 +771,30 @@ impl Links {
             freed: Pool::default(),
             slots: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
             slot_runs: Runs::new(LINK_CHUNK_BITS, Self::CAPACITY),
+            means: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
+            slot_means: Table::new(LINK_CHUNKS, LINK_CHUNK_BITS),
+            keeps_means: false,
         }
+    }
+
+    //from now on a word of visits and mean for every move (SearchSettings' move_means): for links that have no move yet
+    pub fn keep_means(&mut self) {
+        assert!(self.len() == 1 && self.slots() == 0, "the moves' means from a tree's start");
+        self.keeps_means = true;
+        self.make(0);
+    }
+
+    pub fn keeps_means(&self) -> bool {
+        self.keeps_means
+    }
+
+    //the bytes of a link and of a slot, a move's word with them
+    pub fn link_bytes(&self) -> usize {
+        size_of::<Link>() + if self.keeps_means { size_of::<MoveMean>() } else { 0 }
+    }
+
+    pub fn slot_bytes(&self) -> usize {
+        size_of::<Slot>() + if self.keeps_means { size_of::<MoveMean>() } else { 0 }
     }
 
     //the links given out so far, those given back included
@@ -760,6 +825,9 @@ impl Links {
 
     fn make(&self, first: usize) {
         self.table.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Link::new()).collect());
+        if self.keeps_means {
+            self.means.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| MoveMean::default()).collect());
+        }
     }
 
     pub fn get(&self, link: u32) -> &Link {
@@ -793,6 +861,30 @@ impl Links {
         if listed(link) { &self.get(link).visits } else { &self.slot(link).visits }
     }
 
+    //the word of the move's visits and mean (with move_means)
+    pub fn mean(&self, link: u32) -> &MoveMean {
+        if listed(link) { self.means.get(link as usize) } else { self.slot_means.get((link & !SOLID) as usize) }
+    }
+
+    //the move's visits and the mean it holds (0 without move_means), for a tree no thread works in
+    pub fn count(&self, link: u32) -> (u32, f32) {
+        let visits = self.visits(link).load(Ordering::Relaxed);
+        if !self.keeps_means {
+            return (visits, 0.0);
+        }
+        let (held, mean) = self.mean(link).load();
+        debug_assert_eq!(held, visits, "a move's visits and those its mean is for");
+        (visits, mean)
+    }
+
+    //a move's visits and mean, before the move is published or with the tree to itself
+    pub fn set_count(&self, link: u32, (visits, mean): (u32, f32)) {
+        self.visits(link).store(visits, Ordering::Relaxed);
+        if self.keeps_means {
+            self.mean(link).set((visits, mean));
+        }
+    }
+
     //a list link for the move at `place` with its node, not yet in a list
     pub fn push(&self, child: u32, place: usize) -> u32 {
         let link = match self.freed.take() {
@@ -809,6 +901,9 @@ impl Links {
         made.visits.store(0, Ordering::Relaxed);
         made.next.store(NO_LINK, Ordering::Relaxed);
         made.place.store(place as u32, Ordering::Relaxed);
+        if self.keeps_means {
+            self.means.get(link).set((0, 0.0));
+        }
         link as u32
     }
 
@@ -839,11 +934,17 @@ impl Links {
             slot.child.store(NO_NODE, Ordering::Relaxed);
             slot.visits.store(0, Ordering::Relaxed);
         }
+        if self.keeps_means {
+            self.slot_means.slice(first, count).iter().for_each(|word| word.set((0, 0.0)));
+        }
         first as u32 | SOLID
     }
 
     fn make_slots(&self, first: usize) {
         self.slots.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Slot::new()).collect());
+        if self.keeps_means {
+            self.slot_means.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| MoveMean::default()).collect());
+        }
     }
 
     #[cfg(test)]
@@ -908,20 +1009,19 @@ impl Links {
         self.get(link).next.store(next, Ordering::Relaxed);
     }
 
-    //a solid slot's node and visits, before the node is published or with the tree to itself
-    pub fn set_solid(&self, link: u32, child: u32, visits: u32) {
-        let slot = self.slot(link);
-        slot.child.store(child, Ordering::Relaxed);
-        slot.visits.store(visits, Ordering::Relaxed);
+    //a solid slot's node and its move's visits and mean, before the node is published or with the tree to itself
+    pub fn set_solid(&self, link: u32, child: u32, count: (u32, f32)) {
+        self.slot(link).child.store(child, Ordering::Relaxed);
+        self.set_count(link, count);
     }
 
-    //a list's link of a copy nothing reads yet
-    pub fn write(&self, link: u32, child: u32, visits: u32, place: usize, next: u32) {
+    //a list's link of a copy nothing reads yet, with its move's visits and mean
+    pub fn write(&self, link: u32, child: u32, count: (u32, f32), place: usize, next: u32) {
         let written = self.get(link);
         written.child.store(child, Ordering::Relaxed);
-        written.visits.store(visits, Ordering::Relaxed);
         written.place.store(place as u32, Ordering::Relaxed);
         written.next.store(next, Ordering::Relaxed);
+        self.set_count(link, count);
     }
 
     pub fn linked<'a>(&'a self, node: &Node) -> Linked<'a> {
@@ -1177,10 +1277,11 @@ pub struct Fresh {
 }
 
 impl Fresh {
-    pub fn new(nodes: usize, layout: &Layout) -> Fresh {
+    //`means`: with a word of visits and mean for every move (Links' keeps_means)
+    pub fn new(nodes: usize, layout: &Layout, means: bool) -> Fresh {
         assert!(nodes <= Nodes::CAPACITY && layout.edges <= Edges::CAPACITY, "a copy past the arenas' room");
         assert!(layout.links <= Links::CAPACITY && layout.slots <= Links::CAPACITY, "a copy past the arenas' room");
-        let fresh = Fresh { nodes: Nodes::new(), edges: Edges::new(), links: Links::empty() };
+        let fresh = Fresh { nodes: Nodes::new(), edges: Edges::new(), links: Links { keeps_means: means, ..Links::empty() } };
         fresh.nodes.next.store(nodes, Ordering::Relaxed);
         fresh.edges.runs.next.store(layout.edges, Ordering::Relaxed);
         fresh.links.next.store(layout.links, Ordering::Relaxed);
