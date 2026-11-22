@@ -709,7 +709,7 @@ fn a_node_whose_every_move_is_lost_descends_to_its_first_moves_node() {
         let mut nodes_of = Vec::new();
         for edge in tree.nodes[0].edges() {
             let board = after(&tree, edge);
-            let (node, _) = tree.child_node(0, edge, NO_LINK, &board);
+            let (node, _) = tree.child_node(0, edge, NO_LINK, &board, false);
             tree.nodes[node].proof = Some(lost);
             nodes_of.push(node);
         }
@@ -721,7 +721,7 @@ fn a_node_whose_every_move_is_lost_descends_to_its_first_moves_node() {
         let (edge, link) = tree.select_edge(0, &settings(true), None);
         assert_eq!(edge, tree.nodes[0].edges().start, "the first move when every move is lost");
         let board = after(&tree, edge);
-        let (node, _) = tree.child_node(0, edge, link, &board);
+        let (node, _) = tree.child_node(0, edge, link, &board, false);
         assert_eq!(node, nodes_of[0], "the first move's own node");
         assert_eq!((tree.links.len(), tree.slots.len(), tree.nodes.len()), (links, slots, nodes), "nothing made for a move with a node");
     }
@@ -786,7 +786,10 @@ fn assert_move_means_of(tree: &Tree, settings: &SearchSettings, root_too: bool) 
         for (_, link) in tree.linked(*node) {
             let (child, visits, mean) = (tree.link_child(link) as usize, tree.own_visits(link), f64::from(tree.slot(link).mean));
             parents[child] += 1;
-            assert!(visits <= tree.nodes[child].visit_count, "a move has no more visits than its node");
+            //but for its repeats of a path at its position's ordinary node, which are the move's alone (repeat_at_move): a node
+            //right after a capture or pawn move repeats none
+            let repeats_alone = !tree.is_repeat_node(child) && tree.graph.as_ref().is_some_and(|graph| graph.halfmoves[child] != 0);
+            assert!(visits <= tree.nodes[child].visit_count || repeats_alone, "a move has no more visits than its node");
             assert!(visits == 0 || (0.0..=1.0).contains(&mean), "a visited move's mean is a score, not {mean}");
             moves_visits += visits;
             moves_sum += f64::from(visits) * (1.0 - mean);
@@ -798,7 +801,13 @@ fn assert_move_means_of(tree: &Tree, settings: &SearchSettings, root_too: bool) 
             encode_board(board, &mut tokens);
             let seed = tokens.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
             let value = sharpen(answer(&tokens, seed, ANSWER_WIDTH_LAST), settings.value_sharpness);
-            assert!(own_visits >= 1, "an expanded node's own visits: its evaluation's and repeats'");
+            //a position's ordinary node has no visit of its own but its evaluation: the draws of the paths that repeat it are
+            //its repeat node's, or their moves' alone
+            if tree.is_repeat_node(*node) {
+                assert!(own_visits >= 1, "a repeat node's own visits: its evaluation's and repeats'");
+            } else {
+                assert_eq!(own_visits, 1, "node {node}: an ordinary node's own visits are its evaluation's");
+            }
             let own_sum = (1.0 - f64::from(value)) + f64::from(own_visits - 1) * (1.0 - settings.draw);
             let difference = (state.value_sum - own_sum - moves_sum).abs();
             assert!(
@@ -942,4 +951,92 @@ fn in_a_graph_a_later_pass_gives_moves_the_nodes_made_since_the_first() {
         }
     }
     assert!(passed_again > 0 && given_since > 0, "{passed_again} nodes had a later pass, which gave {given_since} moves nodes made since");
+}
+
+//the tests' network's values with every move the same prior: a search that looks at every move, for positions in which the move
+//that matters is one of many
+fn search_evenly(tree: &mut Tree, simulations: u32, settings: &SearchSettings) {
+    let mut boards = Vec::new();
+    while tree.root().visit_count < simulations {
+        let round = new_round(tree, 0, simulations, usize::MAX);
+        boards.clear();
+        tree.gather(&round, settings, None, None, &mut boards);
+        for board in boards.as_chunks::<TOKENS_PER_BOARD>().0 {
+            let seed = board.iter().fold(0, |hash, &token| mix(hash ^ u64::from(token)));
+            let moves = tree.round_moves(0).next().expect("a waiting leaf").0.len();
+            tree.finish_leaf_in_order(0, vec![0.0; moves].into_iter(), answer(board, seed, ANSWER_WIDTH_LAST), None, settings);
+        }
+    }
+}
+
+//the root's most visited move and its score for the side to move
+fn root_move_and_score(tree: &Tree) -> (String, f64) {
+    let edge = tree.most_visited_edge(tree.root);
+    (tree.chess_move(edge).to_move(&tree.board).to_string(), tree.child(tree.root, edge).expect("the move's node").mean_score())
+}
+
+//White, two rooks down and about to be mated, checks on h5 and e8 for ever
+const PERPETUAL: &str = "4Q3/6pk/8/8/8/8/1rr4P/K7 w - - 0 1";
+
+//a position's node holds no draws of the paths that repeat it. The kings' walks repeat many positions, and the same node is
+//come to by paths that repeat it and by paths that do not: its own visits are its evaluation's alone (assert_move_means), the
+//draws being its repeat node's, or the visits of the move alone where the move holds the ordinary node (repeat_at_move). Before
+//this a repeat was a visit of whatever node its move held, and some nodes with moves were nine parts in ten draws
+#[test]
+fn a_positions_node_holds_no_draws_of_the_paths_that_repeat_it() {
+    let network = Network::new();
+    let (mut tree, settings) = graph_tree(LOCKED_PAWNS, &[]);
+    search_without_cache(&mut tree, 20_000, &settings, &network);
+    assert_move_means(&tree, &settings);
+    let (mut repeat_nodes, mut repeat_visits, mut evaluated_repeat_nodes, mut moves_alone) = (0, 0, 0, 0);
+    for (node, _) in nodes_with_boards(&tree) {
+        let state = &tree.nodes[node];
+        if tree.is_repeat_node(node) {
+            repeat_nodes += 1;
+            evaluated_repeat_nodes += usize::from(state.has_edges());
+            if !state.has_edges() && state.proof.is_none() {
+                repeat_visits += state.visit_count;
+                //a repeat node that no path has evaluated holds draws alone
+                assert_eq!(state.value_sum, f64::from(state.visit_count) * (1.0 - settings.draw), "repeat node {node}");
+            }
+        }
+        for (_, link) in tree.linked(node) {
+            let child = tree.link_child(link) as usize;
+            moves_alone += usize::from(!tree.is_repeat_node(child) && tree.own_visits(link) > tree.nodes[child].visit_count);
+        }
+    }
+    assert!(repeat_nodes > 100 && repeat_visits > 1_000, "{repeat_nodes} repeat nodes of {repeat_visits} visits");
+    assert!(evaluated_repeat_nodes > 0 && moves_alone > 0, "{evaluated_repeat_nodes} repeat nodes evaluated, {moves_alone} moves with repeats of their own");
+}
+
+//the path that repeats is credited a draw exactly: the move that makes the repeat holds the draw's score and its node holds
+//draws alone, so a defence by repetition is a draw at the root. White's checks are its only defence: the root's score is the
+//draw's, less what the looks at White's other moves cost, and the first check is its move
+#[test]
+fn a_defence_by_repetition_is_a_draw_at_the_root() {
+    let settings = SearchSettings { transpositions: true, ..settings(true) };
+    let mut tree = tree_after(PERPETUAL, &[]).with_transpositions(true);
+    search_evenly(&mut tree, 4_000, &settings);
+    let (chosen, score) = root_move_and_score(&tree);
+    assert!(chosen == "Qe8-h5" && (score - settings.draw).abs() < 0.03, "{chosen} at {score:.4}");
+    //the root's position four plies on, come to as a repeat: its repeat node, and the move to it
+    let root_key = tree.node_keys[tree.root];
+    let repeat = (0..tree.nodes.len()).find(|&node| tree.is_repeat_node(node) && tree.node_keys[node] == root_key).expect("the root's repeat node");
+    let state = &tree.nodes[repeat];
+    assert!(!state.has_edges() && state.visit_count > 1_000, "{} visits", state.visit_count);
+    assert_eq!(state.value_sum, f64::from(state.visit_count) * (1.0 - settings.draw), "the repeat node's sum");
+    let links = (0..tree.nodes.len()).flat_map(|node| tree.linked(node).map(|(_, link)| link));
+    let to_repeat: Vec<u32> = links.filter(|&link| tree.link_child(link) as usize == repeat).collect();
+    assert!(!to_repeat.is_empty() && to_repeat.iter().all(|&link| tree.slot(link).mean == (1.0 - settings.draw) as f32), "the moves to it");
+}
+
+//a won position that can be shuffled keeps its value: White, a queen up behind blocked pawns, can step to and fro for ever, and
+//the search's looks at stepping back leave the positions' nodes what their own search made them
+#[test]
+fn a_won_position_that_can_be_shuffled_keeps_its_value() {
+    let settings = SearchSettings { transpositions: true, ..settings(true) };
+    let mut tree = tree_after("4k3/8/8/1p1p1p1p/1P1P1P1P/8/Q7/4K3 w - - 0 1", &[]).with_transpositions(true);
+    search_evenly(&mut tree, 16_000, &settings);
+    let (chosen, score) = root_move_and_score(&tree);
+    assert!(score > 0.98, "{chosen} at {score:.4}");
 }

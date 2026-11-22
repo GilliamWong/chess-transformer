@@ -932,7 +932,15 @@ impl SharedTree {
     //the node and link of the parent's move `edge` (select_edge's link), made if the move has none yet; the node's position is
     //board with the path's moves `unplayed` played. Of two threads that make one, one node is kept and the other's stays
     //unused. With transpositions it is the table's node of the position, made by one thread under the shard's lock
-    fn child_node(&self, parent: usize, edge: usize, link: u32, board: &mut Chess, unplayed: &mut Vec<usize>) -> (usize, u32) {
+    fn child_node(
+        &self,
+        parent: usize,
+        edge: usize,
+        link: u32,
+        board: &mut Chess,
+        unplayed: &mut Vec<usize>,
+        repeats: Option<&Repeats>,
+    ) -> (usize, u32) {
         //select_edge names no move when it chose none (every move a proven loss, the first taken): its node if it has one
         let link = if link == NO_LINK { self.link_of(self.nodes.get(parent), edge) } else { link };
         if link != NO_LINK && self.links.child(link) != NO_NODE {
@@ -940,6 +948,8 @@ impl SharedTree {
         }
         self.play_path(board, unplayed);
         let (key, halfmoves) = (position_key(board), halfmove_count(board.halfmoves()));
+        //a move that a descent first comes to as a repeat of its path takes its position's repeat node (Tree::child_node)
+        let halfmoves = halfmoves | if repeats.is_some_and(|repeats| repeats.repeats(key, halfmoves)) { REPEATED } else { 0 };
         let repeats = repeat_filter(key, halfmoves);
         let made = match &self.graph {
             None => self.nodes.push(key),
@@ -1137,6 +1147,28 @@ impl SharedTree {
             jitter();
             seen = word.load();
         }
+    }
+
+    //how a descent that came by the move `link` of the node `id` to `child` as a repeat of a position on its path ends
+    //(Tree::back_up_repeat). At its position's repeat node: Repeat, the draw a visit of that node. At the position's ordinary
+    //node, which is not touched: the visit is the move's alone, taken here in one step of the move at the mean of all its
+    //visits (Tree::repeat_at_move), and the backup goes on from the node `id` as after a move's first visit
+    fn repeat_arrival(&self, id: usize, link: u32, child: &Node, score: f64) -> Arrival {
+        if child.halfmoves() & REPEATED != 0 {
+            return Arrival::Repeat;
+        }
+        let word = self.links.slot(link).held();
+        let mut seen = word.load();
+        let (visits, old, mean) = loop {
+            let ((visits, old), mean) = (seen, blended_mean(seen.0, seen.1, score));
+            match word.change(seen, (visits + 1, mean)) {
+                Ok(()) => break (visits, old, mean),
+                Err(now) => seen = now,
+            }
+            jitter();
+        };
+        self.add_move_visit(id, visits, old, mean);
+        Arrival::FirstVisit
     }
 
     //Tree::known_pass_due and the pass's beginning: whether the node, of `visits` visits, is due a pass of link_known_moves
@@ -1785,7 +1817,7 @@ impl SharedTree {
                 }
             }
             let left = descents - over;
-            let repeats = self.graph.as_ref().map(|_| Repeats::new(keys, walker.root_keys - 1, u32::from(node.halfmoves())));
+            let repeats = self.graph.as_ref().map(|_| Repeats::new(keys, walker.root_keys - 1, u32::from(node.halfmoves() & !REPEATED)));
             //one descent is select_edge's alone; several want to know how long its move stays the choice
             let (edge, selected, looked) = if left == 1 {
                 let (edge, selected) = self.select_edge(id, &walker.settings, repeats.as_ref());
@@ -1800,7 +1832,7 @@ impl SharedTree {
             if !had_node {
                 walker.play_line(self);
             }
-            let (child_id, link) = self.child_node(id, edge, selected, &mut walker.board, &mut walker.no_moves);
+            let (child_id, link) = self.child_node(id, edge, selected, &mut walker.board, &mut walker.no_moves, repeats.as_ref());
             walker.path.push(child_id);
             let child = self.nodes.get(child_id);
             let (mut stop, mut new_mean) = (None, false);
@@ -1808,7 +1840,7 @@ impl SharedTree {
                 walker.edges.push(link as usize);
                 //a repeat of this path's position, whatever the node is to other paths, or a node that knows more than its move
                 if repeats.repeats(child.key(), child.halfmoves()) {
-                    stop = Some(Arrival::Repeat);
+                    stop = Some(self.repeat_arrival(id, link, child, 1.0 - walker.settings.draw));
                 } else if child.has_edges() && child.proof().is_none() {
                     let held = self.links.slot(link).held().load().1;
                     stop = self.meet(id, link, child).then_some(Arrival::FirstVisit);
@@ -1824,7 +1856,8 @@ impl SharedTree {
                         let above = &walker.path[..walker.path.len() - 1];
                         self.back_up_means(above, &walker.edges[..above.len()], id, (0, 1));
                     }
-                    //a repeat is a visit of the node too, at a draw's score for the side that moved into it (Tree::gather's)
+                    //a repeat by a move that holds its position's repeat node is a visit of that node, at a draw's score for
+                    //the side that moved into it (Tree::back_up_repeat)
                     _ => {
                         self.add_own_score(shared, 1.0 - walker.settings.draw);
                         self.back_up_means(&walker.path, &walker.edges, shared, (0, 0));

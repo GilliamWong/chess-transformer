@@ -160,9 +160,9 @@ def test_the_positions_give_moves_known_nodes_and_come_to_visit_them():
 
 
 #a node's later passes over its moves. These positions come to a position by many orders of moves, and so many visits bring nodes
-#below the root to second and third passes that give moves nodes: a search without the second pass leaves the rust search before
-#1600 visits in both searches and one without the third before 18500. A fourth pass and a fifth (8192 visits) are made at a few
-#nodes and give nothing
+#below the root to second, third and fourth passes that give moves nodes: a search without the second pass leaves the rust search
+#before 2300 visits in both searches and one without the third before 14100. The fourth pass gives one move a node, which changes
+#neither search by these visits, and a fifth (8192 visits) is made at a few nodes and gives nothing
 TRANSPOSING = {"queen and pawn ending": chess.Board("8/8/8/4k3/8/2p5/8/3QK3 w - - 0 1"), "blocked pawns": chess.Board(BLOCKED_PAWNS)}
 MANY_VISITS = {"queen and pawn ending": 40000, "blocked pawns": 20000}
 
@@ -187,7 +187,7 @@ def test_the_searches_of_many_visits_give_moves_nodes_at_later_passes():
 
     at_later_passes = lambda by_pass: sum(count for number, count in by_pass.items() if number > 0)
     assert at_later_passes(moves_given) >= 30 and at_later_passes(first_visits) >= 10, (moves_given, first_visits)
-    assert moves_given[2] >= 20, moves_given
+    assert moves_given[2] >= 20 and moves_given[3] >= 1, moves_given
     assert passes_made_below_the_root[3] >= 50 and passes_made_below_the_root[4] >= 10 and passes_made_below_the_root[5] >= 3, passes_made_below_the_root
 
 
@@ -222,16 +222,16 @@ def played_moves(fen: str, line: list[str]) -> chess.Board:
     return board
 
 #a node that comes late to a pass over its moves, its visits past those of the next pass too: only repeats bring a node visits
-#without a descent that picks a move from it, and no search above has a node that took three hundred of them between two picks.
-#Here one does. The kings behind a blocked pawn pair, every score a half but one, and a network that knows a board and not its
-#fifty-move count:
-#- Y, the position after Kd2 Kd7, has a node two plies down and (LATE) one six plies down. The network gives both the same moves:
-#  Kd1 mostly, Ke3 the rest.
-#- REPEATING, which most visits go down, comes back to Y: a repeat, which ends at LATE and gives it a visit without picking a move
-#  from it. So does Kd2 Kd7 Ke3 Kd8 Kd2 Kd7.
-#- ARRIVING comes to LATE without a repeat, a visit in eighty or so. Its sixth visit evaluates LATE, which has hundreds of visits by
-#  then; its seventh is the first to pick a move from LATE, and makes LATE's first pass with later ones due as well; its eighth
-#  picks from LATE again.
+#without a descent that picks a move from it, and only a node for repeats takes them; no search above has one that took a hundred
+#of them between two picks. Here one does. The kings behind a blocked pawn pair, every score a half but one, and a network that
+#knows a board and not its fifty-move count:
+#- Y, the position after Kd2 Kd7, has a node two plies down and six plies down a node for repeats (LATE). The network gives both
+#  the same moves: Kd1 mostly, Ke3 the rest.
+#- REPEATING, which most visits go down, comes back to Y: a repeat, whose last move takes LATE and gives it a visit without picking
+#  a move from it. So does Kd2 Kd7 Ke3 Kd8 Kd2 Kd7.
+#- ARRIVING comes by other moves to the node REPEATING's last move starts from, and by that move to LATE without a repeat, a visit
+#  in eighty or so. Its sixth visit evaluates LATE, which has hundreds of visits by then; its seventh is the first to pick a move
+#  from LATE, and makes LATE's first pass with later ones due as well; its eighth picks from LATE again.
 #- KNOWING comes to the position Ke3 leads to from Y, seven plies down as from LATE, and first visits it between ARRIVING's seventh
 #  visit and its eighth. It scores nothing for White there.
 #At ARRIVING's eighth visit LATE's move Ke3 leads to a known position. A LATE that owed another pass would give Ke3 that
@@ -239,7 +239,7 @@ def played_moves(fen: str, line: list[str]) -> chess.Board:
 #move nothing is known of
 LATE_PASS_FEN = "4k3/8/8/3p4/3P4/8/8/4K3 w - - 0 1"
 REPEATING = "e1d2 e8d7 d2d1 d7d8 d1d2 d8d7".split()
-ARRIVING = "e1d1 e8d7 d1c1 d7c7 c1d2 c7d7".split()
+ARRIVING = "e1d1 e8d7 d1c1 d7d8 c1d2 d8d7".split()
 KNOWING = "e1f2 e8d8 f2f3 d8c7 f3f2 c7d7 f2e3".split()
 LATE_PASS_VISITS = 1000
 
@@ -249,7 +249,6 @@ def late_pass_model() -> ScriptedModel:
     for line in (REPEATING, ARRIVING, KNOWING):
         for plies in range(1, len(line)):
             model.tell(LATE_PASS_FEN, line[:plies], {"d2d1": 0.66, "d2e3": 0.34} if line[:plies] == REPEATING[:2] else {line[plies]: 1.0})
-    model.tell(LATE_PASS_FEN, ARRIVING, {"d2d1": 0.66, "d2e3": 0.34})
     #from the position Ke3 leads to, back to Y by Kd8 Kd2 Kd7
     model.tell(LATE_PASS_FEN, KNOWING, {"d7d8": 1.0}, score=1.0)
     model.tell(LATE_PASS_FEN, KNOWING + ["d7d8"], {"e3d2": 1.0})
@@ -264,7 +263,7 @@ def test_the_rust_search_of_a_node_late_to_its_pass_is_the_reference_at_every_si
 def test_the_node_late_to_its_pass_makes_one_pass_and_then_picks_a_move_it_would_have_given_a_node():
     search = reference.Search(late_pass_model(), chess.Board(LATE_PASS_FEN), CPU)
     #LATE's node, made here before the search comes to it: one without a visit is as none to the search
-    late = search.node_of(played_moves(LATE_PASS_FEN, ARRIVING))
+    late = search.node_of(played_moves(LATE_PASS_FEN, ARRIVING), repeat=True)
     #the lines of the simulations that picked a move from LATE, and where among them the two things happened
     picks, late_pass_at, known_at = [], None, None
     while search.root.visit_count < LATE_PASS_VISITS:
@@ -386,7 +385,6 @@ def test_the_searches_in_rounds_come_to_the_rules_cases():
         #pending counts, and a move that waits for its node's first evaluation or took a node that waited: no mean, whatever
         #repeats have given the node
         assert counts[certainty][reference.COLLISION] >= 1000 and counts[certainty][reference.NO_MEAN_OF_A_VISITED_NODE] >= 50, counts
-        assert counts[certainty][reference.NO_MEAN_OF_A_REPEATED_NODE] >= 3, counts
         assert counts[certainty][reference.STALE_MEAN] >= 1000 and counts[certainty][reference.MEAN_REFRESHED] >= 1000, counts
     assert counts[True][reference.PROVEN] >= 1000 and counts[True][reference.LOST_PASSED_OVER] >= 1000, counts
     #another move to a node proven lost: picked by its mean, and lost once its own descent has met the node
@@ -396,6 +394,11 @@ def test_the_searches_in_rounds_come_to_the_rules_cases():
     for learned, least in ((reference.ARRIVED_AT_A_PROOF, 1000), (reference.PROVED_ITS_LEAF, 500), (reference.PROVED_UP_THE_PATH, 100),
                            (reference.GIVEN_A_PROVEN_NODE, 10), (reference.PROVEN_SCORE_TAKEN, 100)):
         assert counts[True][learned] >= least, counts
+    #the nodes for repeats: made, and come to again; a repeat by a move that holds its position's ordinary node, and a descent
+    #without a repeat by a move that holds a repeat node; a pass that gives a move no node where only repeats had visited its position
+    for case, least in ((reference.REPEAT_NODE_MADE, 400), (reference.REPEAT_NODE_REVISITED, 1000), (reference.REPEAT_AT_AN_ORDINARY_NODE, 200),
+                        (reference.NO_REPEAT_AT_A_REPEAT_NODE, 200), (reference.PASS_OVER_A_REPEATED_POSITION, 30)):
+        assert counts[False][case] + counts[True][case] >= least, counts
 
 
 #two moves to one node, which the descent of one of them proves a loss: the other is picked by the mean it holds once more, meets the

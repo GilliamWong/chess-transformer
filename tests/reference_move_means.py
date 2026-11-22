@@ -7,8 +7,9 @@ comment on search.rs's Round and from watching the rust search.
 
 The rule, in this file's words:
 
-- There is one node a position and fifty-move count, whichever moves led to it. A node's mean is the score of the side that moved
-  into it, over every visit it had on any path.
+- There is one node a position and fifty-move count, whichever moves led to it, and beside it one for the descents that come to
+  the position as a repeat of their own path (a repeat node). A node's mean is the score of the side that moved into it, over
+  every visit it had on any path.
 - A move (Link) that has a node holds what selection reads of it: the visits that went through it, the node's mean as the move last
   took it (a float32; none until it has taken one), the simulations that wait for the network through it (pending) and whether it
   is lost. The node a move starts from holds in its value_sum, for each of its moves, the move's visits times (1 - the held mean):
@@ -17,23 +18,30 @@ The rule, in this file's words:
   more than its visits and its pending. Q is a draw's score if the move's node repeats the descent's path, else the held mean, else
   (no mean held, or no node) the node's first play urgency. A lost move is not picked; where every move is lost, the first is.
   Nothing of a move's node is read but its position, for the repeat.
-- A move picked without a node takes its position's node, the one the search has or a new one, and holds no mean of it.
+- A move picked without a node takes its position's node, the one the search has or a new one, and holds no mean of it: the
+  repeat node if the position repeats one of the descent's path, else the ordinary one. The move keeps the node it took, whatever
+  path comes to it later.
 - The descent stops at the picked move's node without the network if
-  1. the node's position repeats one of the descent's own path: the node takes a visit scored as a draw, or
+  1. the node's position repeats one of the descent's own path. A repeat node takes a visit scored as a draw, and the descent
+     walks back up. An ordinary node is left alone: the move alone takes the draw, its mean the mean of its visits' with the
+     draw's among them (the held mean for the visits it had), and the walk back up begins at the node the move starts from. The
+     move keeps the draw only until a descent next passes it or walks back up through it: it then holds the node's mean again,
+     for every visit it has, and so a move may have more visits than its node. Or
   2. the node is proven (certainty): it takes a visit with its proven score, or
   3. the node has moves already and the move is new to it (no visit yet, whether it took the node now, earlier, or was given it):
      nothing changes in the node, the move only catches up with it.
   Otherwise it goes on through a node that has moves, the move first taking the node's mean where it stands (its visits' share
   of the starting node's value_sum changes with it, and no visit is counted), and a node without moves is its leaf: a collision if
   a simulation waits for the network there already, else scored by the game's result if the game is over there, else it waits for
-  the network, which gives it its score and its moves.
+  the network, which gives it its score and its moves. A repeat node that a descent comes to without a repeat is a node as any
+  other in all this: it keeps the draws among its visits.
 - A descent that does not wait walks back up its path at once, and one that waits when its answer comes: each move catches up
   with its node (its held mean the node's as the node now stands) and each node counts one visit.
 - A simulation that waits for the network adds one to the pending of every move of its path, and marks its leaf as waited at, until
   its answer is backed up. A collision adds the same until the gathering call that made it ends, and counts no visit. Nothing else
   adds: every other descent is backed up at once.
 - A node that has moves makes passes over them as it grows: a pass gives every move of the node that has no node yet the node of
-  the position it leads to, if the search has a node of that position and fifty-move count that has been visited. The node's pass k
+  the position it leads to, if the search has an ordinary node of that position and fifty-move count that has been visited. The node's pass k
   (0 the first, MAX_PASSES in all) is due once it has FIRST_PASS_VISITS * PASS_GROWTH^k visits, whichever way the visits came
   (walks up through it, or repeats that ended at it), and is made by the first descent that then comes to the node to pick one of
   its moves, before it picks. A pass counts as every pass the
@@ -78,6 +86,13 @@ FIRST_PASS_VISITS = 32
 PASS_GROWTH = 4
 MAX_PASSES = 13
 
+#what the tests count of the nodes for repeats
+REPEAT_NODE_MADE = "a move took a new node for the repeats of its position"
+REPEAT_NODE_REVISITED = "a repeat came to a repeat node that had visits"
+REPEAT_AT_AN_ORDINARY_NODE = "a repeat came by a move that holds its position's ordinary node"
+NO_REPEAT_AT_A_REPEAT_NODE = "a descent came without a repeat by a move that holds a repeat node"
+PASS_OVER_A_REPEATED_POSITION = "a pass gave a move no node, whose position only repeats had visited"
+
 #how a simulation ended: at a leaf (the first three), or at a node above one (the rule's stops)
 EVALUATED = "the network evaluated the leaf"
 GAME_OVER = "the game is over at the leaf"
@@ -91,7 +106,6 @@ LOSS, DRAWN, WIN = 0, 1, 2
 
 #what the tests count of a search (Search.counts): the rule's rarer cases
 NO_MEAN_OF_A_VISITED_NODE = "a move weighed that holds no mean of a node that has visits"
-NO_MEAN_OF_A_REPEATED_NODE = "a move weighed that holds no mean of a node that repeats have visited and the network not yet"
 STALE_MEAN = "a move weighed by a mean that is not its node's any more"
 MEAN_REFRESHED = "a move's mean changed as a descent passed it"
 LOST_PASSED_OVER = "a lost move passed over"
@@ -143,6 +157,8 @@ class Node:
     #the position without its counters, and its plies since a capture or pawn move
     key: Hashable
     halfmoves: int
+    #whether it is the node for the descents that come to the position as a repeat of their path
+    repeat: bool = False
     visit_count: int = 0
     #for the side that played a move into this node
     value_sum: float = 0.0
@@ -178,8 +194,11 @@ class Simulation:
 #played from. Same side to move (every other ply), no capture or pawn move since (the node's count reaches back that far), and
 #nothing before the root
 def repeats(path_keys: list[Hashable], node: Node) -> bool:
-    furthest = min(node.halfmoves, len(path_keys))
-    return any(path_keys[-plies_back] == node.key for plies_back in range(SHORTEST_REPEAT_PLIES, furthest + 1, 2))
+    return position_repeats(path_keys, node.key, node.halfmoves)
+
+def position_repeats(path_keys: list[Hashable], key: Hashable, halfmoves: int) -> bool:
+    furthest = min(halfmoves, len(path_keys))
+    return any(path_keys[-plies_back] == key for plies_back in range(SHORTEST_REPEAT_PLIES, furthest + 1, 2))
 
 
 #mcts.select_child for links: a link's visits and pending explore; its Q is a draw if its node repeats the path, the mean it holds,
@@ -206,10 +225,9 @@ def select_link(node: Node, path_keys: list[Hashable], counts: Counter) -> Link:
             elif link.mean is None:
                 Q = first_play_urgency
                 counts[NO_MEAN_OF_A_VISITED_NODE] += child.visit_count > 0
-                counts[NO_MEAN_OF_A_REPEATED_NODE] += child.visit_count > 0 and not child.links
             else:
                 Q = link.mean
-                counts[STALE_MEAN] += link.mean != float(np.float32(child.mean()))
+                counts[STALE_MEAN] += child.visit_count > 0 and link.mean != float(np.float32(child.mean()))
                 counts[UNLEARNED_LOSS] += child.proof is not None and child.proof.outcome == LOSS
         U = Q + c_puct * link.prior * (sqrt_children_visits / (1 + N))
         #the first link with the highest score wins ties
@@ -235,6 +253,20 @@ def back_up(path: list[tuple[Node, Link]]) -> None:
             parent.value_sum = parent.visit_count * parent.proof.value
         link.visits = visits + 1
         link.mean = new_mean
+
+
+#a repeat came by `link`, which holds its position's ordinary node: the node is left alone and the move takes the draw, its mean
+#the mean of its visits' with the draw's among them; the node it starts from counts the visit
+def take_draw(parent: Node, link: Link) -> None:
+    visits, old_mean = link.visits, link.mean if link.mean is not None else 0.0
+    new_mean = float(np.float32((visits * old_mean + (1 - mcts.DRAW)) / (visits + 1) if visits else 1 - mcts.DRAW))
+    parent.visit_count += 1
+    if parent.proof is None:
+        parent.value_sum += (visits + 1) * (1 - new_mean) - visits * (1 - old_mean)
+    else:
+        parent.value_sum = parent.visit_count * parent.proof.value
+    link.visits = visits + 1
+    link.mean = new_mean
 
 
 #mcts.finish's children: the highest prior first, equal priors in python-chess's order, each prior as the rust search stores it
@@ -288,7 +320,7 @@ class Search:
         if mcts.game_result(board) is not None:
             raise ValueError(f"the game is over or the tablebase knows it, there is nothing to search: {board.fen()}")
         self.model, self.board, self.device, self.certainty = model, board.copy(), device, certainty
-        self.nodes: dict[tuple[Hashable, int], Node] = {}
+        self.nodes: dict[tuple[Hashable, int, bool], Node] = {}
         self.root = self.node_of(board)
         #the simulations that wait for the network, a gathering call's together, the oldest call first
         self.rounds: deque[list[Simulation]] = deque()
@@ -296,8 +328,9 @@ class Search:
         #the nodes kept for the root before the last line played, which the root did not reach when the line was played or since
         self.only_held: set[Node] = set()
 
-    def node_of(self, board: chess.Board) -> Node:
-        identity = identity_of(board)
+    #the position's ordinary node, or its node for repeats
+    def node_of(self, board: chess.Board, repeat: bool = False) -> Node:
+        identity = (*identity_of(board), repeat)
         if identity not in self.nodes:
             self.nodes[identity] = Node(*identity)
         return self.nodes[identity]
@@ -323,8 +356,9 @@ class Search:
             if link.child is not None:
                 continue
             board.push(link.move)
-            known = self.nodes.get(identity_of(board))
+            known, for_repeats = (self.nodes.get((*identity_of(board), repeat)) for repeat in (False, True))
             board.pop()
+            self.counts[PASS_OVER_A_REPEATED_POSITION] += (known is None or known.visit_count == 0) and for_repeats is not None and for_repeats.visit_count > 0
             if known is not None and known.visit_count > 0:
                 link.child, link.given_at_pass, link.mean = known, this_pass, float(np.float32(known.mean()))
                 link.lost = known.proof is not None and known.proof.outcome == LOSS
@@ -375,17 +409,26 @@ class Search:
             board.push(link.move)
             line.append(link.move)
             if link.child is None:
-                link.child = self.node_of(board)
+                nodes_before = len(self.nodes)
+                link.child = self.node_of(board, repeat=position_repeats(path_keys, *identity_of(board)))
+                self.counts[REPEAT_NODE_MADE] += link.child.repeat and len(self.nodes) > nodes_before
                 self.meet(link.child)
             child = link.child
             path.append((node, link))
 
             visits_before = child.visit_count
             if repeats(path_keys, child):
-                child.visit_count += 1
-                child.value_sum += 1 - mcts.DRAW
-                back_up(path)
+                if child.repeat:
+                    self.counts[REPEAT_NODE_REVISITED] += child.visit_count > 0
+                    child.visit_count += 1
+                    child.value_sum += 1 - mcts.DRAW
+                    back_up(path)
+                else:
+                    self.counts[REPEAT_AT_AN_ORDINARY_NODE] += 1
+                    take_draw(node, link)
+                    back_up(path[:-1])
                 return ended_as(REPEAT, visits_before)
+            self.counts[NO_REPEAT_AT_A_REPEAT_NODE] += child.repeat
             if child.proof is not None:
                 child.visit_count += 1
                 child.value_sum += child.proof.value
@@ -512,7 +555,8 @@ def most_visited_link(node: Node) -> Link:
     def preference(link: Link) -> tuple[tuple[int, int], int, float, float]:
         proof = link.child.proof if link.child is not None else None
         proven = proof.rank() if proof is not None and proof.outcome != DRAWN else (DRAWN, 0)
-        mean_score = link.child.mean() if link.visits > 0 else 0.0
+        #a move may have visits, repeats by it, and its node none
+        mean_score = link.child.mean() if link.visits > 0 and link.child.visit_count > 0 else 0.0
         return proven, link.visits, mean_score, link.prior
 
     return max(node.links, key=preference)

@@ -1008,7 +1008,7 @@ fn graph_line(tree: &mut Tree, line: &[&str], favoured: &[&str]) -> (Vec<usize>,
         let played = uci_move(&board, played);
         let edge = tree.nodes[node].edges().find(|&edge| tree.chess_move(edge).to_move(&board) == played).expect("a move of the node");
         board.play_unchecked(played);
-        let (child, link) = tree.child_node(node, edge, NO_LINK, &board);
+        let (child, link) = tree.child_node(node, edge, NO_LINK, &board, false);
         node = child;
         nodes.push(child);
         links.push(link);
@@ -1255,7 +1255,7 @@ fn a_root_has_one_move_left_once_the_others_are_proven_lost() {
         for (index, edge) in tree.nodes[0].edges().enumerate().take(lost + drawn) {
             let mut board = tree.board.clone();
             board.play_unchecked(tree.chess_move(edge).to_move(&board));
-            let (node, _) = tree.child_node(0, edge, NO_LINK, &board);
+            let (node, _) = tree.child_node(0, edge, NO_LINK, &board, false);
             tree.nodes[node].proof = Some(proof(if index < lost { Outcome::Loss } else { Outcome::Draw }));
         }
         let shared = SharedTree::from_tree(&tree);

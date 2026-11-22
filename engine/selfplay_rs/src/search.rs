@@ -267,10 +267,17 @@ pub fn graph_key(key: u64, halfmoves: u32) -> u64 {
     key ^ u64::from(halfmoves + 1).wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
 }
 
-//the fifty-move count as Graph keeps it, saturated: the rule's draw ends the game long before
+//the fifty-move count as Graph keeps it, saturated below REPEATED: the rule's draw ends the game long before
 pub fn halfmove_count(halfmoves: u32) -> u16 {
-    halfmoves.min(u32::from(u16::MAX)) as u16
+    halfmoves.min(u32::from(REPEATED - 1)) as u16
 }
+
+//in the count a node keeps (and so in its graph_key): the node is its position's repeat node, made for a move that a descent
+//first came to as a repeat of a position on its path. Such a node is apart from the position's ordinary node, which every
+//other arrival uses: the draws of repeats are its own visits, and never the ordinary node's (lc0 keys its nodes by the
+//position's repetitions too). It has no moves until a descent comes by its move without repeating, and is then evaluated
+//as its position, the draws it holds staying among its own visits
+pub const REPEATED: u16 = 1 << 15;
 
 //the positions of a descent's path that a move from its last node could repeat (a two-fold repetition inside the search): same side
 //to move, four plies or more back, no capture or pawn move between. `keys` is the game's positions then the path's from `path_start`,
@@ -313,8 +320,9 @@ pub fn repeat_filter(key: u64, halfmoves: u16) -> u8 {
     (key >> 57) as u8 | if halfmoves != 0 { COUNTED } else { 0 }
 }
 
-//the node of every position by graph_key, and each node's fifty-move count. The count only grows along a path, so the graph has no
-//cycles; a repeat of a position on a path is a draw on that path only (Repeats), never in the numbers of the shared node
+//the node of every position by graph_key, and each node's fifty-move count (with REPEATED for a repeat node). The count only grows
+//along a path, so the graph has no cycles; a repeat of a position on a path is a draw on that path only (Repeats), never in the
+//numbers of the position's ordinary node: it is a visit of the position's repeat node, or of the move alone (Tree::repeat_at_move)
 #[derive(Clone)]
 struct Graph {
     table: KeyMap<u32>,
@@ -1158,20 +1166,22 @@ impl Tree {
     }
 
     //the node of the parent's move `edge` (select_edge's name for it), made if the move has none yet, and the move's name; board is the
-    //node's position. With transpositions an existing node of the same position and fifty-move count is the move's
-    fn child_node(&mut self, parent: usize, edge: usize, link: u32, board: &Chess) -> (usize, u32) {
+    //node's position. With transpositions an existing node of the same position and fifty-move count is the move's: the position's
+    //repeat node (REPEATED) if the descent comes to it as a repeat of its path (`repeat`), else its ordinary one
+    fn child_node(&mut self, parent: usize, edge: usize, link: u32, board: &Chess, repeat: bool) -> (usize, u32) {
         //select_edge names no move when it chose none (every move a proven loss, the first taken): its node if it has one
         let link = if link == NO_LINK { self.link_of(parent, edge) } else { link };
         if link != NO_LINK && self.link_child(link) != NO_NODE {
             return (self.link_child(link) as usize, link);
         }
         let key = position_key(board);
-        let shared = self.graph.as_ref().and_then(|graph| graph.table.get(&graph_key(key, board.halfmoves())).copied());
+        let count = halfmove_count(board.halfmoves()) | if repeat { REPEATED } else { 0 };
+        let shared = self.graph.as_ref().and_then(|graph| graph.table.get(&graph_key(key, u32::from(count))).copied());
         let child = shared.unwrap_or_else(|| {
             let child = self.nodes.len() as u32;
             if let Some(graph) = &mut self.graph {
-                graph.halfmoves.push(halfmove_count(board.halfmoves()));
-                graph.table.insert(graph_key(key, board.halfmoves()), child);
+                graph.halfmoves.push(count);
+                graph.table.insert(graph_key(key, u32::from(count)), child);
             }
             self.nodes.push(Node::new());
             self.node_keys.push(key);
@@ -1179,7 +1189,7 @@ impl Tree {
         });
         let place = (edge - self.nodes[parent].edges().start) as u32;
         let children = self.nodes[parent].children;
-        let slot = Slot { child, repeats: repeat_filter(key, halfmove_count(board.halfmoves())), ..UNVISITED_SLOT };
+        let slot = Slot { child, repeats: repeat_filter(key, count), ..UNVISITED_SLOT };
         if !listed(children) {
             self.slots[(children & !SOLID) as usize + place as usize] = slot;
             return (child as usize, children + place);
@@ -1390,7 +1400,9 @@ impl Tree {
                 let chess_move = self.moves[edge].to_move(child_board);
                 child_board.play_unchecked(chess_move);
             }
-            let (child, link) = self.child_node(node, edge, selected, child_board);
+            //a move without a node takes its position's repeat node if this descent comes to it as a repeat
+            let repeat = known.is_none() && self.arrives_repeating(root_keys, halfmoves, child_board);
+            let (child, link) = self.child_node(node, edge, selected, child_board, repeat);
             gathering.path.push(child);
             if self.graph.is_some() {
                 gathering.edges.push(link as usize);
@@ -1412,13 +1424,12 @@ impl Tree {
             match step {
                 Step::Repeat | Step::FirstVisit => {
                     self.finished_at_once(gathering);
-                    //a repeat is a visit of the node at a draw's score for the side that moved into it (selection's for the
-                    //move), as in lc0: the move's mean is its node's, whatever the path
-                    if matches!(step, Step::Repeat) {
-                        self.count_own_visit(child, 1.0 - gathering.settings.draw);
-                    }
                     gathering.path.pop();
-                    self.back_up_means(&gathering.path, &gathering.edges, None, 0);
+                    if matches!(step, Step::Repeat) {
+                        self.back_up_repeat(&gathering.path, &gathering.edges, child, 1.0 - gathering.settings.draw);
+                    } else {
+                        self.back_up_means(&gathering.path, &gathering.edges, None, 0);
+                    }
                     gathering.edges.pop();
                     return Walk::Interrupted;
                 }
@@ -1447,6 +1458,55 @@ impl Tree {
                 return Walk::Quiet;
             }
         }
+    }
+
+    //whether a descent that comes to `board`'s position from a node whose fifty-move count is `halfmoves` repeats a position of
+    //its path (Repeats)
+    fn arrives_repeating(&self, root_keys: usize, halfmoves: u32, board: &Chess) -> bool {
+        let Some(_) = &self.graph else { return false };
+        Repeats::new(&self.keys, root_keys - 1, halfmoves).repeats(position_key(board), halfmove_count(board.halfmoves()))
+    }
+
+    //whether the node is its position's repeat node (REPEATED)
+    fn is_repeat_node(&self, node: usize) -> bool {
+        self.graph.as_ref().is_some_and(|graph| graph.halfmoves[node] & REPEATED != 0)
+    }
+
+    //the backup of a descent that came by its last move (the last of `edges`, a move of the path's last node) to `child` as a
+    //repeat of a position on its path: a draw for this path (`score`, for the side that made the move). If `child` is the
+    //position's repeat node the draw is a visit of that node, and the move takes its mean as from any node. If the move holds
+    //the position's ordinary node, which other paths search, that node is not touched: the visit is the move's alone
+    //(repeat_at_move)
+    fn back_up_repeat(&mut self, path: &[usize], edges: &[usize], child: usize, score: f64) {
+        if self.is_repeat_node(child) {
+            self.count_own_visit(child, score);
+            return self.back_up_means(path, edges, None, 0);
+        }
+        let (&link, above) = edges.split_last().expect("the move that repeats");
+        self.repeat_at_move(*path.last().expect("the move's node"), link as u32, score);
+        self.back_up_means(path, above, None, 0);
+    }
+
+    //a visit of the node's move `link` that is the move's alone, at `score`: a repeat by a move that holds its position's
+    //ordinary node. The move's mean is from now on that of all its visits, this one at `score` and those before at the mean
+    //it held, until a descent passes it again and it takes its node's; the node takes the visit and the change, as in a
+    //backup (back_up_means)
+    fn repeat_at_move(&mut self, node: usize, link: u32, score: f64) {
+        let link = self.current_link(node, link);
+        let Slot { visits, mean: old, .. } = *self.slot(link);
+        let mean = blended_mean(visits, old, score);
+        let parent = &mut self.nodes[node];
+        parent.visit_count += 1;
+        parent.value_sum = match parent.proof {
+            Some(proof) => f64::from(parent.visit_count) * proof.value,
+            None => parent.value_sum + f64::from(visits + 1) * (1.0 - f64::from(mean)) - f64::from(visits) * (1.0 - f64::from(old)),
+        };
+        let slot = self.slot_mut(link);
+        (slot.visits, slot.mean) = (visits + 1, mean);
+        if visits == 0 {
+            self.refresh_visited_policy(node);
+        }
+        self.make_solid_once_visited(node);
     }
 
     //what a descent's step from a node into its move's node `child` (the move's name `link`) finds, nothing written: `repeats`
@@ -1807,7 +1867,9 @@ impl Tree {
     fn prove_the_games_third_times(&mut self, settings: &SearchSettings) {
         let Some(graph) = &self.graph else { return };
         let halfmoves = self.board.halfmoves();
-        let nodes_of = |key| (halfmoves + 1..FIFTY_MOVE_PLIES).filter_map(move |count| graph.table.get(&graph_key(key, count)).copied());
+        //the position's ordinary nodes and its repeat nodes, which a descent that did not repeat may have given moves
+        let counts = (halfmoves + 1..FIFTY_MOVE_PLIES).flat_map(|count| [count, count | u32::from(REPEATED)]);
+        let nodes_of = |key| counts.clone().filter_map(move |count| graph.table.get(&graph_key(key, count)).copied());
         let thirds: Vec<u32> = one_short_of_threefold(&self.keys, halfmoves).into_iter().flat_map(nodes_of).collect();
         let was_lost = |node: &u32| self.nodes[*node as usize].proof.is_some_and(|proof| proof.outcome == Outcome::Loss);
         let no_longer_lost: Vec<u32> = thirds.iter().copied().filter(was_lost).collect();
@@ -2449,6 +2511,14 @@ impl Tree {
         }
         true
     }
+}
+
+//the mean of a move's `visits` visits at `old` and one more at `score` (Tree::repeat_at_move), as a move holds one
+pub fn blended_mean(visits: u32, old: f32, score: f64) -> f32 {
+    if visits == 0 {
+        return score as f32;
+    }
+    ((f64::from(visits) * f64::from(old) + score) / f64::from(visits + 1)) as f32
 }
 
 //adds a node's moves with a node, as (place, slot), to the links or slots of a tree being made

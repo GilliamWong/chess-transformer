@@ -53,10 +53,11 @@ impl SharedTree {
                             self.link_known_moves(node, children, visits, board);
                         }
                     }
-                    let repeats = self.graph.as_ref().map(|_| Repeats::new(keys, path_start, u32::from(self.nodes.get(node).halfmoves())));
+                    let count = u32::from(self.nodes.get(node).halfmoves() & !REPEATED);
+                    let repeats = self.graph.as_ref().map(|_| Repeats::new(keys, path_start, count));
                     let (edge, selected) = self.select_edge(node, settings, repeats.as_ref());
                     unplayed.push(edge);
-                    let (child, link) = self.child_node(node, edge, selected, board, unplayed);
+                    let (child, link) = self.child_node(node, edge, selected, board, unplayed, repeats.as_ref());
                     node = child;
                     path.push(node);
                     let child = self.nodes.get(node);
@@ -66,7 +67,7 @@ impl SharedTree {
                         //a repeat of this path's position, whatever the node is to other paths, or a node that knows
                         //more than its move
                         if repeats.repeats(child.key(), child.halfmoves()) {
-                            stop = Some(Arrival::Repeat);
+                            stop = Some(self.repeat_arrival(path[path.len() - 2], link, child, 1.0 - settings.draw));
                         } else if child.has_edges() && child.proof().is_none() {
                             stop = self.meet(path[path.len() - 2], link, child).then_some(Arrival::FirstVisit);
                         }

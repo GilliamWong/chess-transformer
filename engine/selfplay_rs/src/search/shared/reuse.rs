@@ -59,7 +59,9 @@ impl SharedTree {
         let Some(graph) = &self.graph else { return };
         let halfmoves = self.board.halfmoves();
         let node_of = |entry: u64| graph.shard(entry).lock().expect("a table shard").get(&entry).copied();
-        let nodes_of = |key| (halfmoves + 1..FIFTY_MOVE_PLIES).filter_map(move |count| node_of(graph_key(key, count)));
+        //the position's ordinary nodes and its repeat nodes (Tree's)
+        let counts = (halfmoves + 1..FIFTY_MOVE_PLIES).flat_map(|count| [count, count | u32::from(REPEATED)]);
+        let nodes_of = |key| counts.clone().filter_map(move |count| node_of(graph_key(key, count)));
         let thirds: Vec<u32> = one_short_of_threefold(&self.keys, halfmoves).into_iter().flat_map(nodes_of).collect();
         let no_longer_lost: Vec<u32> = thirds.iter().copied().filter(|&id| self.nodes.get(id as usize).proves_a_loss()).collect();
         for id in thirds {

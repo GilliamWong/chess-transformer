@@ -50,7 +50,8 @@ impl Tree {
                 let (edge, selected) = self.select_edge(node, settings, repeats.as_ref());
                 board.play_unchecked(self.moves[edge].to_move(&board));
                 let link;
-                (node, link) = self.child_node(node, edge, selected, &board);
+                let repeat = self.arrives_repeating(root_keys, halfmoves, &board);
+                (node, link) = self.child_node(node, edge, selected, &board, repeat);
                 path.push(node);
                 if let Some(graph) = &self.graph {
                     edges.push(link as usize);
@@ -74,13 +75,12 @@ impl Tree {
             if let Some(stop) = stop {
                 self.keys.truncate(root_keys);
                 simulations += 1;
-                //a repeat is a visit of the node at a draw's score for the side that moved into it (selection's for the move),
-                //as in lc0: the move's mean is its node's, whatever the path
-                if matches!(stop, Stop::Repeat) {
-                    self.count_own_visit(node, 1.0 - settings.draw);
-                }
                 path.pop();
-                self.back_up_means(&path, &edges, None, 0);
+                if matches!(stop, Stop::Repeat) {
+                    self.back_up_repeat(&path, &edges, node, 1.0 - settings.draw);
+                } else {
+                    self.back_up_means(&path, &edges, None, 0);
+                }
                 continue;
             }
 

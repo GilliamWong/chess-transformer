@@ -156,7 +156,9 @@ impl SharedTree {
                 let record = self.links.record(link);
                 let child = self.nodes.get(record.state.child() as usize);
                 let what = format!("node {id}, move {place}");
-                assert!(record.visits <= child.visits(), "{what}: {} visits, its node {}", record.visits, child.visits());
+                //but for its repeats of a path at its position's ordinary node, which are the move's alone (repeat_arrival)
+                let repeats_alone = child.halfmoves() & REPEATED == 0 && child.halfmoves() != 0;
+                assert!(record.visits <= child.visits() || repeats_alone, "{what}: {} visits, its node {}", record.visits, child.visits());
                 assert!(record.visits == 0 || (0.0..=1.0).contains(&record.mean), "{what}: a mean of {}", record.mean);
                 let lost = child.proof().is_some_and(|proof| proof.outcome == Outcome::Loss && record.mean == proof.value as f32);
                 assert!(!record.state.lost() || lost, "{what}: held as lost, its mean {} and its node's proof {:?}", record.mean, child.proof().map(|proof| proof.outcome));
