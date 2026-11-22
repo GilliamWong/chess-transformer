@@ -58,7 +58,8 @@ fn proof_rank(proof: &Proof) -> (Outcome, i64) {
 #[repr(align(64))]
 pub struct Node {
     pub visit_count: u32,
-    //simulations waiting for the network through this node, and a gathering round's collisions
+    //simulations waiting for the network through this node, and a gathering round's collisions; with transpositions only those
+    //that wait at it, its moves counting those that wait through them (Tree::in_flight_nodes)
     in_flight: u32,
     pub value_sum: f64,
     visited_policy_sqrt: f64, //sqrt of the sum of visited children's priors
@@ -1076,8 +1077,8 @@ impl Tree {
     }
 
     //mcts.descend and finish until the round has its leaves or simulations, the leaves' boards added to boards; a leaf that needs no
-    //network (a game's result, a cached answer) is finished at once. A collision counts as waiting along its path (its nodes, and with
-    //transpositions its moves) so the next descents turn elsewhere, and is taken off at the end. Returns the leaves gathered
+    //network (a game's result, a cached answer) is finished at once. A collision counts as waiting along its path (add_in_flight) so
+    //the next descents turn elsewhere, and is taken off at the end. Returns the leaves gathered
     pub fn gather(
         &mut self,
         round: &Round,
@@ -1228,12 +1229,12 @@ impl Tree {
             }
         }
         for (path, edges) in collisions {
-            for (depth, &node) in path.iter().enumerate() {
+            for &node in self.in_flight_nodes(&path) {
                 self.nodes[node].in_flight -= 1;
-                if let Some(&link) = edges.get(depth) {
-                    let link = self.current_link(node, link as u32);
-                    self.slot_mut(link).pending -= 1;
-                }
+            }
+            for (&node, &link) in path.iter().zip(&edges) {
+                let link = self.current_link(node, link as u32);
+                self.slot_mut(link).pending -= 1;
             }
         }
         gathered
@@ -1304,14 +1305,21 @@ impl Tree {
         self.nodes[node].edges_at = (first_edge as u64) << 8 | (self.moves.len() - first_edge) as u64;
     }
 
-    //a simulation waits along the path: at its nodes, and with transpositions at the moves between them (`edges`, their links)
+    //the nodes of a waiting simulation's path that count it: all without transpositions, where selection reads the nodes' counts;
+    //with them only the leaf it waits at, which the count marks as taken, as the path's moves count it
+    fn in_flight_nodes<'p>(&self, path: &'p [usize]) -> &'p [usize] {
+        if self.graph.is_some() { &path[path.len() - 1..] } else { path }
+    }
+
+    //a simulation waits along the path: at in_flight_nodes, and with transpositions at the moves between its nodes (`edges`,
+    //their links)
     fn add_in_flight(&mut self, path: &[usize], edges: &[usize]) {
-        for (depth, &node) in path.iter().enumerate() {
+        for &node in self.in_flight_nodes(path) {
             self.nodes[node].in_flight += 1;
-            if let Some(&link) = edges.get(depth) {
-                let link = self.current_link(node, link as u32);
-                self.slot_mut(link).pending += 1;
-            }
+        }
+        for (&node, &link) in path.iter().zip(edges) {
+            let link = self.current_link(node, link as u32);
+            self.slot_mut(link).pending += 1;
         }
     }
 
@@ -1371,17 +1379,18 @@ impl Tree {
     }
 
     //back_up with transpositions. The path's last node takes the simulation's value if it ended at that node (and not above a node it
-    //stopped at); then, from the bottom up, each move of the path takes its node's new mean and counts the visit (and no longer
-    //the `in_flight` simulations that waited through it), and the node it
+    //stopped at); then, from the bottom up, each move of the path takes its node's new mean and counts the visit, and the node it
     //is a move of takes the change: the move's visits at its mean before go out of the node's sum and its visits at its mean now
     //come in. A node's sum is so its own visits' scores and, for each of its moves, the move's visits at the mean the move holds,
-    //and a path just backed up holds its nodes' means exactly (lc0's dag search)
+    //and a path just backed up holds its nodes' means exactly (lc0's dag search). If it waited for the network (`in_flight` 1),
+    //its leaf and its path's moves count it no longer
     fn back_up_means(&mut self, path: &[usize], edges: &[usize], value: Option<f64>, in_flight: u32) {
         if let Some(value) = value {
-            self.count_own_visit(*path.last().expect("the root at least"), 1.0 - value);
+            let leaf = *path.last().expect("the root at least");
+            self.count_own_visit(leaf, 1.0 - value);
+            self.nodes[leaf].in_flight -= in_flight;
         }
         for (depth, &node) in path.iter().enumerate().rev() {
-            self.nodes[node].in_flight -= in_flight;
             let Some(&link) = edges.get(depth) else { continue };
             let link = self.current_link(node, link as u32);
             let mean = self.nodes[self.link_child(link) as usize].mean_score() as f32;
