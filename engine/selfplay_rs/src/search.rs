@@ -899,18 +899,86 @@ impl Tree {
     //holds (move_value), and one that repeats a position of the path (`repeats`) is worth a draw. Returns the edge and its move's name
     //(NO_LINK for a list's move without a node, a solid slot's whether it has a node or not)
     fn select_edge(&self, node: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> (usize, u32) {
-        let parent = &self.nodes[node];
-        let edges = parent.edges();
         let scan = self.scan(node, settings);
         let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
-        let mut consider = |index: usize, link: u32, prior: f32, slot: &Slot| {
+        self.each_weighed(node, scan.noised, |index, link, prior, slot| {
             if let Some(u) = self.move_value(&scan, repeats, index, prior, slot)
                 && u > best_u
             {
                 (best, best_u, best_link) = (index, u, link);
                 self.prefetch_move(&scan, slot.child);
             }
+        });
+        (self.nodes[node].edges().start + best, best_link)
+    }
+
+    //select_edge for a node that several descents in a row come to (walk_moves): its move, the scan it was weighed by, and the
+    //highest values among the moves weighed before it and among those weighed after it. The move stays select_edge's choice
+    //while its value is above the first and not below the second
+    fn select_with_rivals(&self, node: usize, settings: &SearchSettings, repeats: Option<&Repeats>) -> (usize, u32, Scan, (f64, f64)) {
+        let scan = self.scan(node, settings);
+        let (mut best, mut best_u, mut best_link) = (0, f64::NEG_INFINITY, NO_LINK);
+        let (mut before, mut after) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        self.each_weighed(node, scan.noised, |index, link, prior, slot| {
+            let Some(u) = self.move_value(&scan, repeats, index, prior, slot) else { return };
+            if u > best_u {
+                (before, after) = (before.max(best_u).max(after), f64::NEG_INFINITY);
+                (best, best_u, best_link) = (index, u, link);
+                self.prefetch_move(&scan, slot.child);
+            } else {
+                after = after.max(u);
+            }
+        });
+        (self.nodes[node].edges().start + best, best_link, scan, (before, after))
+    }
+
+    //select_with_rivals' two values for the move at `place`, whichever move selection would take: None if selection does not
+    //weigh the move at all
+    fn rivals(&self, node: usize, scan: &Scan, repeats: Option<&Repeats>, place: usize) -> Option<(f64, f64)> {
+        let (mut before, mut after, mut met) = (f64::NEG_INFINITY, f64::NEG_INFINITY, false);
+        self.each_weighed(node, scan.noised, |index, _, prior, slot| {
+            if index == place {
+                met = true;
+            } else if let Some(u) = self.move_value(scan, repeats, index, prior, slot) {
+                if met { after = after.max(u) } else { before = before.max(u) }
+            }
+        });
+        met.then_some((before, after))
+    }
+
+    //how many more descents in a row select_edge would send down the node's move at `place` (its name `link`, its prior `prior`)
+    //after one that went down it and is not counted there yet, at most `most`: each of them finds one more waiting at the move,
+    //and the move is taken while its value stays above the best before it and not below the best after it (`rivals`). The value
+    //only falls as more wait, so the last number that holds is looked for by doubling and halving
+    fn more_in_a_row(&self, scan: &Scan, repeats: Option<&Repeats>, (place, prior, link): (usize, f32, u32), rivals: (f64, f64), most: u32) -> u32 {
+        let slot = *self.slot(link);
+        let holds = |more: u32| {
+            self.move_value_after(scan, repeats, place, prior, &slot, more).is_some_and(|u| u > rivals.0 && u >= rivals.1)
         };
+        if most == 0 || !holds(1) {
+            return 0;
+        }
+        if holds(most) {
+            return most;
+        }
+        let (mut held, mut failed) = (1, most);
+        while held * 2 < failed && holds(held * 2) {
+            held *= 2;
+        }
+        failed = failed.min(held * 2);
+        while failed - held > 1 {
+            let middle = held + (failed - held) / 2;
+            if holds(middle) { held = middle } else { failed = middle }
+        }
+        held
+    }
+
+    //the node's moves that selection weighs, in the order it weighs them: `weigh` is given each one's place among the node's
+    //moves, its name (NO_LINK for a list's move without a node), its prior and its slot (UNVISITED_SLOT for a move without a node)
+    #[inline(always)]
+    fn each_weighed(&self, node: usize, noised: bool, mut weigh: impl FnMut(usize, u32, f32, &Slot)) {
+        let parent = &self.nodes[node];
+        let edges = parent.edges();
         let priors = &self.priors[edges.clone()];
         let heads = priors.len().min(HEAD_MOVES);
         let children = parent.children;
@@ -926,20 +994,20 @@ impl Tree {
             let (mut head_weighed, mut tail_weighed) = (false, false);
             loop {
                 let to = if link == NO_LINK { priors.len() } else { self.links[link as usize].place as usize };
-                if scan.noised {
+                if noised {
                     for index in from..to {
-                        consider(index, NO_LINK, priors[index], &UNVISITED_SLOT);
+                        weigh(index, NO_LINK, priors[index], &UNVISITED_SLOT);
                     }
                 } else {
                     if from < to.min(heads) && !head_weighed {
                         (head_weighed, head_unvisited) = (true, priors[from]);
-                        consider(from, NO_LINK, priors[from], &UNVISITED_SLOT);
+                        weigh(from, NO_LINK, priors[from], &UNVISITED_SLOT);
                     }
                     let tail = from.max(heads);
                     if tail < to && !tail_weighed {
                         tail_weighed = true;
                         if priors[tail] > head_unvisited {
-                            consider(tail, NO_LINK, priors[tail], &UNVISITED_SLOT);
+                            weigh(tail, NO_LINK, priors[tail], &UNVISITED_SLOT);
                         }
                     }
                 }
@@ -947,7 +1015,7 @@ impl Tree {
                     break;
                 }
                 let Link { slot, next, .. } = &self.links[link as usize];
-                consider(to, link, priors[to], slot);
+                weigh(to, link, priors[to], slot);
                 (link, from) = (*next, to + 1);
             }
         } else {
@@ -961,8 +1029,8 @@ impl Tree {
                     break;
                 }
                 let slot = &slots[index];
-                consider(index, children + index as u32, priors[index], slot);
-                if slot.child != NO_NODE || scan.noised {
+                weigh(index, children + index as u32, priors[index], slot);
+                if slot.child != NO_NODE || noised {
                     index += 1;
                 } else if index < heads {
                     skipped_from = index + 1;
@@ -978,11 +1046,10 @@ impl Tree {
             for index in (skipped_from..heads.min(known_to)).chain(stopped_at.max(heads)..known_to) {
                 let slot = &slots[index];
                 if slot.child != NO_NODE {
-                    consider(index, children + index as u32, priors[index], slot);
+                    weigh(index, children + index as u32, priors[index], slot);
                 }
             }
         }
-        (edges.start + best, best_link)
     }
 
     //what select_edge's scores of the node's moves are made of
@@ -1008,6 +1075,13 @@ impl Tree {
     //position of the path has the node's key read
     #[inline(always)]
     fn move_value(&self, scan: &Scan, repeats: Option<&Repeats>, index: usize, prior: f32, slot: &Slot) -> Option<f64> {
+        self.move_value_after(scan, repeats, index, prior, slot, 0)
+    }
+
+    //move_value of a move that `more` descents have gone down since its counts were read, each waiting there (more_in_a_row):
+    //of a move with a node, as only such a move has been gone down
+    #[inline(always)]
+    fn move_value_after(&self, scan: &Scan, repeats: Option<&Repeats>, index: usize, prior: f32, slot: &Slot, more: u32) -> Option<f64> {
         let prior = if scan.noised { self.noised_priors[index] } else { f64::from(prior) };
         if slot.child == NO_NODE {
             //sqrt_children_visits / 1.0 is sqrt_children_visits: no division
@@ -1020,7 +1094,7 @@ impl Tree {
                 return None;
             }
             let q = if child.visit_count > 0 { child.mean_score() } else { scan.first_play_urgency };
-            let started = child.visit_count + child.in_flight;
+            let started = child.visit_count + child.in_flight + more;
             return Some(q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + started))));
         }
         if slot.lost {
@@ -1038,7 +1112,7 @@ impl Tree {
         } else {
             f64::from(slot.mean)
         };
-        let started = slot.visits + u32::from(slot.pending);
+        let started = slot.visits + u32::from(slot.pending) + more;
         Some(q + (scan.c_puct * prior * (scan.sqrt_children_visits / f64::from(1 + started))))
     }
 
@@ -1117,7 +1191,10 @@ impl Tree {
 
     //mcts.descend and finish until the round has its leaves or simulations, the leaves' boards added to boards; a leaf that needs no
     //network (a game's result, a cached answer) is finished at once. A collision counts as waiting along its path (add_in_flight) so
-    //the next descents turn elsewhere, and is taken off at the end. Returns the leaves gathered
+    //the next descents turn elsewhere, and is taken off at the end. Returns the leaves gathered.
+    //The round's descents are those of one descent from the root after another, in that order and with those choices: the tests'
+    //gather_by_descents, which this equals number for number. But the descents are not each walked from the root: a node that
+    //several of them would pass in a row is passed once (walk_moves)
     pub fn gather(
         &mut self,
         round: &Round,
@@ -1126,157 +1203,334 @@ impl Tree {
         cache: Option<&Cache>,
         boards: &mut Vec<u8>,
     ) -> u32 {
-        let (mut simulations, mut gathered) = (0, 0);
-        let mut collisions: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
-        let mut path = Vec::new();
-        let mut edges = Vec::new();
-        //the tables finish the nodes they cover below the root; below a root they cover (a size with no dtz tables) only those right
-        //after a capture or pawn move, as lc0 probes: the tables' result starts the fifty move count there
-        let root_covered = tables.is_some_and(|tables| tables.covers(&self.board));
-        while gathered < round.leaves
-            && simulations < round.simulations
-            && self.root().visit_count as usize + self.pending() < round.visit_limit as usize
-        {
-            //the root's own evaluation always fits, so that a full search still has moves to report
-            if self.root().has_edges() && !self.make_room(round.memory_limit) {
-                self.full = true;
+        let mut gathering = Gathering {
+            round: *round,
+            settings: *settings,
+            tables,
+            cache,
+            boards,
+            root_keys: self.keys.len(),
+            root_covered: tables.is_some_and(|tables| tables.covers(&self.board)),
+            path: Vec::new(),
+            edges: Vec::new(),
+            gathered: 0,
+            simulations: 0,
+            collisions: Vec::new(),
+            collided: 0,
+            started: false,
+        };
+        //the most descents a walk from the root is given. Any number leaves the same tree: it only bounds the runs, and a run
+        //that a descent finished at once cuts short was counted for nothing. So a walk is given twice the descents that waited
+        //in the last one, and one: where most descents are finished at once (endings) each goes down alone, as before
+        let mut most = u32::MAX;
+        while self.may_start(&mut gathering) {
+            //the descents that may follow one another from here with no result between them: those that may end on a new
+            //leaf, and the collisions the round may still have
+            let waiting = self.root().visit_count as usize + self.pending();
+            let room = (round.visit_limit as usize - waiting).min(u32::MAX as usize) as u32;
+            let leaves = (round.leaves - gathering.gathered).min(round.simulations - gathering.simulations).min(room);
+            let descents = leaves.saturating_add(round.collisions - gathering.collided).min(most);
+            let waited_before = gathering.gathered + gathering.collided;
+            gathering.path.clear();
+            gathering.path.push(self.root);
+            gathering.edges.clear();
+            let mut board = self.board.clone();
+            if matches!(self.arrive(&mut gathering, descents, &mut board), Walk::Ended) {
                 break;
             }
-            let mut board = self.board.clone();
-            let root_keys = self.keys.len();
-            path.clear();
-            path.push(self.root);
-            edges.clear();
-            let mut node = self.root;
-            let mut stop = None;
-            while self.nodes[node].has_edges() {
-                if self.graph.is_some() && self.known_pass_due(node) {
-                    self.link_known_moves(node, &board);
-                }
-                let halfmoves = board.halfmoves();
-                let repeats = self.graph.is_some().then(|| Repeats::new(&self.keys, root_keys - 1, halfmoves));
-                let (edge, selected) = self.select_edge(node, settings, repeats.as_ref());
-                board.play_unchecked(self.moves[edge].to_move(&board));
-                let link;
-                (node, link) = self.child_node(node, edge, selected, &board);
-                path.push(node);
-                if let Some(graph) = &self.graph {
-                    edges.push(link as usize);
-                    //a repeat of this path's position, whatever the node is to other paths, or a node that knows more than its move
-                    if Repeats::new(&self.keys, root_keys - 1, halfmoves).repeats(self.node_keys[node], graph.halfmoves[node]) {
-                        stop = Some(Stop::Repeat);
-                    } else if self.nodes[node].has_edges() && self.nodes[node].proof.is_none() {
-                        if self.stops_at(link) {
-                            stop = Some(Stop::FirstVisit);
-                        } else {
-                            self.take_mean(path[path.len() - 2], link, node);
-                        }
+            most = (gathering.gathered + gathering.collided - waited_before).saturating_mul(2).saturating_add(1);
+        }
+        for (path, edges, count) in std::mem::take(&mut gathering.collisions) {
+            self.take_off_in_flight(&path, &edges, count);
+        }
+        gathering.gathered
+    }
+
+    //whether the round may start another descent, as gather_by_descents asks before each one: it is short of leaves and
+    //simulations, the search of visits, and there is room for one more simulation (the root's own evaluation always fits, so that
+    //a full search still has moves to report)
+    fn may_start(&mut self, gathering: &mut Gathering) -> bool {
+        let round = &gathering.round;
+        let short = gathering.gathered < round.leaves
+            && gathering.simulations < round.simulations
+            && self.root().visit_count as usize + self.pending() < round.visit_limit as usize;
+        if !short {
+            return false;
+        }
+        if self.root().has_edges() && !self.make_room(round.memory_limit) {
+            self.full = true;
+            return false;
+        }
+        gathering.started = true;
+        true
+    }
+
+    //`descents` descents in a row have come to the path's last node, whose position is `board` and whose key is the last of
+    //self.keys: what gather_by_descents does with a descent once it is at a node. The first of them was let start; any other is
+    //asked for (may_start) when its turn comes
+    fn arrive(&mut self, gathering: &mut Gathering, descents: u32, board: &mut Chess) -> Walk {
+        let node = *gathering.path.last().expect("the root at least");
+        let has_moves = self.nodes[node].has_edges();
+        //the root's moves are searched whatever the root is (it is never proven)
+        if let Some(proof) = self.nodes[node].proof.filter(|_| !(has_moves && node == self.root)) {
+            self.finished_at_once(gathering);
+            self.back_up(&gathering.path, &gathering.edges, 1.0 - proof.value, 0);
+            //with transpositions this parent may not have met the proof, made on another path
+            if self.graph.is_some() && gathering.settings.certainty {
+                self.propagate_proofs(&gathering.path);
+            }
+            self.learn_proofs(&gathering.path, &gathering.edges);
+            return Walk::Interrupted;
+        }
+        if has_moves {
+            return self.walk_moves(gathering, descents, board);
+        }
+        if self.nodes[node].in_flight > 0 {
+            return self.collide(gathering, descents);
+        }
+        if !self.evaluate_leaf(gathering, board) {
+            return Walk::Interrupted;
+        }
+        //the descents after the leaf's own find it waiting
+        if descents == 1 {
+            return Walk::Quiet;
+        }
+        if !self.may_start(gathering) {
+            return Walk::Ended;
+        }
+        self.collide(gathering, descents - 1)
+    }
+
+    //a descent has ended without the network: it is one of the round's simulations, and the next descent is asked for anew
+    fn finished_at_once(&mut self, gathering: &mut Gathering) {
+        gathering.simulations += 1;
+        gathering.started = false;
+    }
+
+    //`descents` descents in a row have ended on the path's last node, which already waits for the network. Each stays counted as
+    //waiting along the path until the gathering call ends, so that the next descents turn elsewhere, for as many as the round's
+    //collisions allow; the one after those ends the round and leaves no trace
+    fn collide(&mut self, gathering: &mut Gathering, descents: u32) -> Walk {
+        let held = descents.min(gathering.round.collisions - gathering.collided);
+        //the first of them was counted when it was let start
+        if held > 0 {
+            self.add_in_flight(&gathering.path, &gathering.edges, held);
+            gathering.collisions.push((gathering.path.clone(), gathering.edges.clone(), held));
+            gathering.collided += held;
+            gathering.started = false;
+        }
+        if held < descents { Walk::Ended } else { Walk::Quiet }
+    }
+
+    //`descents` descents in a row have come to the path's last node, which has moves and whose position is `board`. Each is one
+    //of gather_by_descents' descents from here on: the node's selection, the move's node, the step into it, in that order. What
+    //is saved is the way back down from the root between them.
+    //While descents only wait (for the network, or as collisions), all that changes at a node from one descent to the next is
+    //the count of those waiting at the move the last one took. So one look at the node's moves says how many descents in a row
+    //take the same move (more_in_a_row): they go down together, and the node looks again for the move after them. Two things
+    //break this, and the walk answers each as the descents would have met it:
+    //- a descent is finished at once (a result by the rules or the tables, a cached answer, a proven node, a repeat, a move's
+    //  first visit of a node with moves): its backup changes every node above it, so the walk goes back to the root
+    //  (Interrupted) and the next descent starts there;
+    //- a move takes a new mean as a descent passes it (take_mean): the node's own mean moves with it, which the next descent
+    //  through the move above would take in its turn. So that descent goes down alone and the node above is told (Stirred):
+    //  it looks again, and so on up, a level a descent
+    fn walk_moves(&mut self, gathering: &mut Gathering, descents: u32, board: &mut Chess) -> Walk {
+        let node = *gathering.path.last().expect("the root at least");
+        let root_keys = gathering.root_keys;
+        let mut left = descents;
+        loop {
+            if !gathering.started && !self.may_start(gathering) {
+                return Walk::Ended;
+            }
+            if self.graph.is_some() && self.known_pass_due(node) {
+                self.link_known_moves(node, board);
+            }
+            let halfmoves = board.halfmoves();
+            let repeats = self.graph.is_some().then(|| Repeats::new(&self.keys, root_keys - 1, halfmoves));
+            //one descent is select_edge's alone; several want to know how long its move stays the choice
+            let (edge, selected, looked) = if left == 1 {
+                let (edge, selected) = self.select_edge(node, &gathering.settings, repeats.as_ref());
+                (edge, selected, None)
+            } else {
+                let (edge, selected, scan, rivals) = self.select_with_rivals(node, &gathering.settings, repeats.as_ref());
+                (edge, selected, Some((scan, rivals)))
+            };
+            let (place, prior) = (edge - self.nodes[node].edges().start, self.priors[edge]);
+            //a move that has its node already: what the step into it will find, and the descents that take the move in a row,
+            //are read from this look before anything is written
+            let known = (selected != NO_LINK).then(|| self.link_child(selected)).filter(|&child| child != NO_NODE);
+            let ahead = known.map(|child| {
+                let step = self.step_into(child as usize, selected, repeats.as_ref());
+                let run = match (&looked, step) {
+                    (Some((scan, rivals)), Step::Passing(false) | Step::Plain) => {
+                        1 + self.more_in_a_row(scan, repeats.as_ref(), (place, prior, selected), *rivals, left - 1)
                     }
+                    _ => 1,
+                };
+                (step, run)
+            });
+            //a descent that ends at the move's node without evaluating it (a stop above it, a proven node, a collision) needs
+            //no position. For any other the move is played: on the node's own board by its last descent, on a copy while the
+            //node has descents for other moves
+            let ends_unplayed = match (ahead, known) {
+                (Some((Step::Repeat | Step::FirstVisit, _)), _) => true,
+                (_, Some(child)) => {
+                    let child = &self.nodes[child as usize];
+                    child.proof.is_some() || (!child.has_edges() && child.in_flight > 0)
                 }
-                self.keys.push(self.node_keys[node]);
-                if self.nodes[node].proof.is_some() || stop.is_some() {
-                    break;
-                }
+                _ => false,
+            };
+            let mut kept;
+            let child_board = if ends_unplayed || left == 1 {
+                &mut *board
+            } else {
+                kept = board.clone();
+                &mut kept
+            };
+            if !ends_unplayed {
+                let chess_move = self.moves[edge].to_move(child_board);
+                child_board.play_unchecked(chess_move);
             }
-
-            if let Some(stop) = stop {
-                self.keys.truncate(root_keys);
-                simulations += 1;
-                //a repeat is a visit of the node at a draw's score for the side that moved into it (selection's for the move),
-                //as in lc0: the move's mean is its node's, whatever the path
-                if matches!(stop, Stop::Repeat) {
-                    self.count_own_visit(node, 1.0 - settings.draw);
-                }
-                path.pop();
-                self.back_up_means(&path, &edges, None, 0);
-                continue;
+            let (child, link) = self.child_node(node, edge, selected, child_board);
+            gathering.path.push(child);
+            if self.graph.is_some() {
+                gathering.edges.push(link as usize);
             }
-
-            if let Some(proof) = self.nodes[node].proof {
-                self.keys.truncate(root_keys);
-                simulations += 1;
-                self.back_up(&path, &edges, 1.0 - proof.value, 0);
-                //with transpositions this parent may not have met the proof, made on another path
-                if self.graph.is_some() && settings.certainty {
-                    self.propagate_proofs(&path);
+            let (step, run) = ahead.unwrap_or_else(|| {
+                //the move got its node in this descent: the next move without one is weighed from now on, so the rivals are
+                //looked for again
+                let repeats = self.graph.is_some().then(|| Repeats::new(&self.keys, root_keys - 1, halfmoves));
+                let step = self.step_into(child, link, repeats.as_ref());
+                let run = match (&looked, step) {
+                    (Some((scan, _)), Step::Passing(false) | Step::Plain) => {
+                        let rivals = self.rivals(node, scan, repeats.as_ref(), place);
+                        1 + rivals.map_or(0, |rivals| self.more_in_a_row(scan, repeats.as_ref(), (place, prior, link), rivals, left - 1))
+                    }
+                    _ => 1,
+                };
+                (step, run)
+            });
+            match step {
+                Step::Repeat | Step::FirstVisit => {
+                    self.finished_at_once(gathering);
+                    //a repeat is a visit of the node at a draw's score for the side that moved into it (selection's for the
+                    //move), as in lc0: the move's mean is its node's, whatever the path
+                    if matches!(step, Step::Repeat) {
+                        self.count_own_visit(child, 1.0 - gathering.settings.draw);
+                    }
+                    gathering.path.pop();
+                    self.back_up_means(&gathering.path, &gathering.edges, None, 0);
+                    gathering.edges.pop();
+                    return Walk::Interrupted;
                 }
-                self.learn_proofs(&path, &edges);
-                continue;
+                Step::Passing(_) => {
+                    self.take_mean(node, link, child);
+                }
+                Step::Plain => {}
             }
-
-            if self.nodes[node].in_flight > 0 {
-                self.keys.truncate(root_keys);
-                if collisions.len() == round.collisions as usize {
-                    break;
-                }
-                self.add_in_flight(&path, &edges);
-                collisions.push((path.clone(), edges.clone()));
-                continue;
+            self.keys.push(self.node_keys[child]);
+            let walk = self.arrive(gathering, run, child_board);
+            self.keys.pop();
+            gathering.path.pop();
+            if self.graph.is_some() {
+                gathering.edges.pop();
             }
-
-            let mut legal_moves = board.legal_moves();
-            let node_tables = tables.filter(|_| node != self.root && (!root_covered || board.halfmoves() == 0));
-            //the root is searched whatever the rules say of it: Searches.start refuses only a mate or stalemate
-            let game_over =
-                if node == self.root { None } else { game_result(&board, &self.keys, &legal_moves, settings.draw, node_tables) };
-            //a repeat inside the search is a draw, but not a proven one: the game need not repeat (as in lc0)
-            let (&leaf_key, path_keys) = self.keys[root_keys - 1..].split_last().expect("the root's key");
-            //with transpositions a descent stops above a repeat, so a leaf is none; a repetition the rules count holds for every path
-            let value = game_over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
-            self.keys.truncate(root_keys);
-
-            simulations += 1;
-            if let Some(value) = value {
-                //the root is never proven: the rules and the tables never score it
-                if let Some(result) = game_over
-                    && settings.certainty
-                    && node != self.root
-                {
-                    //the result is for the side to move, the proof for the side that moved here; a win or loss with moves left
-                    //is the tables', after any mate
-                    let (outcome, plies) = if result == 0.0 {
-                        (Outcome::Win, if legal_moves.is_empty() { 0 } else { TABLEBASE_PLIES })
-                    } else if result == 1.0 {
-                        (Outcome::Loss, TABLEBASE_PLIES)
-                    } else {
-                        (Outcome::Draw, 0)
-                    };
-                    self.prove(&path, Proof { outcome, value: 1.0 - result, plies });
-                }
-                self.back_up(&path, &edges, value, 0);
-                if settings.certainty {
-                    self.propagate_proofs(&path);
-                    self.learn_proofs(&path, &edges);
-                }
-                continue;
+            match walk {
+                Walk::Quiet => left -= run,
+                Walk::Stirred(waiting) => left -= waiting,
+                Walk::Interrupted | Walk::Ended => return walk,
             }
-            sort_moves_in_python_order(&board, &mut legal_moves);
-            let moves = legal_moves;
-            //a hash collision would give another number of moves
-            match cache.and_then(|cache| cache.get(leaf_key)).filter(|answer| answer.priors.len() == moves.len()) {
-                Some(answer) => {
-                    self.expand(node, &moves, answer.priors);
-                    self.back_up(&path, &edges, f64::from(answer.value), 0);
-                }
-                None => {
-                    encode_board(&board, boards);
-                    self.add_in_flight(&path, &edges);
-                    let leaf = PendingLeaf { path: path.clone(), edges: edges.clone(), key: leaf_key, moves, turn: board.turn() };
-                    self.round_leaves(round.id).push_back(leaf);
-                    gathered += 1;
-                }
+            //after a new mean the next descent's step into this node changes the node above: it is told
+            if matches!(step, Step::Passing(true)) {
+                return Walk::Stirred(descents - left);
+            }
+            if left == 0 {
+                return Walk::Quiet;
             }
         }
-        for (path, edges) in collisions {
-            for &node in self.in_flight_nodes(&path) {
-                self.nodes[node].in_flight -= 1;
+    }
+
+    //what a descent's step from a node into its move's node `child` (the move's name `link`) finds, nothing written: `repeats`
+    //are the path's, None without transpositions, where a descent only goes on
+    fn step_into(&self, child: usize, link: u32, repeats: Option<&Repeats>) -> Step {
+        let Some(repeats) = repeats else { return Step::Plain };
+        //a repeat of this path's position, whatever the node is to other paths, or a node that knows more than its move
+        if repeats.repeats(self.node_keys[child], self.graph.as_ref().expect("the graph").halfmoves[child]) {
+            return Step::Repeat;
+        }
+        if !(self.nodes[child].has_edges() && self.nodes[child].proof.is_none()) {
+            return Step::Plain;
+        }
+        if self.stops_at(link) {
+            return Step::FirstVisit;
+        }
+        Step::Passing((self.nodes[child].mean_score() as f32).to_bits() != self.slot(link).mean.to_bits())
+    }
+
+    //gather_by_descents' end of a descent on the path's last node, which has no moves and nothing waiting at it: true if it now
+    //waits for the network, false if it was finished at once (a game's result, a cached answer)
+    fn evaluate_leaf(&mut self, gathering: &mut Gathering, board: &Chess) -> bool {
+        let node = *gathering.path.last().expect("the root at least");
+        let settings = gathering.settings;
+        let mut legal_moves = board.legal_moves();
+        let node_tables = gathering.tables.filter(|_| node != self.root && (!gathering.root_covered || board.halfmoves() == 0));
+        //the root is searched whatever the rules say of it: Searches.start refuses only a mate or stalemate
+        let game_over = if node == self.root { None } else { game_result(board, &self.keys, &legal_moves, settings.draw, node_tables) };
+        //a repeat inside the search is a draw, but not a proven one: the game need not repeat (as in lc0)
+        let (&leaf_key, path_keys) = self.keys[gathering.root_keys - 1..].split_last().expect("the root's key");
+        //with transpositions a descent stops above a repeat, so a leaf is none; a repetition the rules count holds for every path
+        let value = game_over.or_else(|| path_keys.contains(&leaf_key).then_some(settings.draw));
+        gathering.simulations += 1;
+        gathering.started = false;
+        if let Some(value) = value {
+            //the root is never proven: the rules and the tables never score it
+            if let Some(result) = game_over
+                && settings.certainty
+                && node != self.root
+            {
+                //the result is for the side to move, the proof for the side that moved here; a win or loss with moves left
+                //is the tables', after any mate
+                let (outcome, plies) = if result == 0.0 {
+                    (Outcome::Win, if legal_moves.is_empty() { 0 } else { TABLEBASE_PLIES })
+                } else if result == 1.0 {
+                    (Outcome::Loss, TABLEBASE_PLIES)
+                } else {
+                    (Outcome::Draw, 0)
+                };
+                self.prove(&gathering.path, Proof { outcome, value: 1.0 - result, plies });
             }
-            for (&node, &link) in path.iter().zip(&edges) {
-                let link = self.current_link(node, link as u32);
-                self.slot_mut(link).pending -= 1;
+            self.back_up(&gathering.path, &gathering.edges, value, 0);
+            if settings.certainty {
+                self.propagate_proofs(&gathering.path);
+                self.learn_proofs(&gathering.path, &gathering.edges);
+            }
+            return false;
+        }
+        sort_moves_in_python_order(board, &mut legal_moves);
+        let moves = legal_moves;
+        //a hash collision would give another number of moves
+        match gathering.cache.and_then(|cache| cache.get(leaf_key)).filter(|answer| answer.priors.len() == moves.len()) {
+            Some(answer) => {
+                self.expand(node, &moves, answer.priors);
+                self.back_up(&gathering.path, &gathering.edges, f64::from(answer.value), 0);
+                false
+            }
+            None => {
+                encode_board(board, gathering.boards);
+                self.add_in_flight(&gathering.path, &gathering.edges, 1);
+                let leaf = PendingLeaf {
+                    path: gathering.path.clone(),
+                    edges: gathering.edges.clone(),
+                    key: leaf_key,
+                    moves,
+                    turn: board.turn(),
+                };
+                self.round_leaves(gathering.round.id).push_back(leaf);
+                gathering.gathered += 1;
+                true
             }
         }
-        gathered
     }
 
     fn next_waiting(&mut self, round: u64) -> PendingLeaf {
@@ -1350,15 +1604,27 @@ impl Tree {
         if self.graph.is_some() { &path[path.len() - 1..] } else { path }
     }
 
-    //a simulation waits along the path: at in_flight_nodes, and with transpositions at the moves between its nodes (`edges`,
-    //their links)
-    fn add_in_flight(&mut self, path: &[usize], edges: &[usize]) {
+    //`count` simulations wait along the path: at in_flight_nodes, and with transpositions at the moves between its nodes
+    //(`edges`, their links)
+    fn add_in_flight(&mut self, path: &[usize], edges: &[usize], count: u32) {
         for &node in self.in_flight_nodes(path) {
-            self.nodes[node].in_flight += 1;
+            self.nodes[node].in_flight += count;
+        }
+        let waiting = u16::try_from(count).expect("a move's waiting descents are counted in 16 bits");
+        for (&node, &link) in path.iter().zip(edges) {
+            let link = self.current_link(node, link as u32);
+            self.slot_mut(link).pending += waiting;
+        }
+    }
+
+    //add_in_flight undone, for the collisions a gathering call held
+    fn take_off_in_flight(&mut self, path: &[usize], edges: &[usize], count: u32) {
+        for &node in self.in_flight_nodes(path) {
+            self.nodes[node].in_flight -= count;
         }
         for (&node, &link) in path.iter().zip(edges) {
             let link = self.current_link(node, link as u32);
-            self.slot_mut(link).pending += 1;
+            self.slot_mut(link).pending -= count as u16;
         }
     }
 
@@ -2234,6 +2500,54 @@ impl Iterator for TreeLinked<'_> {
         }
         None
     }
+}
+
+//a descent's step from a node into its move's node (Tree::step_into)
+#[derive(Clone, Copy)]
+enum Step {
+    //the move's node repeats a position of the path: the descent ends above it, a visit of the node at a draw's score
+    Repeat,
+    //the move's first visit of a node that has moves: the descent ends above it, the move taking the node's mean
+    FirstVisit,
+    //the move takes its node's mean in passing (take_mean) and the descent goes on; whether the mean is a new one
+    Passing(bool),
+    //the descent goes on to the node: one without moves or proven, or any node without transpositions
+    Plain,
+}
+
+//how a walk left the descents it was given (Tree::walk_moves)
+enum Walk {
+    //all of them wait, for the network or as collisions: above them only the counts of those waiting have changed
+    Quiet,
+    //so many of them wait, and a move on their way took a new mean in passing: the node above looks again before the next
+    Stirred(u32),
+    //one was finished at once: every node above has new numbers, and the next descent starts at the root
+    Interrupted,
+    //the round has what it may gather
+    Ended,
+}
+
+//a gathering call's state (Tree::gather)
+struct Gathering<'a> {
+    round: Round,
+    settings: SearchSettings,
+    tables: Option<&'a Tables>,
+    cache: Option<&'a Cache>,
+    boards: &'a mut Vec<u8>,
+    root_keys: usize,
+    //the tables finish the nodes they cover below the root; below a root they cover (a size with no dtz tables) only those right
+    //after a capture or pawn move, as lc0 probes: the tables' result starts the fifty move count there
+    root_covered: bool,
+    //the walk's place: the nodes from the root, and with transpositions the links between them
+    path: Vec<usize>,
+    edges: Vec<usize>,
+    gathered: u32,
+    simulations: u32,
+    //the descents that ended on a leaf already waiting, by path, links and number, and their number in all
+    collisions: Vec<(Vec<usize>, Vec<usize>, u32)>,
+    collided: u32,
+    //whether the descent now on its way was let start (may_start)
+    started: bool,
 }
 
 struct Scan {

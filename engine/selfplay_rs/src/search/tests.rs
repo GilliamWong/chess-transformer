@@ -6,6 +6,7 @@ use shakmaty::{CastlingMode, EnPassantMode};
 use std::fmt::Debug;
 
 mod bench;
+mod descents;
 mod shared;
 
 //model.encoding.NUM_MOVE_IDS
