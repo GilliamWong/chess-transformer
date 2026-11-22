@@ -80,19 +80,21 @@ const NO_NODE: u32 = u32::MAX;
 pub const NO_LINK: u32 = 0;
 pub const SOLID: u32 = 1 << 31;
 pub const SOLID_TREE_THRESHOLD: u32 = 100;
-//the passes of link_known_moves a node may have: the first is due at `first_due` visits (a tree's SOLID_TREE_THRESHOLD), each
-//later one at four times the visits the one before was due at, and the last of them at first_due << 24, within the u32 of a
-//node's visits
+//the visits at which a node's first pass of link_known_moves is due, whether its moves with a node are a list or slots: below
+//SOLID_TREE_THRESHOLD, so that the nodes of a few dozen visits have theirs
+pub const KNOWN_FIRST_VISITS: u32 = 32;
+//the passes of link_known_moves a node may have: each after the first is due at four times the visits the one before was due
+//at, and the last of them at KNOWN_FIRST_VISITS << 24, within the u32 of a node's visits
 pub const KNOWN_PASSES: u32 = 13;
 
 //the visits at which a node that has had `passes` passes is due the next; `passes` below KNOWN_PASSES
-pub fn known_pass_due_at(first_due: u32, passes: u32) -> u64 {
-    u64::from(first_due) << (2 * passes)
+pub fn known_pass_due_at(passes: u32) -> u64 {
+    u64::from(KNOWN_FIRST_VISITS) << (2 * passes)
 }
 
 //the passes due to a node of `visits` visits
-pub fn known_passes_due(first_due: u32, visits: u32) -> u32 {
-    (0..KNOWN_PASSES).take_while(|&passes| u64::from(visits) >= known_pass_due_at(first_due, passes)).count() as u32
+pub fn known_passes_due(visits: u32) -> u32 {
+    (0..KNOWN_PASSES).take_while(|&passes| u64::from(visits) >= known_pass_due_at(passes)).count() as u32
 }
 
 pub fn listed(link: u32) -> bool {
@@ -593,7 +595,8 @@ impl Tree {
         };
         reserve_to(&mut self.nodes, nodes);
         reserve_to(&mut self.node_keys, nodes);
-        //a link for this simulation's move and one for each waiting leaf's
+        //a link for this simulation's move and one for each waiting leaf's (the links that link_known_moves gives a list's moves
+        //take what room is left)
         let Some(links) =
             grown_capacity(self.links.capacity(), self.links.len() + self.pending() + 1, size_of::<Link>(), self.spare_bytes())
         else {
@@ -762,26 +765,37 @@ impl Tree {
     //whether a pass of link_known_moves is due to the node: its visits have reached those of a pass it has not had
     fn known_pass_due(&self, node: usize) -> bool {
         let (passes, visits) = (u32::from(self.nodes[node].known_passes), self.nodes[node].visit_count);
-        passes < KNOWN_PASSES && u64::from(visits) >= known_pass_due_at(SOLID_TREE_THRESHOLD, passes)
+        passes < KNOWN_PASSES && u64::from(visits) >= known_pass_due_at(passes)
     }
 
-    //with transpositions, when a descent comes to a solid node (a slot a move, from SOLID_TREE_THRESHOLD visits) that a pass is due
-    //to (known_pass_due): each of its moves without a node takes the node its position has, if other paths have visited one.
-    //The move holds the node's mean of that moment, and whether the node is a proven loss: selection then weighs the move by
-    //that mean where it would weigh a move nothing is known of, which matters for the moves of small priors that wait long for
-    //a first visit; the first visit still only takes the node's mean, as any move's first visit of a node does. No room is
-    //needed. Most positions a move can transpose into are first reached after the node's
-    //first pass: a pass is due again at four times the visits of the one before (100, 400, 1600, ...), and the node then counts
-    //every pass its visits have reached, so that one made late makes up for those before it. `board` is the node's position.
+    //with transpositions, when a descent comes to a node that a pass is due to (known_pass_due: at KNOWN_FIRST_VISITS visits,
+    //then at four times as many, and so on): each of its moves without a node takes the node its position has, if other paths
+    //have visited one. The move holds the node's mean of that moment, and whether the node is a proven loss: selection then
+    //weighs the move by that mean where it would weigh a move nothing is known of, which matters for the moves of small priors
+    //that wait long for a first visit; the first visit still only takes the node's mean, as any move's first visit of a node
+    //does. In a list the move gets a link at its place, like any other move's; a solid node has its slot. Under a memory limit
+    //a list takes only the links there is room for (make_room's). Most positions a move can transpose into are first reached
+    //after the node's first pass, hence the later ones, and the node then counts every pass its visits have reached, so that
+    //one made late makes up for those before it. `board` is the node's position.
     //lc0 has no such step: its moves learn of a shared position when first selected.
-    //Selection stops at a node's first move without a node (the best of those nothing is known of); known_to tells it how far
-    //past that one a move with a node may stand, and only grows
+    //A solid node's selection stops at its first move without a node (the best of those nothing is known of); known_to tells
+    //it how far past that one a move with a node may stand, and only grows. A list's selection weighs every link
     fn link_known_moves(&mut self, node: usize, board: &Chess) {
-        let first_slot = (self.nodes[node].children & !SOLID) as usize;
+        let children = self.nodes[node].children;
+        let mut with_node = [false; MOST_MOVES];
+        for (place, _) in self.linked(node) {
+            with_node[place] = true;
+        }
         let mut known_to = usize::from(self.nodes[node].known_to);
         for (place, edge) in self.nodes[node].edges().enumerate() {
-            if self.slots[first_slot + place].child != NO_NODE {
+            if with_node[place] {
                 continue;
+            }
+            //a list's links stay below SOLID, and under a memory limit within make_room's, which the descent's own move and the
+            //waiting leaves' keep
+            let within_limit = self.memory_limit == usize::MAX || self.links.len() + self.pending() + 1 < self.links.capacity();
+            if listed(children) && !(within_limit && self.links.len() + 1 < SOLID as usize) {
+                break;
             }
             let mut after = board.clone();
             after.play_unchecked(self.moves[edge].to_move(board));
@@ -789,18 +803,40 @@ impl Tree {
             let known = self.graph.as_ref().and_then(|graph| graph.table.get(&graph_key(key, halfmoves)).copied());
             if let Some(child) = known.filter(|&child| self.nodes[child as usize].visit_count > 0) {
                 let found = &self.nodes[child as usize];
-                self.slots[first_slot + place] = Slot {
+                let slot = Slot {
                     child,
                     mean: found.mean_score() as f32,
                     lost: found.proof.is_some_and(|proof| proof.outcome == Outcome::Loss),
                     repeats: repeat_filter(key, halfmove_count(halfmoves)),
                     ..UNVISITED_SLOT
                 };
+                if listed(children) {
+                    self.put_in_list(node, place as u32, slot);
+                } else {
+                    self.slots[(children & !SOLID) as usize + place] = slot;
+                }
                 known_to = known_to.max(place + 1);
             }
         }
-        self.nodes[node].known_passes = known_passes_due(SOLID_TREE_THRESHOLD, self.nodes[node].visit_count) as u8;
+        self.nodes[node].known_passes = known_passes_due(self.nodes[node].visit_count) as u8;
         self.nodes[node].known_to = known_to as u8;
+    }
+
+    //a link for the move at `place` of the node's list, which has none there, with the move's slot: put in at its place, the
+    //links being in the moves' order. Returns the link
+    fn put_in_list(&mut self, node: usize, place: u32, slot: Slot) -> u32 {
+        let made = self.links.len() as u32;
+        let (mut previous, mut next) = (NO_LINK, self.nodes[node].children);
+        while next != NO_LINK && self.links[next as usize].place < place {
+            (previous, next) = (next, self.links[next as usize].next);
+        }
+        self.links.push(Link { slot, next, place });
+        if previous == NO_LINK {
+            self.nodes[node].children = made;
+        } else {
+            self.links[previous as usize].next = made;
+        }
+        made
     }
 
     //with transpositions: the move `link` of `parent` takes its node's mean as a descent passes it (other paths may have visited the
@@ -878,32 +914,41 @@ impl Tree {
         let priors = &self.priors[edges.clone()];
         let heads = priors.len().min(HEAD_MOVES);
         let children = parent.children;
-        //the head's moves, then the tail's: of each one's moves without a node the first has the highest prior. A tail move is looked at
-        //only with a prior above the head's first move without a node (SharedTree::select_edge's reasons). The root with noise has its
-        //priors out of order: every move is looked at
+        //the head's moves, then the tail's: of each one's moves without a node the first has the highest prior. A tail move without a
+        //node is looked at only with a prior above the head's first move without one (SharedTree::select_edge's reasons). The root
+        //with noise has its priors out of order: every move is looked at
         let (mut index, mut head_unvisited) = (0, f32::NEG_INFINITY);
         if listed(children) {
-            let place_of = |link: u32| if link == NO_LINK { usize::MAX } else { self.links[link as usize].place as usize };
-            let (mut next_link, mut next_place) = (children, place_of(children));
-            while index < priors.len() {
-                if index >= heads && priors[index] <= head_unvisited {
+            //every link is weighed, in the moves' order: a move that link_known_moves gave a node may stand anywhere among those
+            //without one. Of the moves without a node between the links, from `from` up to the next link's, the head's first and
+            //the tail's first are weighed
+            let (mut link, mut from) = (children, 0);
+            let (mut head_weighed, mut tail_weighed) = (false, false);
+            loop {
+                let to = if link == NO_LINK { priors.len() } else { self.links[link as usize].place as usize };
+                if scan.noised {
+                    for index in from..to {
+                        consider(index, NO_LINK, priors[index], &UNVISITED_SLOT);
+                    }
+                } else {
+                    if from < to.min(heads) && !head_weighed {
+                        (head_weighed, head_unvisited) = (true, priors[from]);
+                        consider(from, NO_LINK, priors[from], &UNVISITED_SLOT);
+                    }
+                    let tail = from.max(heads);
+                    if tail < to && !tail_weighed {
+                        tail_weighed = true;
+                        if priors[tail] > head_unvisited {
+                            consider(tail, NO_LINK, priors[tail], &UNVISITED_SLOT);
+                        }
+                    }
+                }
+                if link == NO_LINK {
                     break;
                 }
-                let unvisited = index != next_place;
-                if unvisited {
-                    consider(index, NO_LINK, priors[index], &UNVISITED_SLOT);
-                } else {
-                    let Link { slot, next, .. } = &self.links[next_link as usize];
-                    consider(index, next_link, priors[index], slot);
-                    (next_link, next_place) = (*next, place_of(*next));
-                }
-                if !unvisited || scan.noised {
-                    index += 1;
-                } else if index < heads {
-                    (index, head_unvisited) = (heads, priors[index]);
-                } else {
-                    break;
-                }
+                let Link { slot, next, .. } = &self.links[link as usize];
+                consider(to, link, priors[to], slot);
+                (link, from) = (*next, to + 1);
             }
         } else {
             let slots = &self.slots[(children & !SOLID) as usize..][..priors.len()];
@@ -1067,18 +1112,7 @@ impl Tree {
             self.slots[(children & !SOLID) as usize + place as usize] = slot;
             return (child as usize, children + place);
         }
-        let made = self.links.len() as u32;
-        let (mut previous, mut next) = (NO_LINK, self.nodes[parent].children);
-        while next != NO_LINK && self.links[next as usize].place < place {
-            (previous, next) = (next, self.links[next as usize].next);
-        }
-        self.links.push(Link { slot, next, place });
-        if previous == NO_LINK {
-            self.nodes[parent].children = made;
-        } else {
-            self.links[previous as usize].next = made;
-        }
-        (child as usize, made)
+        (child as usize, self.put_in_list(parent, place, slot))
     }
 
     //mcts.descend and finish until the round has its leaves or simulations, the leaves' boards added to boards; a leaf that needs no
@@ -1116,7 +1150,7 @@ impl Tree {
             let mut node = self.root;
             let mut stop = None;
             while self.nodes[node].has_edges() {
-                if self.graph.is_some() && !listed(self.nodes[node].children) && self.known_pass_due(node) {
+                if self.graph.is_some() && self.known_pass_due(node) {
                     self.link_known_moves(node, &board);
                 }
                 let halfmoves = board.halfmoves();

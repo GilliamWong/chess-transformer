@@ -893,12 +893,22 @@ fn check_graph(tree: &Tree) -> usize {
     incoming.iter().filter(|&&moves| moves > 1).count()
 }
 
+//the moves of nodes that still keep a list which a pass gave their position's node, and which have had no visit of their own
+fn given_in_lists(tree: &Tree) -> usize {
+    let given = |id: usize| {
+        let known = |link: u32| tree.own_visits(link) == 0 && tree.nodes[tree.link_child(link) as usize].visit_count > 0;
+        tree.linked(id).filter(|&(_, link)| known(link)).count()
+    };
+    (0..tree.nodes.len()).filter(|&id| tree.nodes[id].known_passes > 0 && listed(tree.nodes[id].children)).map(given).sum()
+}
+
 //a search with transpositions on one thread against Tree's, with `base`'s settings: the same rounds' boards and the same tree,
 //number for number (the means its moves hold too), and as many evaluations as boards. Returns the nodes that several moves lead
-//to, the moves a solid node's passes gave their position's node, and the nodes that have had more than one pass
-fn one_thread_searches_a_graph_as_tree_does(base: SearchSettings) -> (usize, usize, usize) {
+//to, the moves that passes gave their position's node behind a move without one, the nodes that have had more than one pass,
+//and the moves given a node in lists
+fn one_thread_searches_a_graph_as_tree_does(base: SearchSettings) -> (usize, usize, usize, usize) {
     let tables = tables();
-    let (mut shared, mut known, mut passed_again) = (0, 0, 0);
+    let (mut shared, mut known, mut passed_again, mut in_lists) = (0, 0, 0, 0);
     //the kings and the blocked pawn as well, the smallest position in which selection came to weigh a move that a solid node's
     //pass gave a node behind one without, and the queen ending, whose nodes come to their later passes
     let more = [(KINGS_AND_A_BLOCKED_PAWN, &[][..], 2_000, false, None), (QUEEN_AND_PAWN, &[][..], 3_000, false, None)];
@@ -922,9 +932,48 @@ fn one_thread_searches_a_graph_as_tree_does(base: SearchSettings) -> (usize, usi
             shared += check_graph(&old);
             known += known_before_visited(&old);
             passed_again += old.nodes.iter().filter(|node| node.known_passes > 1).count();
+            in_lists += given_in_lists(&old);
         }
     }
-    (shared, known, passed_again)
+    (shared, known, passed_again, in_lists)
+}
+
+//a node's passes and its selection are the same whether its moves with a node are a list or slots: a SharedTree that makes its
+//lists solid at 8 visits, two at a time, searches as a Tree that makes them solid at SOLID_TREE_THRESHOLD, number for number
+#[test]
+fn a_graph_is_searched_alike_whenever_its_lists_are_made_solid() {
+    for (fen, moves) in [(START, OPENING), (LOCKED_PAWNS, &[][..]), (QUEEN_AND_PAWN, &[][..]), (KINGS_AND_A_BLOCKED_PAWN, &[][..])] {
+        for certainty in [false, true] {
+            let settings = SearchSettings { draw: 0.35, ..graph_settings(certainty) };
+            let mut old = tree_for(fen, moves, &settings);
+            let old_rounds = search_in_flight(&mut old, 4_000, 2, &settings, &mut Network::new(), gather_with(&settings, None));
+            let new = shared_tree_for(fen, moves, &settings);
+            let new_rounds = shared_in_flight(&new, 4_000, 2, &settings, None, &SharedNetwork::new(), usize::MAX);
+            assert!(old_rounds == new_rounds, "{fen}: the rounds' boards");
+            assert_same_trees(&old, &new.to_tree());
+            let (lists, solids) = new.lists_and_solids();
+            assert!(lists > 0 && solids > old.slots.len() / 20, "{lists} lists, {solids} solid");
+        }
+    }
+}
+
+//list nodes' passes beside other threads: a tree that keeps its lists to SOLID_TREE_THRESHOLD visits and makes them solid in
+//batches, as the engine's does. Moves are given nodes in lists, every list is in its moves' order with one link a move
+//(check_refs), and the sums hold
+#[test]
+fn list_nodes_passes_on_many_threads_keep_every_nodes_sum() {
+    for (fen, moves) in [(LOCKED_PAWNS, &[][..]), (QUEEN_AND_PAWN, &[][..]), (START, OPENING)] {
+        for (threads, certainty) in [(8, false), (24, true)] {
+            let settings = SearchSettings { draw: 0.35, ..graph_settings(certainty) };
+            let start = tree_after(fen, moves);
+            let tree = SharedTree::new(start.board, start.keys).with_transpositions(true);
+            search_on_threads(&tree, threads, 12_000, 2, 16, &settings, &SharedNetwork::new(), usize::MAX);
+            assert_eq!(tree.pending(), 0);
+            check_after_search(&tree, &settings, false);
+            let given = given_in_lists(&tree.to_tree());
+            assert!(fen == START || given > 0, "{fen} on {threads} threads: no move given a node in a list");
+        }
+    }
 }
 
 //a draw of 0.35 as well: a repeat's visit is scored for the side that moved, which a draw of 0.5 does not tell from the other's.
@@ -933,7 +982,8 @@ fn one_thread_searches_a_graph_as_tree_does(base: SearchSettings) -> (usize, usi
 fn one_thread_with_transpositions_searches_as_tree_does() {
     for draw in [0.5, 0.35] {
         let found = one_thread_searches_a_graph_as_tree_does(SearchSettings { draw, ..graph_settings(false) });
-        assert!(found.0 > 0 && found.1 > 0 && found.2 > 0, "(nodes shared, moves given a node, nodes of several passes): {found:?}");
+        let all = found.0 > 0 && found.1 > 0 && found.2 > 0 && found.3 > 0;
+        assert!(all, "(nodes shared, moves given a node, nodes of several passes, moves given in lists): {found:?}");
     }
 }
 
@@ -1193,8 +1243,8 @@ fn searches_with_transpositions_on_many_threads_keep_every_nodes_sum() {
     assert!(shared > 0 && known > 0, "{shared} nodes shared by two moves, {known} moves given their position's node");
 }
 
-//the moves that a solid node's linking gave their position's node, that have had no visit of their own yet, and that stand
-//behind a move without a node of the head or of the tail, where selection's scan does not come: it looks at them apart
+//the moves that a node's passes gave their position's node, that have had no visit of their own yet, and that stand behind a
+//move without a node of the head or of the tail, where a solid node's scan does not come: it looks at them apart
 fn known_before_visited(tree: &Tree) -> usize {
     let behind = |id: usize| {
         let (edges, with_node) = (tree.nodes[id].edges(), tree.linked(id).map(|(place, _)| place).collect::<Vec<_>>());

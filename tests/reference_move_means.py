@@ -32,11 +32,11 @@ The rule, in this file's words:
 - A simulation that waits for the network adds one to the pending of every move of its path, and marks its leaf as waited at, until
   its answer is backed up. A collision adds the same until the gathering call that made it ends, and counts no visit. Nothing else
   adds: every other descent is backed up at once.
-- A node that has moves and SOLID_VISITS visits or more is solid, whichever way the visits came: walks up through it, or repeats
-  that ended at it. A solid node makes passes over its moves: a pass gives every move of the node that has no node yet the node of
-  the position it leads to, if the search has a node of that position and fifty-move count that has been visited. The passes come
-  as the node grows: its pass k (0 the first, MAX_PASSES in all) is due once it has SOLID_VISITS * PASS_GROWTH^k visits, and is
-  made by the first descent that then comes to the node to pick one of its moves, before it picks. A pass counts as every pass the
+- A node that has moves makes passes over them as it grows: a pass gives every move of the node that has no node yet the node of
+  the position it leads to, if the search has a node of that position and fifty-move count that has been visited. The node's pass k
+  (0 the first, MAX_PASSES in all) is due once it has FIRST_PASS_VISITS * PASS_GROWTH^k visits, whichever way the visits came
+  (walks up through it, or repeats that ended at it), and is made by the first descent that then comes to the node to pick one of
+  its moves, before it picks. A pass counts as every pass the
   node's visits have come to, so a node that comes to its pass late, past the visits of the next one too, makes one pass and not
   two. A position not known at one pass is asked about again at the next. A move given a node has no visit of its own and holds the
   node's mean as it stood at the pass: it is picked by that mean wherever it stands among the node's moves, and its first visit is
@@ -51,8 +51,11 @@ The rule, in this file's words:
 - A move is lost once a descent of its own has met its node as a proven loss: it arrived there (stop 2), or it is on the path of a
   descent whose end proved its node a loss. A move given a node that is a proven loss is lost at once. Another move to the same
   node is picked by its held mean until its own descent meets the node: one more visit.
-- A new root (the game went on down the tree) proves a draw every node whose position the game has had twice by then, and takes
-  the loss off every move to such a node.
+- A new root (the game went on down the tree by a line of moves, played together) keeps the nodes it reaches by its moves and
+  theirs and, for this one line, those the root before the line reaches (the held root): a descent that comes to the position of
+  one of them finds it with its visits. Every other node is dropped, and a move to its position makes a new node. A new root then
+  proves a draw every node it kept whose position the game has had twice by then, and takes the loss off every move to such a
+  node.
 """
 from __future__ import annotations
 from collections import Counter, deque
@@ -67,9 +70,9 @@ from engine import mcts
 
 #no position comes round in fewer plies
 SHORTEST_REPEAT_PLIES = 4
-#the visits from which a node with moves is solid: its first pass over its moves is due. Each later pass is due at PASS_GROWTH
-#times the visits of the one before, and a node makes MAX_PASSES at most
-SOLID_VISITS = 100
+#the visits at which a node's first pass over its moves is due. Each later pass is due at PASS_GROWTH times the visits of the one
+#before, and a node makes MAX_PASSES at most
+FIRST_PASS_VISITS = 32
 PASS_GROWTH = 4
 MAX_PASSES = 13
 
@@ -94,6 +97,8 @@ UNLEARNED_LOSS = "a move to a node proven lost weighed by its mean, not having m
 LOSS_LEARNED = "a move met its node's proof of a loss that another move's descent had made"
 EVERY_MOVE_LOST = "a pick where every move is lost"
 LOSS_CLEARED = "a lost move cleared at a new root"
+HELD_NODE_MET = "a move took or was given a node that only the held root reached"
+NODES_DROPPED = "nodes dropped at a new root"
 
 
 @dataclass(frozen=True)
@@ -112,7 +117,7 @@ class Proof:
 class Link:
     move: chess.Move
     prior: float
-    #the node of the position after the move: found or made when the move is first picked, or given by the solid node it starts from
+    #the node of the position after the move: found or made when the move is first picked, or given by a pass of the node it starts from
     child: Node | None = None
     #where the node was given (the move had it before it was ever picked), the pass of the node the move starts from that gave it
     given_at_pass: int | None = None
@@ -237,7 +242,7 @@ def identity_of(board: chess.Board) -> tuple[Hashable, int]:
 #the passes over its moves that a node with so many visits has come to
 def passes_due(visits: int) -> int:
     passes = 0
-    while passes < MAX_PASSES and visits >= SOLID_VISITS * PASS_GROWTH ** passes:
+    while passes < MAX_PASSES and visits >= FIRST_PASS_VISITS * PASS_GROWTH ** passes:
         passes += 1
     return passes
 
@@ -259,6 +264,17 @@ def proof_from_moves(node: Node) -> Proof | None:
     return Proof({WIN: LOSS, DRAWN: DRAWN, LOSS: WIN}[best.outcome], 1 - best.value, best.plies + 1)
 
 
+#the nodes a node reaches by its moves and theirs, itself among them
+def reached(node: Node) -> set[Node]:
+    found, stack = {node}, [node]
+    while stack:
+        for link in stack.pop().links:
+            if link.child is not None and link.child not in found:
+                found.add(link.child)
+                stack.append(link.child)
+    return found
+
+
 class Search:
     def __init__(self, model: nn.Module, board: chess.Board, device: torch.device, certainty: bool = False):
         if mcts.game_result(board) is not None:
@@ -269,6 +285,8 @@ class Search:
         #the simulations that wait for the network, a gathering call's together, the oldest call first
         self.rounds: deque[list[Simulation]] = deque()
         self.counts = Counter()
+        #the nodes kept for the root before the last line played, which the root did not reach when the line was played or since
+        self.only_held: set[Node] = set()
 
     def node_of(self, board: chess.Board) -> Node:
         identity = identity_of(board)
@@ -276,11 +294,17 @@ class Search:
             self.nodes[identity] = Node(*identity)
         return self.nodes[identity]
 
+    #a move took or was given `node`: the root reaches it now, and what it reaches
+    def meet(self, node: Node) -> None:
+        if node in self.only_held:
+            self.counts[HELD_NODE_MET] += 1
+            self.only_held -= reached(node)
+
     #the simulations waiting for the network
     def waiting(self) -> int:
         return sum(len(leaves) for leaves in self.rounds)
 
-    #a solid node's pass: each of its moves without a node takes the node of the position it leads to, if the search has one that
+    #a node's pass: each of its moves without a node takes the node of the position it leads to, if the search has one that
     #has been visited, with the node's mean as it stands. `board` is the node's position. The pass's number, once for each move it
     #gave a node
     def give_known_nodes(self, node: Node, board: chess.Board) -> list[int]:
@@ -296,6 +320,7 @@ class Search:
             if known is not None and known.visit_count > 0:
                 link.child, link.given_at_pass, link.mean = known, this_pass, float(np.float32(known.mean()))
                 link.lost = known.proof is not None and known.proof.outcome == LOSS
+                self.meet(known)
                 passes_of_moves_given.append(this_pass)
         return passes_of_moves_given
 
@@ -334,6 +359,7 @@ class Search:
             line.append(link.move)
             if link.child is None:
                 link.child = self.node_of(board)
+                self.meet(link.child)
             child = link.child
             path.append((node, link))
 
@@ -425,12 +451,18 @@ class Search:
         self.finish()
         return simulation
 
-    #the game went on by `line`, moves of the tree from its root: the tree's node there is the root. A node whose position the game
-    #has had twice by now is a draw wherever a line comes to it, and a move to it is not lost
+    #the game went on by `line`, moves of the tree from its root played together: the tree's node there is the root. The root before
+    #the line is held until the next line: what it or the new root reaches stays, the rest is dropped. A node whose position the
+    #game has had twice by now is a draw wherever a line comes to it, and a move to it is not lost
     def new_root(self, line: list[chess.Move]) -> None:
+        held = self.root
         for move in line:
             self.root = next(link.child for link in self.root.links if link.move == move)
             self.board.push(move)
+        kept = reached(self.root) | reached(held)
+        self.only_held = kept - reached(self.root)
+        self.counts[NODES_DROPPED] += len(self.nodes) - len(kept)
+        self.nodes = {identity: node for identity, node in self.nodes.items() if node in kept}
         if not self.certainty:
             return
         #the game's positions back to its last capture or pawn move, the root's among them

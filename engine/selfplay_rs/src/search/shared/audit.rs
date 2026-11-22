@@ -127,6 +127,9 @@ impl SharedTree {
                         assert!(links.insert(link), "link {link} in two lists");
                         link = self.links.get(link).next();
                     }
+                    //one link a move, in the moves' order, wherever link_known_moves put some in
+                    assert!(places.is_sorted_by(|before, after| before < after), "node {id}'s list has its links at {places:?}");
+                    assert!(places.last().is_none_or(|&last| last < edges.len()), "node {id}'s list has a link past its moves");
                 }
                 Children::Solid(first) => slot_runs.push(((first & !SOLID) as usize, edges.len())),
             }

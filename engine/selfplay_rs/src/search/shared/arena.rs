@@ -859,7 +859,7 @@ pub struct MoveRecord {
 
 impl MoveRecord {
     //of a move that has `child` as its node and nothing else yet
-    fn new(child: u32, repeats: u8) -> MoveRecord {
+    pub fn new(child: u32, repeats: u8) -> MoveRecord {
         MoveRecord { visits: 0, mean: NO_MEAN, state: MoveState::new(child, repeats, false) }
     }
 
@@ -901,7 +901,12 @@ pub struct Links {
 }
 
 impl Links {
-    const CAPACITY: usize = LINK_CHUNKS << LINK_CHUNK_BITS;
+    pub const CAPACITY: usize = LINK_CHUNKS << LINK_CHUNK_BITS;
+
+    //the links not given out yet (those given back are not counted)
+    pub fn room(&self) -> usize {
+        Self::CAPACITY.saturating_sub(self.len())
+    }
 
     pub fn hold_back(&self, held: bool) {
         self.freed.held_back.store(held, Ordering::Relaxed);
@@ -1013,8 +1018,8 @@ impl Links {
         }
     }
 
-    //a list link for the move at `place` with its node and the node's repeat_filter, not yet in a list
-    pub fn push(&self, child: u32, place: usize, repeats: u8) -> u32 {
+    //a list link for the move at `place` with what the move holds, not yet in a list
+    pub fn push(&self, record: MoveRecord, place: usize) -> u32 {
         let link = match self.freed.take() {
             Some(freed) => freed as usize,
             None => {
@@ -1025,7 +1030,7 @@ impl Links {
             }
         };
         let made = self.table.get(link);
-        made.slot.set(MoveRecord::new(child, repeats));
+        made.slot.set(record);
         made.next.store(NO_LINK, Ordering::Relaxed);
         made.place.store(place as u32, Ordering::Relaxed);
         link as u32
@@ -1541,7 +1546,7 @@ mod tests {
                                 &mut held_links,
                                 turn,
                                 || {
-                                    let link = links.push(0, 0, 0) as usize;
+                                    let link = links.push(MoveRecord::new(0, 0), 0) as usize;
                                     out_links.take(link, 1, "links");
                                     link
                                 },
@@ -1648,7 +1653,7 @@ mod tests {
                         (0..200usize)
                             .map(|turn| {
                                 let place = (turn * 37 + worker as usize * 11) % 150;
-                                let link = links.push(worker * 1000 + turn as u32, place, 0);
+                                let link = links.push(MoveRecord::new(worker * 1000 + turn as u32, 0), place);
                                 loop {
                                     match links.find(head, place) {
                                         Ok(found) => break (place, links.child(found)),

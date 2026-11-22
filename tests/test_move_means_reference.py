@@ -144,7 +144,7 @@ def test_the_positions_come_to_every_way_a_simulation_ends():
     #the fifty move rule eight plies down, and the positions the game had twice before the search
     assert endings["rook ending near fifty moves"][reference.GAME_OVER] >= 100 and endings["blocked pawns after a shuffle"][reference.GAME_OVER] >= 100
 
-#nor about the nodes a solid node gives its moves, if no node of these searches had a move to give one: the moves that were given a
+#nor about the nodes a node's pass gives its moves, if no node of these searches had a move to give one: the moves that were given a
 #node, and those of them a later simulation picked for their first visit. The kings behind blocked pawns come to a position by many
 #orders of moves
 def test_the_positions_give_moves_known_nodes_and_come_to_visit_them():
@@ -159,10 +159,10 @@ def test_the_positions_give_moves_known_nodes_and_come_to_visit_them():
     assert sum(moves_given.values()) >= 50 and sum(first_visits.values()) >= 50, (moves_given, first_visits)
 
 
-#a solid node's later passes over its moves: SIMULATIONS' visits bring nodes to a second pass, but to none that gives a move a node.
-#These positions come to a position by many orders of moves, and so many visits bring nodes below the root to second passes and
-#third ones that do (a search without the second pass leaves the rust search before 13000 visits in each of them, one without the
-#third only in the queen ending, after 19000)
+#a node's later passes over its moves. These positions come to a position by many orders of moves, and so many visits bring nodes
+#below the root to second and third passes that give moves nodes: a search without the second pass leaves the rust search before
+#1600 visits in both searches and one without the third before 18500. A fourth pass and a fifth (8192 visits) are made at a few
+#nodes and give nothing
 TRANSPOSING = {"queen and pawn ending": chess.Board("8/8/8/4k3/8/2p5/8/3QK3 w - - 0 1"), "blocked pawns": chess.Board(BLOCKED_PAWNS)}
 MANY_VISITS = {"queen and pawn ending": 40000, "blocked pawns": 20000}
 
@@ -187,7 +187,8 @@ def test_the_searches_of_many_visits_give_moves_nodes_at_later_passes():
 
     at_later_passes = lambda by_pass: sum(count for number, count in by_pass.items() if number > 0)
     assert at_later_passes(moves_given) >= 30 and at_later_passes(first_visits) >= 10, (moves_given, first_visits)
-    assert passes_made_below_the_root[2] >= 100 and passes_made_below_the_root[3] >= 10, passes_made_below_the_root
+    assert moves_given[2] >= 20, moves_given
+    assert passes_made_below_the_root[3] >= 50 and passes_made_below_the_root[4] >= 10 and passes_made_below_the_root[5] >= 3, passes_made_below_the_root
 
 
 #a network that answers as it was told to for the boards it was told of, and evenly (every move the same, half a point) for the rest
@@ -229,12 +230,13 @@ def played_moves(fen: str, line: list[str]) -> chess.Board:
 #- REPEATING, which most visits go down, comes back to Y: a repeat, which ends at LATE and gives it a visit without picking a move
 #  from it. So does Kd2 Kd7 Ke3 Kd8 Kd2 Kd7.
 #- ARRIVING comes to LATE without a repeat, a visit in eighty or so. Its sixth visit evaluates LATE, which has hundreds of visits by
-#  then; its seventh is the first to pick a move from LATE, and makes LATE's first pass with the second due as well; its eighth
+#  then; its seventh is the first to pick a move from LATE, and makes LATE's first pass with later ones due as well; its eighth
 #  picks from LATE again.
 #- KNOWING comes to the position Ke3 leads to from Y, seven plies down as from LATE, and first visits it between ARRIVING's seventh
 #  visit and its eighth. It scores nothing for White there.
-#At ARRIVING's eighth visit LATE's move Ke3 leads to a known position. A LATE that owed its second pass would give Ke3 that
-#position's node, which scores nothing, and pick Kd1; a LATE whose late pass counted for both picks Ke3, as a move nothing is known of
+#At ARRIVING's eighth visit LATE's move Ke3 leads to a known position. A LATE that owed another pass would give Ke3 that
+#position's node, which scores nothing, and pick Kd1; a LATE whose late pass counted for every pass it had come to picks Ke3, as a
+#move nothing is known of
 LATE_PASS_FEN = "4k3/8/8/3p4/3P4/8/8/4K3 w - - 0 1"
 REPEATING = "e1d2 e8d7 d2d1 d7d8 d1d2 d8d7".split()
 ARRIVING = "e1d1 e8d7 d1c1 d7c7 c1d2 c7d7".split()
@@ -263,7 +265,6 @@ def test_the_node_late_to_its_pass_makes_one_pass_and_then_picks_a_move_it_would
     search = reference.Search(late_pass_model(), chess.Board(LATE_PASS_FEN), CPU)
     #LATE's node, made here before the search comes to it: one without a visit is as none to the search
     late = search.node_of(played_moves(LATE_PASS_FEN, ARRIVING))
-    second_pass_visits = reference.SOLID_VISITS * reference.PASS_GROWTH
     #the lines of the simulations that picked a move from LATE, and where among them the two things happened
     picks, late_pass_at, known_at = [], None, None
     while search.root.visit_count < LATE_PASS_VISITS:
@@ -273,12 +274,13 @@ def test_the_node_late_to_its_pass_makes_one_pass_and_then_picks_a_move_it_would
         if line[:len(ARRIVING)] == ARRIVING and len(line) > len(ARRIVING):
             picks.append(line[len(ARRIVING):])
             if late.passes_made > passes_before:
-                assert (passes_before, late.passes_made, late_pass_at) == (0, 2, None) and visits_before >= second_pass_visits
+                #its first pass, late: it counts for every pass LATE's visits had come to, two at least
+                assert (passes_before, late_pass_at) == (0, None) and late.passes_made == reference.passes_due(visits_before) >= 2
                 late_pass_at = len(picks)
             if len(picks) == 2:
                 #a move that was not given its node, picked as a move nothing is known of: its position's node is found then
                 assert (simulation.ended, simulation.first_visit_given_at_pass, simulation.passes_of_moves_given) == (reference.NEW_MOVE, None, [])
-                assert late.visit_count < second_pass_visits * reference.PASS_GROWTH
+                assert reference.passes_due(visits_before) == late.passes_made, "another pass was due by LATE's visits"
         if line == KNOWING and simulation.ended == reference.EVALUATED:
             known_at = len(picks)
 
@@ -388,7 +390,7 @@ def test_the_searches_in_rounds_come_to_the_rules_cases():
         assert counts[certainty][reference.STALE_MEAN] >= 1000 and counts[certainty][reference.MEAN_REFRESHED] >= 1000, counts
     assert counts[True][reference.PROVEN] >= 1000 and counts[True][reference.LOST_PASSED_OVER] >= 1000, counts
     #another move to a node proven lost: picked by its mean, and lost once its own descent has met the node
-    assert counts[True][reference.UNLEARNED_LOSS] >= 5 and counts[True][reference.LOSS_LEARNED] >= 10, counts
+    assert counts[True][reference.UNLEARNED_LOSS] >= 2 and counts[True][reference.LOSS_LEARNED] >= 10, counts
     assert counts[True][reference.EVERY_MOVE_LOST] >= 1000, counts
 
 
@@ -470,6 +472,66 @@ def test_the_rust_search_at_a_new_root_is_the_reference_where_the_third_time_tak
     assert_the_reference_at_every_simulation(steps, search, visits)
     #a lost move is not picked: the move was, again and again
     assert into_third.visits >= visits_while_lost + 100
+
+
+#a game played down the kept tree (tree_reuse), a search at each of its roots: the search keeps what the new root reaches and, for
+#one line, what the root before the line reached. A line is the moves one start plays. (advance, the engine's way to play its own
+#move, is not compared: it holds the root before our move, the reply's start then holds no other, and what an earlier root reached
+#is dropped only if advance's thread has finished its copy when that start comes.)
+GAMES = {position: (POSITIONS | TRANSPOSING)[position] for position in ("blocked pawns", "pawn ending", "queen and pawn ending", "middlegame")}
+GAME_ROOTS = 5
+GAME_VISITS = 600
+
+#the game's next two moves by the reference's tree: the root's most visited move and a reply to it, the most visited one or
+#(unexpected) the least visited one. Only moves whose nodes have moves: a kept tree is played down those
+def next_moves(search: reference.Search, unexpected: bool) -> list[chess.Move]:
+    with_moves = lambda node: sorted((link for link in node.links if link.child is not None and link.child.links), key=lambda link: -link.visits)
+    ours = with_moves(search.root)[0]
+    return [ours.move, with_moves(ours.child)[-1 if unexpected else 0].move]
+
+#the reference's search of each root of a game, each of `visits` more than the root has: before a search, `at_a_new_root` is told
+#the line or lines (a move each) the game went on by since the search before
+def game_searches(search: reference.Search, a_line_a_move: bool, visits: int = GAME_VISITS):
+    for root in range(GAME_ROOTS):
+        yield search.root.visit_count + visits if root else visits
+        if root == GAME_ROOTS - 1:
+            return
+        moves = next_moves(search, unexpected=root % 2 == 1)
+        for line in ([moves[:1], moves[1:]] if a_line_a_move else [moves]):
+            search.new_root(line)
+            yield line
+
+@pytest.mark.parametrize("a_line_a_move", [False, True], ids=["our move and the reply one line", "each move its own line"])
+@pytest.mark.parametrize("position", GAMES)
+def test_the_rust_search_down_a_game_is_the_reference_at_every_simulation(position, a_line_a_move):
+    model, board = PositionModel(), GAMES[position]
+    searches, search = move_means_searches(tree_reuse=True), reference.Search(model, board, CPU)
+    moves, lines_played = moves_played(board), 0
+    for visits_or_line in game_searches(search, a_line_a_move):
+        if isinstance(visits_or_line, int):
+            assert_the_reference_at_every_simulation(rust_simulations(searches, model, board, moves, visits_or_line), search, visits_or_line)
+            lines_played = 0
+            continue
+        moves = moves + [move.uci() for move in visits_or_line]
+        lines_played += 1
+        if a_line_a_move and lines_played == 1:
+            #our move, played by a start of its own: its root has its visits, there is no simulation to make
+            steps = rust_simulations(searches, model, board, moves, 1)
+            assert [leaves for leaves, _ in steps] == [[]]
+            assert_same_report(steps[0][1], report_of(search.root), " ".join(moves))
+
+#which says little about what a new root keeps unless the searches came to nodes that only the held root reached, and nodes were dropped
+def test_the_searches_down_a_game_meet_held_nodes_and_drop_others():
+    counts = Counter()
+    for a_line_a_move in (False, True):
+        for board in GAMES.values():
+            search = reference.Search(PositionModel(), board, CPU)
+            for visits_or_line in game_searches(search, a_line_a_move):
+                while isinstance(visits_or_line, int) and search.root.visit_count < visits_or_line:
+                    search.simulate()
+            counts[a_line_a_move, reference.HELD_NODE_MET] += search.counts[reference.HELD_NODE_MET]
+            counts[a_line_a_move, reference.NODES_DROPPED] += search.counts[reference.NODES_DROPPED]
+    assert all(count >= 200 for count in counts.values()), counts
 
 
 #the nodes below the root: a tree kept for the next search (tree_reuse) and started again down a line, with no simulation left to

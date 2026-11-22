@@ -860,26 +860,30 @@ fn in_a_graph_proven_nodes_keep_their_scores_and_the_sums_above_them() {
     }
 }
 
-//a graph's solid node's moves take the nodes their positions already have: some moves hold a visited node before their own
-//first visit, selection weighs such a move by its node's mean, and the sums hold as before
+//a graph's node's moves take the nodes their positions already have, from KNOWN_FIRST_VISITS visits on, whether its moves with
+//a node are a list still or slots: some moves hold a visited node before their own first visit, selection weighs such a move by
+//its node's mean, a list keeps its links in the moves' order, and the sums hold as before
 #[test]
-fn in_a_graph_a_solid_nodes_moves_take_the_nodes_their_positions_have() {
+fn in_a_graph_a_nodes_moves_take_the_nodes_their_positions_have() {
     let network = Network::new();
     //kings that can only walk: most positions are reached by many paths
     let (mut tree, settings) = graph_tree(LOCKED_PAWNS, &[]);
     search_without_cache(&mut tree, 6000, &settings, &network);
     assert_move_means(&tree, &settings);
-    let mut known_before_visited = 0;
+    let (mut known_before_visited, mut in_lists) = (0, 0);
     for (node, board) in nodes_with_boards(&tree) {
         let state = &tree.nodes[node];
+        let places: Vec<usize> = tree.linked(node).map(|(place, _)| place).collect();
+        assert!(places.is_sorted_by(|before, after| before < after), "node {node}'s moves with a node at {places:?}");
         if state.known_passes == 0 {
             continue;
         }
-        assert!(!listed(state.children), "only a solid node's moves are given known nodes");
+        assert!(state.visit_count >= KNOWN_FIRST_VISITS, "a pass at {} visits", state.visit_count);
         for (place, link) in tree.linked(node) {
             let child = tree.link_child(link) as usize;
             if tree.own_visits(link) == 0 && tree.nodes[child].visit_count > 0 {
                 known_before_visited += 1;
+                in_lists += usize::from(listed(state.children));
                 let mean = tree.slot(link).mean;
                 assert!((0.0..=1.0).contains(&mean), "a move given a node holds the node's mean of then, not {mean}");
                 let edge = state.edges().start + place;
@@ -889,7 +893,7 @@ fn in_a_graph_a_solid_nodes_moves_take_the_nodes_their_positions_have() {
             }
         }
     }
-    assert!(known_before_visited > 0, "some moves hold their position's node before their first visit");
+    assert!(known_before_visited > in_lists && in_lists > 0, "{known_before_visited} moves given their position's node, {in_lists} in lists");
     assert!(size_of::<Node>() == 64, "the passes' count fits the node's line");
 }
 
@@ -918,12 +922,13 @@ fn in_a_graph_a_later_pass_gives_moves_the_nodes_made_since_the_first() {
     let passed_once = (0..tree.nodes.len()).filter(|&node| tree.nodes[node].known_passes == 1);
     let once: Vec<(usize, Vec<usize>)> = passed_once.map(|node| (node, without_a_node(&tree, node))).collect();
     let nodes_then = tree.nodes.len();
-    assert!(!once.is_empty(), "no node has had its first pass");
+    let lists_then = once.iter().filter(|&&(node, _)| listed(tree.nodes[node].children)).count();
+    assert!(lists_then > 0 && lists_then < once.len(), "{lists_then} of the {} nodes that have had their first pass are lists", once.len());
     search_to(&mut tree, 12_000);
     let (mut passed_again, mut given_since) = (0, 0);
     for (node, without) in once {
         let state = &tree.nodes[node];
-        assert_eq!(u32::from(state.known_passes), known_passes_due(SOLID_TREE_THRESHOLD, state.visit_count).max(1), "node {node}");
+        assert_eq!(u32::from(state.known_passes), known_passes_due(state.visit_count).max(1), "node {node}");
         if state.known_passes < 2 {
             continue;
         }
