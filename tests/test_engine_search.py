@@ -33,8 +33,8 @@ from engine.tablebase import SYZYGY_DIR, TABLEBASE_PIECES
 from engine import engine_search
 from engine.engine_search import EngineSearch, SearchReport, engine_search_settings, parse_changes
 from engine import uci
-from engine.uci import (CACHE_POSITION_BYTES, FITTED_CACHE_POSITIONS, MOST_EXTENSION, MOVE_OVERHEAD_SECONDS, RESERVE_SECONDS, Clock, Options,
-                        fitted_memory, memory_within_limits)
+from engine.uci import (CACHE_POSITION_BYTES, EARLY_SEARCHES, EARLY_SHARE, FITTED_CACHE_POSITIONS, MOST_EXTENSION, MOVE_OVERHEAD_SECONDS,
+                        RESERVE_SECONDS, Clock, Options, fitted_memory, memory_within_limits)
 
 REPOSITORY = Path(__file__).parent.parent
 FREE_QUEEN = "4k3/8/8/3q4/4P3/8/8/4K3 w - - 0 1"
@@ -809,7 +809,7 @@ def test_go_limits():
     assert clock.limits(["infinite"], black, 800) == (800, None)
 
     nodes, seconds = clock.limits("wtime 60000 btime 30000 winc 1000 binc 500".split(), black, 800)
-    assert nodes is None and seconds == pytest.approx(Clock().seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 32))
+    assert nodes is None and seconds == pytest.approx(Clock().seconds_for_move(30 - MOVE_OVERHEAD_SECONDS, 0.5, None, 32, EARLY_SHARE))
     assert 0.5 < seconds < 30 - RESERVE_SECONDS
 
 
@@ -950,18 +950,32 @@ def board_with_men(men: int) -> chess.Board:
         board.remove_piece_at(square)
     return board
 
+#a clock without the larger share of the game's first searches, for the tests of the rest of its plan
+def plain_clock(**settings) -> Clock:
+    return Clock(early_searches=0, **settings)
+
+#the game's first searches get EARLY_SHARE times their share (the moves after the book, where the engine lost most at the CCC), the ones
+#after them their own; a search off the clock is not counted
+def test_the_games_first_searches_get_more_than_their_share():
+    board, clock = chess.Board(), Clock()
+    share = plain_clock().limits(CLOCK_60, board, 800)[1]
+    clock.limits("movetime 1000".split(), board, 800)
+    seconds = [clock.limits(CLOCK_60, board, 800)[1] for _ in range(EARLY_SEARCHES + 2)]
+    assert seconds == [pytest.approx(EARLY_SHARE * share)] * EARLY_SEARCHES + [pytest.approx(share)] * 2
+    assert Clock(early_searches=3, early_share=1.5).limits(CLOCK_60, board, 800)[1] == pytest.approx(1.5 * share)
+
 #what a search is given and does not use is banked for the next move; a movetime search is not on the clock, and no move gets the reserve
 def test_unused_time_goes_to_the_next_move():
-    clock, board = Clock(), chess.Board()
+    clock, board = plain_clock(), chess.Board()
     _, first = clock.limits("wtime 60000 btime 60000".split(), board, 800)
     clock.searched(first / 2, 0)
     _, second = clock.limits("wtime 59000 btime 60000".split(), board, 800)
-    _, without_saving = Clock().limits("wtime 59000 btime 60000".split(), board, 800)
+    _, without_saving = plain_clock().limits("wtime 59000 btime 60000".split(), board, 800)
     assert second == pytest.approx(clock.share + first / 2) and second > 1.4 * without_saving
 
     clock.searched(second, 0)
     _, third = clock.limits("wtime 58000 btime 60000".split(), board, 800)
-    assert third == pytest.approx(Clock().limits("wtime 58000 btime 60000".split(), board, 800)[1])
+    assert third == pytest.approx(plain_clock().limits("wtime 58000 btime 60000".split(), board, 800)[1])
 
     clock.searched(third / 4, 0)
     clock.limits("movetime 1000".split(), board, 800)
@@ -969,12 +983,13 @@ def test_unused_time_goes_to_the_next_move():
     assert clock.saved == pytest.approx(3 / 4 * third)
     assert clock.limits("wtime 1500 btime 60000".split(), board, 800)[1] == pytest.approx(1.5 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS)
 
-#a 60+0.6 game losing men by the points below, every search taking all it is given
-def test_the_clock_follows_the_material_and_never_runs_out():
+#a 60+0.6 game losing men by the points below, every search taking all it is given: the seconds a move in the opening (26 men or more), the
+#middle game (16 or more) and the last 30 moves, the first ten moves' seconds, the clock at 15 men and the lowest clock
+def clock_through_a_game(clock: Clock) -> tuple[float, float, float, float, float, float]:
     points = [(1, 32), (15, 32), (40, 16), (60, 10), (85, 6), (120, 6)]
     men_at = lambda move: next(round(men + (later_men - men) * (move - start) / (end - start))
                                for (start, men), (end, later_men) in zip(points, points[1:]) if start <= move <= end)
-    clock, left, spent, low, late_middlegame_left = Clock(), 60.0, {}, 60.0, None
+    left, spent, low, late_middlegame_left = 60.0, {}, 60.0, None
     for move in range(1, 121):
         men = men_at(move)
         if men <= 15 and late_middlegame_left is None:
@@ -985,18 +1000,29 @@ def test_the_clock_follows_the_material_and_never_runs_out():
         spent.setdefault("opening" if men >= 26 else "middle game" if men >= 16 else "late", []).append(seconds)
         low = min(low, left)
     opening, middle_game, endgame = (sum(moves) / len(moves) for moves in (spent["opening"], spent["middle game"], spent["late"][-30:]))
+    return opening, middle_game, endgame, sum(spent["opening"][:10]), late_middlegame_left, low
+
+def test_the_clock_follows_the_material_and_never_runs_out():
+    opening, middle_game, endgame, _, late_middlegame_left, low = clock_through_a_game(plain_clock())
     assert middle_game > 1.1 * opening and endgame < 0.7
     assert late_middlegame_left > 12 and low > RESERVE_SECONDS / 2
+
+#the first searches' larger share comes out of the moves after them, not out of the game's end
+def test_the_first_searches_share_leaves_the_clock_its_reserve():
+    _, plain_middle_game, _, plain_first_ten, plain_left, _ = clock_through_a_game(plain_clock())
+    _, middle_game, endgame, first_ten, late_middlegame_left, low = clock_through_a_game(Clock())
+    assert first_ten > 1.4 * plain_first_ten and 0.7 * plain_middle_game < middle_game < plain_middle_game
+    assert endgame < 0.7 and 10 < late_middlegame_left < plain_left and low > RESERVE_SECONDS / 2
 
 def test_a_clocks_plan_and_cap_can_be_set():
     board = chess.Board()
     arguments = "wtime 60000 btime 60000 winc 600 binc 600".split()
-    assert Clock(moves_per_man=1.0).limits(arguments, board, 800)[1] > 1.25 * Clock().limits(arguments, board, 800)[1]
+    assert plain_clock(moves_per_man=1.0).limits(arguments, board, 800)[1] > 1.25 * plain_clock().limits(arguments, board, 800)[1]
     #late in the game the least moves left and the reserve decide the share
     board = board_with_men(4)
     arguments = "wtime 10000 btime 10000 winc 600 binc 600".split()
-    assert Clock(least_moves_left=8, reserve_seconds=0.0).limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS) / 8 + 0.6)
-    assert Clock().limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS) / 10 + 0.6)
+    assert plain_clock(least_moves_left=8, reserve_seconds=0.0).limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS) / 8 + 0.6)
+    assert plain_clock().limits(arguments, board, 800)[1] == pytest.approx((10 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS) / 10 + 0.6)
 
 def test_a_new_game_starts_a_fresh_clock(monkeypatch):
     go = ["position startpos", "go wtime 60000 btime 60000 winc 600 binc 600"]
@@ -1021,15 +1047,17 @@ CLOCK_60 = "wtime 60000 btime 60000 winc 600 binc 600".split()
 @pytest.mark.parametrize("ply, bonus", [(0, 2.8), (1, 3.05), (8, 4.8), (16, 5.8), (40, 5.8)])
 def test_the_games_first_search_gets_lc0s_bonus(arguments, ply, bonus):
     board = board_at_ply(ply)
-    assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(bonus * Clock().limits(arguments, board, 800)[1])
+    assert plain_clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(bonus * plain_clock().limits(arguments, board, 800)[1])
+    #on top of the first searches' own larger share
+    assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx((bonus - 1 + EARLY_SHARE) * plain_clock().limits(arguments, board, 800)[1])
 
 #the bonus goes to the first search on the clock only; what it leaves unused is banked as any search's
 def test_the_first_search_bonus_is_given_once_and_banked():
-    clock, board = Clock(**LC0_FIRST_MOVE), board_at_ply(16)
+    clock, board = plain_clock(**LC0_FIRST_MOVE), board_at_ply(16)
     clock.limits("movetime 1000".split(), board, 800)
     clock.searched(0.98, 0)
     _, first = clock.limits(CLOCK_60, board, 800)
-    plain = Clock()
+    plain = plain_clock()
     _, plain_first = plain.limits(CLOCK_60, board, 800)
     assert first == pytest.approx(5.8 * plain_first) and clock.saved == 0
     assert clock.extension == (0, pytest.approx(MOST_EXTENSION * plain.share))
@@ -1045,7 +1073,7 @@ def test_the_first_search_bonus_is_given_once_and_banked():
 
 def test_the_first_search_bonus_keeps_to_the_reserve_and_the_time_left():
     board, arguments = board_at_ply(16), "wtime 3000 btime 60000 winc 1000 binc 1000".split()
-    assert Clock().limits(arguments, board, 800)[1] < 1.1
+    assert plain_clock().limits(arguments, board, 800)[1] < 1.1
     assert Clock(**LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(3 - MOVE_OVERHEAD_SECONDS - RESERVE_SECONDS)
     assert Clock(reserve_seconds=0.0, **LC0_FIRST_MOVE).limits(arguments, board, 800)[1] == pytest.approx(3 - MOVE_OVERHEAD_SECONDS)
 
@@ -1357,7 +1385,7 @@ def test_the_engine_takes_lc0s_time_options(monkeypatch):
     options = ["--first-move-bonus", "1.8", "--book-ply-bonus", "0.25", "--smart-pruning-factor", "1.33"]
     run_uci_main(monkeypatch, *options, stdin="\n".join(script))
 
-    first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
+    first = pytest.approx(Clock(**LC0_FIRST_MOVE).limits(CLOCK_60, chess.Board(), 800)[1])
     assert given[0] == (first, 1.33) and given[1][0] != first and given[2] == given[0]
     with pytest.raises(SystemExit) as refused:
         run_uci_main(monkeypatch, "--smart-pruning-factor", "0")
@@ -1374,7 +1402,8 @@ def test_the_engine_keeps_to_gos_limits(model_path):
         seconds = time.perf_counter() - started
         other = chess.Board(MATE_IN_ONE)
         counted = engine.play(other, chess.engine.Limit(nodes=50), info=chess.engine.INFO_BASIC)
-        #a game of its own ("clock", so ucinewgame), a 10+0.1 clock: ~0.27 s for the first move, ~1 s for a 9 man endgame
+        #a game of its own ("clock", so ucinewgame), a 10+0.1 clock: ~0.4 s for the first move, ~1.4 s for a 9 man endgame (the game's
+        #first searches, at one and a half times their share)
         clock = chess.engine.Limit(white_clock=10, black_clock=10, white_inc=0.1, black_inc=0.1)
         started = time.perf_counter()
         engine.play(board, clock, game="clock")
@@ -1387,7 +1416,7 @@ def test_the_engine_keeps_to_gos_limits(model_path):
 
     assert timed.move in board.legal_moves and timed.info["nodes"] > 10 and 0.3 < seconds < 0.5 + 0.1
     assert counted.info["nodes"] == 50
-    assert first_move < 0.5 and 0.8 < endgame_move < 1.3
+    assert first_move < 0.9 and 1.2 < endgame_move < 1.8
 
 #the report (id, line, score, root moves, visits) of Searches' search of board, one leaf a round
 def searched(searches: selfplay_rs.Searches, board: chess.Board, simulations: int, evaluate, search_id: int = 0):
@@ -1884,7 +1913,7 @@ def test_the_competition_options_reach_the_search(monkeypatch):
     (loaded, _, options), (loaded_again, _, options_again) = built
     assert (loaded[2], loaded[5]) == (32, [0, 1, 2]) and (loaded_again[2], loaded_again[5]) == (16, [0, 1, 2])
     assert options["smart_pruning"] is False and options["settings"] == {"c_puct": 0.7, "fpu_reduction": 0.3} and options_again == options
-    first = pytest.approx(2.8 * Clock().limits(CLOCK_60, chess.Board(), 800)[1])
+    first = pytest.approx(Clock(first_move_bonus=1.8).limits(CLOCK_60, chess.Board(), 800)[1])
     assert [seconds for _, _, seconds, _ in searches] == [first, first]
     told = [line for line in sent if line.startswith("info string")]
     assert len(told) == 3 and "device 7" in told[0] and "nope" in told[1] and "BookPlyBonus" in told[2]

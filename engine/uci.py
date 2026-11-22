@@ -116,6 +116,13 @@ MOST_OF_THE_TIME_LEFT_EXTENDED = 1 / 3
 FIRST_MOVE_BONUS = 0.0
 BOOK_PLY_BONUS = 0.0
 MOST_BOOK_PLIES = 12
+#the game's first searches get EARLY_SHARE times their share. At the CCC (3+2) the engine had spent 48 s by its tenth move after the book
+#where Leela had spent 75 and the alpha-beta engines 90; of its six clear mistakes there a search twice as long avoided three and one
+#four times as long five. Twice the share spent 90 s by the tenth move and left 46 s after the thirtieth where Leela keeps 58 to 91: in
+#the games played again with it the engine held worse positions to move 45 and then lost them to single moves made on the increment. With
+#1.5 its games against Leela, played again on paper, spend 72 s by the tenth move and keep 91 s after the twentieth and 56 after the
+#thirtieth, which is Leela's own use of the clock there
+EARLY_SEARCHES, EARLY_SHARE = 10, 1.5
 
 #depth and mate are read only to flag a value that is not whole; the search ignores them, as searchmoves
 def go_numbers(arguments: list[str]) -> tuple[dict[str, int], list[str]]:
@@ -189,11 +196,12 @@ def info_line(report: SearchReport, seconds: float) -> str:
 class Clock:
     def __init__(self, moves_per_man: float = MOVES_PER_MAN, least_moves_left: int = LEAST_MOVES_LEFT, reserve_seconds: float = RESERVE_SECONDS,
                  first_move_bonus: float = FIRST_MOVE_BONUS, book_ply_bonus: float = BOOK_PLY_BONUS,
-                 move_overhead_seconds: float = MOVE_OVERHEAD_SECONDS):
+                 move_overhead_seconds: float = MOVE_OVERHEAD_SECONDS, early_searches: int = EARLY_SEARCHES, early_share: float = EARLY_SHARE):
         self.moves_per_man, self.least_moves_left, self.reserve_seconds = moves_per_man, least_moves_left, reserve_seconds
         self.first_move_bonus, self.book_ply_bonus = first_move_bonus, book_ply_bonus
         self.move_overhead_seconds = move_overhead_seconds
-        self.first_search = True
+        self.early_searches, self.early_share = early_searches, early_share
+        self.searches = 0 #those on the clock so far in this game
         self.saved = 0.0 #the bank: seconds given to earlier searches and not used
         self.allotted: float | None = None
         self.share = 0.0 #the move's share of the time left, increment included
@@ -210,10 +218,10 @@ class Clock:
             seconds = max(0.0, numbers["movetime"] / 1000 - self.move_overhead_seconds)
         elif time_left in numbers:
             seconds_left = numbers[time_left] / 1000 - self.move_overhead_seconds
-            bonus = 1.0
-            if self.first_search:
+            bonus = self.early_share if self.searches < self.early_searches else 1.0
+            if self.searches == 0:
                 bonus += self.first_move_bonus + self.book_ply_bonus * min(MOST_BOOK_PLIES, board.ply())
-                self.first_search = False
+            self.searches += 1
             seconds = self.allotted = self.seconds_for_move(seconds_left, numbers.get(increment, 0) / 1000, numbers.get("movestogo"),
                                                             chess.popcount(board.occupied), bonus)
             if self.last_score is not None:
