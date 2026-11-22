@@ -65,8 +65,8 @@ impl SharedTree {
         [
             (self.nodes.len() * NODE_BYTES, self.nodes.used() * NODE_BYTES),
             (self.edges.len() * EDGE_BYTES, self.edges.taken() * EDGE_BYTES),
-            (self.links.len() * self.links.link_bytes(), self.links.used() * self.links.link_bytes()),
-            (self.links.slots() * self.links.slot_bytes(), self.links.slots_taken() * self.links.slot_bytes()),
+            (self.links.len() * LINK_BYTES, self.links.used() * LINK_BYTES),
+            (self.links.slots() * SLOT_BYTES, self.links.slots_taken() * SLOT_BYTES),
         ]
     }
 
@@ -96,9 +96,6 @@ impl SharedTree {
         assert_eq!(freed.len(), freed_nodes.len(), "a node given back twice");
         let mut counts: HashMap<usize, u32> = HashMap::from([(self.root, 1)]);
         let (mut links, mut edge_runs, mut slot_runs) = (HashSet::new(), Vec::new(), Vec::new());
-        //with move_means the visits a move's link or slot counts are those its word holds with its mean
-        let visits = |link: u32| self.links.visits(link).load(Ordering::Relaxed);
-        let counted_alike = |link: u32| !self.move_means() || self.links.mean(link).load().0 == visits(link);
         let alive: Vec<usize> = (0..self.nodes.len()).filter(|&id| !freed.contains(&(id as u32))).collect();
         assert!(!freed.contains(&(self.root as u32)), "the root was freed");
         for &id in &alive {
@@ -115,8 +112,9 @@ impl SharedTree {
                 head.is_sorted_by(|before, after| before >= after) && tail.is_sorted_by(|before, after| before >= after),
                 "the priors of node {id}"
             );
+            //the moves that link_known_moves gave nodes are any of the node's
             let places: Vec<usize> = self.links.linked(node).map(|(place, _)| place).collect();
-            assert!(first_of_head_and_tail(&places), "node {id}'s moves with a node are {places:?}");
+            assert!(node.known_passes() > 0 || first_of_head_and_tail(&places), "node {id}'s moves with a node are {places:?}");
             match node.children() {
                 Children::List(mut link) => {
                     while link != NO_LINK {
@@ -128,7 +126,6 @@ impl SharedTree {
             }
             for (_, link) in self.links.linked(node) {
                 let child = self.links.child(link) as usize;
-                assert!(counted_alike(link), "node {id}: a move's visits and those its mean is for");
                 assert!(!freed.contains(&(child as u32)), "node {id} has the freed node {child} as a child");
                 *counts.entry(child).or_default() += 1;
             }
@@ -179,21 +176,22 @@ impl SharedTree {
     //the same tree in the same arenas: every node, edge, link and slot alike, and the table's entries; for trees no thread works in
     pub fn assert_same_arenas(&self, other: &SharedTree) {
         assert_eq!((self.root, &self.keys, self.is_full()), (other.root, &other.keys, other.is_full()), "the root, game or fullness");
-        assert_eq!(self.move_means(), other.move_means(), "one tree with move means and the other without");
+        assert_eq!(self.graph.is_some(), other.graph.is_some(), "one tree with transpositions and the other without");
         assert_eq!((self.arena_bytes(), self.in_use()), (other.arena_bytes(), other.in_use()), "the arenas");
         let children = |node: &Node| match node.children() {
             Children::List(head) => (false, head),
             Children::Solid(first) => (true, first),
         };
-        //a move's visits and the bits of the mean it holds
+        //all that a move holds, its mean by its bits
         let count = |tree: &SharedTree, link: u32| {
-            let (visits, mean) = tree.links.count(link);
-            (visits, mean.to_bits())
+            let record = tree.links.record(link);
+            (record.visits, record.mean.to_bits(), record.state)
         };
         let numbers = |node: &Node| {
             let proof = node.proof().map(|proof| (proof.outcome, proof.value.to_bits(), proof.plies));
             let sums = (node.value_sum().to_bits(), node.visited_policy_sqrt().to_bits());
-            (node.counts(), sums, node.edges(), proof, node.key(), node.halfmoves(), node.references(), node.refreshes(), children(node))
+            let (known, names) = ((node.known_passes(), node.known_to()), (node.references(), children(node)));
+            (node.counts(), sums, node.edges(), proof, known, node.key(), node.halfmoves(), node.refreshes(), names)
         };
         for id in 0..self.nodes.len() {
             let (node, other_node) = (self.nodes.get(id), other.nodes.get(id));
@@ -203,16 +201,13 @@ impl SharedTree {
                 Children::List(mut link) => {
                     while link != NO_LINK {
                         let (one, another) = (self.links.get(link), other.links.get(link));
-                        let numbers = |link: &Link| (link.child(), link.place(), link.next());
+                        let numbers = |link: &Link| (link.place(), link.next());
                         assert_eq!((numbers(one), count(self, link)), (numbers(another), count(other, link)), "link {link}");
                         link = one.next();
                     }
                 }
                 Children::Solid(first) => {
-                    let slots = |tree: &SharedTree| -> Vec<(u32, (u32, u32))> {
-                        let slots = tree.links.solid_slots(first, node.edges().len());
-                        slots.iter().zip(first..).map(|(slot, link)| (slot.child(), count(tree, link))).collect()
-                    };
+                    let slots = |tree: &SharedTree| -> Vec<_> { (first..).take(node.edges().len()).map(|link| count(tree, link)).collect() };
                     assert_eq!(slots(self), slots(other), "node {id}'s slots");
                 }
             }
@@ -248,14 +243,16 @@ impl SharedTree {
                 edges_at: if edges.is_empty() { 0 } else { (moves.len() as u64) << 8 | edges.len() as u64 },
                 proof: node.proof().filter(|_| number > 0),
                 children: NO_LINK,
+                known_passes: node.known_passes() as u8,
+                known_to: node.known_to() as u8,
             };
             for edge in edges.clone() {
                 moves.push(self.edges.chess_move(edge));
                 priors.push(self.edges.prior(edges.clone(), edge));
             }
             let children = self.links.linked(node).map(|(place, link)| {
-                let (visits, mean) = self.links.count(link);
-                (place, numbers[&(self.links.child(link) as usize)], visits, mean)
+                let slot = slot_of(self.links.record(link));
+                (place, crate::search::Slot { child: numbers[&(slot.child as usize)], ..slot })
             });
             let solid = copy.solid_in_a_copy();
             link_up(&mut copy, &mut links, &mut slots, solid, children);
@@ -265,7 +262,7 @@ impl SharedTree {
         }
         let graph = self.graph.as_ref().map(|_| {
             let table = node_keys.iter().zip(&halfmoves).enumerate().map(|(number, (&key, &count))| (graph_key(key, u32::from(count)), number as u32));
-            Graph { table: table.collect(), halfmoves, means: self.move_means() }
+            Graph { table: table.collect(), halfmoves }
         });
         Tree {
             board: self.board.clone(),

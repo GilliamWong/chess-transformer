@@ -152,7 +152,6 @@ impl SelfPlayGames {
                     value_sharpness: 1.0,
                     certainty: false,
                     transpositions: false,
-                    move_means: false,
                 },
                 simulations,
                 sampled_plies,
@@ -299,6 +298,8 @@ struct Search {
     simulations: u32,
     stopped: bool,
     tree: Tree,
+    //the leaves the search has sent to the network: not those the cache answered, nor the simulations that needed none
+    evaluations: u64,
 }
 
 impl Search {
@@ -312,12 +313,13 @@ impl Search {
         let score = score_of(tree, Some(line[0]));
         let expected_line = line.iter().map(|&edge| uci(tree.chess_move(edge))).collect();
         let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(tree.root_index(), edge)));
-        (self.id, expected_line, score, root_moves.collect(), tree.root().visit_count)
+        (self.id, expected_line, score, root_moves.collect(), tree.root().visit_count, self.evaluations)
     }
 }
 
-//(id, expected line in uci, the chosen move's mean score, root moves by visits, the root's visits)
-type SearchReport = (u64, Vec<String>, f64, Vec<(String, u32)>, u32);
+//(id, expected line in uci, the chosen move's mean score, root moves by visits, the root's visits, the leaves the search sent
+//to the network)
+type SearchReport = (u64, Vec<String>, f64, Vec<(String, u32)>, u32, u64);
 
 //number is the round's id in the trees, name the one the caller gave it; leaves are (search id, count) in board order
 struct RoundOut {
@@ -571,6 +573,7 @@ impl Searches {
                 memory_limit: self.memory_limit,
             };
             let gathered = search.tree.gather(&limits, &self.settings, self.tables.as_deref(), state.cache.as_ref(), boards);
+            search.evaluations += u64::from(gathered);
             if gathered > 0 {
                 round_leaves.push((search.id, gathered));
             }
@@ -753,7 +756,7 @@ impl Searches {
     #[new]
     #[pyo3(signature = (*, move_id_table, answer_width, c_puct, c_puct_factor, c_puct_base, fpu_reduction, draw,
                         tablebase_folder, tablebase_pieces, tree_reuse=false, cache_positions=0, value_sharpness=1.0, certainty=false,
-                        memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false, move_means=false,
+                        memory_limit_mb=0, advance_threads=4, gc_threads=2, concurrent_descents=false, transpositions=false,
                         gather_helpers=0, helper_threads=0, helper_cpus=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -775,16 +778,12 @@ impl Searches {
         gc_threads: usize,
         concurrent_descents: bool,
         transpositions: bool,
-        move_means: bool,
         gather_helpers: usize,
         helper_threads: usize,
         helper_cpus: Option<Vec<usize>>,
     ) -> PyResult<Searches> {
         if (gather_helpers > 0 || helper_threads > 0) && !concurrent_descents {
             return Err(PyValueError::new_err("helpers join a gather in the tree of concurrent descents only"));
-        }
-        if move_means && !transpositions {
-            return Err(PyValueError::new_err("move_means is a rule for the moves of a tree with transpositions"));
         }
         if value_sharpness <= 0.0 {
             return Err(PyValueError::new_err(format!(
@@ -801,7 +800,6 @@ impl Searches {
                 value_sharpness,
                 certainty,
                 transpositions,
-                move_means,
             },
             move_ids: move_ids(move_id_table)?,
             answer_width,
@@ -848,10 +846,8 @@ impl Searches {
             }
             let tree = self
                 .reused_tree(&mut state, id, fen, &moves)
-                .unwrap_or_else(|| {
-                    Tree::new(board, keys).with_transpositions(self.settings.transpositions).with_move_means(self.settings.move_means)
-                });
-            state.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
+                .unwrap_or_else(|| Tree::new(board, keys).with_transpositions(self.settings.transpositions));
+            state.searches.push(Search { id, fen: fen.to_string(), moves, simulations, stopped: false, tree, evaluations: 0 });
             Ok(())
         })
     }

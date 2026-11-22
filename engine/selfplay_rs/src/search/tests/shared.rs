@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant};
 
 const KING_AND_QUEEN: &str = "8/8/8/4k3/8/8/8/4K2Q w - - 0 1";
+const KINGS_AND_A_BLOCKED_PAWN: &str = "4k3/8/8/3p4/3P4/8/8/4K3 w - - 0 1";
 const KING_AND_ROOK: &str = "8/8/8/4k3/8/8/8/4K2R w - - 0 1";
 const CORNERED_KING: &str = "7k/8/5K2/8/8/8/8/6Q1 w - - 0 1";
 const POSITIONS: [(&str, &[&str]); 5] = [(START, OPENING), (ROOKS, &[]), (LOCKED_PAWNS, &[]), (MATE_IN_TWO, &[]), (KING_AND_ROOK, &[])];
@@ -390,7 +391,7 @@ fn search_each_position_on_threads(base: SearchSettings, mut check: impl FnMut(&
             let settings = SearchSettings { certainty, ..base };
             for threads in [2, 4, 8, 24] {
                 for in_flight in [1, 3] {
-                    let tree = shared_tree_after(fen, moves).with_transpositions(base.transpositions).with_move_means(base.move_means);
+                    let tree = shared_tree_for(fen, moves, &settings);
                     search_on_threads(&tree, threads, 3_000, in_flight, 16, &settings, &SharedNetwork::new(), usize::MAX);
                     assert_eq!(tree.pending(), 0);
                     let visits = tree.root().visits();
@@ -475,13 +476,13 @@ fn a_search_under_a_memory_limit_gives_back_every_reservation() {
     }
 }
 
-//with move_means a move's word is among the bytes a tree counts, 8 more a link: a search ends within its memory limit, on one
+//a graph's move's word is among the bytes a tree counts, 8 more a link: a search ends within its memory limit, on one
 //thread and on many, and its sums are whole
 #[test]
-fn with_move_means_a_search_ends_within_its_memory_limit() {
-    let (memory_limit, settings) = (4_000_000, graph_settings(true, true));
+fn a_graphs_search_ends_within_its_memory_limit() {
+    let (memory_limit, settings) = (4_000_000, graph_settings(true));
     for threads in [1, 8] {
-        let tree = graph_shared_tree_after(START, &[], true);
+        let tree = graph_shared_tree_after(START, &[]);
         search_on_threads(&tree, threads, 1_000_000, 2, 64, &settings, &SharedNetwork::new(), memory_limit);
         assert!(tree.is_full() && tree.pending() == 0 && tree.allocated_bytes() <= memory_limit, "{} bytes", tree.allocated_bytes());
         assert_eq!(tree.reserved_bytes(), 0, "{threads} threads");
@@ -649,29 +650,27 @@ fn moving_the_root_then_draining_leaves_the_tree_a_compacted_one_is() {
 fn moving_the_root_of_a_tree_with_transpositions_then_draining_leaves_the_tree_a_compacted_one_is() {
     let tables = tables();
     let mut lines = 0;
-    for move_means in GRAPHS {
-        for (fen, moves, simulations, certainty, tables) in cases(&tables) {
-            let settings = graph_settings(certainty, move_means);
-            let mut tree = graph_tree_after(fen, moves, move_means);
-            search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
-            for line in reusable_lines(&tree) {
-                let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
-                let mut old = copied(&tree);
-                old.play_line(&line);
-                old.drop_stale_leaves(&settings, tables);
+    for (fen, moves, simulations, certainty, tables) in cases(&tables) {
+        let settings = graph_settings(certainty);
+        let mut tree = tree_for(fen, moves, &settings);
+        search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
+        for line in reusable_lines(&tree) {
+            let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+            let mut old = copied(&tree);
+            old.play_line(&line);
+            old.drop_stale_leaves(&settings, tables);
 
-                //a graph is not copied by from_tree: the search is made again, as the tree's was
-                let mut shared = graph_shared_tree_after(fen, moves, move_means);
-                shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
-                assert_same_trees(&tree, &shared.to_tree());
-                shared.move_root(&edges_of(&shared, &line_moves));
-                shared.drop_stale_leaves(&settings, tables);
-                assert_moved_as_compacted(&old, shared);
-                lines += 1;
-            }
+            //a graph is not copied by from_tree: the search is made again, as the tree's was
+            let mut shared = shared_tree_as_tree(fen, moves, &settings);
+            shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
+            assert_same_trees(&tree, &shared.to_tree());
+            shared.move_root(&edges_of(&shared, &line_moves));
+            shared.drop_stale_leaves(&settings, tables);
+            assert_moved_as_compacted(&old, shared);
+            lines += 1;
         }
     }
-    assert!(lines >= 30, "{lines} lines");
+    assert!(lines >= 15, "{lines} lines");
 }
 
 //a proof hides the leaves below it from the stale walk unless it is the new root
@@ -816,21 +815,33 @@ fn a_thread_that_wants_the_tree_to_itself_waits_for_a_descent_not_a_call() {
     assert!(gave_way > 0 && a_fraction(wait, call), "waits and calls {tries:?}, gave way {gave_way} times");
 }
 
-//transpositions, with or without move_means
-const GRAPHS: [bool; 2] = [false, true];
-//(transpositions, move_means)
-const TREES_AND_GRAPHS: [(bool, bool); 3] = [(false, false), (true, false), (true, true)];
-
-fn graph_settings(certainty: bool, move_means: bool) -> SearchSettings {
-    SearchSettings { transpositions: true, move_means, ..settings(certainty) }
+fn graph_settings(certainty: bool) -> SearchSettings {
+    SearchSettings { transpositions: true, ..settings(certainty) }
 }
 
-fn graph_tree_after(fen: &str, moves: &[&str], move_means: bool) -> Tree {
-    tree_after(fen, moves).with_transpositions(true).with_move_means(move_means)
+//a Tree for the settings
+fn tree_for(fen: &str, moves: &[&str], settings: &SearchSettings) -> Tree {
+    tree_after(fen, moves).with_transpositions(settings.transpositions)
 }
 
-fn graph_shared_tree_after(fen: &str, moves: &[&str], move_means: bool) -> SharedTree {
-    shared_tree_after(fen, moves).with_transpositions(true).with_move_means(move_means)
+//a SharedTree for the settings whose lists are made solid early and in batches (shared_tree_after): small trees with many solid nodes
+fn shared_tree_for(fen: &str, moves: &[&str], settings: &SearchSettings) -> SharedTree {
+    shared_tree_after(fen, moves).with_transpositions(settings.transpositions)
+}
+
+//a SharedTree for the settings to hold against a Tree. With transpositions a solid node's moves take their positions' nodes
+//(Tree's link_known_moves), so its lists are made solid when Tree's are: at SOLID_TREE_THRESHOLD visits, before the next descent
+fn shared_tree_as_tree(fen: &str, moves: &[&str], settings: &SearchSettings) -> SharedTree {
+    let tree = shared_tree_for(fen, moves, settings);
+    if settings.transpositions { tree.with_solid_links(SOLID_TREE_THRESHOLD, 1) } else { tree }
+}
+
+fn graph_tree_after(fen: &str, moves: &[&str]) -> Tree {
+    tree_for(fen, moves, &graph_settings(false))
+}
+
+fn graph_shared_tree_after(fen: &str, moves: &[&str]) -> SharedTree {
+    shared_tree_as_tree(fen, moves, &graph_settings(false))
 }
 
 fn check_graph(tree: &Tree) -> usize {
@@ -852,18 +863,21 @@ fn check_graph(tree: &Tree) -> usize {
             let child = tree.link_child(link);
             moves += tree.move_visits(link);
             incoming[child as usize] += 1;
+            //what selection reads of the move in its node's place
+            let (slot, proof) = (tree.slot(link), tree.nodes[child as usize].proof);
+            assert_eq!(slot.pending, 0, "a move with simulations waiting through it after the search");
+            assert!(slot.visits == 0 || slot.mean != NO_MEAN, "a visited move that holds no mean");
+            assert!(!slot.lost || proof.is_some_and(|proof| proof.outcome == Outcome::Loss), "a move that holds an unproven node as lost");
+            let filter = repeat_filter(tree.node_keys[child as usize], graph.halfmoves[child as usize]);
+            assert_eq!(slot.repeats, filter, "a move's filter of its node's repeats");
             if !std::mem::replace(&mut seen[child as usize], true) {
                 order.push(child as usize);
             }
         }
         //a root's proof is dropped: the visits it stopped with belong to no move
         if node.has_edges() && node.proof.is_none() && id != tree.root_index() {
-            //with move_means a path's repeat that ends at the node is its visit too
-            if tree.move_means() {
-                assert!(node.visit_count > moves, "visits of an unproven node: its evaluation's, its repeats' and its moves'");
-            } else {
-                assert_eq!(node.visit_count, 1 + moves, "visits of an unproven node and its moves'");
-            }
+            //a path's repeat that ends at the node is its visit too
+            assert!(node.visit_count > moves, "visits of an unproven node: its evaluation's, its repeats' and its moves'");
         }
         if node.visit_count > 0 {
             let mean = node.mean_score();
@@ -877,42 +891,47 @@ fn check_graph(tree: &Tree) -> usize {
     incoming.iter().filter(|&&moves| moves > 1).count()
 }
 
-//a search with transpositions on one thread against Tree's: the same rounds' boards and the same tree, number for number (the
-//means its moves hold too). Returns the nodes that several moves lead to
-fn one_thread_searches_a_graph_as_tree_does(move_means: bool, draw: f64) -> usize {
+//a search with transpositions on one thread against Tree's, with `base`'s settings: the same rounds' boards and the same tree,
+//number for number (the means its moves hold too), and as many evaluations as boards. Returns the nodes that several moves lead
+//to, the moves a solid node's passes gave their position's node, and the nodes that have had more than one pass
+fn one_thread_searches_a_graph_as_tree_does(base: SearchSettings) -> (usize, usize, usize) {
     let tables = tables();
-    let mut shared = 0;
-    for (fen, moves, simulations, certainty, tables) in cases(&tables) {
-        let settings = SearchSettings { draw, ..graph_settings(certainty, move_means) };
+    let (mut shared, mut known, mut passed_again) = (0, 0, 0);
+    //the kings and the blocked pawn as well, the smallest position in which selection came to weigh a move that a solid node's
+    //pass gave a node behind one without, and the queen ending, whose nodes come to their later passes
+    let more = [(KINGS_AND_A_BLOCKED_PAWN, &[][..], 2_000, false, None), (QUEEN_AND_PAWN, &[][..], 3_000, false, None)];
+    for (fen, moves, simulations, certainty, tables) in cases(&tables).into_iter().chain(more) {
+        let settings = SearchSettings { certainty, ..base };
         for in_flight in [1, 2, 3] {
-            let mut old = graph_tree_after(fen, moves, move_means);
+            let mut old = tree_for(fen, moves, &settings);
             let old_rounds =
                 search_in_flight(&mut old, simulations, in_flight, &settings, &mut Network::new(), gather_with(&settings, tables));
-            let new = graph_shared_tree_after(fen, moves, move_means);
+            let new = shared_tree_as_tree(fen, moves, &settings);
             let new_rounds = shared_in_flight(&new, simulations, in_flight, &settings, tables, &SharedNetwork::new(), usize::MAX);
-            assert!(old_rounds == new_rounds, "{fen}, {in_flight} in flight, move means {move_means}: the rounds' boards");
+            assert!(old_rounds == new_rounds, "{fen}, {in_flight} in flight: the rounds' boards");
             assert_eq!(new.counts.orphans.load(Ordering::Relaxed), 0);
+            let boards: usize = new_rounds.iter().map(|boards| boards.len() / TOKENS_PER_BOARD).sum();
+            assert_eq!(new.evaluations(), boards as u64, "the leaves sent to the network");
             //the move choice too, whose ties a node's own mean breaks
             let new_line: Vec<PackedMove> = new.principal_variation().into_iter().map(|edge| new.chess_move(edge)).collect();
             let old_line: Vec<PackedMove> = old.principal_variation().into_iter().map(|edge| old.chess_move(edge)).collect();
             assert_eq!(new_line, old_line);
             assert_same_trees(&old, &new.to_tree());
             shared += check_graph(&old);
+            known += known_before_visited(&old);
+            passed_again += old.nodes.iter().filter(|node| node.known_passes > 1).count();
         }
     }
-    shared
+    (shared, known, passed_again)
 }
 
+//a draw of 0.35 as well: a repeat's visit is scored for the side that moved, which a draw of 0.5 does not tell from the other's.
+//The searches are long enough for solid nodes, whose moves take the nodes their positions have, in more than one pass
 #[test]
 fn one_thread_with_transpositions_searches_as_tree_does() {
-    assert!(one_thread_searches_a_graph_as_tree_does(false, 0.5) > 0, "no node shared by two moves");
-}
-
-//a draw of 0.35 as well: a repeat's visit is scored for the side that moved, which a draw of 0.5 does not tell from the other's
-#[test]
-fn one_thread_with_move_means_searches_as_tree_does() {
     for draw in [0.5, 0.35] {
-        assert!(one_thread_searches_a_graph_as_tree_does(true, draw) > 0, "no node shared by two moves");
+        let found = one_thread_searches_a_graph_as_tree_does(SearchSettings { draw, ..graph_settings(false) });
+        assert!(found.0 > 0 && found.1 > 0 && found.2 > 0, "(nodes shared, moves given a node, nodes of several passes): {found:?}");
     }
 }
 
@@ -944,7 +963,7 @@ fn graph_line(tree: &mut Tree, line: &[&str], favoured: &[&str]) -> (Vec<usize>,
 //two move orders to one position, whose node is proven by the first line's descent only: the second line's node before it has a winning
 //move to it, and is not proven. Returns the tree and the second line's nodes
 fn proven_after_the_first_of_two_lines() -> (Tree, Vec<usize>) {
-    let mut tree = graph_tree_after(START, &[], false);
+    let mut tree = graph_tree_after(START, &[]);
     let (second, second_links) = graph_line(&mut tree, &SECOND_LINE, &SECOND_LINE);
     let (first, first_links) = graph_line(&mut tree, &FIRST_LINE, &FIRST_LINE);
     assert_eq!(first[3], second[3], "one node for the position");
@@ -952,7 +971,8 @@ fn proven_after_the_first_of_two_lines() -> (Tree, Vec<usize>) {
         for (depth, (&node, &link)) in nodes[1..].iter().zip(links).enumerate() {
             let visits = [3, 2, 1][depth] + extra;
             (tree.nodes[node].visit_count, tree.nodes[node].value_sum) = (visits, f64::from(visits) / 2.0);
-            *tree.link_visits(link) = visits;
+            //the move's own visits, at its node's mean
+            (tree.slot_mut(link).visits, tree.slot_mut(link).mean) = (visits, 0.5);
         }
     }
     (tree.nodes[0].visit_count, tree.nodes[0].value_sum) = (20, 10.0);
@@ -965,9 +985,88 @@ fn one_round(visit_limit: u32) -> Round {
     Round { id: 0, leaves: 1, simulations: 1, collisions: 1, visit_limit, memory_limit: usize::MAX }
 }
 
+//the moves that hold their node as a proven loss
+fn lost_moves(tree: &Tree) -> usize {
+    (0..tree.nodes.len()).map(|node| tree.linked(node).filter(|&(_, link)| tree.slot(link).lost).count()).sum()
+}
+
+//two move orders to one position, whose node the first line proves a loss for the side that moves into it. The first line's move
+//has learnt so; the second line's learns when a descent meets the node through it: until then selection picks it by the mean it
+//holds, and from then on passes it over. A SharedTree's descent leaves the Tree's tree
+#[test]
+fn a_move_learns_of_a_proven_loss_when_a_descent_meets_its_node() {
+    let settings = graph_settings(true);
+    let mut tree = graph_tree_after(START, &[]);
+    let (second, second_links) = graph_line(&mut tree, &SECOND_LINE, &SECOND_LINE);
+    let (first, first_links) = graph_line(&mut tree, &FIRST_LINE, &FIRST_LINE);
+    for (nodes, links, extra) in [(&first, &first_links, 0), (&second, &second_links, 1)] {
+        for (depth, (&node, &link)) in nodes[1..].iter().zip(links).enumerate() {
+            let visits = [3, 2, 1][depth] + extra;
+            (tree.nodes[node].visit_count, tree.nodes[node].value_sum) = (visits, f64::from(visits) / 2.0);
+            (tree.slot_mut(link).visits, tree.slot_mut(link).mean) = (visits, 0.5);
+        }
+    }
+    (tree.nodes[0].visit_count, tree.nodes[0].value_sum) = (20, 10.0);
+    tree.prove(&first, Proof { outcome: Outcome::Loss, value: 0.0, plies: 2 });
+    let first_edges: Vec<usize> = first_links.iter().map(|&link| link as usize).collect();
+    tree.learn_proofs(&first, &first_edges);
+    let (parent, to_the_loss) = (second[2], second_links[2]);
+    assert!(tree.slot(first_links[2]).lost && !tree.slot(to_the_loss).lost, "the move that met the proof holds it, the other not yet");
+    let losing = tree.nodes[parent].edges().find(|&edge| tree.link_of(parent, edge) == to_the_loss).expect("the move's edge");
+    assert_eq!(tree.select_edge(parent, &settings, None).0, losing, "a move that has not learnt of the loss is picked by its mean");
+    let shared = SharedTree::from_tree(&tree);
+
+    assert_eq!(tree.gather(&one_round(1_000), &settings, None, None, &mut Vec::new()), 0);
+    assert!(tree.slot(to_the_loss).lost, "the descent met the proven node through the move");
+    assert_ne!(tree.select_edge(parent, &settings, None).0, losing, "a move that holds its node as lost is passed over");
+    assert!(shared.gather(&one_round(1_000), &settings, None, None, &mut Vec::new()).is_empty());
+    assert_same_trees(&tree, &shared.to_tree());
+}
+
+//while leaves wait for the network, every move counts the simulations that wait through it, as every node does: selection weighs
+//a move by its own count. The counts are the waiting leaves' paths' (a round's collisions are taken off when its gather ends),
+//the same in both trees, and none is left once the leaves are finished
+#[test]
+fn a_move_counts_the_simulations_that_wait_through_it() {
+    let settings = graph_settings(false);
+    let (mut old, mut network) = (graph_tree_after(START, OPENING), Network::new());
+    search_in_flight(&mut old, 3_000, 1, &settings, &mut network, gather_with(&settings, None));
+    let (new, new_network) = (graph_shared_tree_after(START, OPENING), SharedNetwork::new());
+    shared_in_flight(&new, 3_000, 1, &settings, None, &new_network, usize::MAX);
+    let round = Round { id: 1 << 40, leaves: 24, simulations: 1_000, collisions: 8, visit_limit: u32::MAX, memory_limit: usize::MAX };
+    let (mut old_boards, mut new_boards) = (Vec::new(), Vec::new());
+    let waiting = old.gather(&round, &settings, None, Some(&network.cache), &mut old_boards);
+    let leaves = new.gather(&round, &settings, None, Some(&new_network.cache), &mut new_boards);
+    assert!(waiting >= 8 && old_boards == new_boards, "{waiting} leaves wait");
+    new.queue(round.id, leaves);
+    assert_same_trees(&old, &new.to_tree());
+    //each waiting leaf's path, as its nodes and the places of the moves between them
+    let mut through = vec![HashMap::<usize, u16>::new(); old.nodes.len()];
+    for leaf in old.pending.iter().flat_map(|(_, leaves)| leaves) {
+        for (&node, &link) in leaf.path.iter().zip(&leaf.edges) {
+            let link = old.current_link(node, link as u32);
+            let place = old.linked(node).find(|&(_, named)| named == link).expect("the path's move").0;
+            *through[node].entry(place).or_default() += 1;
+        }
+    }
+    let mut shared_paths = 0;
+    for node in 0..old.nodes.len() {
+        for (place, link) in old.linked(node) {
+            let expected = through[node].get(&place).copied().unwrap_or(0);
+            assert_eq!(old.slot(link).pending, expected, "node {node}'s move {place}");
+            shared_paths += usize::from(expected > 1);
+        }
+    }
+    assert!(shared_paths > 0, "no move with two leaves waiting through it");
+    finish_leaves(&mut old, round.id, &old_boards, &settings, &mut network);
+    finish_round(&new, round.id, &new_boards, &settings, &new_network);
+    assert_same_trees(&old, &new.to_tree());
+    check_graph(&old);
+}
+
 #[test]
 fn a_descent_to_a_proven_node_proves_its_other_parents_in_a_graph() {
-    let settings = graph_settings(true, false);
+    let settings = graph_settings(true);
     let (mut tree, second) = proven_after_the_first_of_two_lines();
     let parent = second[2];
     assert!(tree.nodes[parent].proof.is_none() && tree.proof_from_moves(parent).is_some(), "a parent the proof has not reached");
@@ -1043,18 +1142,17 @@ const MATE_IN_TWO_AT_98: &str = "k7/8/2K5/8/8/8/8/7R w - - 98 80";
 
 #[test]
 fn the_proofs_in_a_graph_are_mates() {
-    let mut checked = 0;
-    for move_means in GRAPHS {
-        let settings = graph_settings(true, move_means);
-        for fen in [MATE_IN_TWO, MATE_IN_TWO_AT_97, MATE_IN_TWO_AT_98, CORNERED_KING, KING_AND_ROOK, ROOKS] {
-            let mut old = graph_tree_after(fen, &[], move_means);
-            search(&mut old, 3_000, usize::MAX, &settings, None, &mut Network::new());
-            let new = graph_shared_tree_after(fen, &[], move_means);
-            shared_in_flight(&new, 3_000, 2, &settings, None, &SharedNetwork::new(), usize::MAX);
-            checked += check_mates(&old) + check_mates(&new.to_tree());
-        }
+    let (mut checked, mut lost) = (0, 0);
+    let settings = graph_settings(true);
+    for fen in [MATE_IN_TWO, MATE_IN_TWO_AT_97, MATE_IN_TWO_AT_98, CORNERED_KING, KING_AND_ROOK, ROOKS] {
+        let mut old = tree_for(fen, &[], &settings);
+        search(&mut old, 3_000, usize::MAX, &settings, None, &mut Network::new());
+        let new = shared_tree_as_tree(fen, &[], &settings);
+        shared_in_flight(&new, 3_000, 2, &settings, None, &SharedNetwork::new(), usize::MAX);
+        checked += check_mates(&old) + check_mates(&new.to_tree());
+        lost += lost_moves(&old);
     }
-    assert!(checked > 40, "{checked} mates checked");
+    assert!(checked > 60 && lost > 0, "{checked} mates checked, {lost} moves that hold their node as lost");
 }
 
 #[test]
@@ -1077,37 +1175,45 @@ fn a_root_has_one_move_left_once_the_others_are_proven_lost() {
     }
 }
 
+//whatever the threads' order was: once the search is over the graph is whole (check_graph) and every node's sum is its own
+//visits' scores and its moves' visits at the means they hold, but for rounding. A draw of 0.35 tells a repeat's score from the
+//other side's. The trees' solid nodes give their moves the nodes their positions have: some moves hold a visited node before
+//their own first visit
 #[test]
-fn searches_with_transpositions_on_many_threads_leave_a_consistent_graph() {
-    let mut shared = 0;
-    search_each_position_on_threads(graph_settings(false, false), |tree, _| {
+fn searches_with_transpositions_on_many_threads_keep_every_nodes_sum() {
+    let (mut shared, mut known) = (0, 0);
+    search_each_position_on_threads(SearchSettings { draw: 0.35, ..graph_settings(false) }, |tree, settings| {
+        shared += check_after_search(tree, settings, false);
         let tree = tree.to_tree();
-        shared += check_graph(&tree);
         check_mates(&tree);
+        known += known_before_visited(&tree);
     });
-    assert!(shared > 0, "no node shared by two moves");
+    assert!(shared > 0 && known > 0, "{shared} nodes shared by two moves, {known} moves given their position's node");
 }
 
-//with move_means, whatever the threads' order was: once the search is over every node's sum is its own visits' scores and its
-//moves' visits at the means they hold, but for rounding. A draw of 0.35 tells a repeat's score from the other side's
-#[test]
-fn searches_with_move_means_on_many_threads_keep_every_nodes_sum() {
-    let mut shared = 0;
-    search_each_position_on_threads(SearchSettings { draw: 0.35, ..graph_settings(false, true) }, |tree, settings| {
-        shared += check_after_search(tree, settings, false);
-        check_mates(&tree.to_tree());
-    });
-    assert!(shared > 0, "no node shared by two moves");
+//the moves that a solid node's linking gave their position's node, that have had no visit of their own yet, and that stand
+//behind a move without a node of the head or of the tail, where selection's scan does not come: it looks at them apart
+fn known_before_visited(tree: &Tree) -> usize {
+    let behind = |id: usize| {
+        let (edges, with_node) = (tree.nodes[id].edges(), tree.linked(id).map(|(place, _)| place).collect::<Vec<_>>());
+        let heads = edges.len().min(HEAD_MOVES);
+        let first_without = |mut places: Range<usize>| places.find(|place| !with_node.contains(place)).unwrap_or(usize::MAX);
+        let (head_stop, tail_stop) = (first_without(0..heads), first_without(heads..edges.len()));
+        let known = |link: u32| tree.own_visits(link) == 0 && tree.nodes[tree.link_child(link) as usize].visit_count > 0;
+        let stop = |place: usize| if place < heads { head_stop } else { tail_stop };
+        tree.linked(id).filter(|&(place, link)| known(link) && place > stop(place)).count()
+    };
+    (0..tree.nodes.len()).filter(|&id| tree.nodes[id].known_passes > 0).map(behind).sum()
 }
 
 //a node proven while a leaf below it waits for the network counts the leaf's visit as its move's: its sum is then its visits at
 //the proven score written whole, as Tree's, whatever rounding the sum had gathered. A draw of 0.35, whose multiples are not exact
 #[test]
-fn with_move_means_a_proven_node_takes_its_moves_visit_as_tree_does() {
-    let settings = SearchSettings { draw: 0.35, ..graph_settings(true, true) };
-    let (mut old, mut network) = (graph_tree_after(START, OPENING, true), Network::new());
+fn a_graphs_proven_node_takes_its_moves_visit_as_tree_does() {
+    let settings = SearchSettings { draw: 0.35, ..graph_settings(true) };
+    let (mut old, mut network) = (graph_tree_after(START, OPENING), Network::new());
     search_in_flight(&mut old, 2_000, 1, &settings, &mut network, gather_with(&settings, None));
-    let (new, new_network) = (graph_shared_tree_after(START, OPENING, true), SharedNetwork::new());
+    let (new, new_network) = (graph_shared_tree_after(START, OPENING), SharedNetwork::new());
     shared_in_flight(&new, 2_000, 1, &settings, None, &new_network, usize::MAX);
     //one more leaf, left waiting
     let round = Round { id: 1 << 40, leaves: 1, simulations: 1_000, collisions: 0, visit_limit: u32::MAX, memory_limit: usize::MAX };
@@ -1131,13 +1237,13 @@ fn with_move_means_a_proven_node_takes_its_moves_visit_as_tree_does() {
     assert_same_trees(&old, &new.to_tree());
 }
 
-//with move_means a path's repeats may visit a node before it has moves, and past the visits of a solid node: its list, begun
+//with transpositions a path's repeats may visit a node before it has moves, and past the visits of a solid node: its list, begun
 //at its evaluation, is made solid then, as Tree::make_solid_once_visited does (the kings' walks repeat many positions)
 #[test]
-fn with_move_means_a_node_visited_before_it_had_moves_is_made_solid_once_it_has() {
-    let (settings, network) = (graph_settings(false, true), SharedNetwork::new());
+fn a_graphs_node_visited_before_it_had_moves_is_made_solid_once_it_has() {
+    let (settings, network) = (graph_settings(false), SharedNetwork::new());
     let start = tree_after(LOCKED_PAWNS, &[]);
-    let tree = SharedTree::new(start.board, start.keys).with_solid_links(8, 1).with_transpositions(true).with_move_means(true);
+    let tree = SharedTree::new(start.board, start.keys).with_solid_links(8, 1).with_transpositions(true);
     shared_in_flight(&tree, 6_000, 1, &settings, None, &network, usize::MAX);
     //a call that has no visits left to make: it makes the queued lists solid and descends nothing
     assert!(tree.gather(&one_round(0), &settings, None, Some(&network.cache), &mut Vec::new()).is_empty());
@@ -1177,8 +1283,8 @@ fn reusing_a_tree_with_transpositions_keeps_it_whole() {
     let tables = tables();
     let mut lines = 0;
     for (fen, moves, simulations, certainty, tables) in cases(&tables) {
-        let settings = graph_settings(certainty, false);
-        let mut tree = graph_tree_after(fen, moves, false);
+        let settings = graph_settings(certainty);
+        let mut tree = graph_tree_after(fen, moves);
         search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
         for line in reusable_lines(&tree) {
             let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
@@ -1231,27 +1337,68 @@ fn finish_leaves_evenly(tree: &mut Tree, id: u64, boards: &[u8], settings: &Sear
     }
 }
 
+const SHUFFLE: [&str; 6] = ["e1d1", "e8d8", "d1e1", "d8e8", "e1d1", "e8d8"];
+
+fn node_of(tree: &Tree, entry: u64) -> Option<&Node> {
+    let graph = tree.graph.as_ref().expect("a tree with transpositions");
+    graph.table.get(&entry).map(|&node| &tree.nodes[node as usize])
+}
+
+//the tree after SHUFFLE's first pair of moves, searched until the position that the game makes a third time has a node with
+//moves, and that node's entry in the table
+fn searched_to_the_third_time(settings: &SearchSettings) -> (Tree, u64) {
+    let mut tree = graph_tree_after(LOCKED_PAWNS, &SHUFFLE[..2]);
+    let third_time = graph_key(tree.keys[0], 8);
+    let has_moves = |tree: &Tree| node_of(tree, third_time).is_some_and(Node::has_edges);
+    let mut simulations = 0;
+    while !has_moves(&tree) && simulations < 400_000 {
+        simulations += 20_000;
+        search_with(finish_leaves_evenly, &mut tree, simulations, usize::MAX, settings, None, &mut Network::new());
+    }
+    assert!(has_moves(&tree), "the first search never gave the position moves");
+    (tree, third_time)
+}
+
+//a move that holds its node as a proven loss is never picked again, so it would not learn that the game has since made the node a
+//draw: under the new root the moves to the node hold no loss any more, in both trees
+#[test]
+fn a_move_forgets_a_proven_loss_once_the_game_has_made_its_node_a_draw() {
+    let settings = graph_settings(true);
+    let (mut tree, third_time) = searched_to_the_third_time(&settings);
+    let moves_to = |tree: &Tree| -> Vec<u32> {
+        let node = tree.graph.as_ref().expect("a tree with transpositions").table[&third_time];
+        let links = (0..tree.nodes.len()).flat_map(|parent| tree.linked(parent).map(|(_, link)| link));
+        links.filter(|&link| tree.link_child(link) == node).collect()
+    };
+    //as if a descent had proven the node a loss for the side that moves into it, and its moves had learnt so
+    let node = tree.graph.as_ref().expect("a tree with transpositions").table[&third_time] as usize;
+    tree.nodes[node].proof = Some(Proof { outcome: Outcome::Loss, value: 0.0, plies: 3 });
+    for link in moves_to(&tree) {
+        tree.slot_mut(link).lost = true;
+    }
+    let line = edges_of_uci(&tree, &SHUFFLE[2..4]);
+    let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
+    let mut shared = SharedTree::from_tree(&tree);
+    shared.move_root(&edges_of(&shared, &line_moves));
+    shared.drop_stale_leaves(&settings, None);
+    tree.play_line(&line);
+    tree.drop_stale_leaves(&settings, None);
+    let proven = node_of(&tree, third_time).is_some_and(|node| matches!(node.proof, Some(Proof { outcome: Outcome::Draw, .. })));
+    let (kept, lost): (Vec<u32>, usize) = (moves_to(&tree), lost_moves(&tree));
+    assert!(proven && !kept.is_empty(), "the node is a proven draw under the new root, with {} moves to it", kept.len());
+    assert!(kept.iter().all(|&link| !tree.slot(link).lost) && lost == 0, "{lost} moves still hold a loss");
+    assert_moved_as_compacted(&tree, shared);
+}
+
 //the kings step e1-d1-e1 and e8-d8-e8 twice: the position after the fourth pair of moves is the game's third. The search two pairs
 //before comes to that position by other king moves, six plies down, when the game had had it once: no draw then, so it is given
 //moves. The node is kept, and a search that went on through it would take the move to it for more than a draw. A SharedTree's
 //reuse leaves the Tree's tree
 #[test]
 fn a_kept_node_is_a_draw_once_the_game_has_made_its_position_a_third_time() {
-    let settings = graph_settings(true, false);
-    let shuffle = ["e1d1", "e8d8", "d1e1", "d8e8", "e1d1", "e8d8"];
-    let mut tree = graph_tree_after(LOCKED_PAWNS, &shuffle[..2], false);
-    let third_time = graph_key(tree.keys[0], 8);
-    fn node_of(tree: &Tree, entry: u64) -> Option<&Node> {
-        let graph = tree.graph.as_ref().expect("a tree with transpositions");
-        graph.table.get(&entry).map(|&node| &tree.nodes[node as usize])
-    }
-    let has_moves = |tree: &Tree| node_of(tree, third_time).is_some_and(Node::has_edges);
-    let mut simulations = 0;
-    while !has_moves(&tree) && simulations < 400_000 {
-        simulations += 20_000;
-        search_with(finish_leaves_evenly, &mut tree, simulations, usize::MAX, &settings, None, &mut Network::new());
-    }
-    assert!(has_moves(&tree), "the first search never gave the position moves");
+    let settings = graph_settings(true);
+    let shuffle = SHUFFLE;
+    let (mut tree, third_time) = searched_to_the_third_time(&settings);
     for pair in [&shuffle[2..4], &shuffle[4..]] {
         let line = edges_of_uci(&tree, pair);
         let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
@@ -1266,7 +1413,7 @@ fn a_kept_node_is_a_draw_once_the_game_has_made_its_position_a_third_time() {
         let visits = tree.root().visit_count;
         search_with(finish_leaves_evenly, &mut tree, visits + 20_000, usize::MAX, &settings, None, &mut Network::new());
     }
-    let mut fresh = graph_tree_after(LOCKED_PAWNS, &shuffle, false);
+    let mut fresh = graph_tree_after(LOCKED_PAWNS, &shuffle);
     search_with(finish_leaves_evenly, &mut fresh, 20_000, usize::MAX, &settings, None, &mut Network::new());
     //White's score after the king's step back, which lets Black make the third time
     let score_after_the_step = |tree: &Tree| {
@@ -1275,30 +1422,6 @@ fn a_kept_node_is_a_draw_once_the_game_has_made_its_position_a_third_time() {
     };
     let (kept, fresh) = (score_after_the_step(&tree), score_after_the_step(&fresh));
     assert!((kept - fresh).abs() < 0.02, "the step back scores {kept:.3} in the kept tree, {fresh:.3} in a fresh one");
-}
-
-//after 1.Kd1 Kd8 2.Ke1, Black's Ke8 is the root's position again: a draw of that path, which the move's visits count and the
-//position's node does not. Under the root after 1...Kd8 the move repeats nothing on the path. Black, a little worse, has moves
-//that score above one not played yet, so the move is searched only if the repeats' visits are not counted as its own
-#[test]
-fn a_move_visited_only_as_a_paths_repeat_is_a_move_not_played_yet_under_a_new_root() {
-    let settings = SearchSettings { value_sharpness: 1.0, ..graph_settings(true, false) };
-    let mut tree = graph_tree_after(LOCKED_PAWNS, &["e1d1", "e8d8", "d1e1", "d8e8"], false);
-    search_with(finish_leaves_evenly, &mut tree, 20_000, usize::MAX, &settings, None, &mut Network::new());
-    let line = edges_of_uci(&tree, &["e1d1", "e8d8", "d1e1", "d8e8"]);
-    let repeat = tree.link_of(line_end(&tree, &line[..3]), line[3]);
-    let repeats_node = &tree.nodes[tree.link_child(repeat) as usize];
-    assert!(tree.move_visits(repeat) > 10 && repeats_node.visit_count == 0, "the repeat was not searched as its path's draw");
-    tree.play_line(&line[..2]);
-    let line = edges_of_uci(&tree, &["d1e1", "d8e8"]);
-    let before_the_repeat = line_end(&tree, &line[..1]);
-    assert_eq!(tree.select_edge(before_the_repeat, &settings, None).0, line[1]);
-    //a SharedTree's search on comes to the move, and its position is the game's third time
-    let shared = SharedTree::from_tree(&tree);
-    shared_in_flight(&shared, tree.root().visit_count + 5_000, 1, &settings, None, &SharedNetwork::new(), usize::MAX);
-    let searched = shared.to_reachable_tree();
-    let third_time = &searched.nodes[line_end(&searched, &edges_of_uci(&searched, &["d1e1", "d8e8"]))];
-    assert!(matches!(third_time.proof, Some(Proof { outcome: Outcome::Draw, .. })), "the shared search never came to the move");
 }
 
 //the root's most visited move, if the node it leads to has moves to search on
@@ -1332,10 +1455,10 @@ fn visits_without_a_move(tree: &Tree) -> usize {
 fn continuing_a_reused_tree_searches_as_a_compacted_one_does() {
     let tables = tables();
     let mut continued = 0;
-    for (transpositions, move_means) in TREES_AND_GRAPHS {
+    for transpositions in [false, true] {
         for (fen, moves, simulations, certainty, tables) in cases(&tables).into_iter().take(4) {
-            let settings = SearchSettings { transpositions, move_means, ..settings(certainty) };
-            let mut tree = tree_after(fen, moves).with_transpositions(transpositions).with_move_means(move_means);
+            let settings = SearchSettings { transpositions, ..settings(certainty) };
+            let mut tree = tree_for(fen, moves, &settings);
             search(&mut tree, simulations, usize::MAX, &settings, tables, &mut Network::new());
             for line in reusable_lines(&tree).into_iter().take(2) {
                 let line_moves: Vec<PackedMove> = line.iter().map(|&edge| tree.chess_move(edge)).collect();
@@ -1345,7 +1468,7 @@ fn continuing_a_reused_tree_searches_as_a_compacted_one_does() {
                 search(&mut old, simulations + 3_000, usize::MAX, &settings, tables, &mut Network::new());
                 old.compact(1, None);
 
-                let mut shared = shared_tree_after(fen, moves).with_transpositions(transpositions).with_move_means(move_means);
+                let mut shared = shared_tree_as_tree(fen, moves, &settings);
                 shared_in_flight(&shared, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
                 shared.move_root(&edges_of(&shared, &line_moves));
                 shared.drop_stale_leaves(&settings, tables);
@@ -1359,7 +1482,7 @@ fn continuing_a_reused_tree_searches_as_a_compacted_one_does() {
             }
         }
     }
-    assert!(continued >= 18, "{continued} continued searches");
+    assert!(continued >= 16, "{continued} continued searches");
 }
 
 #[test]
@@ -1367,9 +1490,9 @@ fn a_dead_node_is_revived_by_a_transposition_before_the_sweep() {
     let tables = tables();
     let (mut revived_trees, mut lazy_visits, mut strict_visits) = (0, 0, 0);
     for (fen, moves, simulations, certainty, tables) in cases(&tables).into_iter().take(4) {
-        let settings = graph_settings(certainty, false);
+        let settings = graph_settings(certainty);
         let built = || {
-            let tree = graph_shared_tree_after(fen, moves, false);
+            let tree = graph_shared_tree_after(fen, moves);
             shared_in_flight(&tree, simulations, 1, &settings, tables, &SharedNetwork::new(), usize::MAX);
             tree
         };
@@ -1424,10 +1547,9 @@ fn trees_alike(one: &Tree, other: &Tree) -> bool {
     numbers(one) == numbers(other)
 }
 
-//with move_means, for a tree no thread works in: every node's sum is its own visits' scores and its moves' visits at the means
-//they hold (assert_move_means), and a proven node's its visits at its proven score. `root_too` as assert_move_means_of's
+//for a graph no thread works in: every node's sum is its own visits' scores and its moves' visits at the means they hold
+//(assert_move_means), and a proven node's its visits at its proven score. `root_too` as assert_move_means_of's
 fn check_move_means(tree: &Tree, settings: &SearchSettings, root_too: bool) {
-    assert!(tree.move_means(), "a tree without move means");
     assert_move_means_of(tree, settings, root_too);
     for node in &tree.nodes {
         if let Some(proof) = node.proof {
@@ -1437,14 +1559,12 @@ fn check_move_means(tree: &Tree, settings: &SearchSettings, root_too: bool) {
 }
 
 //the checks of a tree no thread works in, whatever garbage it holds; returns the nodes that several moves lead to.
-//`root_was_proven`: the root had a proof before the game came to it, which leaves its sum another than its moves' (move_means)
+//`root_was_proven`: the root had a proof before the game came to it, which leaves its sum another than its moves' (a graph's)
 fn check_after_search(tree: &SharedTree, settings: &SearchSettings, root_was_proven: bool) -> usize {
     tree.check_refs();
     if settings.transpositions {
         let reachable = tree.to_reachable_tree();
-        if settings.move_means {
-            check_move_means(&reachable, settings, !root_was_proven);
-        }
+        check_move_means(&reachable, settings, !root_was_proven);
         return check_graph(&reachable);
     }
     if !settings.certainty {
@@ -1462,11 +1582,11 @@ fn leads_to_a_proven_node(tree: &SharedTree, edge: usize) -> bool {
 fn gc_workers_beside_searching_threads_lose_no_live_node() {
     let network = SharedNetwork::new();
     let (mut reclaimed, mut shared_nodes) = (0, 0);
-    for (transpositions, move_means) in TREES_AND_GRAPHS {
+    for transpositions in [false, true] {
         for certainty in [false, true] {
-            let settings = SearchSettings { transpositions, move_means, ..settings(certainty) };
+            let settings = SearchSettings { transpositions, ..settings(certainty) };
             for threads in [2, 8, 24] {
-                let mut tree = shared_tree_after(START, OPENING).with_transpositions(transpositions).with_move_means(move_means);
+                let mut tree = shared_tree_for(START, OPENING, &settings);
                 let mut root_was_proven = false;
                 for _ in 0..8 {
                     let searching = Arc::new(tree);
@@ -1613,11 +1733,11 @@ fn a_game_compacted_at_the_memory_limit_keeps_to_it() {
     }
 }
 
-//a tree with the engine's settings: transpositions or not, move_means or not, and lists made solid at SOLID_TREE_THRESHOLD visits
-//as compacted() makes them
-fn compactable_tree_after(fen: &str, moves: &[&str], transpositions: bool, move_means: bool) -> SharedTree {
+//a tree with the engine's own making of solid lists, at SOLID_TREE_THRESHOLD visits as compacted() makes them, for the
+//settings' transpositions
+fn compactable_tree_after(fen: &str, moves: &[&str], settings: &SearchSettings) -> SharedTree {
     let tree = tree_after(fen, moves);
-    SharedTree::new(tree.board, tree.keys).with_transpositions(transpositions).with_move_means(move_means)
+    SharedTree::new(tree.board, tree.keys).with_transpositions(settings.transpositions)
 }
 
 //a compaction on any number of threads is compacted()'s tree in the same arenas, of a graph or not, with garbage after a move or
@@ -1626,10 +1746,10 @@ fn compactable_tree_after(fen: &str, moves: &[&str], transpositions: bool, move_
 fn compacting_on_threads_makes_compacteds_tree() {
     let network = SharedNetwork::new();
     let (mut compactions, mut proven, mut shared_nodes) = (0, 0, 0);
-    for (transpositions, move_means) in TREES_AND_GRAPHS {
-        let settings = SearchSettings { transpositions, move_means, ..settings(true) };
+    for transpositions in [false, true] {
+        let settings = SearchSettings { transpositions, ..settings(true) };
         for (fen, moves) in [(START, OPENING), (KING_AND_ROOK, &[][..])] {
-            let mut tree = compactable_tree_after(fen, moves, transpositions, move_means);
+            let mut tree = compactable_tree_after(fen, moves, &settings);
             let mut root_was_proven = false;
             for turn in 0..6 {
                 let searching = Arc::new(tree);
@@ -1665,7 +1785,7 @@ fn compacting_on_threads_makes_compacteds_tree() {
             }
         }
     }
-    assert!(compactions >= 45 && proven > 0 && shared_nodes > 0, "{compactions} compactions, {proven} proven nodes, {shared_nodes} shared");
+    assert!(compactions >= 40 && proven > 0 && shared_nodes > 0, "{compactions} compactions, {proven} proven nodes, {shared_nodes} shared");
 }
 
 //a compaction whose walk says it would take much of its search's time gives way: the tree is left as it was, and searched as it is
@@ -1674,7 +1794,7 @@ fn a_compaction_too_long_for_its_search_leaves_the_tree_as_it_was() {
     let network = SharedNetwork::new();
     for transpositions in [false, true] {
         let settings = SearchSettings { transpositions, ..settings(true) };
-        let mut tree = compactable_tree_after(START, OPENING, transpositions, false);
+        let mut tree = compactable_tree_after(START, OPENING, &settings);
         search_on_threads(&tree, 4, 20_000, 2, 16, &settings, &network, usize::MAX);
         tree.move_root(&[best_edge(&tree).expect("a move")]);
         let expected = tree.compacted();
@@ -1718,8 +1838,8 @@ fn search_move_drain_100_times_returns_to_the_same_bytes() {
 
 #[test]
 fn a_kept_tree_is_owned_again_after_every_search() {
-    let (settings, network) = (graph_settings(true, false), SharedNetwork::new());
-    let mut tree = graph_shared_tree_after(START, OPENING, false);
+    let (settings, network) = (graph_settings(true), SharedNetwork::new());
+    let mut tree = graph_shared_tree_after(START, OPENING);
     for _ in 0..50 {
         let searching = Arc::new(tree);
         searching.start_sweepers(2);
@@ -1732,12 +1852,12 @@ fn a_kept_tree_is_owned_again_after_every_search() {
         tree.reopen();
         match best_edge(&tree) {
             Some(edge) => tree.move_root(&[edge]),
-            None => tree = graph_shared_tree_after(START, OPENING, false),
+            None => tree = graph_shared_tree_after(START, OPENING),
         }
     }
 
     //a tree dropped with its sweepers at work: they find it gone and leave
-    let searching = Arc::new(graph_shared_tree_after(START, OPENING, false));
+    let searching = Arc::new(graph_shared_tree_after(START, OPENING));
     search_on_threads(&searching, 8, 20_000, 2, 16, &settings, &network, usize::MAX);
     let mut tree = owned_again(searching);
     tree.move_root(&[best_edge(&tree).expect("a move")]);
@@ -1757,8 +1877,8 @@ fn a_kept_tree_is_owned_again_after_every_search() {
 
 #[test]
 fn starting_on_a_reused_300k_node_tree_takes_under_20_ms() {
-    let (settings, network) = (graph_settings(true, false), SharedNetwork::new());
-    let mut tree = graph_shared_tree_after(START, OPENING, false);
+    let (settings, network) = (graph_settings(true), SharedNetwork::new());
+    let mut tree = graph_shared_tree_after(START, OPENING);
     search_on_threads(&tree, 8, 340_000, 3, 64, &settings, &network, usize::MAX);
     let nodes = tree.in_use().nodes;
     assert!(nodes >= 300_000, "{nodes} nodes");
@@ -1792,9 +1912,9 @@ fn starting_on_a_reused_300k_node_tree_takes_under_20_ms() {
 fn calls_that_gather_a_round_together_take_its_leaves_between_them() {
     let network = SharedNetwork::new();
     crate::search::shared::JITTER.store(true, Ordering::Relaxed);
-    for (transpositions, move_means) in TREES_AND_GRAPHS {
-        let settings = SearchSettings { transpositions, move_means, ..settings(true) };
-        let tree = shared_tree_after(START, OPENING).with_transpositions(transpositions).with_move_means(move_means);
+    for transpositions in [false, true] {
+        let settings = SearchSettings { transpositions, ..settings(true) };
+        let tree = shared_tree_for(START, OPENING, &settings);
         shared_in_flight(&tree, 3_000, 2, &settings, None, &network, usize::MAX);
         let mut full = 0;
         for id in 1_000..1_020 {

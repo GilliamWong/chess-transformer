@@ -201,7 +201,7 @@ impl SharedSearch {
         let score = self.score(Some(line[0]));
         let moves = line.iter().map(|&edge| uci(tree.chess_move(edge)));
         let root_moves = tree.edges_by_visits().into_iter().map(|edge| (uci(tree.chess_move(edge)), tree.visits(tree.root(), edge)));
-        (self.id, moves.collect(), score, root_moves.collect(), tree.root().visits())
+        (self.id, moves.collect(), score, root_moves.collect(), tree.root().visits(), tree.evaluations())
     }
 }
 
@@ -236,9 +236,10 @@ impl Searches {
         if board.legal_moves().is_empty() {
             return Err(PyValueError::new_err(format!("the game is over, there is nothing to search: {fen} {moves:?}")));
         }
-        let tree = self.shared_reused_tree(&mut state, id, fen, &moves, seconds).unwrap_or_else(|| {
-            SharedTree::new(board, keys).with_transpositions(self.settings.transpositions).with_move_means(self.settings.move_means)
-        });
+        let mut tree = self
+            .shared_reused_tree(&mut state, id, fen, &moves, seconds)
+            .unwrap_or_else(|| SharedTree::new(board, keys).with_transpositions(self.settings.transpositions));
+        tree.begin_search();
         let tree = Arc::new(tree);
         tree.start_sweepers(self.gc_threads);
         state.shared_searches.push(SharedSearch { id, fen: fen.to_string(), moves, simulations, stopped: false, tree });
@@ -572,7 +573,6 @@ mod tests {
             value_sharpness: 1.0,
             certainty: false,
             transpositions: false,
-            move_means: false,
         };
         let move_ids = MoveIds::new((0..MOVE_ID_TABLE_LENGTH).map(|index| (index % (ANSWER_WIDTH - 1)) as i16).collect());
         for id in 0..2 {

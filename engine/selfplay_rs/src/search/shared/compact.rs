@@ -79,7 +79,7 @@ impl SharedTree {
         {
             return None;
         }
-        let fresh = Fresh::new(order.len(), &layout, self.move_means());
+        let fresh = Fresh::new(order.len(), &layout);
         in_parallel(threads, fresh.chunks(), |chunk| fresh.make_chunk(chunk));
         let graph = self.graph.as_ref().map(|_| {
             let graph = SharedGraph::new();
@@ -114,7 +114,7 @@ impl SharedTree {
     fn copy_bytes(&self, nodes: usize, layout: &Layout) -> usize {
         let (edge_units, links, slots) = layout.room();
         let table = self.graph.as_ref().map_or(0, |_| nodes * TABLE_ENTRY_BYTES);
-        nodes * NODE_BYTES + edge_units * EDGE_BYTES + links * self.links.link_bytes() + slots * self.links.slot_bytes() + table
+        nodes * NODE_BYTES + edge_units * EDGE_BYTES + links * LINK_BYTES + slots * SLOT_BYTES + table
     }
 
     //the nodes the root reaches in breadth first order, a node that several moves lead to at the first, and their shapes; with
@@ -176,14 +176,15 @@ impl SharedTree {
                 let child = plan.numbers.map_or(next_child, |numbers| marked(&numbers[self.links.child(link) as usize]));
                 next_child += 1;
                 plan.fresh.nodes.get(child as usize).add_reference();
-                //the move's visits and the mean it holds
-                let count = self.links.count(link);
+                //all that the move holds, of the node as the copy numbers it
+                let held = self.links.record(link);
+                let record = MoveRecord { state: held.state.with_child(child), ..held };
                 if shape.solid {
-                    plan.fresh.links.set_solid(children + place as u32, child, count);
+                    plan.fresh.links.set_solid(children + place as u32, record);
                 } else {
                     let link = children + index as u32;
                     let next = if index + 1 < usize::from(shape.links) { link + 1 } else { NO_LINK };
-                    plan.fresh.links.write(link, child, count, place, next);
+                    plan.fresh.links.write(link, record, place, next);
                 }
             }
             if let Some(graph) = plan.graph {

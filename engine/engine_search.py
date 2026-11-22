@@ -54,9 +54,8 @@ ADVANCE_THREADS = 4
 #the threads that free the dead rest of a moved tree beside the next search; 0 for the search's start to free it all, on the engine's own clock
 GC_THREADS = 2
 #the engine's changes to mcts.py's search, which self-play keeps as it is
-#move_means: a move keeps its node's mean and a visit passes through a node other paths made, as lc0's dag search;
-#off while it is measured against the visit-by-visit catch-up
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True, "move_means": False}
+#transpositions: one node a position, whose moves keep its mean, and a visit passes through a node other paths made, as lc0's dag search
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True}
 #the threads that join rounds' gathers, for each of several networks (EngineSearch's descent_helpers). On two RTX 5090s a thread a network
 #alone fell a fifth short of the gpus' rate in a middlegame of 40M visits and to under half in an endgame of 100M; three helpers a network
 #kept 95% and 80% of it, five 88% in the endgame, eight no more than five
@@ -68,7 +67,8 @@ ROOT_MOVES_REPORTED = 3
 MAX_REPORTED_SCORE = 0.9999 #about 25 pawns
 
 
-#score is for the side to move (0 lost to 1 won), line starts with the move played; simulations are the root's visits, reused those it had at the start
+#score is for the side to move (0 lost to 1 won), line starts with the move played; simulations are the root's visits, reused those it had at the start,
+#evaluations the leaves the search sent to the networks (the positions the cache answered and the simulations that needed no network are not among them)
 @dataclass
 class SearchReport:
     score: float
@@ -76,6 +76,7 @@ class SearchReport:
     simulations: int
     root_moves: list[tuple[chess.Move, int]]
     reused: int = 0
+    evaluations: int = 0
 
 def score_to_centipawns(score: float) -> int:
     score = min(max(score, 1 - MAX_REPORTED_SCORE), MAX_REPORTED_SCORE)
@@ -365,9 +366,11 @@ class EngineSearch:
         return self.search_report(run.report, run.reused)
 
     def search_report(self, report: tuple, reused: int) -> SearchReport:
-        _, line, score, root_moves, visits = report
+        #Searches' report ends with its evaluations; one of five values counts none
+        _, line, score, root_moves, visits, *evaluations = report
         return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
-                            [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]], reused)
+                            [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]], reused,
+                            evaluations[0] if evaluations else 0)
 
     #rounds_on on the thread pinned to cpu if it is given, a failure stopping the other networks' rounds too
     def drive(self, network, run: SearchRun, cpu: int | None = None) -> None:

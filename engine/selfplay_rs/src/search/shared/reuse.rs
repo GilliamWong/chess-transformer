@@ -53,10 +53,15 @@ impl SharedTree {
         let node_of = |entry: u64| graph.shard(entry).lock().expect("a table shard").get(&entry).copied();
         let nodes_of = |key| (halfmoves + 1..FIFTY_MOVE_PLIES).filter_map(move |count| node_of(graph_key(key, count)));
         let thirds: Vec<u32> = one_short_of_threefold(&self.keys, halfmoves).into_iter().flat_map(nodes_of).collect();
+        let no_longer_lost: Vec<u32> = thirds.iter().copied().filter(|&id| self.nodes.get(id as usize).proves_a_loss()).collect();
         for id in thirds {
             //prove keeps a proof the node has, and the rules' draw comes before it
             self.nodes.get(id as usize).clear_proof();
             self.prove(&[id as usize], Proof { outcome: Outcome::Draw, value: 1.0 - settings.draw, plies: 0 });
+        }
+        //the moves that hold one of those nodes as a proven loss are told otherwise (Tree's)
+        if !no_longer_lost.is_empty() {
+            self.links.forget_losses(&no_longer_lost);
         }
     }
 

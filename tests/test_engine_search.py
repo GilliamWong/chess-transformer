@@ -42,6 +42,8 @@ MATE_IN_ONE = "6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1"
 MATE_IN_TWO = "k7/8/2K5/8/8/8/8/7R w - - 0 1"
 #both mate in two
 MATES_IN_TWO = ("c6b6", "c6c7")
+#a tree with transpositions
+GRAPH = {"transpositions": True}
 gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="no gpu")
 
 @pytest.fixture(autouse=True)
@@ -208,7 +210,7 @@ def test_answers_that_are_no_numbers_do_not_spoil_a_search(concurrent_descents):
             answers[::2, -1] = np.nan
             answers[1::3, :-1] = np.inf
         reports = searches.finish(answers)
-    _, line, score, root_moves, visits = reports[0]
+    _, line, score, root_moves, visits, _ = reports[0]
     assert 0 <= score <= 1 and visits == 400 and sum(move_visits for _, move_visits in root_moves) == 399
 
 def test_a_failed_search_settles_its_network():
@@ -517,7 +519,9 @@ def test_the_cache_answers_transpositions_as_the_network_would():
         found[cache_positions] = (reports[0], evaluated)
 
     (without, evaluated_without), (with_cache, evaluated_with_cache) = found[0], found[100_000]
-    assert with_cache == without
+    #the report's last value is the leaves the search sent to the network: the cache's answers are not among them
+    assert with_cache[:-1] == without[:-1]
+    assert (without[-1], with_cache[-1]) == (evaluated_without, evaluated_with_cache)
     assert evaluated_with_cache < 0.9 * evaluated_without
 
 def test_one_leaf_a_round_is_the_exact_search_at_every_move(monkeypatch, carlsen_games):
@@ -533,7 +537,7 @@ def test_one_leaf_a_round_is_the_exact_search_at_every_move(monkeypatch, carlsen
         reports = []
         while not reports:
             reports = exact.finish(evaluate(leaf_boards(exact.descend())))
-        _, line, score, root_moves, visits = reports[0]
+        _, line, score, root_moves, visits, _ = reports[0]
         assert ([played.uci() for played in report.line], report.score, report.simulations) == (line, score, visits)
         assert [(played.uci(), move_visits) for played, move_visits in report.root_moves] == root_moves[:len(report.root_moves)]
         board.push(report.line[0])
@@ -1644,7 +1648,7 @@ def test_stale_draws_come_out_of_a_kept_tree():
 #third time. The search at move 2 came to it by other king moves, when the game had had it once, and its node is kept with moves
 def test_a_kept_tree_with_transpositions_knows_the_games_third_time():
     def player() -> EngineSearch:
-        return EngineSearch(cpu_batches(EvenModel()), 16, smart_pruning=False, settings={"transpositions": True, "certainty": True})
+        return EngineSearch(cpu_batches(EvenModel()), 16, smart_pruning=False, settings={**GRAPH, "certainty": True})
 
     board, kept = chess.Board("4k3/8/8/1p1p1p1p/1P1P1P1P/1P6/8/4K3 w - - 0 1"), player()
     for king, other_king in [("e1d1", "e8d8"), ("d1e1", "d8e8"), ("e1d1", "e8d8")]:
@@ -2087,7 +2091,7 @@ def test_a_game_on_several_networks_moves_its_tree_beside_the_gc_threads(gc_thre
         assert search.advance(board)
         board.push(report.line[1])
 
-@pytest.mark.parametrize("settings", [{"certainty": True}, {"certainty": True, "transpositions": True}], ids=["certainty", "certainty_and_transpositions"])
+@pytest.mark.parametrize("settings", [{"certainty": True}, {"certainty": True, **GRAPH}], ids=["certainty", "certainty_and_transpositions"])
 def test_concurrent_descents_prove_a_mate_on_several_networks(settings):
     search = EngineSearch(SlowNetworks(3, 0.003, UniformModel()).networks, 16, concurrent_descents=True, settings=settings)
     proven = search.search(chess.Board(MATE_IN_TWO), simulations=20_000)
@@ -2181,7 +2185,7 @@ def test_concurrent_searches_end_under_stops_at_any_moment():
     assert len(ended) == 40 and sum(ended) > 40 * 20
 
 def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
-    graph = {"settings": {"transpositions": True}}
+    graph = {"settings": GRAPH}
     for way in ("plain", "advance", "drop"):
         reports, replies, boards, advanced, _ = advancing_game(BoardModel(), middlegame.copy(), 8, way, **graph)
         concurrent = advancing_game(BoardModel(), middlegame.copy(), 8, way, replies, concurrent_descents=True, gc_threads=0, **graph)
@@ -2192,14 +2196,14 @@ def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
 
     model = shuffling_model()
     for certainty in (False, True):
-        options = {"settings": {"transpositions": True, "certainty": certainty}}
+        options = {"settings": {**GRAPH, "certainty": certainty}}
         plain = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, **options)
         concurrent = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, concurrent_descents=True, gc_threads=0, **options)
         assert concurrent[0] == plain[0] and concurrent[3] == plain[3] == len(SHUFFLES)
 
 def test_transpositions_on_several_networks():
     group = SlowNetworks(3, 0.002, BoardModel())
-    search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, settings={"transpositions": True})
+    search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, settings=GRAPH)
     board = chess.Board(FREE_QUEEN)
     report = search.search(board, simulations=3000)
     assert 3000 <= report.simulations < 3000 + 3 * 16 * 3 and report.line[0] in board.legal_moves
