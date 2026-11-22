@@ -1649,7 +1649,8 @@ fn check_move_means(tree: &Tree, settings: &SearchSettings, root_too: bool) {
 //the checks of a tree no thread works in, whatever garbage it holds; returns the nodes that several moves lead to.
 //`root_was_proven`: the root had a proof before the game came to it, which leaves its sum another than its moves' (a graph's)
 fn check_after_search(tree: &SharedTree, settings: &SearchSettings, root_was_proven: bool) -> usize {
-    tree.check_refs();
+    //what a hardware check asks of a real search's tree (Searches.audit), which holds of the tests' trees too
+    tree.audit();
     if settings.transpositions {
         let reachable = tree.to_reachable_tree();
         check_move_means(&reachable, settings, !root_was_proven);

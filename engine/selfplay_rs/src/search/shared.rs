@@ -71,7 +71,7 @@ mod cache;
 mod compact;
 mod reclaim;
 mod reuse;
-#[cfg(test)]
+#[cfg(any(test, feature = "audit"))]
 mod audit;
 #[cfg(test)]
 mod descents;
@@ -323,6 +323,8 @@ pub struct Counts {
     //nodes freed, and the times a descent short of room freed some
     pub reclaimed: AtomicU64,
     pub assists: AtomicU64,
+    //the descents that ended on a leaf another one owned and stayed in flight to their calls' ends
+    pub collisions: AtomicU64,
 }
 
 pub struct SharedTree {
@@ -1549,6 +1551,7 @@ impl SharedTree {
             (nodes, moves) = (nodes_end, moves_end);
         }
         self.evaluations.fetch_add(call.leaves.len() as u64, Ordering::Relaxed);
+        self.counts.collisions.fetch_add(call.collisions as u64, Ordering::Relaxed);
         call.leaves
     }
 
@@ -2044,7 +2047,7 @@ fn record_of(slot: &super::Slot) -> MoveRecord {
 }
 
 //what a SharedTree's move holds, as a Tree's
-#[cfg(test)]
+#[cfg(any(test, feature = "audit"))]
 fn slot_of(record: MoveRecord) -> super::Slot {
     let state = record.state;
     super::Slot {

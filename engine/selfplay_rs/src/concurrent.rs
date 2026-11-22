@@ -224,6 +224,16 @@ impl Searches {
         Ok(self.lock()?.shared_search(id).map(|search| search.tree.clone()))
     }
 
+    //the tree of the search `id` while it runs, or as it was kept when it ended, for a look at its numbers
+    pub(crate) fn searched_tree(&self, id: u64) -> PyResult<Arc<SharedTree>> {
+        let state = self.lock()?;
+        let kept = || match state.shared_kept.get(&id) {
+            Some(KeptTree { tree: Kept::Searched(tree), .. }) => Some(tree.clone()),
+            _ => None,
+        };
+        state.shared_search(id).map(|search| search.tree.clone()).or_else(kept).ok_or_else(|| no_search(id))
+    }
+
     pub(crate) fn shared_start(&self, id: u64, fen: &str, moves: Vec<String>, simulations: u32, seconds: Option<f64>) -> PyResult<()> {
         if simulations == 0 {
             return Err(PyValueError::new_err("a search needs at least one simulation"));

@@ -2201,6 +2201,20 @@ def test_transpositions_on_one_network_are_the_same_on_both_trees(middlegame):
         concurrent = advancing_game(model, chess.Board(), len(SHUFFLES), "advance", SHUFFLES, concurrent_descents=True, gc_threads=0, **options)
         assert concurrent[0] == plain[0] and concurrent[3] == plain[3] == len(SHUFFLES)
 
+#tests/hardware_check.py's check, which a pod runs on its gpus, on stand-in networks: a line of numbers a position, with the tree's own
+#numbers, and its audit where the extension is built with that feature
+def test_the_hardware_check_reports_each_position():
+    import hardware_check
+    group = SlowNetworks(2, 0.002, BoardModel())
+    player = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, settings=GRAPH)
+    lines = []
+    results = hardware_check.check(player, 0.3, out=lines.append)
+    assert [result["position"] for result in results] == ["middlegame", "endgame"] and len(lines) == 2
+    for result, line in zip(results, lines):
+        assert result["evaluations"] > 0 and result["root_visits"] == result["visits"] > 0 and result["allocated_bytes"] > 0
+        assert ("audited_nodes" in result) == hasattr(player.searches, "audit") and result["position"] in line
+        assert ("audit passed" in line) == hasattr(player.searches, "audit")
+
 def test_transpositions_on_several_networks():
     group = SlowNetworks(3, 0.002, BoardModel())
     search = EngineSearch(group.networks, 16, smart_pruning=False, concurrent_descents=True, settings=GRAPH)

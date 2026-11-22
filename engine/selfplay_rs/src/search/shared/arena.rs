@@ -154,17 +154,17 @@ impl Node {
     }
 
     //for a node of a tree being copied, before anything else sees it
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn set_references(&self, references: u32) {
         self.references.store(references, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn references(&self) -> u32 {
         self.references.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn is_freed(&self) -> bool {
         self.count.load(Ordering::Relaxed) == FREED
     }
@@ -433,7 +433,7 @@ impl Pool {
         self.idle.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     fn held(&self) -> Vec<u32> {
         self.indices.lock().expect("a pool").clone()
     }
@@ -535,7 +535,7 @@ impl FreeRuns {
         Some(first)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     fn held(&self) -> Vec<(usize, usize)> {
         let runs = self.runs.lock().expect("the runs given back");
         let mut held: Vec<(usize, usize)> = runs.by_first.iter().map(|(&first, &length)| (first, length)).collect();
@@ -614,7 +614,7 @@ impl Nodes {
         self.freed.give_all(indices);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn freed(&self) -> Vec<u32> {
         self.freed.held()
     }
@@ -645,7 +645,7 @@ fn run_start(at: usize, count: usize, bits: u32) -> usize {
 //runs of elements, each in one chunk: from the runs given back, else from the end of those given out so far
 struct Runs {
     next: Alone<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     skipped: AtomicUsize, //the elements left unused at chunk ends
     freed: FreeRuns,
     bits: u32,
@@ -656,7 +656,7 @@ impl Runs {
     fn new(bits: u32, capacity: usize) -> Runs {
         Runs {
             next: Alone(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "audit"))]
             skipped: AtomicUsize::new(0),
             freed: FreeRuns::new(bits),
             bits,
@@ -667,7 +667,7 @@ impl Runs {
     fn alloc(&self, count: usize) -> usize {
         self.freed.take(count).unwrap_or_else(|| {
             let (first, _skipped) = alloc_run(&self.next, count, self.bits, self.capacity);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "audit"))]
             self.skipped.fetch_add(_skipped, Ordering::Relaxed);
             first
         })
@@ -684,7 +684,7 @@ impl Runs {
     }
 
     //the elements in the runs in use
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     fn used(&self) -> usize {
         self.taken() - self.skipped.load(Ordering::Relaxed)
     }
@@ -953,7 +953,7 @@ impl Links {
     }
 
     //the slots in the runs in use
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn slots_used(&self) -> usize {
         self.slot_runs.used()
     }
@@ -1068,12 +1068,12 @@ impl Links {
         self.slots.ensure_chunk(first, || (0..1 << LINK_CHUNK_BITS).map(|_| Slot::new()).collect());
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn freed_links(&self) -> Vec<u32> {
         self.freed.held()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn freed_slot_runs(&self) -> Vec<(usize, usize)> {
         self.slot_runs.freed.held()
     }
@@ -1243,7 +1243,7 @@ impl Edges {
     }
 
     //the units in the runs in use
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn used(&self) -> usize {
         self.runs.used()
     }
@@ -1259,7 +1259,7 @@ impl Edges {
         self.units.ensure_chunk(first, || (0..1 << EDGE_CHUNK_BITS).map(|_| AtomicU16::new(0)).collect());
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn freed_runs(&self) -> Vec<(usize, usize)> {
         self.runs.freed.held()
     }
@@ -1342,7 +1342,7 @@ impl Edges {
     }
 
     //the units of the node's edges, for an audit
-    #[cfg(test)]
+    #[cfg(any(test, feature = "audit"))]
     pub fn run(&self, edges: Range<usize>) -> Vec<u16> {
         self.units.slice(edges.start, units(edges.len())).iter().map(|unit| unit.load(Ordering::Relaxed)).collect()
     }
@@ -1405,7 +1405,7 @@ impl Fresh {
         fresh.edges.runs.next.store(layout.edges, Ordering::Relaxed);
         fresh.links.next.store(layout.links, Ordering::Relaxed);
         fresh.links.slot_runs.next.store(layout.slots, Ordering::Relaxed);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "audit"))]
         {
             fresh.edges.runs.skipped.store(layout.edges - layout.edges_in_runs, Ordering::Relaxed);
             fresh.links.slot_runs.skipped.store(layout.slots - layout.slots_in_runs, Ordering::Relaxed);

@@ -1065,6 +1065,40 @@ impl Searches {
         })
     }
 
+    //for a hardware check (tests/hardware_check.py), with concurrent descents: the numbers of the tree of the search `id`,
+    //running or kept: its bytes in use and those of its arenas, the root's visits, the leaves sent to the networks, the
+    //descents that collided, and how often its threads gave way to a writer, had the tree to themselves, made a node another
+    //thread made too, freed nodes, and freed some for want of room
+    fn tree_numbers(&self, py: Python<'_>, id: u64) -> PyResult<HashMap<&'static str, u64>> {
+        py.detach(|| {
+            let tree = self.searched_tree(id)?;
+            let counts = &tree.counts;
+            let count = |count: &AtomicU64| count.load(Ordering::Relaxed);
+            Ok(HashMap::from([
+                ("allocated_bytes", tree.allocated_bytes() as u64),
+                ("footprint_bytes", tree.footprint_bytes() as u64),
+                ("root_visits", u64::from(tree.root().visits())),
+                ("evaluations", tree.evaluations()),
+                ("collisions", count(&counts.collisions)),
+                ("gave_way", count(&counts.gave_way)),
+                ("exclusive", count(&counts.exclusive)),
+                ("orphans", count(&counts.orphans)),
+                ("reclaimed", count(&counts.reclaimed)),
+                ("assists", count(&counts.assists)),
+            ]))
+        })
+    }
+
+    //with the cargo feature `audit`: the tests' checks of the tree that the search `id` left (SharedTree::audit), which panic
+    //with what they find. For a search that has ended, with no thread in its tree. Returns the nodes and moves looked at
+    #[cfg(feature = "audit")]
+    fn audit(&self, py: Python<'_>, id: u64) -> PyResult<(usize, usize)> {
+        py.detach(|| {
+            let tree = self.searched_tree(id)?;
+            Ok(tree.quiet(|| tree.audit()))
+        })
+    }
+
     //the gathers that helpers joined, and the leaves the helpers found, since the searches were made
     fn helper_counts(&self) -> (u64, u64) {
         (self.helped[0].load(Ordering::Relaxed), self.helped[1].load(Ordering::Relaxed))

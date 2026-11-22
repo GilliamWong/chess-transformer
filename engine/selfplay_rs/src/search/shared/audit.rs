@@ -1,4 +1,6 @@
-//what the tests ask of a tree: its arenas as the references and the pools see them, and its reachable part as a Tree
+//what the tests ask of a tree: its arenas as the references and the pools see them, and its reachable part as a Tree. With the
+//cargo feature `audit` the checks that need no test's network are Searches.audit's, for the tree a real search left
+#![cfg_attr(not(test), allow(dead_code))]
 use super::arena::units;
 use super::*;
 use crate::search::{Node as TreeNode, UNLINKED, link_up};
@@ -122,6 +124,64 @@ impl SharedTree {
             }
         }
         assert_eq!((nodes, moves), (at_nodes.len(), at_moves.len()), "a waiting leaf's node or move is no longer the tree's");
+    }
+
+    //the audits of a tree that a search has left and no thread works in, whatever network evaluated it: the references and the
+    //arenas (check_refs), the counts of what waits (assert_waiting_counts) and what the moves hold against their nodes
+    //(check_moves). Each panics with what it found. Returns the nodes and the moves that check_moves looked at
+    pub fn audit(&self) -> (usize, usize) {
+        self.check_refs();
+        self.assert_waiting_counts();
+        self.check_moves()
+    }
+
+    //with transpositions, for every node the root reaches: a move has no more visits than its node; a visited move's mean is a
+    //score; a move that holds its node as lost leads to a node proven lost and holds its score; a move's filter is its node's;
+    //a node's visits are its own and its moves'; a proven node's sum is its visits at its proven score; an unproven node with
+    //moves has a visit of its own at least, and its own visits' scores (its sum less its moves' visits at the means they hold)
+    //are scores. The network's values are not known here, so no more can be said of a node's own scores: the tests, which
+    //know their network's, say it (assert_move_means). The root's sum is left out: a root proven before the game came to it
+    //keeps the sum its proof wrote
+    fn check_moves(&self) -> (usize, usize) {
+        let ids = self.reachable_ids();
+        if self.graph.is_none() {
+            return (ids.len(), 0);
+        }
+        let mut moves = 0;
+        for &id in &ids {
+            let node = self.nodes.get(id);
+            let visits = node.visits();
+            let (mut moves_visits, mut moves_sum) = (0u64, 0.0);
+            for (place, link) in self.links.linked(node) {
+                let record = self.links.record(link);
+                let child = self.nodes.get(record.state.child() as usize);
+                let what = format!("node {id}, move {place}");
+                assert!(record.visits <= child.visits(), "{what}: {} visits, its node {}", record.visits, child.visits());
+                assert!(record.visits == 0 || (0.0..=1.0).contains(&record.mean), "{what}: a mean of {}", record.mean);
+                let lost = child.proof().is_some_and(|proof| proof.outcome == Outcome::Loss && record.mean == proof.value as f32);
+                assert!(!record.state.lost() || lost, "{what}: held as lost, its mean {} and its node's proof {:?}", record.mean, child.proof().map(|proof| proof.outcome));
+                assert_eq!(record.state.repeats(), repeat_filter(child.key(), child.halfmoves()), "{what}: its filter of its node's repeats");
+                moves_visits += u64::from(record.visits);
+                moves_sum += f64::from(record.visits) * (1.0 - f64::from(record.mean));
+                moves += 1;
+            }
+            assert!(u64::from(visits) >= moves_visits, "node {id}: {visits} visits, its moves {moves_visits}");
+            let (own_visits, tolerance) = (f64::from(visits) - moves_visits as f64, 1e-6 * f64::from(visits.max(1)));
+            match node.proof() {
+                _ if id == self.root => {}
+                Some(proof) => {
+                    let sum = f64::from(visits) * proof.value;
+                    assert!((node.value_sum() - sum).abs() <= tolerance, "node {id}: a proven node's sum {} for {visits} visits", node.value_sum());
+                }
+                None if node.has_edges() => {
+                    let own_sum = node.value_sum() - moves_sum;
+                    let scores = own_visits >= 1.0 && (-tolerance..=own_visits + tolerance).contains(&own_sum);
+                    assert!(scores, "node {id}: sum {} less its moves' {moves_sum} over {own_visits} visits of its own", node.value_sum());
+                }
+                None => {}
+            }
+        }
+        (ids.len(), moves)
     }
 
     //every reference is the number of moves that name the node (plus the root's and a held root's), nothing given back is still
