@@ -57,8 +57,9 @@ GC_THREADS = 2
 #transpositions: one node a position, whose moves keep its mean, and a visit passes through a node other paths made, as lc0's dag search.
 #fresh_share (for the round loops, rounds_on and Searches' own): a move's lead stops a search only once the visits the search has made itself
 #are this share of those it is expected to make in all, so that a lead a kept tree brought does not end a search that has hardly looked; 0 for
-#no such wait
-ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True, "fresh_share": 0.0}
+#no such wait. A tenth: about a tenth of the search's time, by when the speed that says what is left is measured over many rounds; a search
+#without a kept tree is held up by no share up to a half
+ENGINE_SETTINGS: dict = {"value_sharpness": 3.0, "certainty": True, "transpositions": True, "fresh_share": 0.1}
 #the threads that join rounds' gathers, for each of several networks (EngineSearch's descent_helpers). On two RTX 5090s a thread a network
 #alone fell a fifth short of the gpus' rate in a middlegame of 40M visits and to under half in an endgame of 100M; three helpers a network
 #kept 95% and 80% of it, five 88% in the endgame, eight no more than five

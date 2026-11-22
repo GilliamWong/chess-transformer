@@ -1598,23 +1598,25 @@ def test_search_settings_that_are_not_numbers_are_refused():
         assert options.set("SearchSettings", change).endswith("the search's settings stay as they were")
     assert options.settings is None
 
-#fresh_share is off as the engine plays, and SearchSettings sets it as it changes any setting: it is Searches', whose own round loop takes
-#it from there as python's does
-def test_fresh_share_is_a_search_setting_that_is_off_until_set(monkeypatch):
+#the engine plays with a fresh_share of a tenth. A competition's other SearchSettings leave it in place (they change the engine's own
+#settings), and SearchSettings changes it or, with 0, takes the wait away: it is Searches', whose own round loop takes it from there as
+#python's does. The search of one leaf a round is mcts.py's, and has no such wait
+def test_fresh_share_is_a_tenth_as_the_engine_plays_until_search_settings_change_it(monkeypatch):
     monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", ENGINES_OWN_SETTINGS)
-    assert ENGINES_OWN_SETTINGS["fresh_share"] == 0.0
-    options = Options(False, TABLEBASE_PIECES)
-    assert options.set("SearchSettings", "fresh_share=0.1") is None
-    assert options.settings == {"fresh_share": 0.1} and options.search()[1]["settings"] == options.settings
-
+    assert ENGINES_OWN_SETTINGS["fresh_share"] == 0.1
     made = []
     searches = selfplay_rs.Searches
     monkeypatch.setattr(selfplay_rs, "Searches", lambda **settings: made.append(settings) or searches(**settings))
+    found = []
+    for changes in ("c_puct=1.5", "fresh_share=0.25", "fresh_share=0"):
+        options = Options(False, TABLEBASE_PIECES)
+        assert options.set("SearchSettings", changes) is None and options.search()[1]["settings"] == options.settings
+        found.append(EngineSearch(cpu_batches(BoardModel()), 16, settings=options.settings).fresh_share)
     as_it_plays = EngineSearch(cpu_batches(BoardModel()), 16)
-    switched_on = EngineSearch(cpu_batches(BoardModel()), 16, settings=options.settings)
-    assert [settings["fresh_share"] for settings in made] == [0.0, 0.1]
-    assert (as_it_plays.fresh_share, switched_on.fresh_share) == (0.0, 0.1)
-    report = switched_on.search(chess.Board(), simulations=200)
+    assert found == [0.1, 0.25, 0.0] and as_it_plays.fresh_share == 0.1
+    assert [settings["fresh_share"] for settings in made] == [0.1, 0.25, 0.0, 0.1]
+    assert EngineSearch(cpu_batches(BoardModel()), 1).fresh_share == 0.0
+    report = as_it_plays.search(chess.Board(), simulations=200)
     assert report.simulations <= 200 and report.line[0] in chess.Board().legal_moves
 
 
