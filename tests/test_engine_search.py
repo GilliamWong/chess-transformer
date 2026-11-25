@@ -1136,6 +1136,9 @@ class ScriptedSearches:
     def start(self, game, fen, moves, simulations, seconds=None):
         pass
 
+    def tablebase_hits(self):
+        return 0
+
     def descend_into(self, boards, count, collisions, simulations, round=None, root_of=None, legal_columns=False, alone=None):
         boards[:count] = 0
         return count, self.root
@@ -1420,7 +1423,8 @@ def test_a_gpu_that_fails_is_left_out(monkeypatch, model_path):
 
     assert len(search.networks) == 2 and search.search(chess.Board(), simulations=200).simulations >= 200
     assert sent == ["info string gpu 1 failed (RuntimeError('the gpu fell over')): searching without it",
-                    f"info string Fry on 2 of 3 gpus (0,2); no tables; no tree limit; cache {engine_search.CACHE_POSITIONS} positions"]
+                    f"info string Fry on 2 of 3 gpus (0,2); no tables; no tree limit; cache {engine_search.CACHE_POSITIONS} positions; "
+                    f"no smart pruning; search {uci.settings_text(search.search_settings)}"]
     for devices in ([1], [1, 3]):
         with pytest.raises(RuntimeError, match="fell over"):
             load_player(model_path, True, 4, False, {}, "int8", 1, devices)
@@ -1430,9 +1434,24 @@ def test_the_gui_is_told_what_was_loaded(monkeypatch, tablebase, model_path):
     monkeypatch.setattr(uci, "engine_network", fake_engine_network())
     monkeypatch.setattr(uci, "send", sent.append)
 
-    load_player(model_path, True, 4, True, {"memory_limit_mb": 64, "cache_positions": 1000}, "int8", 1)
+    search = load_player(model_path, True, 4, True, {"memory_limit_mb": 64, "cache_positions": 1000}, "int8", 1)
 
-    assert sent == ["info string Fry on one gpu; 145 wdl and 145 dtz tables, used up to 5 pieces; tree limit 64 MB; cache 1000 positions"]
+    assert sent == ["info string Fry on one gpu; 145 wdl and 145 dtz tables, used up to 5 pieces; tree limit 64 MB; cache 1000 positions; "
+                    f"smart pruning factor {engine_search.SMART_PRUNING_FACTOR}; search {uci.settings_text(search.search_settings)}"]
+
+#the start-up line shows the settings the search was built with, as SearchSettings takes them: a value the gui cut short shows there
+def test_the_gui_is_told_the_search_settings(monkeypatch, model_path):
+    sent = []
+    monkeypatch.setattr(uci, "engine_network", fake_engine_network())
+    monkeypatch.setattr(uci, "send", sent.append)
+    monkeypatch.setattr(engine_search, "ENGINE_SETTINGS", ENGINES_OWN_SETTINGS)
+    changes = parse_changes("c_puct=1.68,c_puct_factor=2.30,fpu_reduction=0.571", engine_search_settings(False))
+
+    load_player(model_path, True, 4, False, {"settings": changes}, "int8", 1)
+
+    settings = sent[-1].split("; search ")[1].split(",")
+    assert {"c_puct=1.68", "c_puct_factor=2.3", "fpu_reduction=0.571", "transpositions=true", "certainty=true"} <= set(settings)
+    assert parse_changes(",".join(settings), engine_search_settings(False))
 
 #a checkpoint recording the value sharpness it is served at sets the engine's default; one the engine is told wins over it
 def test_the_engine_serves_a_checkpoint_at_its_own_value_sharpness(monkeypatch, model_path):
@@ -2054,8 +2073,29 @@ def test_a_syzygy_path_reaches_the_search(monkeypatch, tablebase, tmp_path, mode
     gui.tell("go nodes 50")
     assert gui.sent_at("bestmove", seconds=30) is not None
     assert gui.lines_sent("bestmove") == ["bestmove h1h8"] and gui.last_info("nodes") == 0
+    #a root the tables rank counts each of its moves
+    assert gui.last_info("tbhits") == chess.Board("k7/8/1K6/8/8/8/8/7R w - - 0 1").legal_moves.count()
     #the refused path, then what the player was built with
     assert [line.split("; ")[1] for line in gui.lines_sent("info string")[1:]] == ["145 wdl and 145 dtz tables, used up to 5 pieces"]
+    gui.close()
+
+#tbhits counts the probes the tables answered in this search's tree: a root of one man more than they hold whose every move is a capture
+@pytest.mark.parametrize("tables", [False, True])
+def test_tbhits_counts_the_tree_probes_of_this_search(monkeypatch, tablebase, model_path, tables):
+    gui = Gui(monkeypatch, None, model_path)
+    if tables:
+        gui.tell(f"setoption name SyzygyPath value {SYZYGY_DIR}")
+    gui.tell("isready")
+    assert gui.sent_at("readyok", seconds=30) is not None
+    gui.tell("position fen 6Kq/2r5/8/8/8/7R/3N4/3k4 w - - 0 1")
+    gui.tell("go nodes 200")
+    assert gui.sent_at("bestmove", seconds=30) is not None
+    first = gui.last_info("tbhits")
+    assert (first > 0) == tables and gui.last_info("nodes") >= 200
+    #a second search's tbhits are its own, not added to the first's
+    asked = gui.tell("go nodes 200")
+    assert gui.sent_at("bestmove", since=asked, seconds=30) is not None
+    assert gui.last_info("tbhits") <= first
     gui.close()
 
 #fastchess's order (the CCC's): ucinewgame and isready, which loads, then the options, then isready again. The search is built again

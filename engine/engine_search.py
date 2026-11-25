@@ -81,6 +81,7 @@ class SearchReport:
     root_moves: list[tuple[chess.Move, int]]
     reused: int = 0
     evaluations: int = 0
+    tablebase_hits: int = 0 #this search's: the tree's probes the tables answered, or the root's moves they ranked
 
 def score_to_centipawns(score: float) -> int:
     score = min(max(score, 1 - MAX_REPORTED_SCORE), MAX_REPORTED_SCORE)
@@ -293,7 +294,8 @@ class EngineSearch:
         self.smart_pruning = batched and smart_pruning
         self.smart_pruning_factor = smart_pruning_factor
         self.advance_threads = advance_threads
-        search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces, syzygy_path=syzygy_path)
+        search_settings = self.search_settings = engine_search_settings(use_tablebase, settings, own=batched, tablebase_pieces=tablebase_pieces,
+                                                                        syzygy_path=syzygy_path)
         if descent_helpers is None:
             descent_helpers = HELPERS_A_NETWORK * len(self.networks) if several and self.concurrent_descents else 0
         if descent_helpers and not self.concurrent_descents:
@@ -316,6 +318,7 @@ class EngineSearch:
             self.tablebase = open_tablebase(tablebase_pieces)
         else:
             self.tablebase = open_tablebase_path(syzygy_path)
+        self.hits_before = 0 #Searches' tablebase hits when the search began
         self.certainty = search_settings.get("certainty", False)
         #smart pruning's wait for a search's own visits (fresh_enough), which Searches' own loop takes from Searches
         self.fresh_share = search_settings.get("fresh_share", 0.0)
@@ -351,8 +354,9 @@ class EngineSearch:
             #a root the tables have not ranked in their share of the search's time is searched in the rest of it
             ranked = ranked_moves(self.tablebase, board, None if seconds is None else started + TABLE_MOVE_SHARE * seconds)
             if ranked is not None:
-                return SearchReport(wdl_score(ranked[0].wdl), [ranked[0].move], 0, [])
+                return SearchReport(wdl_score(ranked[0].wdl), [ranked[0].move], 0, [], tablebase_hits=len(ranked))
 
+        self.hits_before = self.searches.tablebase_hits()
         #the seconds let a kept tree's compaction (at the memory limit) give way to a short search
         self.searches.start(GAME, board.root().fen(), [move.uci() for move in board.move_stack], UNLIMITED if simulations is None else simulations, seconds)
         deadline = started + seconds if seconds is not None else None
@@ -376,7 +380,7 @@ class EngineSearch:
         _, line, score, root_moves, visits, *evaluations = report
         return SearchReport(sharpen(score, 1 / self.value_sharpness), [chess.Move.from_uci(move) for move in line], visits,
                             [(chess.Move.from_uci(move), move_visits) for move, move_visits in root_moves[:ROOT_MOVES_REPORTED]], reused,
-                            evaluations[0] if evaluations else 0)
+                            evaluations[0] if evaluations else 0, self.searches.tablebase_hits() - self.hits_before)
 
     #rounds_on on the thread pinned to cpu if it is given, a failure stopping the other networks' rounds too
     def drive(self, network, run: SearchRun, cpu: int | None = None) -> None:

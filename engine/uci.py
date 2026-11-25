@@ -190,10 +190,10 @@ def shown_centipawns(score: float) -> int:
     return round(score_to_centipawns(score) * 100 / EVEN_WIN_CENTIPAWNS)
 
 #depth is the length of the expected line: cutechess keeps score, depth and time in the pgn. As lc0's, nodes are the root's visits, those of a kept tree
-#included, and nps the speed of this search's own
+#included, nps the speed of this search's own, and tbhits its own
 def info_line(report: SearchReport, seconds: float) -> str:
     nps = round((report.simulations - report.reused) / max(seconds, 1e-3))
-    return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {nps} "
+    return (f"info depth {len(report.line)} nodes {report.simulations} time {round(seconds * 1000)} nps {nps} tbhits {report.tablebase_hits} "
             f"score cp {shown_centipawns(report.score)} pv {' '.join(move.uci() for move in report.line)}")
 
 #a new game needs a new Clock
@@ -283,7 +283,12 @@ def working_networks(checkpoint_path: Path, leaves: int, precision: str, fp16_bl
         raise failed
     return networks, working
 
-#tells the gui what the player searches with, for its log: a wrong SyzygyPath or a missing gpu shows here
+#the settings SearchSettings can change, as it takes them
+def settings_text(settings: dict) -> str:
+    shown = {name: value for name, value in sorted(settings.items()) if type(value) in (bool, int, float)}
+    return ",".join(f"{name}={str(value).lower() if type(value) is bool else value}" for name, value in shown.items())
+
+#tells the gui what the player searches with, for its log: a wrong SyzygyPath, a missing gpu or a SearchSettings the gui cut short shows here
 def tell_loaded(player: EngineSearch, where: str, search_options: dict) -> EngineSearch:
     pieces, limit = search_options.get("tablebase_pieces", TABLEBASE_PIECES), search_options.get("memory_limit_mb", 0)
     if player.tablebase is None:
@@ -291,8 +296,9 @@ def tell_loaded(player: EngineSearch, where: str, search_options: dict) -> Engin
     else:
         found = found_tables(path_folders(search_options.get("syzygy_path") or tablebase_path(pieces)))
         tables = f"{len(found['rtbw'])} wdl and {len(found['rtbz'])} dtz tables, used up to {pieces} pieces"
+    pruning = f"smart pruning factor {player.smart_pruning_factor}" if player.smart_pruning else "no smart pruning"
     send(f"info string {ENGINE_NAME} on {where}; {tables}; {f'tree limit {limit} MB' if limit else 'no tree limit'}; "
-         f"cache {search_options.get('cache_positions', CACHE_POSITIONS)} positions")
+         f"cache {search_options.get('cache_positions', CACHE_POSITIONS)} positions; {pruning}; search {settings_text(player.search_settings)}")
     return player
 
 #what a load leaves the searches built on it: the network (one, or a list of several gpus'), its leaves a round, where it runs for the

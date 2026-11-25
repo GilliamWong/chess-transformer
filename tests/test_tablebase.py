@@ -227,7 +227,7 @@ def search_in_rust(fen: str, simulations: int, tablebase_pieces: int = 5) -> tup
         leaves = np.frombuffer(bytearray(searches.descend()), dtype=np.uint8).reshape(-1, TOKENS_PER_BOARD)
         reports = searches.finish(evaluate(leaves) if len(leaves) else np.zeros((0, ANSWER_WIDTH), np.float32))
         if reports:
-            _, line, _, root_moves, _ = reports[0]
+            _, line, _, root_moves, *_ = reports[0]
             return line, dict(root_moves)
 
 #a covered root is searched; below it only positions after a capture or pawn move are probed, so the winning move takes the visits

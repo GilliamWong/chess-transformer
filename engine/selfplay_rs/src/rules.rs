@@ -4,7 +4,7 @@ use shakmaty::{CastlingSide, Chess, Color, EnPassantMode, File, Move, MoveList, 
 use shakmaty_syzygy::filesystem::MmapFilesystem;
 use shakmaty_syzygy::{SyzygyError, Tablebase, Wdl};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub const TOKENS_PER_BOARD: usize = 70;
 //encoding.py's token offsets
@@ -229,6 +229,7 @@ pub struct Tables {
     tablebase: Tablebase<Chess>,
     pieces: usize,
     failures: AtomicUsize,
+    hits: AtomicU64, //the searches' probes the tables answered, uci's tbhits
 }
 
 impl Tables {
@@ -247,7 +248,7 @@ impl Tables {
                 }
             }
         }
-        Ok(Tables { tablebase, pieces, failures: AtomicUsize::new(0) })
+        Ok(Tables { tablebase, pieces, failures: AtomicUsize::new(0), hits: AtomicU64::new(0) })
     }
 
     pub fn covers(&self, board: &Chess) -> bool {
@@ -266,12 +267,19 @@ impl Tables {
     //the tables' score for a search: none after a failed probe, so that the network scores the position (as lc0 does); the first is said
     fn search_score(&self, board: &Chess, draw: f64) -> Option<f64> {
         self.score(board, draw)
+            .inspect(|_| {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+            })
             .inspect_err(|error| {
                 if self.failures.fetch_add(1, Ordering::Relaxed) == 0 {
                     eprintln!("syzygy tables: {error}; the positions they fail on are searched without them");
                 }
             })
             .ok()
+    }
+
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]

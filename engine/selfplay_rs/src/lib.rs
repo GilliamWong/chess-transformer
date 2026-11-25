@@ -1107,6 +1107,11 @@ impl Searches {
         })
     }
 
+    //the probes of the searches' trees that the tables answered, since the searches were made
+    fn tablebase_hits(&self) -> u64 {
+        self.tables.as_ref().map_or(0, |tables| tables.hits())
+    }
+
     //the gathers that helpers joined, and the leaves the helpers found, since the searches were made
     fn helper_counts(&self) -> (u64, u64) {
         (self.helped[0].load(Ordering::Relaxed), self.helped[1].load(Ordering::Relaxed))
